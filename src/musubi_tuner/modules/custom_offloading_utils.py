@@ -103,10 +103,12 @@ class Offloader:
             self.thread_pool = None
             pinned_status = "ON" if self.use_pinned_memory else "OFF"
             auto_msg = " (auto-enable if transfers exceed {:.0f}ms)".format(auto_pin_threshold_ms) if self._allow_auto_pin else ""
-            print(f"[{self.block_type}] 🪟 WINDOWS detected: Pinned memory={pinned_status}{auto_msg}, Threading=OFF, Batched operations=ON")
+            if self.debug:
+                print(f"[{self.block_type}] 🪟 WINDOWS detected: Pinned memory={pinned_status}{auto_msg}, Threading=OFF, Batched operations=ON")
         else:
             self.thread_pool = ThreadPoolExecutor(max_workers=1)
-            print(f"[{self.block_type}] 🐧 LINUX detected: Pinned memory=ON, Threading=ON, Interleaved operations=ON")
+            if self.debug:
+                print(f"[{self.block_type}] 🐧 LINUX detected: Pinned memory=ON, Threading=ON, Interleaved operations=ON")
 
         self.futures = {}
         self.cuda_available = device.type == "cuda"
@@ -286,9 +288,10 @@ class Offloader:
             and max(timings.get('gpu_to_staging_max', 0.0), timings.get('staging_to_gpu_max', 0.0)) > self._auto_pin_threshold
         ):
             peak_ms = max(timings.get('gpu_to_staging_max', 0.0), timings.get('staging_to_gpu_max', 0.0)) * 1000.0
-            print(
-                f"[{self.block_type}] 🪟 Auto-enabling pinned memory (transfer took {peak_ms:.1f}ms > {self._auto_pin_threshold * 1000:.1f}ms threshold)."
-            )
+            if self.debug:
+                print(
+                    f"[{self.block_type}] 🪟 Auto-enabling pinned memory (transfer took {peak_ms:.1f}ms > {self._auto_pin_threshold * 1000:.1f}ms threshold)."
+                )
             self.use_pinned_memory = True
             self._allow_auto_pin = False
             self.staging_buffer_a = None
@@ -300,7 +303,7 @@ class Offloader:
             self._swap_count = 0
 
         self._swap_count += 1
-        if self._swap_count % 10 == 0:
+        if self.debug and self._swap_count % 10 == 0:
             platform_indicator = "🪟 WINDOWS" if self.is_windows else "🐧 LINUX"
             pinned_status = "pinned" if self.use_pinned_memory else "unpinned"
             print(f"\n[{self.block_type}] {platform_indicator} BLOCK SWAP #{self._swap_count} ({pinned_status}):")
