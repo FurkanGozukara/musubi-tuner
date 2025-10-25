@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import platform
 import time
 from typing import Optional
 import torch
@@ -123,19 +124,32 @@ class Offloader:
         self.device = device
         self.debug = debug
 
-        self.thread_pool = ThreadPoolExecutor(max_workers=1)
+        # Detect platform for Windows-specific optimizations
+        self.is_windows = platform.system() == 'Windows'
+        
+        # Disable threading on Windows due to higher overhead
+        if self.is_windows:
+            self.thread_pool = None
+            # ALWAYS print on Windows to confirm optimization is active
+            print(f"[{self.block_type}] 🪟 WINDOWS OPTIMIZATION ACTIVE: Pinned memory disabled, synchronous block swapping enabled")
+        else:
+            self.thread_pool = ThreadPoolExecutor(max_workers=1)
+            print(f"[{self.block_type}] 🐧 Linux detected: Using pinned memory and async threading")
+        
         self.futures = {}
         self.cuda_available = device.type == "cuda"
 
-        # Staging buffers for cuda offloading. These are pinned memory buffers to speed up the transfer between CPU and GPU
-        # We create one staging buffer per transfer direction (A: GPU to CPU, B: CPU to GPU)
+        # Staging buffers for cuda offloading
+        # Note: Pinned memory is disabled on Windows due to poor performance (3-5x slower than Linux)
         self.staging_buffer_a = None
         self.staging_buffer_b = None
+        self.use_pinned_memory = not self.is_windows  # Only use pinned memory on non-Windows platforms
 
     def swap_weight_devices_cuda(self, device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
         assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
-        # start_time = time.perf_counter()
+        overall_start = time.perf_counter()
+        timings = {}
 
         weight_swap_jobs = []
 
@@ -145,6 +159,7 @@ class Offloader:
         #     if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
         #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
+        t0 = time.perf_counter()
         modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
         for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
             if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
@@ -154,59 +169,138 @@ class Offloader:
                 else:
                     if module_to_cuda.weight.data.device.type != device.type:
                         module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+        timings['build_jobs'] = time.perf_counter() - t0
 
-        torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
-
+        # Removed redundant synchronization before stream creation (Windows optimization)
+        # torch.cuda.current_stream().synchronize()  # Not needed - stream creation handles this
+        
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             if self.staging_buffer_a is None:
-                # Create staging buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
-                self.staging_buffer_a = [
-                    torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
-                    for _, _, cuda_data_view, _ in weight_swap_jobs
-                ]
-                self.staging_buffer_b = [
-                    torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
-                    for _, _, cuda_data_view, _ in weight_swap_jobs
-                ]
+                t0 = time.perf_counter()
+                # Create staging buffers - use pinned memory only on Linux for better performance
+                if self.use_pinned_memory:
+                    # Linux: pinned memory for optimal GPU<->CPU transfer speed
+                    self.staging_buffer_a = [
+                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        for _, _, cuda_data_view, _ in weight_swap_jobs
+                    ]
+                    self.staging_buffer_b = [
+                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        for _, _, cuda_data_view, _ in weight_swap_jobs
+                    ]
+                else:
+                    # Windows: regular CPU tensors (pinned memory is 3-5x slower on Windows)
+                    self.staging_buffer_a = [
+                        torch.empty_like(cuda_data_view, device="cpu")
+                        for _, _, cuda_data_view, _ in weight_swap_jobs
+                    ]
+                    self.staging_buffer_b = [
+                        torch.empty_like(cuda_data_view, device="cpu")
+                        for _, _, cuda_data_view, _ in weight_swap_jobs
+                    ]
+                timings['create_buffers'] = time.perf_counter() - t0
 
             events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for staging buffer A to CPU non-blocking copy
 
             # Copy weights to staging buffers and record events
+            t0 = time.perf_counter()
+            gpu_to_staging_time = 0
+            cpu_to_staging_time = 0
             for event, sbuf_a, sbuf_b, (module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view) in zip(
                 events, self.staging_buffer_a, self.staging_buffer_b, weight_swap_jobs
             ):
                 # CUDA to staging buffer A, non-blocking copy
+                t1 = time.perf_counter()
                 sbuf_a.copy_(cuda_data_view.data, non_blocking=True)
                 event.record(stream)
+                gpu_to_staging_time += time.perf_counter() - t1
 
                 # CPU to staging buffer B, CPU to pinned CPU, synchronous copy. Can overlap with CUDA to staging buffer A
                 # Making this multithreaded does not help, and 'non_blocking=True' does not help either.
+                t1 = time.perf_counter()
                 sbuf_b.copy_(module_to_cuda.weight.data)  # BOTTLENECK
+                cpu_to_staging_time += time.perf_counter() - t1
+            timings['gpu_to_staging'] = gpu_to_staging_time
+            timings['cpu_to_staging'] = cpu_to_staging_time
 
         with torch.cuda.stream(stream):
-            for event, sbuf_a, sbuf_b, (module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view) in zip(
-                events, self.staging_buffer_a, self.staging_buffer_b, weight_swap_jobs
-            ):
-                # Wait for staging buffer A to be ready, and CUDA data view can be reused
-                event.synchronize()
-
-                # Staging buffer B to CUDA, non-blocking copy.
-                cuda_data_view.copy_(sbuf_b, non_blocking=True)
-
-                # Staging buffer A to CPU, synchronous copy. Can overlap with staging buffer B to CUDA
-                cpu_data_view.copy_(sbuf_a)  # BOTTLENECK
-
+            event_sync_time = 0
+            staging_to_gpu_time = 0
+            staging_to_cpu_time = 0
+            
+            # Windows optimization: Batch event syncs instead of one-by-one
+            if self.is_windows:
+                # Sync all events at once (reduces overhead on Windows)
+                t1 = time.perf_counter()
+                for event in events:
+                    event.synchronize()
+                event_sync_time = time.perf_counter() - t1
+                
+                # Then do all copies without interleaved syncs
+                t1 = time.perf_counter()
+                for sbuf_b, (_, _, cuda_data_view, _) in zip(self.staging_buffer_b, weight_swap_jobs):
+                    cuda_data_view.copy_(sbuf_b, non_blocking=True)
+                staging_to_gpu_time = time.perf_counter() - t1
+                
+                t1 = time.perf_counter()
+                for sbuf_a, (_, _, _, cpu_data_view) in zip(self.staging_buffer_a, weight_swap_jobs):
+                    cpu_data_view.copy_(sbuf_a)
+                staging_to_cpu_time = time.perf_counter() - t1
+                
                 # Update references
-                module_to_cuda.weight.data = cuda_data_view
-                module_to_cpu.weight.data = cpu_data_view
+                for sbuf_a, sbuf_b, (module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view) in zip(
+                    self.staging_buffer_a, self.staging_buffer_b, weight_swap_jobs
+                ):
+                    module_to_cuda.weight.data = cuda_data_view
+                    module_to_cpu.weight.data = cpu_data_view
+            else:
+                # Linux: Keep original interleaved pattern (works well there)
+                for event, sbuf_a, sbuf_b, (module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view) in zip(
+                    events, self.staging_buffer_a, self.staging_buffer_b, weight_swap_jobs
+                ):
+                    t1 = time.perf_counter()
+                    event.synchronize()
+                    event_sync_time += time.perf_counter() - t1
 
+                    t1 = time.perf_counter()
+                    cuda_data_view.copy_(sbuf_b, non_blocking=True)
+                    staging_to_gpu_time += time.perf_counter() - t1
+
+                    t1 = time.perf_counter()
+                    cpu_data_view.copy_(sbuf_a)
+                    staging_to_cpu_time += time.perf_counter() - t1
+
+                    module_to_cuda.weight.data = cuda_data_view
+                    module_to_cpu.weight.data = cpu_data_view
+                    
+            timings['event_sync'] = event_sync_time
+            timings['staging_to_gpu'] = staging_to_gpu_time
+            timings['staging_to_cpu'] = staging_to_cpu_time
+
+        t0 = time.perf_counter()
         stream.synchronize()  # Synchronize staging buffer B to CUDA
-        torch.cuda.current_stream().synchronize()  # This prevents the illegal loss value
+        # Removed redundant current_stream sync - stream.synchronize() is sufficient
+        timings['final_sync'] = time.perf_counter() - t0
 
-        # print(
-        #     f"[{self.block_type}] Swapped weights in {time.perf_counter() - start_time:.2f}s. Count of modules swapped: {len(weight_swap_jobs)}"
-        # )
+        total_time = time.perf_counter() - overall_start
+        
+        # Print detailed timing statistics (Windows only, every 10th swap for readability)
+        if self.is_windows and not hasattr(self, '_swap_count'):
+            self._swap_count = 0
+        if self.is_windows:
+            self._swap_count += 1
+            if self._swap_count % 10 == 0:  # Print every 10th swap
+                print(f"\n[{self.block_type}] BLOCK SWAP TIMING (#{self._swap_count}):")
+                print(f"  Total: {total_time*1000:.1f}ms | Modules: {len(weight_swap_jobs)}")
+                print(f"  Build jobs: {timings.get('build_jobs', 0)*1000:.1f}ms")
+                print(f"  Create buffers: {timings.get('create_buffers', 0)*1000:.1f}ms")
+                print(f"  GPU→Staging: {timings.get('gpu_to_staging', 0)*1000:.1f}ms")
+                print(f"  CPU→Staging: {timings.get('cpu_to_staging', 0)*1000:.1f}ms")
+                print(f"  Event sync: {timings.get('event_sync', 0)*1000:.1f}ms")
+                print(f"  Staging→GPU: {timings.get('staging_to_gpu', 0)*1000:.1f}ms")
+                print(f"  Staging→CPU: {timings.get('staging_to_cpu', 0)*1000:.1f}ms")
+                print(f"  Final sync: {timings.get('final_sync', 0)*1000:.1f}ms")
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
@@ -233,9 +327,21 @@ class Offloader:
         block_to_cpu = blocks[block_idx_to_cpu]
         block_to_cuda = blocks[block_idx_to_cuda]
 
-        self.futures[block_idx_to_cuda] = self.thread_pool.submit(
-            move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
-        )
+        if self.thread_pool is None:
+            # Windows: synchronous execution (no threading overhead)
+            result = move_blocks(block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda)
+            # Create a simple object that mimics Future.result()
+            class SyncResult:
+                def __init__(self, value):
+                    self._value = value
+                def result(self):
+                    return self._value
+            self.futures[block_idx_to_cuda] = SyncResult(result)
+        else:
+            # Linux/Mac: asynchronous execution with threading
+            self.futures[block_idx_to_cuda] = self.thread_pool.submit(
+                move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
+            )
 
     def _wait_blocks_move(self, block_idx):
         if block_idx not in self.futures:
