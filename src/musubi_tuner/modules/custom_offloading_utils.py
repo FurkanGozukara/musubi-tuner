@@ -130,11 +130,11 @@ class Offloader:
         # Disable threading on Windows due to higher overhead
         if self.is_windows:
             self.thread_pool = None
-            # ALWAYS print on Windows to confirm optimization is active
-            print(f"[{self.block_type}] 🪟 WINDOWS OPTIMIZATION ACTIVE: Pinned memory disabled, synchronous block swapping enabled")
+            # Print platform-specific optimization status
+            print(f"[{self.block_type}] 🪟 WINDOWS detected: Pinned memory=OFF, Threading=OFF, Batched operations=ON")
         else:
             self.thread_pool = ThreadPoolExecutor(max_workers=1)
-            print(f"[{self.block_type}] 🐧 Linux detected: Using pinned memory and async threading")
+            print(f"[{self.block_type}] 🐧 LINUX detected: Pinned memory=ON, Threading=ON, Interleaved operations=ON")
         
         self.futures = {}
         self.cuda_available = device.type == "cuda"
@@ -285,22 +285,24 @@ class Offloader:
 
         total_time = time.perf_counter() - overall_start
         
-        # Print detailed timing statistics (Windows only, every 10th swap for readability)
-        if self.is_windows and not hasattr(self, '_swap_count'):
+        # Print detailed timing statistics on ALL platforms for comparison
+        if not hasattr(self, '_swap_count'):
             self._swap_count = 0
-        if self.is_windows:
-            self._swap_count += 1
-            if self._swap_count % 10 == 0:  # Print every 10th swap
-                print(f"\n[{self.block_type}] BLOCK SWAP TIMING (#{self._swap_count}):")
-                print(f"  Total: {total_time*1000:.1f}ms | Modules: {len(weight_swap_jobs)}")
-                print(f"  Build jobs: {timings.get('build_jobs', 0)*1000:.1f}ms")
-                print(f"  Create buffers: {timings.get('create_buffers', 0)*1000:.1f}ms")
-                print(f"  GPU→Staging: {timings.get('gpu_to_staging', 0)*1000:.1f}ms")
-                print(f"  CPU→Staging: {timings.get('cpu_to_staging', 0)*1000:.1f}ms")
-                print(f"  Event sync: {timings.get('event_sync', 0)*1000:.1f}ms")
-                print(f"  Staging→GPU: {timings.get('staging_to_gpu', 0)*1000:.1f}ms")
-                print(f"  Staging→CPU: {timings.get('staging_to_cpu', 0)*1000:.1f}ms")
-                print(f"  Final sync: {timings.get('final_sync', 0)*1000:.1f}ms")
+        
+        self._swap_count += 1
+        if self._swap_count % 10 == 0:  # Print every 10th swap
+            platform_indicator = "🪟 WINDOWS" if self.is_windows else "🐧 LINUX"
+            pinned_status = "pinned" if self.use_pinned_memory else "unpinned"
+            print(f"\n[{self.block_type}] {platform_indicator} BLOCK SWAP #{self._swap_count} ({pinned_status}):")
+            print(f"  Total: {total_time*1000:.1f}ms | Modules: {len(weight_swap_jobs)}")
+            print(f"  Build jobs: {timings.get('build_jobs', 0)*1000:.1f}ms")
+            print(f"  Create buffers: {timings.get('create_buffers', 0)*1000:.1f}ms")
+            print(f"  GPU→Staging: {timings.get('gpu_to_staging', 0)*1000:.1f}ms")
+            print(f"  CPU→Staging: {timings.get('cpu_to_staging', 0)*1000:.1f}ms")
+            print(f"  Event sync: {timings.get('event_sync', 0)*1000:.1f}ms")
+            print(f"  Staging→GPU: {timings.get('staging_to_gpu', 0)*1000:.1f}ms")
+            print(f"  Staging→CPU: {timings.get('staging_to_cpu', 0)*1000:.1f}ms")
+            print(f"  Final sync: {timings.get('final_sync', 0)*1000:.1f}ms")
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
