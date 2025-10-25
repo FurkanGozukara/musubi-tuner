@@ -339,9 +339,21 @@ class Offloader:
         block_to_cpu = blocks[block_idx_to_cpu]
         block_to_cuda = blocks[block_idx_to_cuda]
 
-        self.futures[block_idx_to_cuda] = self.thread_pool.submit(
-            move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
-        )
+        if self.thread_pool is None:
+            result = move_blocks(block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda)
+
+            class SyncResult:
+                def __init__(self, value):
+                    self._value = value
+
+                def result(self):
+                    return self._value
+
+            self.futures[block_idx_to_cuda] = SyncResult(result)
+        else:
+            self.futures[block_idx_to_cuda] = self.thread_pool.submit(
+                move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
+            )
 
     def _wait_blocks_move(self, block_idx):
         if block_idx not in self.futures:
