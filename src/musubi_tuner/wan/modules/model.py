@@ -417,15 +417,19 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
-            y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).to(org_dtype), seq_lens, grid_sizes, freqs)
-            x = (x + y.to(torch.float32) * e[2]).to(org_dtype)
+            # y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).to(org_dtype), seq_lens, grid_sizes, freqs)
+            y = self.self_attn(torch.addcmul(e[0], self.norm1(x).float(), (1 + e[1])).to(org_dtype), seq_lens, grid_sizes, freqs)
+            # x = (x + y.to(torch.float32) * e[2]).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[2]).to(org_dtype)
             del y
 
             # cross-attention & ffn
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             del context
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(org_dtype))
-            x = (x + y.to(torch.float32) * e[5]).to(org_dtype)
+            # y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(org_dtype))
+            y = self.ffn(torch.addcmul(e[3], self.norm2(x).float(), (1 + e[4])).to(org_dtype))
+            # x = (x + y.to(torch.float32) * e[5]).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[5]).to(org_dtype)
             del y
         else:  # For Wan2.2
             e = self.modulation.to(torch.float32) + e
@@ -433,17 +437,23 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
+            # y = self.self_attn(
+            #     (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(org_dtype), seq_lens, grid_sizes, freqs
+            # )
             y = self.self_attn(
-                (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(org_dtype), seq_lens, grid_sizes, freqs
+                torch.addcmul(e[0].squeeze(2), self.norm1(x).float(), (1 + e[1].squeeze(2))).to(org_dtype), seq_lens, grid_sizes, freqs
             )
-            x = (x + y.to(torch.float32) * e[2].squeeze(2)).to(org_dtype)
+            # x = (x + y.to(torch.float32) * e[2].squeeze(2)).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[2].squeeze(2)).to(org_dtype)
             del y
 
             # cross-attention & ffn
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             del context
-            y = self.ffn((self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(org_dtype))
-            x = (x + y.to(torch.float32) * e[5].squeeze(2)).to(org_dtype)
+            # y = self.ffn((self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(org_dtype))
+            y = self.ffn(torch.addcmul(e[3].squeeze(2), self.norm2(x).float(), (1 + e[4].squeeze(2))).to(org_dtype))
+            # x = (x + y.to(torch.float32) * e[5].squeeze(2)).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[5].squeeze(2)).to(org_dtype)
             del y
 
         return x
@@ -484,10 +494,12 @@ class Head(nn.Module):
         assert e.dtype == torch.float32
         if self.model_version == "2.1":
             e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            # x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            x = self.head(torch.addcmul(e[0], self.norm(x), (1 + e[1])))
         else:  # For Wan2.2
             e = (self.modulation.unsqueeze(0).to(torch.float32) + e.unsqueeze(2)).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+            # x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+            x = self.head(torch.addcmul(e[0].squeeze(2), self.norm(x), (1 + e[1].squeeze(2))))
 
         return x
 
@@ -733,7 +745,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         print(f"WanModel: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.blocks)
 
@@ -742,7 +754,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
 
         self.offloader = ModelOffloader(
-            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device  # , debug=True
+            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device, use_pinned_memory  # , debug=True
         )
         print(
             f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"

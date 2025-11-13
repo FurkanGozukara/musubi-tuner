@@ -910,9 +910,9 @@ class QwenImageTransformerBlock(nn.Module):
         del attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
+        hidden_states = torch.addcmul(hidden_states, img_gate1, img_attn_output)
         del img_gate1, img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate1, txt_attn_output)
         del txt_gate1, txt_attn_output
 
         # Process image stream - norm2 + MLP
@@ -921,7 +921,7 @@ class QwenImageTransformerBlock(nn.Module):
         del img_normed2, img_mod2
         img_mlp_output = self.img_mlp(img_modulated2)
         del img_modulated2
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        hidden_states = torch.addcmul(hidden_states, img_gate2, img_mlp_output)
         del img_gate2, img_mlp_output
 
         # Process text stream - norm2 + MLP
@@ -930,7 +930,7 @@ class QwenImageTransformerBlock(nn.Module):
         del txt_normed2, txt_mod2
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         del txt_modulated2
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, txt_mlp_output)
         del txt_gate2, txt_mlp_output
 
         # Clip to prevent overflow for fp16
@@ -1044,7 +1044,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         self.activation_cpu_offloading = False
         print("QwenModel: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.transformer_blocks)
 
@@ -1053,7 +1053,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
 
         self.offloader = ModelOffloader(
-            "qwen-image-block", self.transformer_blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device
+            "qwen-image-block", self.transformer_blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device, use_pinned_memory
         )
         # , debug=True
         print(
