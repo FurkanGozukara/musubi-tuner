@@ -294,6 +294,10 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
         "mode": s.mode,
         "guidance_strength": s.guidance_strength,
     }
+    # anchor settings only matter for text mode; emit when anchors are present
+    if s.mode == "text" and any((a.prompt or "").strip() for a in s.anchors):
+        doc["anchor_strength"] = s.anchor_strength
+        doc["anchor_cap_mult"] = s.anchor_cap_mult
     if s.reference_modality:
         doc["reference_modality"] = s.reference_modality
     if s.pos_cache_dir:
@@ -327,6 +331,13 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
             if target.target_class:
                 lines.append(f"target_class = {_toml_value(target.target_class)}")
             lines.append(f"weight = {target.weight}")
+            lines.append("")
+
+        for anchor in s.anchors:
+            if not (anchor.prompt or "").strip():
+                continue
+            lines.append("[[anchors]]")
+            lines.append(f"prompt = {_toml_value(anchor.prompt)}")
             lines.append("")
 
     output_path.write_text("\n".join(lines), encoding="utf-8")

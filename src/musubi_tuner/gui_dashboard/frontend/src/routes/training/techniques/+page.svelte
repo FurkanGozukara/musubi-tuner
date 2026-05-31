@@ -56,6 +56,34 @@
 		saveProjectDebounced();
 	}
 
+	function updateAnchor(index, key, value) {
+		projectConfig.update((c) => {
+			if (!c) return c;
+			const anchors = [...(c.slider?.anchors || [])];
+			anchors[index] = { ...(anchors[index] || {}), [key]: value };
+			return { ...c, slider: { ...(c.slider || {}), anchors } };
+		});
+		saveProjectDebounced();
+	}
+
+	function addAnchor() {
+		projectConfig.update((c) => {
+			if (!c) return c;
+			const anchors = [...(c.slider?.anchors || []), { prompt: '' }];
+			return { ...c, slider: { ...(c.slider || {}), anchors } };
+		});
+		saveProjectDebounced();
+	}
+
+	function removeAnchor(index) {
+		projectConfig.update((c) => {
+			if (!c?.slider?.anchors) return c;
+			const anchors = c.slider.anchors.filter((_, i) => i !== index);
+			return { ...c, slider: { ...(c.slider || {}), anchors } };
+		});
+		saveProjectDebounced();
+	}
+
 	function updateTraining(key, value) {
 		projectConfig.update((c) => {
 			if (!c) return c;
@@ -73,6 +101,7 @@
 	}
 
 	let targets = $derived($projectConfig?.slider?.targets || [{ positive: '', negative: '', target_class: '', weight: 1.0 }]);
+	let anchors = $derived($projectConfig?.slider?.anchors || []);
 	let sliderStatus = $derived($processStatuses.slider_training || { state: 'idle', exit_code: null });
 	let sliderLogs = $derived($processLogs.slider_training || []);
 	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
@@ -779,7 +808,13 @@
 									<FormField fieldPath="slider.output_name" value={$projectConfig?.slider?.output_name || 'ltx2_slider'} oninput={(e) => update('output_name', e.target.value)} tooltip="Output filename prefix for slider LoRA" />
 								</div>
 								{#if ($projectConfig?.slider?.mode || 'text') === 'text'}
-									<FormField type="number" fieldPath="slider.guidance_strength" value={$projectConfig?.slider?.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="slider.guidance_strength" value={$projectConfig?.slider?.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
+										<FormField type="number" fieldPath="slider.anchor_strength" value={$projectConfig?.slider?.anchor_strength ?? 1.0} oninput={(e) => update('anchor_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Weight on the anchor preservation loss (text mode only). Anchors keep listed concepts unchanged by the slider." />
+									</div>
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="slider.anchor_cap_mult" value={$projectConfig?.slider?.anchor_cap_mult ?? 5.0} oninput={(e) => update('anchor_cap_mult', Number(e.target.value))} step="1" min={0} tooltip="Caps per-step anchor loss at this multiple of its running median (0=off). Tames the rare spikes that inflate grad_norm. Lower (3-5) clamps harder." />
+									</div>
 									<div class="grid grid-cols-3 gap-2">
 										<FormField fieldPath="slider.latent_frames" label="Frames" type="number" value={$projectConfig?.slider?.latent_frames ?? 1} oninput={(e) => update('latent_frames', Number(e.target.value))} min={1} tooltip="Latent frames (1=image, >1=video)" />
 										<FormField type="number" fieldPath="slider.latent_height" value={$projectConfig?.slider?.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
@@ -887,6 +922,57 @@
 										<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 6v12m6-6H6"/></svg>
 										Add Target
 									</button>
+
+									<!-- Anchors (concept preservation) -->
+									<div class="pt-3 mt-1" style="border-top: 1px solid var(--border-subtle);">
+										<div class="text-[11px] font-semibold mb-1" style="color: var(--text-primary);">Anchors</div>
+										<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
+											Optional concepts to preserve. The slider is constrained to leave these prompts unchanged at both <code>+1</code> and <code>-1</code>, preventing drift on unrelated content. Keep the count small (1-3).
+										</p>
+										{#each anchors as anchor, i}
+											<div class="p-3 mb-2 space-y-2 relative" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+												<div class="flex items-center justify-between">
+													<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--accent);">Anchor #{i + 1}</span>
+													<button
+														onclick={() => removeAnchor(i)}
+														class="px-2 py-0.5 text-[10px] font-medium"
+														style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+														onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+														onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
+													>
+														Remove
+													</button>
+												</div>
+												<!-- svelte-ignore a11y_label_has_associated_control -->
+												<label class="block">
+													<span class="flex items-center gap-1 text-[10px] font-medium mb-0.5" style="color: var(--text-secondary);">
+														<span>Preserve Prompt</span>
+														<FieldResetButton fieldPath={`slider.anchors.${i}.prompt`} />
+													</span>
+													<textarea
+														class="w-full text-[11px] px-2 py-1.5 resize-y"
+														rows="2"
+														value={anchor.prompt || ''}
+														oninput={(e) => updateAnchor(i, 'prompt', e.target.value)}
+														placeholder="a portrait of a person..."
+														style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
+														onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
+														onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
+													></textarea>
+												</label>
+											</div>
+										{/each}
+										<button
+											onclick={addAnchor}
+											class="w-full py-1.5 text-[11px] font-medium flex items-center justify-center gap-1"
+											style="background: var(--bg-elevated); border: 1px dashed var(--border); color: var(--text-muted); border-radius: var(--radius-sm);"
+											onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+											onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+										>
+											<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 6v12m6-6H6"/></svg>
+											Add Anchor
+										</button>
+									</div>
 								{:else}
 									<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
 										Reference-based slider modes use paired cached examples instead of prompt targets. The positive and negative samples must share basename-aligned cache files.

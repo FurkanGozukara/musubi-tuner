@@ -89,10 +89,25 @@ class SliderTargetConfig:
 
 
 @dataclass
+class SliderAnchorConfig:
+    """A concept to preserve (text-mode only).
+
+    At both slider multipliers (+1 and -1) the LoRA's prediction for the anchor
+    prompt is constrained (MSE) to match the frozen base model's prediction,
+    preventing the slider from drifting on unrelated concepts.
+    """
+
+    prompt: str
+
+
+@dataclass
 class SliderConfig:
     mode: str  # "text", "reference", or "ic_reference"
     reference_modality: str = "video"  # "video" or "audio" for reference mode
     targets: List[SliderTargetConfig] = field(default_factory=list)
+    anchors: List[SliderAnchorConfig] = field(default_factory=list)  # text-mode preservation
+    anchor_strength: float = 1.0  # weight on the anchor preservation loss (text-mode only)
+    anchor_cap_mult: float = 5.0  # cap per-step anchor loss at this x running median (0=off)
     guidance_strength: float = 1.0
     frame_rate: int = 25
     sample_slider_range: List[float] = field(default_factory=lambda: [-2.0, -1.0, 0.0, 1.0, 2.0])
@@ -110,6 +125,8 @@ def load_slider_config(path: str) -> SliderConfig:
     mode = raw.get("mode", "text")
     reference_modality = str(raw.get("reference_modality", "video")).lower()
     guidance_strength = float(raw.get("guidance_strength", 1.0))
+    anchor_strength = float(raw.get("anchor_strength", 1.0))
+    anchor_cap_mult = float(raw.get("anchor_cap_mult", 5.0))
     frame_rate = int(raw.get("frame_rate", 25))
     default_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
     sample_slider_range = raw.get("sample_slider_range", default_slider_range)
@@ -133,6 +150,10 @@ def load_slider_config(path: str) -> SliderConfig:
             )
         )
 
+    anchors = []
+    for a in raw.get("anchors", []):
+        anchors.append(SliderAnchorConfig(prompt=a["prompt"]))
+
     pos_cache_dir = raw.get("pos_cache_dir", None)
     neg_cache_dir = raw.get("neg_cache_dir", None)
     text_cache_dir = raw.get("text_cache_dir", None) or pos_cache_dir
@@ -142,6 +163,9 @@ def load_slider_config(path: str) -> SliderConfig:
         mode=mode,
         reference_modality=reference_modality,
         targets=targets,
+        anchors=anchors,
+        anchor_strength=anchor_strength,
+        anchor_cap_mult=anchor_cap_mult,
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
         sample_slider_range=[float(v) for v in sample_slider_range],
@@ -165,6 +189,24 @@ def _norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     (Ported from ai-toolkit ConceptSliderTrainer.)
     """
     return (tensor - tensor.mean()) / (tensor.std() + 1e-8) * target.std() + target.mean()
+
+
+def _anchor_mse(lora_pred: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    """Raw MSE between LoRA and frozen-base anchor predictions (velocity space).
+
+    The per-step magnitude of this loss is intrinsically spiky: on ~90% of steps
+    the LoRA barely moves the anchor prediction (loss ~1e-4), but on a small
+    fraction of steps it deviates a lot. An offline probe over real predictions
+    showed this spikiness is NOT a removable per-step scale factor — every
+    per-step normalizer tried (variance-normalize, cosine, relative-MSE) left a
+    1000x-7000x dynamic range, because the variation lives in the genuine
+    deviation (the numerator), not in a divisible scale. The robust fix is to
+    *cap* the per-step contribution (see ``_anchor_loss``), which bounds the
+    rare spikes while leaving the typical steps untouched. This mirrors the
+    spirit of Min-SNR-gamma clamping.
+    """
+    diff = lora_pred.float() - base_pred.float()
+    return (diff * diff).mean()
 
 
 def _pad_and_batch(
@@ -402,6 +444,7 @@ class LTX2SliderTrainer:
         self._net_trainer = LTX2NetworkTrainer()
         self.slider_config: Optional[SliderConfig] = None
         self.cached_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._anchor_running_median: Optional[float] = None  # for spike capping
 
     def _prepare_first_frame_conditioning(
         self,
@@ -509,6 +552,8 @@ class LTX2SliderTrainer:
             prompts.add(target.positive)
             prompts.add(target.negative)
             prompts.add(target.target_class)
+        for anchor in self.slider_config.anchors:
+            prompts.add(anchor.prompt)
         prompts.add("")  # neutral / empty prompt
 
         for prompt_text in prompts:
@@ -571,27 +616,41 @@ class LTX2SliderTrainer:
         neu_e, neu_m = self.cached_embeds[""]
         tgt_e, tgt_m = self.cached_embeds[target.target_class]
 
-        # Pad and batch for 3-pass: [positive, neutral, negative]
-        text_3x, mask_3x = _pad_and_batch([(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)], device, dit_dtype)
+        # Anchors (text-mode preservation). Each anchor's frozen-base prediction
+        # becomes a target that the LoRA must match at BOTH multipliers (+1 / -1),
+        # so the slider does not drift on these unrelated concepts.
+        anchors = self.slider_config.anchors
+        n_anchors = len(anchors)
+        anchor_strength = self.slider_config.anchor_strength
+        anchor_items = [self.cached_embeds[a.prompt] for a in anchors]
 
-        # No-grad 3-pass forward (LoRA disabled)
+        # Pad and batch the no-grad reference pass:
+        #   [positive, neutral, negative, anchor_0..N]
+        ref_items = [(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)] + anchor_items
+        num_ref = 3 + n_anchors
+        text_ref, mask_ref = _pad_and_batch(ref_items, device, dit_dtype)
+
+        # No-grad forward (LoRA disabled)
         network.set_multiplier(0.0)
-        noisy_3x = noisy.expand(3, -1, -1, -1, -1).to(dtype=dit_dtype)
-        ts_3x = model_ts.expand(3, -1)
+        noisy_ref = noisy.expand(num_ref, -1, -1, -1, -1).to(dtype=dit_dtype)
+        ts_ref = model_ts.expand(num_ref, -1)
 
         with torch.no_grad():
             self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
             with accelerator.autocast():
-                pred_3x = transformer(
-                    noisy_3x,
-                    timestep=ts_3x,
-                    context=text_3x,
-                    attention_mask=mask_3x,
+                pred_ref = transformer(
+                    noisy_ref,
+                    timestep=ts_ref,
+                    context=text_ref,
+                    attention_mask=mask_ref,
                     frame_rate=self.slider_config.frame_rate,
                     transformer_options={},
                 )
 
-        pred_pos, pred_neu, pred_neg = pred_3x.chunk(3, dim=0)
+        ref_chunks = pred_ref.chunk(num_ref, dim=0)
+        pred_pos, pred_neu, pred_neg = ref_chunks[0], ref_chunks[1], ref_chunks[2]
+        # Frozen-base anchor predictions (detached) — the preservation targets.
+        anchor_targets = [c.detach() for c in ref_chunks[3:]]
 
         # Compute directional offset
         direction = pred_pos - pred_neg
@@ -599,25 +658,85 @@ class LTX2SliderTrainer:
         target_enhance = _norm_like_tensor(pred_neu + gs * direction, pred_neu).detach()
         target_erase = _norm_like_tensor(pred_neu - gs * direction, pred_neu).detach()
 
-        del pred_3x, noisy_3x, ts_3x, text_3x, mask_3x, pred_pos, pred_neu, pred_neg, direction
+        del pred_ref, noisy_ref, ts_ref, text_ref, mask_ref, pred_pos, pred_neu, pred_neg, direction
         clean_memory_on_device(device)
 
-        # Prepare target_class embeddings for training passes
-        tgt_text, tgt_mask = _pad_and_batch([(tgt_e, tgt_m)], device, dit_dtype)
+        # Prepare conditioning for the gradient passes:
+        #   [target_class, anchor_0..N]  (anchors share the same noisy latent)
+        grad_items = [(tgt_e, tgt_m)] + anchor_items
+        num_grad = 1 + n_anchors
+        grad_text, grad_mask = _pad_and_batch(grad_items, device, dit_dtype)
         noisy_dit = noisy.to(dtype=dit_dtype)
+        noisy_grad = noisy_dit.expand(num_grad, -1, -1, -1, -1) if n_anchors > 0 else noisy_dit
+        ts_grad = model_ts.expand(num_grad, -1) if n_anchors > 0 else model_ts
+
+        def _anchor_loss(pred_chunks) -> torch.Tensor:
+            """Anchor preservation loss with running-median spike capping.
+
+            Per-step anchor MSE is intrinsically spiky (most steps ~1e-4, a few
+            steps far larger) and no per-step normalizer removes that (verified
+            by offline probe). We instead cap each step's anchor loss at a
+            multiple of its running median, which bounds the rare gradient-norm
+            spikes while leaving typical steps untouched. The cap is applied in
+            a gradient-preserving way (scale the loss tensor by a detached ratio)
+            so the optimizer still moves in the anchor's direction, just not with
+            an explosive magnitude.
+            """
+            if n_anchors == 0:
+                return None
+            losses = [
+                _anchor_mse(pred_chunks[i + 1], anchor_targets[i])
+                for i in range(n_anchors)
+            ]
+            anchor = sum(losses) / n_anchors
+
+            # Running-median cap (self-calibrating, no model-specific constant).
+            cap_mult = self.slider_config.anchor_cap_mult
+            val = float(anchor.detach().item())
+            med = self._anchor_running_median
+            if med is not None and cap_mult > 0:
+                cap = med * cap_mult
+                if val > cap and val > 0:
+                    # Scale the (grad-bearing) loss down to the cap. Ratio is
+                    # detached so only magnitude is clipped, not direction.
+                    anchor = anchor * (cap / val)
+            # Update running median estimate with the UNCAPPED value via a simple
+            # exponential tracker toward the observed value (robust enough for a
+            # cap reference; not a true median but tracks the typical scale).
+            if med is None:
+                self._anchor_running_median = val
+            else:
+                # Move 2% toward current; downweight giant spikes so they don't
+                # inflate the cap reference.
+                step = 0.02 if val <= med * cap_mult else 0.002
+                self._anchor_running_median = med + step * (val - med)
+
+            return anchor * anchor_strength
 
         # Training pass 1: positive direction (multiplier=+1)
         network.set_multiplier(1.0)
         with accelerator.autocast():
             lora_pred_pos = transformer(
-                noisy_dit,
-                timestep=model_ts,
-                context=tgt_text,
-                attention_mask=tgt_mask,
+                noisy_grad,
+                timestep=ts_grad,
+                context=grad_text,
+                attention_mask=grad_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options={},
             )
-        loss_pos = F_torch.mse_loss(lora_pred_pos.float(), target_enhance.float())
+        # Keep the direction loss and the anchor loss as SEPARATE quantities for
+        # reporting (loss/average stays direction-only, loss/anchor is its own
+        # series). The backward pass still uses their sum, so training behaviour
+        # is unchanged — only what we report is split.
+        if n_anchors > 0:
+            pos_chunks = lora_pred_pos.chunk(num_grad, dim=0)
+            class_pred_pos = pos_chunks[0]
+            dir_pos = F_torch.mse_loss(class_pred_pos.float(), target_enhance.float())
+            anc_pos = _anchor_loss(pos_chunks)
+        else:
+            dir_pos = F_torch.mse_loss(lora_pred_pos.float(), target_enhance.float())
+            anc_pos = None
+        loss_pos = dir_pos if anc_pos is None else (dir_pos + anc_pos)
         accelerator.backward(loss_pos * target.weight)
 
         del lora_pred_pos
@@ -627,22 +746,38 @@ class LTX2SliderTrainer:
         network.set_multiplier(-1.0)
         with accelerator.autocast():
             lora_pred_neg = transformer(
-                noisy_dit,
-                timestep=model_ts,
-                context=tgt_text,
-                attention_mask=tgt_mask,
+                noisy_grad,
+                timestep=ts_grad,
+                context=grad_text,
+                attention_mask=grad_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options={},
             )
-        loss_neg = F_torch.mse_loss(lora_pred_neg.float(), target_erase.float())
+        if n_anchors > 0:
+            neg_chunks = lora_pred_neg.chunk(num_grad, dim=0)
+            class_pred_neg = neg_chunks[0]
+            dir_neg = F_torch.mse_loss(class_pred_neg.float(), target_erase.float())
+            anc_neg = _anchor_loss(neg_chunks)
+        else:
+            dir_neg = F_torch.mse_loss(lora_pred_neg.float(), target_erase.float())
+            anc_neg = None
+        loss_neg = dir_neg if anc_neg is None else (dir_neg + anc_neg)
         accelerator.backward(loss_neg * target.weight)
 
-        del lora_pred_neg, noisy_dit, tgt_text, tgt_mask
+        del lora_pred_neg, noisy_dit, noisy_grad, ts_grad, grad_text, grad_mask
         clean_memory_on_device(device)
 
         # Restore multiplier
         network.set_multiplier(1.0)
-        return (loss_pos.item() + loss_neg.item()) / 2.0
+
+        # loss/average == direction only (same meaning as before anchors existed).
+        direction_avg = (dir_pos.item() + dir_neg.item()) / 2.0
+        # loss/anchor == anchor term only; None when no anchors are configured.
+        if n_anchors > 0:
+            anchor_avg = (anc_pos.item() + anc_neg.item()) / 2.0
+        else:
+            anchor_avg = None
+        return direction_avg, anchor_avg
 
     # -- Reference-based slider step -----------------------------------------
 
@@ -1482,6 +1617,9 @@ class LTX2SliderTrainer:
             "ss_slider_mode": self.slider_config.mode,
             "ss_slider_guidance_strength": self.slider_config.guidance_strength,
         }
+        if self.slider_config.mode == "text" and len(self.slider_config.anchors) > 0:
+            metadata["ss_slider_anchor_count"] = len(self.slider_config.anchors)
+            metadata["ss_slider_anchor_strength"] = self.slider_config.anchor_strength
         if self.slider_config.mode == "ic_reference":
             metadata["ss_ic_lora_strategy"] = "v2v"
             metadata["ss_slider_ic_reference_training"] = True
@@ -1731,9 +1869,13 @@ class LTX2SliderTrainer:
             grad_norm_value = None
             _step_start_time = time.perf_counter()
 
+            anchor_loss = None  # populated only in text mode when anchors are configured
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
-                    loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
+                    # Text mode returns (direction_loss, anchor_loss). loss/average
+                    # tracks the direction loss only (unchanged meaning); anchor_loss
+                    # is reported separately as loss/anchor.
+                    loss, anchor_loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
                 else:
                     # Reference mode: get next batch
                     try:
@@ -1787,6 +1929,8 @@ class LTX2SliderTrainer:
                 }
                 if grad_norm_value is not None:
                     logs["grad_norm"] = float(grad_norm_value) if not isinstance(grad_norm_value, float) else grad_norm_value
+                if anchor_loss is not None:
+                    logs["loss/anchor"] = anchor_loss
                 accelerator.log(logs, step=global_step)
 
             if gui_metrics is not None:

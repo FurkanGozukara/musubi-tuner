@@ -955,6 +955,10 @@ class SliderTargetConfig(BaseModel):
     weight: float = 1.0
 
 
+class SliderAnchorConfig(BaseModel):
+    prompt: str = ""
+
+
 class SliderConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")  # old projects may have fields that moved to TrainingConfig
 
@@ -969,8 +973,13 @@ class SliderConfig(BaseModel):
     # Targets (text-only mode)
     targets: list[SliderTargetConfig] = Field(default_factory=lambda: [SliderTargetConfig()])
 
+    # Anchors (text-only mode preservation)
+    anchors: list[SliderAnchorConfig] = Field(default_factory=list)
+
     # Text mode settings
     guidance_strength: float = 1.0
+    anchor_strength: float = 1.0
+    anchor_cap_mult: float = 5.0
     latent_frames: int = 1
     latent_height: int = 512
     latent_width: int = 768
