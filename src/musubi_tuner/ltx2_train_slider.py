@@ -108,6 +108,7 @@ class SliderConfig:
     anchors: List[SliderAnchorConfig] = field(default_factory=list)  # text-mode preservation
     anchor_strength: float = 1.0  # weight on the anchor preservation loss (text-mode only)
     anchor_cap_mult: float = 5.0  # cap per-step anchor loss at this x running median (0=off)
+    batch_all_targets: bool = False  # text-mode: process ALL targets per step (avg) vs one random
     guidance_strength: float = 1.0
     frame_rate: int = 25
     sample_slider_range: List[float] = field(default_factory=lambda: [-2.0, -1.0, 0.0, 1.0, 2.0])
@@ -127,6 +128,7 @@ def load_slider_config(path: str) -> SliderConfig:
     guidance_strength = float(raw.get("guidance_strength", 1.0))
     anchor_strength = float(raw.get("anchor_strength", 1.0))
     anchor_cap_mult = float(raw.get("anchor_cap_mult", 5.0))
+    batch_all_targets = bool(raw.get("batch_all_targets", False))
     frame_rate = int(raw.get("frame_rate", 25))
     default_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
     sample_slider_range = raw.get("sample_slider_range", default_slider_range)
@@ -166,6 +168,7 @@ def load_slider_config(path: str) -> SliderConfig:
         anchors=anchors,
         anchor_strength=anchor_strength,
         anchor_cap_mult=anchor_cap_mult,
+        batch_all_targets=batch_all_targets,
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
         sample_slider_range=[float(v) for v in sample_slider_range],
@@ -574,10 +577,63 @@ class LTX2SliderTrainer:
         args: argparse.Namespace,
         dit_dtype: torch.dtype,
     ) -> float:
-        """One training step for text-only slider mode."""
+        """One training step for text-only slider mode.
+
+        By default a single target is picked at random per step. When
+        ``batch_all_targets`` is enabled, EVERY target is processed in the same
+        step and their gradients are averaged (each target's loss scaled by
+        1/N) into a single optimizer update. This yields a lower-variance,
+        more context-general direction (the shared signal across targets
+        reinforces, context-specific noise partially cancels) at ~N x the
+        per-step cost. The anchor loss, when present, is scaled by the same
+        1/N so anchor magnitude/behaviour is identical to the non-batched path.
+        """
         device = accelerator.device
 
-        target = random.choice(self.slider_config.targets)
+        targets = self.slider_config.targets
+        if self.slider_config.batch_all_targets and len(targets) > 0:
+            n_targets = len(targets)
+            loss_scale = 1.0 / n_targets
+            dir_sum = 0.0
+            anc_sum = 0.0
+            anc_count = 0
+            for tgt in targets:
+                d, a = self._run_one_text_target(
+                    transformer, network, accelerator, args, dit_dtype, tgt, loss_scale
+                )
+                dir_sum += d
+                if a is not None:
+                    anc_sum += a
+                    anc_count += 1
+            direction_avg = dir_sum / n_targets
+            anchor_avg = (anc_sum / anc_count) if anc_count > 0 else None
+            return direction_avg, anchor_avg
+
+        target = random.choice(targets)
+        return self._run_one_text_target(
+            transformer, network, accelerator, args, dit_dtype, target, 1.0
+        )
+
+    def _run_one_text_target(
+        self,
+        transformer,
+        network,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        dit_dtype: torch.dtype,
+        target: "SliderTargetConfig",
+        loss_scale: float,
+    ) -> Tuple[float, Optional[float]]:
+        """Process one slider target: +1/-1 gradient passes for ``target``.
+
+        ``loss_scale`` multiplies the backward loss (1.0 for the single-random
+        path; 1/N when averaging all targets in one step). Returns
+        ``(direction_avg, anchor_avg)`` for this target (anchor_avg is None when
+        no anchors are configured). The reported direction/anchor values are the
+        UNSCALED averages so loss/average keeps its meaning regardless of
+        loss_scale.
+        """
+        device = accelerator.device
 
         # Synthetic noise latents
         latent_frames = getattr(args, "latent_frames", 1)
@@ -737,7 +793,7 @@ class LTX2SliderTrainer:
             dir_pos = F_torch.mse_loss(lora_pred_pos.float(), target_enhance.float())
             anc_pos = None
         loss_pos = dir_pos if anc_pos is None else (dir_pos + anc_pos)
-        accelerator.backward(loss_pos * target.weight)
+        accelerator.backward(loss_pos * target.weight * loss_scale)
 
         del lora_pred_pos
         clean_memory_on_device(device)
@@ -762,7 +818,7 @@ class LTX2SliderTrainer:
             dir_neg = F_torch.mse_loss(lora_pred_neg.float(), target_erase.float())
             anc_neg = None
         loss_neg = dir_neg if anc_neg is None else (dir_neg + anc_neg)
-        accelerator.backward(loss_neg * target.weight)
+        accelerator.backward(loss_neg * target.weight * loss_scale)
 
         del lora_pred_neg, noisy_dit, noisy_grad, ts_grad, grad_text, grad_mask
         clean_memory_on_device(device)

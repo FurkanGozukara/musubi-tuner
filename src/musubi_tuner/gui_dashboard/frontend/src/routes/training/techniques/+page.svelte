@@ -820,6 +820,7 @@
 										<FormField type="number" fieldPath="slider.latent_height" value={$projectConfig?.slider?.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
 										<FormField type="number" fieldPath="slider.latent_width" value={$projectConfig?.slider?.latent_width ?? 768} oninput={(e) => update('latent_width', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent width" />
 									</div>
+									<FormToggle fieldPath="slider.batch_all_targets" checked={$projectConfig?.slider?.batch_all_targets ?? false} onchange={(e) => update('batch_all_targets', e.target.checked)} tooltip="Process ALL slider targets every step (gradients averaged into one update) instead of picking one target at random per step. Produces a more stable, context-general direction; ~Nx slower per step but visits every target each step." />
 								{:else}
 									<div class="grid grid-cols-2 gap-2">
 										<PathInput fieldPath="slider.pos_cache_dir" value={$projectConfig?.slider?.pos_cache_dir || ''} oninput={(e) => update('pos_cache_dir', e.target.value)} showFiles tooltip="Directory with positive latent caches" />

@@ -980,6 +980,7 @@ class SliderConfig(BaseModel):
     guidance_strength: float = 1.0
     anchor_strength: float = 1.0
     anchor_cap_mult: float = 5.0
+    batch_all_targets: bool = False
     latent_frames: int = 1
     latent_height: int = 512
     latent_width: int = 768

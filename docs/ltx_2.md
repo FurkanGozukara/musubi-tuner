@@ -3031,6 +3031,7 @@ Learns a slider direction from positive/negative prompt pairs. No images or data
 mode = "text"
 guidance_strength = 1.0
 anchor_strength = 1.0
+batch_all_targets = false   # true = train on every target each step (averaged)
 sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
 
 [[targets]]
@@ -3052,6 +3053,8 @@ prompt = "a landscape"
 - `sample_slider_range`: Multiplier values used for preview samples during training.
 
 Multiple `[[targets]]` blocks can be defined to train several directions at once (e.g., detail + lighting).
+
+- `batch_all_targets`: Text mode only (default `false`). When `false`, one target is picked at random each step. When `true`, **every** target is processed in the same step and their gradients are averaged (each target's loss scaled by `1/N`) into a single optimizer update. Averaging yields a lower-variance, more context-general direction — the signal shared across targets reinforces while context-specific noise partially cancels — at roughly `N x` the per-step compute. This is **not** equivalent to simply training longer: doubling steps applies sequential, separately-clipped updates that can interfere, whereas batching reconciles all targets in one move. If anchors are configured, the anchor loss is scaled by the same `1/N`, so anchor magnitude/behaviour is unchanged versus the non-batched path.
 
 ##### Anchors (concept preservation)
 

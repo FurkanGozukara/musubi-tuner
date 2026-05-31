@@ -298,6 +298,9 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
     if s.mode == "text" and any((a.prompt or "").strip() for a in s.anchors):
         doc["anchor_strength"] = s.anchor_strength
         doc["anchor_cap_mult"] = s.anchor_cap_mult
+    # batch_all_targets is text-mode only; emit when enabled
+    if s.mode == "text" and s.batch_all_targets:
+        doc["batch_all_targets"] = s.batch_all_targets
     if s.reference_modality:
         doc["reference_modality"] = s.reference_modality
     if s.pos_cache_dir:
