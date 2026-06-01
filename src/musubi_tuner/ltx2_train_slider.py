@@ -1771,6 +1771,15 @@ class LTX2SliderTrainer:
                 _training["lr"] = float(lr_scheduler.get_last_lr()[0])
             except Exception:
                 pass
+            # Smoothed seconds-per-step (s/it) from the dashboard metrics writer's
+            # rolling window. Omitted when the writer is disabled (CLI-only runs).
+            if gui_metrics is not None:
+                _sec = gui_metrics.current_sec_per_step()
+                if _sec is not None:
+                    _training["sec_per_step"] = round(_sec, 4)
+                _elapsed = gui_metrics.current_elapsed_sec()
+                if _elapsed is not None:
+                    _training["elapsed_sec"] = round(_elapsed, 1)
             return {
                 "training": _training,
                 "command": _argv_to_command_list(),
