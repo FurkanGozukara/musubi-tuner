@@ -96,6 +96,7 @@ class CachingConfig(BaseModel):
     atomic_cache_writes: bool = False
     keep_cache: bool = False
     num_workers: Optional[int] = None
+    cache_distributed: bool = False
     # VAE tiling
     vae_chunk_size: Optional[int] = None
     vae_spatial_tile_size: Optional[int] = None
@@ -184,6 +185,9 @@ class TrainingConfig(BaseModel):
     loftq_iters: int = 2
     fp8_w8a8: bool = False
     w8a8_mode: Literal["int8", "fp8"] = "int8"
+    int8_base: bool = False
+    int8_base_dynamic: bool = False
+    int8_fused_quant: bool = False
     awq_calibration: bool = False
     awq_alpha: float = 0.25
     awq_num_batches: int = 8

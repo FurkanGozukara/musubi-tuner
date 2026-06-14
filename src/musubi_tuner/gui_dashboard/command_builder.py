@@ -284,6 +284,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--keep_cache")
     if c.num_workers is not None:
         cmd += ["--num_workers", str(c.num_workers)]
+    if getattr(c, "cache_distributed", False):
+        cmd.append("--cache_distributed")
     if c.vae_chunk_size is not None:
         cmd += ["--vae_chunk_size", str(c.vae_chunk_size)]
     if c.vae_spatial_tile_size is not None:
@@ -380,6 +382,8 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--keep_cache")
     if c.num_workers is not None:
         cmd += ["--num_workers", str(c.num_workers)]
+    if getattr(c, "cache_distributed", False):
+        cmd.append("--cache_distributed")
     if c.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
     if c.gemma_load_in_4bit:
@@ -748,6 +752,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_w8a8")
         if t.w8a8_mode != "int8":
             cmd += ["--w8a8_mode", t.w8a8_mode]
+    if getattr(t, "int8_base", False):
+        cmd.append("--int8_base")
+    if getattr(t, "int8_base_dynamic", False):
+        cmd.append("--int8_base_dynamic")
+    if getattr(t, "int8_fused_quant", False):
+        cmd.append("--int8_fused_quant")
     if t.awq_calibration:
         cmd.append("--awq_calibration")
         if t.awq_alpha != 0.25:

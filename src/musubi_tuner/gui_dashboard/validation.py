@@ -384,6 +384,23 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
+    if getattr(t, "int8_base", False) and getattr(t, "int8_base_dynamic", False):
+        message = "int8 Base and int8 Base (dynamic) are mutually exclusive."
+        errors.append(_make_issue("error", "training.int8_base", message, label="int8 Base", page="training"))
+        errors.append(_make_issue("error", "training.int8_base_dynamic", message, label="int8 Base (dynamic)", page="training"))
+    if getattr(t, "int8_base", False) or getattr(t, "int8_base_dynamic", False):
+        _int8_field = "training.int8_base" if t.int8_base else "training.int8_base_dynamic"
+        _int8_label = "int8 Base" if t.int8_base else "int8 Base (dynamic)"
+        for _conf_field, _conf_val, _conf_label in (
+            ("training.fp8_base", t.fp8_base, "FP8 Base"),
+            ("training.fp8_scaled", t.fp8_scaled, "FP8 Scaled"),
+            ("training.nf4_base", t.nf4_base, "NF4 Base"),
+        ):
+            if _conf_val:
+                message = f"{_int8_label} is mutually exclusive with {_conf_label}."
+                errors.append(_make_issue("error", _int8_field, message, label=_int8_label, page="training"))
+                errors.append(_make_issue("error", _conf_field, message, label=_conf_label, page="training"))
+
     network_module = t.network_module or get_ltx2_training_network_module_default()
     lycoris_requested = (
         "lycoris" in network_module.lower()

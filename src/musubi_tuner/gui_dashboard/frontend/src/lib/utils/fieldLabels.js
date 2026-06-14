@@ -20,6 +20,7 @@ const ACRONYMS = new Map([
 	['i2v', 'I2V'],
 	['ic', 'IC'],
 	['ia3', 'IA3'],
+	['int8', 'int8'],
 	['lr', 'LR'],
 	['locon', 'LoCon'],
 	['loha', 'LoHa'],

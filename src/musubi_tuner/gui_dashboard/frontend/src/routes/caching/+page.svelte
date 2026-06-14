@@ -301,6 +301,7 @@
 			<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 				<FormToggle fieldPath="caching.skip_existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
 				<FormToggle fieldPath="caching.atomic_cache_writes" checked={caching.atomic_cache_writes ?? false} onchange={(e) => updateCaching('atomic_cache_writes', e.target.checked)} tooltip="Write cache files through a temporary sibling file, then atomically replace the final cache path after a successful save." />
+					<FormToggle fieldPath="caching.cache_distributed" checked={caching.cache_distributed ?? false} onchange={(e) => updateCaching('cache_distributed', e.target.checked)} tooltip="Shard caching work across multiple processes (opt-in multi-process cache sharding)." />
 			</div>
 			{#if $advancedMode}
 				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">

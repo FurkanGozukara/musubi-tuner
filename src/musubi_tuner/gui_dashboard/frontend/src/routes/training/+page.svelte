@@ -614,6 +614,11 @@
 								<FormToggle fieldPath="training.fp8_w8a8" checked={t.fp8_w8a8 ?? false} onchange={(e) => update('fp8_w8a8', e.target.checked)} tooltip="W8A8 activation quantization (requires FP8 Base and FP8 Scaled)" />
 								<FormToggle fieldPath="training.awq_calibration" checked={t.awq_calibration ?? false} onchange={(e) => update('awq_calibration', e.target.checked)} tooltip="Activation-aware calibration for NF4" />
 							</div>
+							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+								<FormToggle fieldPath="training.int8_base" checked={t.int8_base ?? false} onchange={(e) => update('int8_base', e.target.checked)} tooltip="Train a LoRA over a pre-quantized Optimum-Quanto int8 checkpoint (needs Triton). Mutually exclusive with FP8/NF4." />
+								<FormToggle fieldPath="training.int8_base_dynamic" checked={t.int8_base_dynamic ?? false} onchange={(e) => update('int8_base_dynamic', e.target.checked)} tooltip="Quantize a standard (bf16) checkpoint to int8 on the fly at load time (no pre-quantized file needed)." />
+								<FormToggle fieldPath="training.int8_fused_quant" checked={t.int8_fused_quant ?? false} onchange={(e) => update('int8_fused_quant', e.target.checked)} tooltip="Also fuse the int8 activation/gradient quantization (faster int8 on Ampere; needs Triton)." />
+							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormField type="number" fieldPath="training.nf4_block_size" value={t.nf4_block_size ?? 32} oninput={(e) => update('nf4_block_size', Number(e.target.value))} disabled={!t.nf4_base} tooltip="Block size for NF4 quantization" />
 								<FormField type="number" fieldPath="training.loftq_iters" value={t.loftq_iters ?? 2} oninput={(e) => update('loftq_iters', Number(e.target.value))} min={1} disabled={!t.loftq_init} tooltip="LoftQ alternating iterations" />
