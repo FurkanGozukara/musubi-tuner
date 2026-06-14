@@ -568,7 +568,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx2_dokr_oft
 ```
 
-Plain OFT (`use_oft=true`) defaults to a scaled rotation (`scaled_oft=true`, divides the skew by `2*sqrt(block_size-1)` before the Cayley transform). Pass `scaled_oft=false` for the canonical OFTv2 rotation with no divisor. DoRA-OFT / DoKr-OFT always use the scaled rotation.
+OFT (`use_oft=true`), DoRA-OFT, and DoKr-OFT default to a scaled rotation (`scaled_oft=true`, divides the skew by `2*sqrt(block_size-1)` before the Cayley transform). Pass `scaled_oft=false` for the canonical OFTv2 rotation with no divisor.
 
 OFT / DoRA-OFT / DoKr-OFT weights use this trainer's own format (input-side block rotation, PEFT OFTv2 lineage) and are loadable only by this trainer. They are not interchangeable with kohya-ss / LyCORIS / diffusers diag-OFT checkpoints, which rotate output features under a different block structure; there is no lossless conversion between the two.
 

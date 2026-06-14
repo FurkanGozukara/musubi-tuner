@@ -182,6 +182,8 @@ def _rotate_weight_with_oft_state_dict(
     """Apply the saved OFT rotation to a dense weight tensor."""
     in_features = int(weight.shape[1])
     block_size, block_share, coft, coft_eps = _resolve_oft_config_from_state_dict(module_state, in_features)
+    # Legacy DoKr-OFT checkpoints predate scaled_oft_metadata and were always scaled.
+    scaled_oft = _metadata_tensor_to_bool(module_state.get("scaled_oft_metadata"), default=True)
     oft_weight = module_state["oft_R.weight"].to(device=weight.device, dtype=weight.dtype, non_blocking=non_blocking)
     rotation_module = lora_module.OFTRotationModule(
         r=int(oft_weight.shape[0]),
@@ -191,7 +193,7 @@ def _rotate_weight_with_oft_state_dict(
         coft=coft,
         coft_eps=coft_eps,
         block_share=block_share,
-        scaled_oft=True,
+        scaled_oft=scaled_oft,
         use_cayley_neumann=True,
         num_cayley_neumann_terms=5,
         dropout_probability=0.0,
@@ -690,7 +692,7 @@ class DoKrOFTModule(DoKrModule):
         self.oft_block_share = lora_module._parse_bool_network_arg(kwargs.get("oft_block_share", kwargs.get("block_share", False)))
         self.oft_coft = lora_module._parse_bool_network_arg(kwargs.get("oft_coft", kwargs.get("coft", False)))
         self.coft_eps = float(kwargs.get("coft_eps", 6e-5))
-        self.scaled_oft = True
+        self.scaled_oft = lora_module._parse_bool_network_arg(kwargs.get("scaled_oft", True))
         self.oft_dropout = float(kwargs.get("oft_dropout", kwargs.get("dropout_probability", 0.0)) or 0.0)
         self.rank = self.in_features // self.oft_block_size
         n_elements = self.oft_block_size * (self.oft_block_size - 1) // 2
@@ -702,7 +704,7 @@ class DoKrOFTModule(DoKrModule):
             coft=self.oft_coft,
             coft_eps=self.coft_eps,
             block_share=self.oft_block_share,
-            scaled_oft=True,
+            scaled_oft=self.scaled_oft,
             use_cayley_neumann=True,
             num_cayley_neumann_terms=5,
             dropout_probability=self.oft_dropout,
@@ -716,6 +718,7 @@ class DoKrOFTModule(DoKrModule):
         )
         self.register_buffer("oft_coft_metadata", torch.tensor(1.0 if self.oft_coft else 0.0, device=metadata_device))
         self.register_buffer("coft_eps_metadata", torch.tensor(float(self.coft_eps), device=metadata_device))
+        self.register_buffer("scaled_oft_metadata", torch.tensor(1.0 if self.scaled_oft else 0.0, device=metadata_device))
 
     def _rotated_input(self, x: torch.Tensor, multiplier: Optional[float] = None) -> torch.Tensor:
         multiplier = self.multiplier if multiplier is None else multiplier
@@ -751,6 +754,9 @@ class DoKrOFTModule(DoKrModule):
         state_dict[f"{self.lora_name}.oft_block_share_metadata"] = self.oft_block_share_metadata.detach().clone()
         state_dict[f"{self.lora_name}.oft_coft_metadata"] = self.oft_coft_metadata.detach().clone()
         state_dict[f"{self.lora_name}.coft_eps_metadata"] = self.coft_eps_metadata.detach().clone()
+        state_dict[f"{self.lora_name}.scaled_oft_metadata"] = self.scaled_oft_metadata.detach().clone()
+        if self.scaled_oft:
+            state_dict[f"{self.lora_name}.oft_R.scaled_oft"] = torch.tensor(1.0, device=self.oft_R.weight.device)
         return state_dict
 
     def forward(self, x):
@@ -936,7 +942,7 @@ def create_arch_network(
 
     module_kwargs = {"factor": factor, "decompose_both": decompose_both}
     if use_dora_oft:
-        module_kwargs["scaled_oft"] = True
+        module_kwargs["scaled_oft"] = lora_module._parse_bool_network_arg(kwargs.get("scaled_oft", True))
         for key in ("oft_block_size", "oft_coft", "coft_eps", "oft_block_share", "oft_dropout"):
             if kwargs.get(key, None) is not None:
                 module_kwargs[key] = kwargs.get(key)
@@ -1018,6 +1024,10 @@ def create_network_from_weights(
             module_kwargs_for_name["oft_block_share"] = block_share
             module_kwargs_for_name["oft_coft"] = coft
             module_kwargs_for_name["coft_eps"] = coft_eps
+            module_kwargs_for_name["scaled_oft"] = _metadata_tensor_to_bool(
+                module_state.get("scaled_oft_metadata"),
+                default=True,  # legacy DoKr-OFT was always scaled
+            )
 
     # extract factor for LoKr (user must specify via --network_args factor=N if different from default)
     factor = int(kwargs.pop("factor", -1))

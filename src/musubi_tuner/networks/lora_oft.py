@@ -396,7 +396,6 @@ class DoRAOFTModule(OFTModule):
         split_dims: Optional[List[int]] = None,
         **kwargs,
     ):
-        kwargs["scaled_oft"] = True
         super().__init__(
             lora_name,
             org_module,
@@ -424,7 +423,6 @@ class DoRAOFTModule(OFTModule):
         self.register_buffer("initial_norm", initial_norm.detach().clone())
         self.dora_scale = torch.nn.Parameter(torch.ones_like(initial_norm), requires_grad=not self.freeze_dora_scale)
         self.dora_scale._is_dora_scale = True
-        self.scaled_oft = True
 
     def _get_initial_norm(self, org_module: torch.nn.Module) -> torch.Tensor:
         with torch.no_grad():
