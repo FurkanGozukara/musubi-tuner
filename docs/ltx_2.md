@@ -50,6 +50,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [NF4 Quantization](#nf4-quantization)
+    - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Function Type](#loss-function-type)
@@ -667,6 +668,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 - `--fp8_keep_blocks "0,1,2,45"`: with `--fp8_scaled`, keep selected transformer blocks in high precision instead of FP8. Comma lists and ranges such as `0-2,45` are accepted. This is useful for testing whether boundary or otherwise sensitive blocks should avoid FP8 quantization.
 - `--fp8_w8a8`: with `--fp8_base --fp8_scaled`, use W8A8 activation quantization for LoRA training. `--w8a8_mode int8` is the default; `--w8a8_mode fp8` keeps FP8 weights and dequantizes transiently.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
+- `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
 - `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 
 ##### Other Memory Options
@@ -823,6 +825,25 @@ accelerate launch ... ltx2_train_network.py ^
 - `--awq_calibration` is experimental. Adds a per-layer division during forward passes. In synthetic tests, reduces activation-weighted error by ~3-5%; effect on real training quality has not been validated.
 - Compatible with `--blocks_to_swap`, `--gradient_checkpointing`, and other training options. NF4 reduces block swap transfer size (4-bit vs 16-bit per weight).
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
+
+#### int8 Base (Optimum-Quanto)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--int8_base` loads a checkpoint that was quantized to int8 with [Optimum-Quanto](https://github.com/huggingface/optimum-quanto) (`qint8` weight-only) and trains a LoRA over the frozen int8 base. The int8 Linear layers run int8×int8 matmuls (`torch._int_mm`); layers the checkpoint left in bf16 (and the LoRA) run in bf16.
+
+```bat
+python src/musubi_tuner/ltx2_train.py ^
+  --ltx2_checkpoint path\to\model_qint8.safetensors ^
+  --int8_base ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  (other training options)
+```
+
+Notes:
+- Requires LoRA training (`--network_module`); the int8 base is frozen.
+- Mutually exclusive with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- The checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
+- Installing [`triton`](https://github.com/woct0rdho/triton-windows) (Triton on Windows) lets the int8 matmul avoid keeping a transposed weight copy, lowering memory use.
 
 #### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>

@@ -442,3 +442,70 @@ def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch
     backend = "triton" if triton_mm is not None else "torch"
     logger.info("W8A8 %s (%s): patched %d linear layers", w8a8_mode, backend, patched_count)
     return model
+
+
+# ---------------------------------------------------------------------------
+# Pre-quantized Optimum-Quanto int8 checkpoints
+# ---------------------------------------------------------------------------
+
+
+def register_quanto_int8_scale_buffers(model, state_dict):
+    """Register scale_weight buffers on the Linear layers that carry a
+    pre-quantized int8 weight in ``state_dict``.
+
+    Call BEFORE ``load_state_dict(assign=True)`` so both the int8 weight and its
+    per-row scale get assigned (mirrors apply_fp8_monkey_patch's registration).
+    """
+    scale_shapes = {k.rsplit(".scale_weight", 1)[0]: state_dict[k].shape for k in state_dict if k.endswith(".scale_weight")}
+    registered = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name in scale_shapes:
+            module.register_buffer("scale_weight", torch.ones(scale_shapes[name], dtype=torch.float32))
+            # int8 weights can't be leaf parameters that require grad; clear the flag
+            # so load_state_dict(assign=True) can assign the int8 tensor in place.
+            module.weight.requires_grad_(False)
+            registered += 1
+    logger.info("Quanto int8: registered scale_weight buffers on %d linear layers", registered)
+    return registered
+
+
+def apply_quanto_int8_monkey_patch(model):
+    """Bind the int8 W8A8 forward to Linear layers that already hold an int8
+    weight + scale_weight buffer (Optimum-Quanto qint8 checkpoints).
+
+    Unlike apply_w8a8_monkey_patch, the weights are already int8, so there is no
+    fp8->int8 conversion. When the Triton matmul is unavailable, a transposed
+    int8 buffer is built for the fast backward. Call AFTER load_state_dict.
+    """
+    use_int_mm = hasattr(torch, "_int_mm")
+    triton_mm = _get_triton_mm_8bit() if use_int_mm else None
+    if not use_int_mm:
+        logger.warning(
+            "torch._int_mm unavailable (PyTorch < 2.1); quanto int8 will dequantize+matmul (VRAM saved, no int8 speedup)."
+        )
+    new_forward = _make_w8a8_int8_forward(use_int_mm, triton_mm)
+
+    patched = 0
+    for module in model.modules():
+        if not isinstance(module, nn.Linear) or not hasattr(module, "scale_weight"):
+            continue
+        if module.weight.dtype != torch.int8:
+            continue
+        module.weight.requires_grad_(False)
+        if module.bias is not None:
+            module.bias.requires_grad_(False)
+        module.scale_weight = module.scale_weight.reshape(module.weight.shape[0], 1).to(
+            device=module.weight.device, dtype=torch.float32
+        )
+        if triton_mm is None and use_int_mm:
+            weight_int8_t = module.weight.t().contiguous()
+            if "weight_int8_t" in module._buffers:
+                module.weight_int8_t = weight_int8_t
+            else:
+                module.register_buffer("weight_int8_t", weight_int8_t, persistent=False)
+        module.forward = new_forward.__get__(module, type(module))
+        patched += 1
+
+    backend = "triton" if triton_mm is not None else ("torch._int_mm" if use_int_mm else "dequant-fallback")
+    logger.info("Quanto int8 (%s): patched %d linear layers", backend, patched)
+    return model

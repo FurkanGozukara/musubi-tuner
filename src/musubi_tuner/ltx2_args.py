@@ -828,6 +828,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="W8A8 quantization format: int8 (Turing+, default) or fp8 (Ada Lovelace+).",
     )
     parser.add_argument(
+        "--int8_base",
+        action="store_true",
+        help=(
+            "Load a pre-quantized Optimum-Quanto qint8 DiT checkpoint and train a LoRA over it. "
+            "Quantized Linear layers run int8xint8 matmuls (torch._int_mm, INT8 tensor cores on Turing+); "
+            "the frozen base stays int8 while the LoRA trains in bf16. Requires LoRA training "
+            "(--network_module) and an int8 checkpoint. Mutually exclusive with "
+            "--fp8_base/--fp8_scaled/--nf4_base."
+        ),
+    )
+    parser.add_argument(
         "--fp8_gemm",
         action="store_true",
         help=(

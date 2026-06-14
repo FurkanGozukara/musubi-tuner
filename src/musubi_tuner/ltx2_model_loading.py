@@ -17,7 +17,11 @@ from musubi_tuner.modules.nf4_optimization_utils import (
 )
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
-from musubi_tuner.modules.w8a8_optimization_utils import apply_w8a8_monkey_patch
+from musubi_tuner.modules.w8a8_optimization_utils import (
+    apply_w8a8_monkey_patch,
+    apply_quanto_int8_monkey_patch,
+    register_quanto_int8_scale_buffers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +256,79 @@ def detect_ltx2_config(model_path: str) -> Dict[str, Any]:
     return config
 
 
+def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any]:
+    """Reconstruct the nested transformer config for checkpoints that carry no
+    config metadata (e.g. Optimum-Quanto exports).
+
+    Structural dims fall back to the configurator's defaults; the LTX-2.3 markers
+    that change the architecture are auto-detected from weight keys/shapes:
+      - apply_gated_attention      <- presence of ``to_gate_logits``
+      - cross_attention_adaln      <- adaln_single.linear out-dim / inner-dim == 9
+      - caption_proj_before_connector <- absence of ``caption_projection``
+    """
+    from musubi_tuner.ltx_2.model.transformer.adaln import (
+        ADALN_BASE_PARAMS_COUNT,
+        ADALN_CROSS_ATTN_PARAMS_COUNT,
+    )
+
+    def _strip_quanto(key: str) -> str:
+        return key[: -len("._data")] if key.endswith("._data") else key
+
+    with MemoryEfficientSafeOpen(model_path) as handle:
+        raw_keys = list(handle.keys())
+        norm_keys = {_strip_quanto(k) for k in raw_keys}
+
+        def shape_of(name: str) -> Optional[Tuple[int, ...]]:
+            for key in raw_keys:
+                if _strip_quanto(key) == name:
+                    return tuple(handle.get_tensor(key).shape)
+            return None
+
+        # Architecture constants asserted by the configurators' check_config_value calls.
+        tcfg: Dict[str, Any] = {
+            "dropout": 0.0,
+            "attention_bias": True,
+            "num_vector_embeds": None,
+            "activation_fn": "gelu-approximate",
+            "num_embeds_ada_norm": 1000,
+            "use_linear_projection": False,
+            "only_cross_attention": False,
+            "cross_attention_norm": True,
+            "double_self_attention": False,
+            "upcast_attention": False,
+            "standardization_norm": "rms_norm",
+            "norm_elementwise_affine": False,
+            "qk_norm": "rms_norm",
+            "positional_embedding_type": "rope",
+            "use_audio_video_cross_attention": True,
+            "share_ff": False,
+            "av_cross_ada_norm": True,
+            "use_middle_indices_grid": True,
+        }
+
+        block_indices = {int(m.group(1)) for k in norm_keys if (m := re.search(r"transformer_blocks\.(\d+)\.", k))}
+        if block_indices:
+            tcfg["num_layers"] = max(block_indices) + 1
+
+        attn1_shape = shape_of("transformer_blocks.0.attn1.to_q.weight")
+        inner_dim = attn1_shape[0] if attn1_shape and len(attn1_shape) == 2 else None
+
+        adaln_shape = shape_of("adaln_single.linear.weight")
+        if adaln_shape and inner_dim and inner_dim > 0 and adaln_shape[0] % inner_dim == 0:
+            coeff = adaln_shape[0] // inner_dim
+            tcfg["cross_attention_adaln"] = coeff >= (ADALN_BASE_PARAMS_COUNT + ADALN_CROSS_ATTN_PARAMS_COUNT)
+
+        tcfg["caption_proj_before_connector"] = shape_of("caption_projection.linear_1.weight") is None
+        tcfg["apply_gated_attention"] = any(k.endswith("to_gate_logits.weight") or k.endswith("to_gate_logits") for k in norm_keys)
+
+        attn2_shape = shape_of("transformer_blocks.0.attn2.to_k.weight")
+        if attn2_shape and len(attn2_shape) == 2:
+            tcfg["cross_attention_dim"] = attn2_shape[1]
+
+    logger.info("Inferred LTX-2 transformer config from weights (no config metadata): %s", tcfg)
+    return {"transformer": tcfg}
+
+
 def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[str, List[str]]:
     """Infer checkpoint generation (2.0 vs 2.3) from metadata config markers."""
     markers: List[str] = []
@@ -372,6 +449,53 @@ def _apply_memory_optimization_settings(
             )
 
 
+def load_quanto_int8_state_dict(
+    model_files: List[str],
+    *,
+    non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
+    key_filter: Optional[Callable[[str], bool]] = None,
+) -> dict[str, torch.Tensor]:
+    """Load an Optimum-Quanto qint8 (weight-only) checkpoint into a plain state dict.
+
+    Quanto stores each quantized Linear as ``<name>.weight._data`` (int8 [out, in])
+    plus ``<name>.weight._scale`` (per-row [out, 1]); the scalar ``input_scale`` /
+    ``output_scale`` entries are activation-quant artifacts (activations are not
+    quantized here) and are dropped. Non-quantized tensors (bias, excluded blocks)
+    are cast to ``non_quant_dtype``. Output keys are the standard module names:
+    ``<name>.weight`` (int8), ``<name>.scale_weight`` (float32 [out, 1]).
+    """
+    sd: dict[str, torch.Tensor] = {}
+    dropped = 0
+    for model_file in model_files:
+        with MemoryEfficientSafeOpen(model_file) as f:
+            for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                if key.endswith(".input_scale") or key.endswith(".output_scale"):
+                    dropped += 1
+                    continue
+                if key.endswith(".weight._data"):
+                    base = key[: -len("._data")]  # -> <name>.weight
+                    if key_filter is not None and not key_filter(base):
+                        continue
+                    sd[base] = f.get_tensor(key)  # int8, keep as-is
+                elif key.endswith(".weight._scale"):
+                    base = key[: -len(".weight._scale")] + ".scale_weight"
+                    if key_filter is not None and not key_filter(base):
+                        continue
+                    scale = f.get_tensor(key).float()
+                    if scale.ndim == 1:
+                        scale = scale.reshape(-1, 1)
+                    sd[base] = scale
+                else:
+                    if key_filter is not None and not key_filter(key):
+                        continue
+                    value = f.get_tensor(key)
+                    if value.is_floating_point() and non_quant_dtype is not None:
+                        value = value.to(non_quant_dtype)
+                    sd[key] = value
+    logger.info("Quanto int8: loaded %d tensors (dropped %d input/output_scale artifacts)", len(sd), dropped)
+    return sd
+
+
 def load_ltx2_model(
     model_path: str,
     device: Union[str, torch.device] = "cpu",
@@ -392,6 +516,7 @@ def load_ltx2_model(
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
     fp8_keep_blocks: Optional[str] = None,
+    int8_base: bool = False,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -468,7 +593,14 @@ def load_ltx2_model(
     else:
         logger.info("LTX-2 load path: load weights on %s (quantize_device=%s)", load_device, _qdev_raw)
     loader = SafetensorsModelStateDictLoader()
-    config = loader.metadata(model_path)
+    _config_path = model_path[0] if isinstance(model_path, list) else model_path
+    try:
+        config = loader.metadata(_config_path)
+    except (KeyError, TypeError):
+        # Optimum-Quanto exports carry no "config" metadata; rebuild it from weights.
+        if not int8_base:
+            raise
+        config = infer_ltx2_transformer_config_from_weights(_config_path)
     attn_mode = (attn_mode or "torch").lower()
     attn_type = None
     if attn_mode in {"xformers", "xformers-attn"}:
@@ -731,6 +863,14 @@ def load_ltx2_model(
             exclude_keys=fp8_exclude_keys,
             key_filter=state_dict_key_filter,
         )
+    elif int8_base:
+        logger.info("LTX-2 int8: loading pre-quantized Optimum-Quanto qint8 checkpoint")
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        sd = load_quanto_int8_state_dict(
+            model_files,
+            non_quant_dtype=torch_dtype or torch.bfloat16,
+            key_filter=state_dict_key_filter,
+        )
     else:
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
@@ -764,6 +904,8 @@ def load_ltx2_model(
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+    elif int8_base:
+        register_quanto_int8_scale_buffers(base_model, sd)
     _trace_vram_ltx2("AFTER apply monkey patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
     _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
@@ -775,6 +917,9 @@ def load_ltx2_model(
     if fp8_w8a8:
         apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
+    if int8_base:
+        apply_quanto_int8_monkey_patch(base_model)
+        _trace_vram_ltx2("AFTER quanto int8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")
