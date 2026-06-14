@@ -3,6 +3,7 @@ from typing import Protocol
 
 import logging
 import math
+import os
 import torch
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
@@ -25,6 +26,7 @@ except ImportError:
 try:
     from flash_attn import flash_attn_func as flash_attention_2
     from flash_attn.flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func
+
     flash_attn_varlen_func = _flash_attn_varlen_func
 except ImportError:
     flash_attention_2 = None
@@ -35,6 +37,48 @@ try:
         import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
+
+try:
+    import inspect as _inspect
+
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    # cuDNN attention first, with fallback for masked / unsupported shapes. cuDNN is the
+    # fastest SDPA backend on Hopper and the only fast one on Windows (Windows torch wheels
+    # ship no flash backend).
+    _CUDNN_SDPA_ORDER = [
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
+    _SDPA_HAS_SET_PRIORITY = "set_priority" in _inspect.signature(sdpa_kernel).parameters
+except Exception:
+    SDPBackend = None
+    sdpa_kernel = None
+    _CUDNN_SDPA_ORDER = None
+    _SDPA_HAS_SET_PRIORITY = False
+
+
+_cudnn_logged = False
+
+
+def _sdpa_cudnn_enabled() -> bool:
+    """Opt-in via LTX2_SDPA_CUDNN=1; requires a torch new enough for sdpa_kernel priority."""
+    return (
+        sdpa_kernel is not None
+        and _SDPA_HAS_SET_PRIORITY
+        and os.environ.get("LTX2_SDPA_CUDNN", "0").lower() in ("1", "true", "yes")
+    )
+
+
+def _cudnn_attention_callable() -> "PytorchCudnnAttention":
+    """Return the cuDNN-prioritized SDPA callable, logging the opt-in once per process."""
+    global _cudnn_logged
+    if not _cudnn_logged:
+        logger.info("LTX2_SDPA_CUDNN=1: using cuDNN-prioritized SDPA attention")
+        _cudnn_logged = True
+    return PytorchCudnnAttention()
 
 
 class AttentionCallable(Protocol):
@@ -60,6 +104,31 @@ class PytorchAttention(AttentionCallable):
                 mask = mask.unsqueeze(1)
 
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out
+
+
+class PytorchCudnnAttention(AttentionCallable):
+    """SDPA with the cuDNN attention backend prioritized (flash/efficient/math fallback for
+    masked or unsupported paths). Opt-in via LTX2_SDPA_CUDNN=1. Numerically equivalent to
+    PytorchAttention (cos ~1.0); faster on Hopper and on Windows, where no flash SDPA
+    backend exists."""
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
+
+        if mask is not None:
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+
+        with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
 
@@ -95,9 +164,7 @@ class XFormersAttention(AttentionCallable):
             # but when using separated heads, the shape has to be (B, H, Nq, Nk)
             # in flux, this matrix ends up being over 1GB
             # here, we create a mask with the same batch/head size as the input mask (potentially singleton or full)
-            mask_out = torch.empty(
-                [mask.shape[0], mask.shape[1], q.shape[1], mask.shape[-1] + pad], dtype=q.dtype, device=q.device
-            )
+            mask_out = torch.empty([mask.shape[0], mask.shape[1], q.shape[1], mask.shape[-1] + pad], dtype=q.dtype, device=q.device)
 
             mask_out[..., : mask.shape[-1]] = mask
             # doesn't this remove the padding again??
@@ -243,7 +310,7 @@ class AttentionFunction(Enum):
     def to_callable(self) -> AttentionCallable:
         """Resolve enums at init time so torch.compile can trace the attention call cleanly."""
         if self is AttentionFunction.PYTORCH:
-            return PytorchAttention()
+            return _cudnn_attention_callable() if _sdpa_cudnn_enabled() else PytorchAttention()
         elif self is AttentionFunction.XFORMERS:
             return XFormersAttention()
         elif self is AttentionFunction.FLASH_ATTENTION_2:
@@ -251,8 +318,10 @@ class AttentionFunction(Enum):
         elif self is AttentionFunction.FLASH_ATTENTION_3:
             return FlashAttention3()
         else:
-            # Default behavior: XFormers if installed else - PyTorch
-            return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()
+            # Default behavior: XFormers if installed else - PyTorch (cuDNN-prioritized if opted in)
+            if memory_efficient_attention is not None:
+                return XFormersAttention()
+            return _cudnn_attention_callable() if _sdpa_cudnn_enabled() else PytorchAttention()
 
 
 class Attention(torch.nn.Module):
@@ -270,9 +339,7 @@ class Attention(torch.nn.Module):
         super().__init__()
         self.rope_type = rope_type
         self.attention_function = (
-            attention_function.to_callable()
-            if isinstance(attention_function, AttentionFunction)
-            else attention_function
+            attention_function.to_callable() if isinstance(attention_function, AttentionFunction) else attention_function
         )
 
         inner_dim = dim_head * heads
@@ -282,6 +349,7 @@ class Attention(torch.nn.Module):
         self.dim_head = dim_head
 
         from musubi_tuner.ltx_2.utils import RMSNorm
+
         self.q_norm = RMSNorm(inner_dim, eps=norm_eps)
         self.k_norm = RMSNorm(inner_dim, eps=norm_eps)
 
@@ -456,20 +524,12 @@ class Attention(torch.nn.Module):
                 if q_count >= int(qh.shape[2]):
                     q_idx = torch.arange(int(qh.shape[2]), device=qh.device, dtype=torch.long)
                 else:
-                    q_idx = (
-                        torch.linspace(0, int(qh.shape[2]) - 1, steps=q_count, device=qh.device)
-                        .round()
-                        .to(torch.long)
-                    )
+                    q_idx = torch.linspace(0, int(qh.shape[2]) - 1, steps=q_count, device=qh.device).round().to(torch.long)
                     q_idx = torch.unique(q_idx, sorted=True)
                 if k_count >= int(kh.shape[2]):
                     k_idx = torch.arange(int(kh.shape[2]), device=kh.device, dtype=torch.long)
                 else:
-                    k_idx = (
-                        torch.linspace(0, int(kh.shape[2]) - 1, steps=k_count, device=kh.device)
-                        .round()
-                        .to(torch.long)
-                    )
+                    k_idx = torch.linspace(0, int(kh.shape[2]) - 1, steps=k_count, device=kh.device).round().to(torch.long)
                     k_idx = torch.unique(k_idx, sorted=True)
 
                 q_sample = qh[:, :, q_idx, :].to(torch.float32)
