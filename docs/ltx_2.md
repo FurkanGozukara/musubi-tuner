@@ -844,6 +844,9 @@ Notes:
 - Mutually exclusive with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
 - The checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
 - Installing [`triton`](https://github.com/woct0rdho/triton-windows) (Triton on Windows) lets the int8 matmul avoid keeping a transposed weight copy, lowering memory use.
+- With Triton, the int8 dequantization is fused into one pass. Setting `LTX2_INT8_FUSED_QUANT=1` additionally fuses the activation quantization (forward) and gradient quantization (backward) into single Triton kernels; this is off by default and also applies to `--fp8_w8a8 --w8a8_mode int8`.
+
+**Measured speed (Linear-layer forward+backward microbenchmark, not end-to-end).** The int8 speedup is hardware-dependent. On Ampere consumer GPUs (e.g. RTX 3090) the int8 layers run up to ~2× faster than bf16 with `LTX2_INT8_FUSED_QUANT=1` (about 1.1–1.5× without it). On an H100 int8 is slower than bf16 — the int8 matmul itself is only ~1.1× faster there (the bf16 tensor cores are already very fast), so the quantization overhead makes the net result slower; on such cards int8 only saves memory, which they rarely need. End-to-end gains are smaller than the per-layer figure because attention and other operations stay in bf16.
 
 #### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>

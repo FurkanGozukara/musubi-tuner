@@ -13,6 +13,7 @@ Two modes:
 """
 
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -212,6 +213,32 @@ def _get_int8_epilogue():
     return _INT8_EPILOGUE
 
 
+_INT8_QUANTIZE = "unset"
+_USE_FUSED_QUANT = None
+
+
+def _get_int8_quantize():
+    """Lazily import the fused Triton per-token quant (None if Triton absent)."""
+    global _INT8_QUANTIZE
+    if _INT8_QUANTIZE == "unset":
+        try:
+            from musubi_tuner.modules.triton_int8_epilogue import have_triton, quantize_rowwise
+
+            _INT8_QUANTIZE = quantize_rowwise if have_triton() else None
+        except ImportError:
+            _INT8_QUANTIZE = None
+    return _INT8_QUANTIZE
+
+
+def _use_fused_quant():
+    """Opt-in (LTX2_INT8_FUSED_QUANT=1): also fuse the per-token activation quant
+    and the backward weight-scale fold into single Triton kernels. Off by default."""
+    global _USE_FUSED_QUANT
+    if _USE_FUSED_QUANT is None:
+        _USE_FUSED_QUANT = os.getenv("LTX2_INT8_FUSED_QUANT", "0").strip().lower() in ("1", "true", "yes", "on")
+    return _USE_FUSED_QUANT
+
+
 # ---------------------------------------------------------------------------
 # Custom autograd Functions
 # ---------------------------------------------------------------------------
@@ -232,7 +259,11 @@ class _W8A8Int8Function(torch.autograd.Function):
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        x_int8, x_scale = _quantize_int8_per_token(x_2d)
+        quantize = _get_int8_quantize()
+        if quantize is not None and _use_fused_quant():
+            x_int8, x_scale = quantize(x_2d, None)
+        else:
+            x_int8, x_scale = _quantize_int8_per_token(x_2d)
 
         # [M, K] @ [K, N] -> [M, N] int32   (N = out_features)
         # _int_mm handles transposed second operand (column-major) natively via cuBLAS;
@@ -271,12 +302,17 @@ class _W8A8Int8Function(torch.autograd.Function):
             )
 
         weight_saved, weight_scale = ctx.saved_tensors
-        go_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+        go = grad_output.reshape(-1, grad_output.shape[-1])
+        out_features = grad_output.shape[-1]
 
         # Row-wise weight scales live on the contraction dimension for grad_input,
         # so fold them into grad_output before the int8 matmul.
-        go_2d = go_2d * _output_scale_view(weight_scale)
-        grad_int8, grad_scale = _quantize_int8_per_token(go_2d)
+        quantize = _get_int8_quantize()
+        if quantize is not None and _use_fused_quant() and weight_scale.numel() == out_features:
+            grad_int8, grad_scale = quantize(go, weight_scale)  # fused fold + per-token quant
+        else:
+            go_2d = go.float() * _output_scale_view(weight_scale)
+            grad_int8, grad_scale = _quantize_int8_per_token(go_2d)
         if ctx.triton_mm is None:
             grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved.t())
             in_features = weight_saved.shape[0]

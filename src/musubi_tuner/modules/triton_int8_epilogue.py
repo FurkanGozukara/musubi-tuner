@@ -12,6 +12,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     _HAVE_TRITON = True
 except ImportError:  # pragma: no cover - triton optional
@@ -46,9 +47,50 @@ if _HAVE_TRITON:
             out = out + tl.load(bias_ptr + offs_n, mask=mask, other=0.0)
         tl.store(out_ptr + base, out.to(out_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _quantize_rowwise_kernel(
+        x_ptr,
+        cs_ptr,
+        q_ptr,
+        s_ptr,
+        N,
+        HAS_COL: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(x_ptr + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+        if HAS_COL:
+            x = x * tl.load(cs_ptr + offs, mask=mask, other=0.0)
+        scale = tl.maximum(tl.max(tl.abs(x), axis=0) / 127.0, 1e-30)
+        q = tl.minimum(tl.maximum(libdevice.rint(x / scale), -127.0), 127.0)
+        tl.store(q_ptr + row * N + offs, q.to(tl.int8), mask=mask)
+        tl.store(s_ptr + row, scale)
+
 
 def have_triton() -> bool:
     return _HAVE_TRITON
+
+
+def quantize_rowwise(x, col_scale=None):
+    """Fused per-token int8 quant in one pass; optionally folds a per-column scale
+    (``col_scale[N]``) before quantizing (used by the backward to absorb the weight
+    scale). Returns (int8 [M,N], fp32 scale [M,1])."""
+    x = x.contiguous()
+    M, N = x.shape
+    q = torch.empty((M, N), device=x.device, dtype=torch.int8)
+    s = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+    _quantize_rowwise_kernel[(M,)](
+        x,
+        col_scale.reshape(N).contiguous() if col_scale is not None else x,
+        q,
+        s,
+        N,
+        HAS_COL=col_scale is not None,
+        BLOCK=triton.next_power_of_2(N),
+    )
+    return q, s
 
 
 def dequant_epilogue(out_int32, row_scale, col_scale, bias, out_dtype):
