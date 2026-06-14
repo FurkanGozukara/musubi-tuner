@@ -280,8 +280,8 @@ class LoKrModule(torch.nn.Module):
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()
         alpha = lora_dim if alpha is None or alpha == 0 else alpha
-        # if both w1 and w2 are full matrices, use scale = 1
-        if self.use_w2:
+        # scale = 1 only when both Kronecker factors are full; honor alpha if w1 is decomposed.
+        if self.use_w2 and not self.decompose_both:
             alpha = lora_dim
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))
@@ -289,7 +289,8 @@ class LoKrModule(torch.nn.Module):
         # Initialization
         if self.decompose_both:
             torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
-            torch.nn.init.constant_(self.lokr_w1_b, 1)
+            # both decomposed w1 factors get kaiming (ΔW=0 still held by lokr_w2 zero init below)
+            torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
         else:
             torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
         if self.use_w2:
@@ -304,6 +305,8 @@ class LoKrModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # True -> LyCORIS stochastic renorm (drop / drop.mean()); False -> kohya 1/(1-p).
+        self.rank_dropout_scale = lora_module._parse_bool_network_arg(kwargs.get("rank_dropout_scale", False))
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -336,6 +339,9 @@ class LoKrModule(torch.nn.Module):
         else:
             state_dict[f"{self.lora_name}.lokr_w2_a"] = self.lokr_w2_a.detach().clone()
             state_dict[f"{self.lora_name}.lokr_w2_b"] = self.lokr_w2_b.detach().clone()
+        if self.decompose_both and self.use_w2:
+            # full w2 can't encode lora_dim in its shape; persist it so reload recovers scale.
+            state_dict[f"{self.lora_name}.lokr_dim"] = torch.tensor(float(self.lora_dim))
         return state_dict
 
     def forward(self, x):
@@ -352,8 +358,13 @@ class LoKrModule(torch.nn.Module):
         if self.rank_dropout is not None and self.training:
             drop = (torch.rand(diff_weight.size(0), device=diff_weight.device) > self.rank_dropout).to(diff_weight.dtype)
             drop = drop.view(-1, 1)
-            diff_weight = diff_weight * drop
-            scale = 1.0 / (1.0 - self.rank_dropout)
+            if self.rank_dropout_scale:
+                drop = drop / drop.mean().clamp_min(1e-8)
+                diff_weight = diff_weight * drop
+                scale = 1.0
+            else:
+                diff_weight = diff_weight * drop
+                scale = 1.0 / (1.0 - self.rank_dropout)
         else:
             scale = 1.0
 
@@ -992,6 +1003,8 @@ def create_network_from_weights(
             # full matrix mode: set dim large enough to trigger full-matrix path
             if lora_name not in modules_dim:
                 modules_dim[lora_name] = max(value.shape)
+        elif key.endswith(".lokr_dim"):
+            modules_dim[lora_name] = int(value.item())  # explicit dim for decompose_both + full-w2
 
     if has_dokr_oft_weights:
         for lora_name in {key.split(".")[0] for key in weights_sd.keys() if "." in key and key.startswith("lora_")}:
@@ -1095,8 +1108,12 @@ def merge_weights_to_tensor(
         # full matrix mode
         w2a = None
         w2b = None
-        dim = None  # will use scale=1.0
+        dim = None
         consumed_keys = w1_consumed_keys + [w2_key, alpha_key]
+        lokr_dim_key = lora_name + ".lokr_dim"
+        if lokr_dim_key in lora_weight_keys:
+            dim = int(lora_sd[lokr_dim_key].item())
+            consumed_keys.append(lokr_dim_key)
     else:
         return model_weight
 
@@ -1110,8 +1127,10 @@ def merge_weights_to_tensor(
         if alpha is None:
             alpha = dim
         scale = alpha / dim
+    elif w1a is not None and alpha is not None and dim is not None:
+        # decompose_both + full w2: honor alpha via explicit lokr_dim
+        scale = alpha / dim
     else:
-        # full matrix mode: scale = 1.0
         scale = 1.0
 
     original_dtype = model_weight.dtype

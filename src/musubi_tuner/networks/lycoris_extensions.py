@@ -67,21 +67,27 @@ def init_lokr_network_with_perturbed_normal(network, scale: float = 1e-3) -> Non
     """Initialize LoKR network with perturbed normal distribution.
 
     This helps training stability by starting with small perturbations
-    rather than zeros. 
+    rather than zeros.
 
     Args:
         network: LyCORIS network instance
         scale: Standard deviation for perturbation (default: 1e-3)
     """
-    if not hasattr(network, 'loras'):
-        logger.warning("Network doesn't have 'loras' attribute, skipping LoKR init")
+    # LoKrNetwork exposes modules as unet_loras / text_encoder_loras, not `loras`.
+    modules = []
+    for attr in ("loras", "unet_loras", "text_encoder_loras"):
+        modules.extend(getattr(network, attr, None) or [])
+    if not modules:
+        logger.warning(
+            "Network exposes no LoKr modules (checked loras/unet_loras/text_encoder_loras); skipping LoKr perturbed-normal init"
+        )
         return
 
     logger.info(f"Initializing LoKR network with perturbed normal (scale={scale})")
 
     initialized_count = 0
     with torch.no_grad():
-        for lora_module in network.loras:
+        for lora_module in modules:
             # LoKR modules have lokr_w1 and lokr_w2
             if hasattr(lora_module, "lokr_w1"):
                 # Initialize w1 to identity (ones)
@@ -94,7 +100,10 @@ def init_lokr_network_with_perturbed_normal(network, scale: float = 1e-3) -> Non
 
             org_weight = getattr(lora_module, "org_weight", None)
             if not isinstance(org_weight, torch.Tensor):
-                logger.warning("LoKR module %s has no org_weight; falling back to plain normal init", getattr(lora_module, "lora_name", "<unknown>"))
+                logger.warning(
+                    "LoKR module %s has no org_weight; falling back to plain normal init",
+                    getattr(lora_module, "lora_name", "<unknown>"),
+                )
 
             if hasattr(lora_module, "lokr_w2"):
                 # Match dense-weight statistics for the full-matrix branch.
@@ -258,7 +267,8 @@ def validate_lycoris_available() -> bool:
         True if LyCORIS is available, False otherwise
     """
     try:
-        import lycoris
+        import lycoris  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -281,6 +291,7 @@ def get_lycoris_info() -> Dict[str, Any]:
         # Try to get available algorithms
         try:
             from lycoris import list_algorithms
+
             info["algorithms"] = list_algorithms()
         except (ImportError, AttributeError):
             info["algorithms"] = ["lora", "loha", "lokr", "locon", "ia3"]
@@ -288,11 +299,4 @@ def get_lycoris_info() -> Dict[str, Any]:
         return info
 
     except ImportError:
-        return {
-            "installed": False,
-            "version": None,
-            "algorithms": []
-        }
-
-
-
+        return {"installed": False, "version": None, "algorithms": []}

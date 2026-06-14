@@ -801,6 +801,10 @@ def create_network(
             if kwargs.get(key, None) is not None:
                 effective_module_kwargs[key] = kwargs.get(key)
 
+    # Opt-in LyCORIS-style rank-dropout renorm for LoHa/LoKr (base LoRA ignores it).
+    if kwargs.get("rank_dropout_scale", None) is not None:
+        effective_module_kwargs["rank_dropout_scale"] = kwargs.get("rank_dropout_scale")
+
     if network_class is None:
         network_class = LoRANetwork
 
