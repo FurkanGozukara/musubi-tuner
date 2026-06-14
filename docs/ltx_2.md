@@ -568,6 +568,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx2_dokr_oft
 ```
 
+OFT / DoRA-OFT / DoKr-OFT weights use this trainer's own format (input-side block rotation, PEFT OFTv2 lineage) and are loadable only by this trainer. They are not interchangeable with kohya-ss / LyCORIS / diffusers diag-OFT checkpoints, which rotate output features under a different block structure; there is no lossless conversion between the two.
+
 ### Advanced: LyCORIS/LoKR Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
