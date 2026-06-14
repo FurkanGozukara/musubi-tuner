@@ -1379,7 +1379,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--hfato_args",
         type=str,
         nargs="*",
-        help="Key=value args for HFATO, e.g. scale_factor=0.5 interpolation=bilinear probability=1.0",
+        help="Key=value args for HFATO, e.g. scale_factor=0.5 interpolation=trilinear probability=1.0",
     )
 
     # -- Per-module learning rate groups --

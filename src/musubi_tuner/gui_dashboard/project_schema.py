@@ -583,7 +583,7 @@ class TrainingConfig(BaseModel):
     hfato: bool = False
     hfato_args: str = ""
     hfato_scale_factor: float = 0.5
-    hfato_interpolation: Literal["bilinear", "nearest", "bicubic"] = "bilinear"
+    hfato_interpolation: Literal["trilinear", "nearest", "bilinear", "bicubic"] = "trilinear"
     hfato_probability: float = 1.0
 
     # Latent temporal objectives

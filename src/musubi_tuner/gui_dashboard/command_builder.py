@@ -1345,7 +1345,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         _append_key_value_args(args_parts, t.hfato_args)
         if t.hfato_scale_factor != 0.5:
             args_parts.append(f"scale_factor={t.hfato_scale_factor}")
-        if t.hfato_interpolation != "bilinear":
+        if t.hfato_interpolation != "trilinear":
             args_parts.append(f"interpolation={t.hfato_interpolation}")
         if t.hfato_probability != 1.0:
             args_parts.append(f"probability={t.hfato_probability}")

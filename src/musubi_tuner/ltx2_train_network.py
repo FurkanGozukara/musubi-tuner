@@ -1225,8 +1225,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if k in float_keys:
                 cfg_kwargs[k] = float(v)
             elif k == "interpolation":
-                if v not in ("bilinear", "nearest", "bicubic"):
-                    raise ValueError(f"HFATO interpolation must be bilinear|nearest|bicubic, got: {v}")
+                if v not in ("trilinear", "nearest", "bilinear", "bicubic"):
+                    raise ValueError(f"HFATO interpolation must be trilinear|nearest|bilinear|bicubic, got: {v}")
                 cfg_kwargs[k] = v
             else:
                 raise ValueError(f"Unknown HFATO arg: {k}")

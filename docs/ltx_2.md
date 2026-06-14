@@ -1476,7 +1476,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 Adapted from [ViBe (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326). Experimental — not yet validated on LTX-2.
 
-**HFATO** is a training objective designed for image-only fine-tuning of video models. Before adding noise, clean latents are spatially degraded via downsample-upsample, destroying high-frequency details. The model is then supervised to reconstruct the original clean latents (x₀-prediction loss instead of standard velocity loss). Can be combined with the Relay LoRA workflow below for two-stage image-only training.
+**HFATO** is a training objective designed for image-only fine-tuning of video models. Before adding noise, clean latents are spatially degraded via the ViBe Stage 2 downsample-upsample operator: 5D trilinear interpolation with `scale_factor=(1.0, 0.5, 0.5)` and `align_corners=False`, destroying high-frequency details. The model is then supervised to reconstruct the original clean latents (x₀-prediction loss instead of standard velocity loss). Can be combined with the Relay LoRA workflow below for two-stage image-only training.
 
 Enable with `--hfato`. Parameters are passed via `--hfato_args` as `key=value` pairs. Incompatible with `--ic_lora_strategy v2v`.
 
@@ -1500,8 +1500,8 @@ accelerate launch ... ltx2_train_network.py ^
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scale_factor` | `0.5` | Spatial downsample ratio. `0.5` = halve each spatial dimension. Lower values destroy more high-frequency info and force stronger reconstruction. `0.25` is more aggressive. |
-| `interpolation` | `bilinear` | Interpolation mode for downsample-upsample: `bilinear`, `nearest`, or `bicubic` |
-| `probability` | `1.0` | Per-step probability of applying HFATO. `1.0` = always. Values `< 1.0` mix HFATO and standard flow matching steps. |
+| `interpolation` | `trilinear` | Interpolation mode for downsample-upsample. `trilinear` matches the authors' ViBe implementation. `nearest`, `bilinear`, and `bicubic` are non-original experimental variants. |
+| `probability` | `1.0` | Per-step probability of applying HFATO. `1.0` = always, matching the authors' Stage 2 objective. Values `< 1.0` mix HFATO and standard flow matching steps and are non-original. |
 
 ##### Relay LoRA Workflow (Image-Only Training)
 <sub>[↑ contents](#table-of-contents)</sub>

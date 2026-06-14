@@ -8,7 +8,7 @@ latents.  Forces the model to learn high-frequency detail recovery from images.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HFATOConfig:
-    scale_factor: float = 0.5  # Downsample ratio (0.5 = halve spatial res)
-    interpolation: str = "bilinear"  # "bilinear" | "nearest" | "bicubic"
+    scale_factor: float = 0.5  # ViBe Stage 2 uses 0.5 spatial downsample
+    interpolation: str = "trilinear"  # ViBe Stage 2 uses 5D trilinear, align_corners=False
     probability: float = 1.0  # Probability of applying HFATO per step (1.0 = always)
 
 
@@ -40,11 +40,14 @@ def parse_hfato_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
 def degrade_latents(
     latents: torch.Tensor,
     scale_factor: float = 0.5,
-    interpolation: str = "bilinear",
+    interpolation: str = "trilinear",
 ) -> torch.Tensor:
     """Apply downsample-then-upsample degradation to 5D video latents.
 
-    Operates spatially per-frame — temporal dimension is untouched.
+    The default path matches the ViBe authors' Stage 2 HFATO implementation:
+    5D trilinear interpolation with scale_factor=(1.0, 0.5, 0.5) and
+    align_corners=False.  Legacy 2D spatial modes remain available only when
+    requested explicitly.
 
     Args:
         latents: ``[B, C, T, H, W]`` clean video latents.
@@ -54,25 +57,43 @@ def degrade_latents(
     Returns:
         Degraded latents with same shape as input, high-frequency info destroyed.
     """
+    if latents.dim() != 5:
+        raise ValueError(f"HFATO expects 5D latents [B, C, T, H, W], got shape {tuple(latents.shape)}")
+
     B, C, T, H, W = latents.shape
-    # Reshape to [B*T, C, H, W] for spatial-only interpolation
+    if interpolation in ("trilinear", "nearest"):
+        kwargs = {}
+        if interpolation == "trilinear":
+            kwargs["align_corners"] = False
+        x_small = F.interpolate(
+            latents,
+            scale_factor=(1.0, scale_factor, scale_factor),
+            mode=interpolation,
+            **kwargs,
+        )
+        return F.interpolate(
+            x_small,
+            size=(T, H, W),
+            mode=interpolation,
+            **kwargs,
+        )
+
+    if interpolation not in ("bilinear", "bicubic"):
+        raise ValueError(f"HFATO interpolation must be trilinear|nearest|bilinear|bicubic, got: {interpolation}")
+
     x = latents.reshape(B * T, C, H, W)
-
-    small_H = max(1, int(H * scale_factor))
-    small_W = max(1, int(W * scale_factor))
-    align = interpolation not in ("nearest",)
-
-    # Downsample
     x_small = F.interpolate(
-        x, size=(small_H, small_W), mode=interpolation,
-        align_corners=align if align else None,
+        x,
+        scale_factor=scale_factor,
+        mode=interpolation,
+        align_corners=False,
     )
-    # Upsample back to original resolution
     x_restored = F.interpolate(
-        x_small, size=(H, W), mode=interpolation,
-        align_corners=align if align else None,
+        x_small,
+        size=(H, W),
+        mode=interpolation,
+        align_corners=False,
     )
-
     return x_restored.reshape(B, C, T, H, W)
 
 
