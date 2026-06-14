@@ -839,12 +839,14 @@ python src/musubi_tuner/ltx2_train.py ^
   (other training options)
 ```
 
+To quantize a standard (bf16/fp16) checkpoint on the fly instead of supplying a pre-quantized file, use `--int8_base_dynamic` (same flag set otherwise; quantization is streamed, so the full bf16 model is never held in memory).
+
 Notes:
 - Requires LoRA training (`--network_module`); the int8 base is frozen.
-- Mutually exclusive with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
-- The checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
-- Installing [`triton`](https://github.com/woct0rdho/triton-windows) (Triton on Windows) lets the int8 matmul avoid keeping a transposed weight copy, lowering memory use.
-- With Triton, the int8 dequantization is fused into one pass. Setting `LTX2_INT8_FUSED_QUANT=1` additionally fuses the activation quantization (forward) and gradient quantization (backward) into single Triton kernels; this is off by default and also applies to `--fp8_w8a8 --w8a8_mode int8`.
+- `--int8_base` / `--int8_base_dynamic` are mutually exclusive with each other and with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- For `--int8_base` the checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
+- **Triton is required for the fused int8 kernels and the lower-memory path, and is not installed by default.** Install it separately: `pip install triton` on Linux, or [`triton-windows`](https://github.com/woct0rdho/triton-windows) on Windows. Without Triton the int8 path still works — it falls back to an eager dequantize-and-matmul path — but keeps a transposed weight copy (more memory) and gets none of the fused-kernel speedups.
+- With Triton, the int8 dequantization is fused into one pass. Passing `--int8_fused_quant` (or setting `LTX2_INT8_FUSED_QUANT=1`) additionally fuses the activation quantization (forward) and gradient quantization (backward) into single Triton kernels; this is off by default and also applies to `--fp8_w8a8 --w8a8_mode int8`.
 
 **Measured speed (Linear-layer forward+backward microbenchmark, not end-to-end).** The int8 speedup is hardware-dependent. On Ampere consumer GPUs (e.g. RTX 3090) the int8 layers run up to ~2× faster than bf16 with `LTX2_INT8_FUSED_QUANT=1` (about 1.1–1.5× without it). On an H100 int8 is slower than bf16 — the int8 matmul itself is only ~1.1× faster there (the bf16 tensor cores are already very fast), so the quantization overhead makes the net result slower; on such cards int8 only saves memory, which they rarely need. End-to-end gains are smaller than the per-layer figure because attention and other operations stay in bf16.
 

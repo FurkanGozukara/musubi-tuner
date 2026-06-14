@@ -839,6 +839,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--int8_base_dynamic",
+        action="store_true",
+        help=(
+            "Like --int8_base but quantizes a standard (bf16/fp16) DiT checkpoint to per-row int8 "
+            "on the fly at load time (no pre-quantized file needed; streamed, so the full bf16 model "
+            "is never resident). Requires LoRA training. Mutually exclusive with "
+            "--int8_base/--fp8_base/--fp8_scaled/--nf4_base."
+        ),
+    )
+    parser.add_argument(
+        "--int8_fused_quant",
+        action="store_true",
+        help=(
+            "Opt-in: also fuse the int8 activation/gradient quantization into Triton kernels "
+            "(~2x faster int8 Linear layers on Ampere; needs Triton). Equivalent to setting "
+            "LTX2_INT8_FUSED_QUANT=1. Applies to --int8_base/--int8_base_dynamic and "
+            "--fp8_w8a8 --w8a8_mode int8."
+        ),
+    )
+    parser.add_argument(
         "--fp8_gemm",
         action="store_true",
         help=(

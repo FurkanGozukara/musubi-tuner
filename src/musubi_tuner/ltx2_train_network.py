@@ -2932,16 +2932,23 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
-        if getattr(args, "int8_base", False):
+        _int8_base = getattr(args, "int8_base", False)
+        _int8_dynamic = getattr(args, "int8_base_dynamic", False)
+        if _int8_base and _int8_dynamic:
+            raise ValueError("--int8_base and --int8_base_dynamic are mutually exclusive")
+        if _int8_base or _int8_dynamic:
+            _flag = "--int8_base" if _int8_base else "--int8_base_dynamic"
             for _conflict in ("fp8_base", "fp8_scaled", "nf4_base"):
                 if getattr(args, _conflict, False):
-                    raise ValueError(f"--int8_base and --{_conflict} are mutually exclusive")
+                    raise ValueError(f"{_flag} and --{_conflict} are mutually exclusive")
             if not getattr(args, "network_module", None):
-                raise ValueError("--int8_base requires LoRA training (--network_module); the int8 base is frozen")
-            if getattr(args, "train_connectors", False):
+                raise ValueError(f"{_flag} requires LoRA training (--network_module); the int8 base is frozen")
+            if _int8_base and getattr(args, "train_connectors", False):
                 raise ValueError(
                     "--int8_base is incompatible with --train_connectors (the quanto DiT checkpoint carries no connector weights)"
                 )
+        if getattr(args, "int8_fused_quant", False):
+            os.environ["LTX2_INT8_FUSED_QUANT"] = "1"
 
         validate_lycoris_quantized_base_compatibility(args, logger, DEFAULT_NF4_BLOCK_SIZE)
 
@@ -3388,6 +3395,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),
             fp8_keep_blocks=getattr(args, "fp8_keep_blocks", None),
             int8_base=bool(getattr(args, "int8_base", False)),
+            int8_dynamic=bool(getattr(args, "int8_base_dynamic", False)),
             nf4_base=bool(getattr(args, "nf4_base", False)),
             nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
             loftq_init=bool(getattr(args, "loftq_init", False)),
@@ -3590,7 +3598,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         Scope: the plain T2V/AV forward boundary only. AV/IC/reference-conditioning *input*
         construction is NOT factored here (deferred to its own slice).
         """
-        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False) or getattr(args, "int8_base", False):
+        if (
+            getattr(args, "fp8_base", False)
+            or getattr(args, "fp8_scaled", False)
+            or getattr(args, "int8_base", False)
+            or getattr(args, "int8_base_dynamic", False)
+        ):
             self._ensure_fp8_buffers_on_device(transformer)
         forward_args = (model_input,)
         forward_kwargs = {
@@ -4240,7 +4253,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 if audio_force_keep_mask is not None:
                     resolved_transformer_options["audio_force_keep_mask"] = audio_force_keep_mask
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False) or getattr(args, "int8_base", False):
+            if (
+                getattr(args, "fp8_base", False)
+                or getattr(args, "fp8_scaled", False)
+                or getattr(args, "int8_base", False)
+                or getattr(args, "int8_base_dynamic", False)
+            ):
                 self._ensure_fp8_buffers_on_device(transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(transformer)
@@ -4573,7 +4591,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             perturbations = BatchedPerturbationConfig.empty(bsz)
             unwrapped_transformer = accelerator.unwrap_model(transformer)
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False) or getattr(args, "int8_base", False):
+            if (
+                getattr(args, "fp8_base", False)
+                or getattr(args, "fp8_scaled", False)
+                or getattr(args, "int8_base", False)
+                or getattr(args, "int8_base_dynamic", False)
+            ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
@@ -4921,7 +4944,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False) or getattr(args, "int8_base", False):
+            if (
+                getattr(args, "fp8_base", False)
+                or getattr(args, "fp8_scaled", False)
+                or getattr(args, "int8_base", False)
+                or getattr(args, "int8_base_dynamic", False)
+            ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
@@ -5492,7 +5520,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False) or getattr(args, "int8_base", False):
+            if (
+                getattr(args, "fp8_base", False)
+                or getattr(args, "fp8_scaled", False)
+                or getattr(args, "int8_base", False)
+                or getattr(args, "int8_base_dynamic", False)
+            ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)

@@ -496,6 +496,61 @@ def load_quanto_int8_state_dict(
     return sd
 
 
+def load_safetensors_dynamic_int8(
+    model_files: List[str],
+    *,
+    target_keys: List[str],
+    exclude_keys: List[str],
+    non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
+    calc_device: Union[str, torch.device] = "cpu",
+    key_filter: Optional[Callable[[str], bool]] = None,
+) -> dict[str, torch.Tensor]:
+    """Stream a standard checkpoint and quantize the targeted Linear weights to per-row
+    int8 on the fly (no fp8 intermediate; one tensor at a time, so the full bf16 model is
+    never resident).
+
+    Keys are renamed to model names during the stream so target/exclude matching uses the
+    model's naming. Each targeted ``<name>.weight`` becomes int8 plus a per-row
+    ``<name>.scale_weight`` (float32 [out, 1]); other tensors are cast to ``non_quant_dtype``.
+    Output keys are final (the caller must not rename again).
+    """
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+
+    calc_device = torch.device(calc_device)
+    sd: dict[str, torch.Tensor] = {}
+    quantized = 0
+    for model_file in model_files:
+        with MemoryEfficientSafeOpen(model_file) as f:
+            for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(key)
+                mkey = renamed if renamed is not None else key
+                if key_filter is not None and not key_filter(mkey):
+                    continue
+                value = f.get_tensor(key)
+                is_target = (
+                    mkey.endswith(".weight")
+                    and value.ndim == 2
+                    and any(t in mkey for t in target_keys)
+                    and not any(e in mkey for e in exclude_keys)
+                )
+                if is_target:
+                    w = value.to(device=calc_device, dtype=torch.float32)
+                    scale = (w.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
+                    q = (w / scale).round_().clamp_(-127, 127).to(torch.int8)
+                    sd[mkey] = q
+                    sd[mkey[: -len(".weight")] + ".scale_weight"] = scale.to(torch.float32)
+                    quantized += 1
+                    del w
+                else:
+                    if value.is_floating_point() and non_quant_dtype is not None:
+                        value = value.to(non_quant_dtype)
+                    if calc_device.type == "cuda":
+                        value = value.to(calc_device)
+                    sd[mkey] = value
+    logger.info("int8 dynamic: quantized %d Linear weights to per-row int8 (%d tensors total)", quantized, len(sd))
+    return sd
+
+
 def load_ltx2_model(
     model_path: str,
     device: Union[str, torch.device] = "cpu",
@@ -517,6 +572,7 @@ def load_ltx2_model(
     fp8_upcast_seed: int = 0,
     fp8_keep_blocks: Optional[str] = None,
     int8_base: bool = False,
+    int8_dynamic: bool = False,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -871,6 +927,17 @@ def load_ltx2_model(
             non_quant_dtype=torch_dtype or torch.bfloat16,
             key_filter=state_dict_key_filter,
         )
+    elif int8_dynamic:
+        logger.info("LTX-2 int8: dynamic per-row int8 quantization of standard checkpoint")
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        sd = load_safetensors_dynamic_int8(
+            model_files,
+            target_keys=["transformer_blocks"],
+            exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
+            non_quant_dtype=torch_dtype or torch.bfloat16,
+            calc_device=_resolved_quant_device,
+            key_filter=state_dict_key_filter,
+        )
     else:
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
@@ -885,7 +952,8 @@ def load_ltx2_model(
             key_filter=state_dict_key_filter,
         )
 
-    if not (nf4_base and locals().get("_skip_rename", False)):
+    # int8_dynamic already renamed keys during the streaming quantization.
+    if not (int8_dynamic or (nf4_base and locals().get("_skip_rename", False))):
         renamed_sd: dict[str, torch.Tensor] = {}
         for k, v in sd.items():
             nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
@@ -904,7 +972,7 @@ def load_ltx2_model(
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
-    elif int8_base:
+    elif int8_base or int8_dynamic:
         register_quanto_int8_scale_buffers(base_model, sd)
     _trace_vram_ltx2("AFTER apply monkey patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
@@ -917,7 +985,7 @@ def load_ltx2_model(
     if fp8_w8a8:
         apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
-    if int8_base:
+    if int8_base or int8_dynamic:
         apply_quanto_int8_monkey_patch(base_model)
         _trace_vram_ltx2("AFTER quanto int8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
