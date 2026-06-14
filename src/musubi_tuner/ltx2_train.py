@@ -3624,7 +3624,14 @@ def main() -> None:
     )
 
     transformer.train()
-    transformer.requires_grad_(True)
+    if getattr(args, "int8_base", False) or getattr(args, "int8_base_dynamic", False):
+        # int8-quantized base params can't require grad; enable grad only on float params.
+        # (LoRA freezes the base again afterward; the int8 base stays frozen.)
+        for _p in transformer.parameters():
+            if _p.is_floating_point():
+                _p.requires_grad_(True)
+    else:
+        transformer.requires_grad_(True)
     qgalore_summary = None
     if bool(getattr(args, "qgalore_full_ft", False)):
         from musubi_tuner.optimizers.q_galore import replace_ltx2_linear_with_qgalore
