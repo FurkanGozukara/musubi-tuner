@@ -196,6 +196,22 @@ def _supports_triton_mm(device):
     return device.type == "cuda" and torch.cuda.is_available()
 
 
+_INT8_EPILOGUE = "unset"
+
+
+def _get_int8_epilogue():
+    """Lazily import the fused Triton dequant epilogue (None if Triton absent)."""
+    global _INT8_EPILOGUE
+    if _INT8_EPILOGUE == "unset":
+        try:
+            from musubi_tuner.modules.triton_int8_epilogue import dequant_epilogue, have_triton
+
+            _INT8_EPILOGUE = dequant_epilogue if have_triton() else None
+        except ImportError:
+            _INT8_EPILOGUE = None
+    return _INT8_EPILOGUE
+
+
 # ---------------------------------------------------------------------------
 # Custom autograd Functions
 # ---------------------------------------------------------------------------
@@ -223,13 +239,18 @@ class _W8A8Int8Function(torch.autograd.Function):
         # no .contiguous() needed on weight_int8.t(), which avoids a 16MB transient copy.
         out_int32 = _int_mm_allow_small_m(x_int8.contiguous(), weight_int8.t())
 
-        # Rescale: x_scale [M,1] * row-wise weight_scale [1,out]
-        output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
-
-        if bias is not None:
-            output = output + bias.float()
-
-        output = output.to(x.dtype).reshape(*original_shape[:-1], -1)
+        # Rescale int32 -> compute dtype. Fused Triton epilogue (one pass over [M,N])
+        # when available and weight scale is per-row; else eager multi-pass rescale.
+        out_features = weight_int8.shape[0]
+        epilogue = _get_int8_epilogue()
+        if epilogue is not None and weight_scale.numel() == out_features:
+            output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, x.dtype)
+            output = output.reshape(*original_shape[:-1], out_features)
+        else:
+            output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
+            if bias is not None:
+                output = output + bias.float()
+            output = output.to(x.dtype).reshape(*original_shape[:-1], -1)
 
         # Save ONLY references to existing module buffers.
         if triton_mm is None:
@@ -266,8 +287,12 @@ class _W8A8Int8Function(torch.autograd.Function):
                 logger.exception("W8A8 Triton backward failed; falling back to torch._int_mm.")
                 grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved)
             in_features = weight_saved.shape[1]
-        grad_input = grad_int32.float() * grad_scale
-        grad_input = grad_input.to(ctx.input_dtype).reshape(*grad_output.shape[:-1], in_features)
+        epilogue = _get_int8_epilogue()
+        if epilogue is not None:
+            grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
+        else:
+            grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
+        grad_input = grad_input.reshape(*grad_output.shape[:-1], in_features)
         return grad_input, None, None, None, None, None
 
 
