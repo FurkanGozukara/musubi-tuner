@@ -640,9 +640,24 @@ def _compose_target_audio_loss_mask(
     batch_size: int,
     target_seq_len: int,
     device: torch.device,
+    audio_lengths: Any = None,
 ) -> torch.Tensor:
     if target_audio_loss_mask is None or int(target_audio_loss_mask.shape[1]) != target_seq_len:
         target_audio_loss_mask = torch.ones((batch_size, target_seq_len), device=device, dtype=torch.bool)
+    if isinstance(audio_lengths, dict):
+        audio_lengths = audio_lengths.get("lengths")
+    if isinstance(audio_lengths, torch.Tensor):
+        if audio_lengths.dim() == 0:
+            audio_lengths = audio_lengths.view(1)
+        if audio_lengths.numel() == 1 and batch_size != 1:
+            audio_lengths = audio_lengths.expand(batch_size)
+        if audio_lengths.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch size mismatch: audio_latents batch={batch_size} vs audio_lengths batch={audio_lengths.shape[0]}"
+            )
+        audio_lengths = audio_lengths.to(device=device, dtype=torch.int64).clamp(min=0, max=target_seq_len)
+        t = torch.arange(target_seq_len, device=device).view(1, -1)
+        target_audio_loss_mask = target_audio_loss_mask & (t < audio_lengths.view(-1, 1))
     return _combine_loss_masks(target_audio_loss_mask, cached_audio_loss_mask)
 
 
@@ -1555,6 +1570,19 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "--self_flow is mutually exclusive with --tread: TREAD routing drops/permutes tokens only in "
                 "the grad-enabled student forward (not the no_grad teacher forward), which misaligns the "
                 "per-token Self-Flow feature comparison."
+            )
+        if self._ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av"):
+            # Placed here (not in pre_train_hook) so it covers BOTH LoRA and full fine-tuning:
+            # ltx2_train.py calls _setup_self_flow directly and never runs pre_train_hook, yet
+            # reuses the same call_dit forward. The IC reference-prefix branches collapse the
+            # per-token Self-Flow timesteps to a single sigma and early-return before the
+            # teacher/distillation pass, so the Self-Flow loss would be silently 0 while the
+            # student input stays perturbed.
+            raise ValueError(
+                f"--self_flow is not supported with --ic_lora_strategy {self._ic_lora_strategy}: the IC-LoRA "
+                "reference-prefix branches collapse the per-token Self-Flow timesteps to a single sigma and "
+                "return before the teacher/distillation pass, so the Self-Flow loss would be silently 0 while "
+                "the student input stays perturbed. Disable one of the two."
             )
 
         from musubi_tuner.self_flow import (
@@ -3308,6 +3336,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_self_ref_v2v_training"] = True
         elif self._ic_lora_strategy == "audio_ref_ic":
             md["ss_audio_ref_ic_training"] = True
+            if bool(getattr(args, "audio_ref_use_negative_positions", False)):
+                md["ss_audio_ref_use_negative_positions"] = True
         elif self._ic_lora_strategy == "av_ic":
             md["ss_av_ic_training"] = True
             av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
@@ -3315,6 +3345,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 md["ss_av_cross_attention_mode"] = av_cross_attention_mode
             if bool(getattr(args, "av_multi_ref", False)):
                 md["ss_av_multi_ref"] = True
+            if bool(getattr(args, "audio_ref_use_negative_positions", False)):
+                md["ss_audio_ref_use_negative_positions"] = True
         elif self._ic_lora_strategy == "video_ref_only_av":
             md["ss_video_ref_only_av_training"] = True
         elif self._i2v_training:
@@ -4039,6 +4071,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         ref_latent_tensors = _collect_reference_tensors(batch, "ref_latents", expected_ndim=5)
         ref_latents = _merge_reference_tensors(ref_latent_tensors, concat_dim=2)
 
+        if ref_latents is None and ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av"):
+            raise ValueError(
+                f"--ic_lora_strategy {ic_lora_strategy} requires reference-video latents in every batch, but none "
+                "were found. Configure reference_directory / reference_cache_directory for the dataset and cache "
+                "reference latents (this mirrors the audio_ref_ic ref-audio requirement). Without it, training "
+                "would silently fall through to the unconditioned path while still tagging the checkpoint as an "
+                "IC-LoRA run."
+            )
+
         if ref_latents is not None:
             if ic_lora_strategy not in ("v2v", "av_ic", "video_ref_only_av"):
                 if not self._warned_ignored_ref_latents:
@@ -4168,9 +4209,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ref_audio_seq_len = 0
 
             if audio_ref_ic_enabled:
-                ref_audio_latents = batch.get("ref_audio_latents")
-                if isinstance(ref_audio_latents, dict):
-                    ref_audio_latents = ref_audio_latents.get("latents")
+                ref_audio_latents = _merge_reference_tensors(
+                    _collect_reference_tensors(batch, "ref_audio_latents", expected_ndim=4),
+                    concat_dim=2,
+                )
                 if ref_audio_latents is None:
                     raise ValueError(
                         "--ic_lora_strategy audio_ref_ic requires ref_audio_latents. "
@@ -5009,6 +5051,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 batch_size=bsz,
                 target_seq_len=tgt_audio_seq_len,
                 device=accelerator.device,
+                audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
             )
 
             out_av_ic: Dict[str, Any] = {
@@ -5135,9 +5178,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     audio_timestep_for_model = audio_model_timesteps
 
             if audio_ref_ic_enabled:
-                ref_audio_latents = batch.get("ref_audio_latents")
-                if isinstance(ref_audio_latents, dict):
-                    ref_audio_latents = ref_audio_latents.get("latents")
+                ref_audio_latents = _merge_reference_tensors(
+                    _collect_reference_tensors(batch, "ref_audio_latents", expected_ndim=4),
+                    concat_dim=2,
+                )
 
                 if not audio_enabled_for_batch or audio_latents is None or noisy_audio is None:
                     raise ValueError("--ic_lora_strategy audio_ref_ic requires target audio_latents in every AV batch")
@@ -5579,6 +5623,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 batch_size=bsz,
                 target_seq_len=tgt_audio_seq_len,
                 device=accelerator.device,
+                audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
             )
 
             out_video_ref_av: Dict[str, Any] = {

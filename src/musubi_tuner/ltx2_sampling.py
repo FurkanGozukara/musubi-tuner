@@ -2441,6 +2441,18 @@ class LTX2SamplingMixin:
             generator=generator,
         )
 
+        # Reference-video IC-LoRA helpers (v2v / av_ic / video_ref_only_av) call base_model directly and
+        # bypass the first-frame / latent_idx / keyframe guide-append path used during training. Composing
+        # those guides here is unsupported, so fail fast instead of silently diverging from a guide-trained LoRA.
+        if v2v_ref_latents is not None and (conditioning_latent is not None or latent_idx_guides or keyframe_guides):
+            raise ValueError(
+                "Reference-video IC-LoRA sampling (v2v / av_ic / video_ref_only_av) does not compose first-frame "
+                "(conditioning_latent / --i), latent_idx, or keyframe guides at inference: the dedicated denoising "
+                "helpers bypass the guide-append path used in training, so results would diverge from a "
+                "guide-trained LoRA. Sample without these guides, or use --ic_lora_strategy audio_ref_ic / none "
+                "(which run through the wrapper path that composes guides)."
+            )
+
         # ===== AV_IC: combined video+audio IC-LoRA sampling path =====
         if av_ic_sampling and v2v_ref_latents is not None and isinstance(ref_audio_latents, torch.Tensor):
             video, audio_waveform = self._do_av_ic_denoising(
@@ -4241,6 +4253,7 @@ class LTX2SamplingMixin:
                         positions=cfg_audio_pos,
                         context=cfg_audio_ctx,
                         sigma=sigma,
+                        context_mask=prompt_mask,
                         v2a_cross_attention_mask=cfg_v2a_mask,
                     )
 
@@ -4337,6 +4350,7 @@ class LTX2SamplingMixin:
                         positions=audio_combined_pos,
                         context=audio_ctx,
                         sigma=sigma,
+                        context_mask=prompt_mask,
                         v2a_cross_attention_mask=v2a_mask,
                     )
 

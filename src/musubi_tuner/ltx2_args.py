@@ -1637,6 +1637,12 @@ def main() -> None:
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "video_ref_only_av"
             logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
+    elif requested_ic_strategy == "v2v" and not explicit_lora_preset and not uses_lycoris_module:
+        if args.network_args is None:
+            args.network_args = []
+        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
+            args.lora_target_preset = "v2v"
+            logger.info("Using lora_target_preset=v2v for --ic_lora_strategy v2v")
 
     if (
         explicit_ic_strategy

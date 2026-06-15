@@ -2244,6 +2244,8 @@ keyframe_guide_extra_strengths         = [0.7]
 
 `latent_idx` overwrites the noisy-target tensor before patchify, so it works on every branch that produces video tokens. `keyframe` token-append is wired through the `LTX2Wrapper.forward` path for the simple/audio-ref-only paths and via `build_keyframe_extension` for the v2v / av_ic / video_ref_only_av IC-LoRA branches; in all cases the appended timesteps are `(1 − strength) × sigma` and the predictions are sliced off before loss.
 
+**Inference:** the `✓` above is training-only. `v2v` / `av_ic` / `video_ref_only_av` do not compose first-frame, `latent_idx`, or `keyframe` guides at sample time — only `none` and `audio_ref_ic` do, and supplying a guide with a reference-video strategy raises an error. Don't train such a LoRA expecting to sample it with guides.
+
 Notes on edge cases:
 - **`reference_downscale_factor`** (set on the dataset for v2v / av_ic / video_ref_only_av when ref-video resolution is lower than the target) is propagated into keyframe positions inside `build_keyframe_extension` so a downscaled keyframe carries spatial positions consistent with the ref-video. The simple path runs at full resolution and ignores this factor.
 - **Inference image-resize on shape mismatch**: in `ltx2_inference.py:_denoise_loop`, both latent_idx and keyframe guide latents are bilinearly resized to the current denoising stage's spatial resolution if they don't already match (relevant for `--sample_two_stage` where stage 1 runs at half-resolution).

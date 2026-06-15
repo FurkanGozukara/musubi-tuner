@@ -670,6 +670,12 @@ def _load_reference_frames(
         container.close()
         if not frames:
             raise ValueError(f"No frames decoded from reference video: {path}")
+        if len(frames) < num_frames:
+            # Pad short reference videos by repeating the last frame so every reference in a
+            # batch shares the same frame count (mirrors the image branch below and the
+            # target-video last-frame padding); otherwise collate's torch.stack fails on
+            # heterogeneous reference frame counts.
+            frames.extend([frames[-1]] * (num_frames - len(frames)))
     else:
         image = Image.open(path).convert("RGB")
         arr = resize_image_to_bucket(image, ref_reso)
