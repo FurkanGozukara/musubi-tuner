@@ -1550,6 +1550,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             return
         if self._ltx_mode not in {"video", "av"}:
             raise ValueError("--self_flow currently supports --ltx_mode video or av")
+        if bool(getattr(args, "tread", False)):
+            raise ValueError(
+                "--self_flow is mutually exclusive with --tread: TREAD routing drops/permutes tokens only in "
+                "the grad-enabled student forward (not the no_grad teacher forward), which misaligns the "
+                "per-token Self-Flow feature comparison."
+            )
 
         from musubi_tuner.self_flow import (
             SelfFlowConfig,
@@ -1692,21 +1698,44 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         module.setup(accelerator.device, dtype)
         module.init_teacher(self_flow_network)
 
-        if getattr(args, "resume", None):
-            proj_path = os.path.join(args.resume, "self_flow_projector.safetensors")
-            if os.path.exists(proj_path):
-                from safetensors.torch import load_file
+        resume_dir = getattr(args, "resume", None)
+        if resume_dir:
+            from safetensors.torch import load_file
 
-                sd = load_file(proj_path)
-                module.load_state_dict(sd)
+            # LoRA saves these into the Accelerate `-state` dir (== args.resume); full-FT saves them
+            # flat to output_dir. Try the resume dir first, then fall back to output_dir so an
+            # autoresume (args.resume = a per-step `-state` subdir) still finds the full-FT copies.
+            candidate_dirs = [resume_dir]
+            out_dir = getattr(args, "output_dir", None)
+            if out_dir and out_dir not in candidate_dirs:
+                candidate_dirs.append(out_dir)
+
+            proj_path = next(
+                (p for p in (os.path.join(d, "self_flow_projector.safetensors") for d in candidate_dirs) if os.path.exists(p)),
+                None,
+            )
+            if proj_path is not None:
+                module.load_state_dict(load_file(proj_path))
                 logger.info("Self-Flow: resumed projector weights from %s", proj_path)
-            teacher_path = os.path.join(args.resume, "self_flow_teacher_ema.safetensors")
-            if os.path.exists(teacher_path):
-                from safetensors.torch import load_file
+            else:
+                logger.warning(
+                    "Self-Flow: no projector state found under %s on resume; projector starts from random init.",
+                    candidate_dirs,
+                )
 
-                teacher_sd = load_file(teacher_path)
-                module.load_teacher_state_dict(teacher_sd)
+            teacher_path = next(
+                (p for p in (os.path.join(d, "self_flow_teacher_ema.safetensors") for d in candidate_dirs) if os.path.exists(p)),
+                None,
+            )
+            if teacher_path is not None:
+                module.load_teacher_state_dict(load_file(teacher_path))
                 logger.info("Self-Flow: resumed EMA teacher state from %s", teacher_path)
+            elif str(getattr(module.config, "teacher_mode", "base")).lower() in {"ema", "partial_ema"}:
+                logger.warning(
+                    "Self-Flow: no EMA teacher state found under %s on resume; the EMA teacher "
+                    "re-initializes from the current weights.",
+                    candidate_dirs,
+                )
 
         self._self_flow = module
         self._self_flow_active = True
@@ -2038,7 +2067,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             num_latent_frames=sf_ctx.get("num_latent_frames"),
             latent_height=sf_ctx.get("latent_height"),
             latent_width=sf_ctx.get("latent_width"),
-            token_mask=sf_ctx.get("dual_timestep_mask"),
+            token_mask=sf_ctx.get("focus_mask", sf_ctx.get("dual_timestep_mask")),
         )
 
         metrics: Dict[str, float] = {}

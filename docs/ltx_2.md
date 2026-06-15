@@ -1410,7 +1410,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 #### Self-Flow (Self-Supervised Flow Matching)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The default `teacher_mode=base` uses the **frozen pretrained model** as teacher by zeroing LoRA multipliers for the teacher forward pass, avoiding a separate teacher-weight copy. An EMA-based teacher (`teacher_mode=ema`) is also available for LoRA-aware distillation. The optional **temporal extension** adds frame-neighbor and motion-delta consistency terms. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
+**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The paper's Self-Flow ([arXiv 2603.06507](https://arxiv.org/abs/2603.06507), Eq. 6) is EMA self-distillation — the teacher is a weight-EMA copy of the same network — which is reproduced here by `teacher_mode=ema` / `partial_ema`. The shipped default `teacher_mode=base` is a related but **non-paper variant**: it disables the LoRA/adapter for the teacher forward pass so the teacher is the frozen pretrained base (a consistency / REPA-against-base regularizer — no separate teacher-weight copy and no teacher↔student co-adaptation). The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is an LTX-specific addition not covered by the paper attribution.
 
 Enable with `--self_flow`. Supported in `--ltx2_mode video` and `--ltx2_mode av`. In AV mode the video alignment runs by default; an optional audio alignment branch is enabled with `lambda_audio > 0` (see the audio notes below). All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
@@ -1439,7 +1439,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; zero LoRA multipliers during teacher pass, no separate teacher-weight copy), `ema` (EMA over all LoRA params), `partial_ema` (EMA over teacher block's LoRA params only) |
+| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; disables the adapter during the teacher pass, no separate teacher-weight copy — **diverges from the paper**, see the intro note), `ema` (EMA over all LoRA params — the paper's method), `partial_ema` (EMA over teacher block's LoRA params only) |
 | `student_block_idx` | `16` | Student feature block index (0-based; overridden by `student_block_ratio` when set) |
 | `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`; overridden by `teacher_block_ratio` when set) |
 | `student_block_ratio` | `None` | Ratio-based student layer selection. Resolves to `floor(ratio * depth)`. Takes priority over `student_block_idx`. |
@@ -1482,9 +1482,9 @@ accelerate launch ... ltx2_train_network.py ^
 
 - Supported modes: `--ltx2_mode video`, `--ltx2_mode av`. In AV mode, video alignment is always active when `lambda_self_flow > 0`; audio alignment is active when `lambda_audio > 0`.
 - Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
-- Cost: one extra teacher forward pass per train step. `teacher_mode=base` reuses the existing model with LoRA multipliers zeroed instead of keeping a separate teacher-weight copy.
-- Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned); `ema` / `partial_ema` give a moving target that shrinks as training converges.
-- Temporal extension: when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
+- Cost: one extra teacher forward pass per train step. `teacher_mode=base` reuses the existing model with the adapter disabled for the teacher pass instead of keeping a separate teacher-weight copy.
+- Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned) but is **not** the paper's method; `ema` / `partial_ema` are the paper's EMA self-distillation, a moving target that shrinks as training converges.
+- Temporal extension (LTX-specific, **not** part of arXiv 2603.06507): when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
 - Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
 - Local patch matching: when `temporal_granularity=patch` and `patch_spatial_radius > 0`, each student patch can align to the best teacher patch inside a local spatial window, which is more tolerant to small motion and camera drift than strict same-patch matching.
 - Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.

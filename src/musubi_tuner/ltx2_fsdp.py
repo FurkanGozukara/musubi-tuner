@@ -171,5 +171,5 @@ def validate_ltx2_fsdp_setup(args: argparse.Namespace, accelerator) -> None:
     if optimizer_type and optimizer_type not in _FSDP_SAFE_OPTIMIZERS:
         raise RuntimeError(f"--ltx2_fsdp supports only {sorted(_FSDP_SAFE_OPTIMIZERS)} optimizers (got {optimizer_type!r}).")
 
-    if getattr(getattr(args, "_trainer", None), "_self_flow", False):
+    if bool(getattr(args, "self_flow", False)):
         raise RuntimeError("--ltx2_fsdp is mutually exclusive with Self-Flow.")

@@ -347,6 +347,8 @@ class LoKrModule(torch.nn.Module):
         return state_dict
 
     def forward(self, x):
+        if not getattr(self, "enabled", True):
+            return self.org_forward(x)
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -531,6 +533,8 @@ class DoKrModule(LoKrModule):
         return state_dict
 
     def forward(self, x):
+        if not getattr(self, "enabled", True):
+            return self.org_forward(x)
         org_forwarded = self.org_forward(x)
 
         if self.module_dropout is not None and self.training:
@@ -760,6 +764,8 @@ class DoKrOFTModule(DoKrModule):
         return state_dict
 
     def forward(self, x):
+        if not getattr(self, "enabled", True):
+            return self.org_forward(x)
         org_forwarded = self.org_forward(x)
 
         if self.module_dropout is not None and self.training:
