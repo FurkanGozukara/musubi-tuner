@@ -1075,9 +1075,9 @@ class LTX2SliderTrainer:
                 if requested_ic not in {"auto", "none", "v2v"}:
                     raise ValueError(f"IC reference slider mode currently supports only --ic_lora_strategy v2v; got {requested_ic}")
                 args.ic_lora_strategy = "v2v"
-                if getattr(args, "lora_target_preset", None) is None:
+                if not _slider_lora_preset_explicit():
                     logger.info("Using lora_target_preset=v2v for IC reference slider training")
-                    args.lora_target_preset = "v2v"
+                    _force_slider_lora_preset(args, "v2v")
                 elif getattr(args, "lora_target_preset", None) != "v2v":
                     logger.warning(
                         "IC reference sliders work best with --lora_target_preset v2v; got %s",
@@ -1089,9 +1089,9 @@ class LTX2SliderTrainer:
                 if getattr(args, "sample_prompts", None) and not bool(getattr(args, "sample_audio_only", False)):
                     logger.info("Enabling --sample_audio_only automatically for audio reference sliders.")
                     args.sample_audio_only = True
-                if getattr(args, "lora_target_preset", None) is None:
+                if not _slider_lora_preset_explicit():
                     logger.info("Using lora_target_preset=audio for audio reference slider training")
-                    args.lora_target_preset = "audio"
+                    _force_slider_lora_preset(args, "audio")
                 elif getattr(args, "lora_target_preset", None) != "audio":
                     logger.warning(
                         "Audio reference sliders work best with --lora_target_preset audio; got %s",
@@ -1616,6 +1616,27 @@ def slider_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         help="Comma-separated multiplier values for preview, e.g. '-2,-1,0,1,2'",
     )
     return parser
+
+
+def _slider_lora_preset_explicit() -> bool:
+    """True when the user passed --lora_target_preset on the command line."""
+    return any(a == "--lora_target_preset" or a.startswith("--lora_target_preset=") for a in sys.argv)
+
+
+def _force_slider_lora_preset(args: argparse.Namespace, preset: str) -> None:
+    """Auto-select a LoRA target preset for slider modes.
+
+    Updates both the scalar and the ``network_args`` entry that ``create_network``
+    actually reads, replacing any preset injected earlier by ``apply_ltx2_tweaks``.
+    Explicit ``include_patterns`` always win, matching ``apply_ltx2_tweaks``.
+    """
+    if args.network_args and any(a.startswith("include_patterns=") for a in args.network_args):
+        return
+    args.lora_target_preset = preset
+    if args.network_args is None:
+        args.network_args = []
+    args.network_args = [a for a in args.network_args if not a.startswith("lora_target_preset=")]
+    args.network_args.append(f"lora_target_preset={preset}")
 
 
 def main() -> None:

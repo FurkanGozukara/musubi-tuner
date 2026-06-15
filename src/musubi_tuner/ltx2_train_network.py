@@ -1549,7 +1549,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             logger.warning("Self-Flow enabled but transformer is unavailable — skipping setup")
             return
         if self._ltx_mode not in {"video", "av"}:
-            raise ValueError("--self_flow currently supports --ltx_mode video or av (video branch only in av)")
+            raise ValueError("--self_flow currently supports --ltx_mode video or av")
 
         from musubi_tuner.self_flow import (
             SelfFlowConfig,
