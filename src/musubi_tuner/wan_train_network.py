@@ -9,6 +9,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device
 from musubi_tuner.training.outputs import DiTOutput
@@ -500,7 +501,9 @@ class WanNetworkTrainer(NetworkTrainer):
             if self.blocks_to_swap > 0:
                 # This moves the weights to the appropriate device
                 logger.info(f"Prepare block swap for high noise model, blocks_to_swap={self.blocks_to_swap}")
-                model_high_noise.enable_block_swap(self.blocks_to_swap, accelerator.device, supports_backward=True)
+                model_high_noise.enable_block_swap(
+                    self.blocks_to_swap, BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+                )
                 model_high_noise.move_to_device_except_swap_blocks(accelerator.device)
                 model_high_noise.prepare_block_swap_before_forward()
 

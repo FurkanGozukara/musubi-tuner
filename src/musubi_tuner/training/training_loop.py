@@ -1,6 +1,7 @@
 """Shared NetworkTrainer training loop."""
 
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -33,6 +34,7 @@ from musubi_tuner.dataset.audio_quota_sampler import (
 )
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modality_freezer import ModalityFreezer
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, collator_class, prepare_accelerator
@@ -348,16 +350,29 @@ def train(self, args):
         _log_vram("AFTER enable_model_parallel_transformer", logger)
 
     if blocks_to_swap > 0:
-        logger.info(
-            f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
-        )
-        transformer.enable_block_swap(
-            blocks_to_swap,
-            accelerator.device,
-            supports_backward=True,
-            use_pinned_memory=args.use_pinned_memory_for_block_swap,
-            swap_norms=getattr(args, "swap_norms", False),
-        )
+        enable_block_swap_params = inspect.signature(transformer.enable_block_swap).parameters
+        if "config" in enable_block_swap_params:
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}, H2D-only: {swap_config.h2d_only}"
+            )
+            transformer.enable_block_swap(blocks_to_swap, swap_config)
+        else:
+            use_pinned_memory = getattr(args, "use_pinned_memory_for_block_swap", False)
+            logger.info(
+                f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, "
+                f"use pinned memory: {use_pinned_memory}"
+            )
+            if getattr(args, "block_swap_h2d_only", False):
+                logger.warning("--block_swap_h2d_only is not supported by this transformer's block swap implementation.")
+            transformer.enable_block_swap(
+                blocks_to_swap,
+                accelerator.device,
+                supports_backward=True,
+                use_pinned_memory=use_pinned_memory,
+                swap_norms=getattr(args, "swap_norms", False),
+            )
         _log_vram("AFTER enable_block_swap (offloader created)", logger)
         transformer.move_to_device_except_swap_blocks(accelerator.device)
         _log_vram("AFTER move_to_device_except_swap_blocks #1 (18 blocks to GPU)", logger)
