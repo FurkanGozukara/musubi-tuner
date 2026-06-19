@@ -39,6 +39,7 @@ from musubi_tuner.ltx2_rl_objectives import RL_LOSS_CHOICES, compute_rl_objectiv
 from musubi_tuner.ltx2_lora_ema import LoraEMA
 from musubi_tuner.ltx2_rollout_cache import RolloutCacheReader
 from musubi_tuner.ltx_2.utils import to_denoised
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.training.accelerator_setup import prepare_accelerator
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.trainer_base import NetworkTrainer
@@ -98,12 +99,7 @@ class LTX2RLTrainer:
         transformer.requires_grad_(False)
 
         if blocks_to_swap > 0:
-            transformer.enable_block_swap(
-                blocks_to_swap,
-                device,
-                supports_backward=True,
-                use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
-            )
+            transformer.enable_block_swap(blocks_to_swap, BlockSwapConfig.from_args(args, device, supports_backward=True))
             transformer.move_to_device_except_swap_blocks(device)
 
         sys.path.append(os.path.dirname(__file__))

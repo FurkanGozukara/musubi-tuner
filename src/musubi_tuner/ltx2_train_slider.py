@@ -37,6 +37,7 @@ from musubi_tuner.ltx2_train_network import (
     ltx2_setup_parser,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, prepare_accelerator
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import should_sample_images
@@ -1150,9 +1151,7 @@ class LTX2SliderTrainer:
             logger.info("Enable block swap: %d blocks", blocks_to_swap)
             transformer.enable_block_swap(
                 blocks_to_swap,
-                accelerator.device,
-                supports_backward=True,
-                use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
+                BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True),
                 swap_norms=getattr(args, "swap_norms", False),
             )
             transformer.move_to_device_except_swap_blocks(accelerator.device)

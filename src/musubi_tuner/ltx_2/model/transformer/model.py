@@ -9,9 +9,11 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
     LTX2BlockSwapManager,
+    LTX2H2DModelOffloader,
     LTX2ModelOffloader,
 )
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import _clean_memory_on_device
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
@@ -490,11 +492,22 @@ class LTXModel(torch.nn.Module):
     def enable_block_swap(
         self,
         blocks_to_swap: int,
-        device: torch.device,
-        supports_backward: bool,
+        config: BlockSwapConfig | torch.device,
+        supports_backward: bool | None = None,
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
     ) -> None:
+        if isinstance(config, BlockSwapConfig):
+            swap_config = config
+            device = swap_config.device
+            supports_backward = swap_config.supports_backward
+            use_pinned_memory = swap_config.use_pinned_memory
+        else:
+            swap_config = None
+            device = config
+            if supports_backward is None:
+                raise TypeError("supports_backward is required when enable_block_swap is called without BlockSwapConfig")
+
         swap_mode = getattr(self, "swap_mode", "default")
         _log_cuda_memory("before_enable_block_swap")
         self.blocks_to_swap = int(blocks_to_swap)
@@ -528,6 +541,39 @@ class LTXModel(torch.nn.Module):
         assert self.blocks_to_swap <= self.num_blocks - 1, (
             f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
         )
+
+        if swap_config is not None and swap_config.h2d_only:
+            if swap_mode != "default":
+                raise ValueError(
+                    "--block_swap_h2d_only is incompatible with LTX-2 aggressive block swap modes. "
+                    "Use the default LTX block swap mode or disable --block_swap_h2d_only."
+                )
+            if swap_config.device.type != "cuda":
+                raise ValueError("--block_swap_h2d_only currently requires a CUDA device for LTX block swap.")
+            if swap_norms:
+                logger.warning("--swap_norms is ignored when --block_swap_h2d_only is enabled.")
+            self._ltx2_block_swap = None
+            self.offloader = LTX2H2DModelOffloader(
+                "ltx2_block",
+                self.transformer_blocks,
+                self.num_blocks,
+                self.blocks_to_swap,
+                swap_config.supports_backward,
+                swap_config.device,
+                ring_size=swap_config.ring_size,
+                use_pinned_memory=swap_config.use_pinned_memory,
+                debug=swap_config.debug,
+                swap_norms=swap_norms,
+            )
+            managed_indices = set(getattr(self.offloader, "stream_idx", []))
+            for idx, block in enumerate(self.transformer_blocks):
+                enabled = idx in managed_indices
+                setattr(block, "swap_weight_offload", enabled)
+                for module in block.modules():
+                    if module.__class__.__name__.endswith("Linear"):
+                        setattr(module, "swap_weight_offload", enabled)
+            _log_cuda_memory("after_enable_block_swap")
+            return
 
         prefetch_window = int(os.getenv("LTX2_SWAP_PREFETCH_WINDOW", "1"))
         self._prefetch_window = prefetch_window
@@ -620,16 +666,26 @@ class LTXModel(torch.nn.Module):
         if self.blocks_to_swap:
             self.transformer_blocks = saved_blocks
             # Ensure swapped blocks stay on CPU to avoid transient full-model GPU spikes.
-            swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
+            managed_indices = set(getattr(self.offloader, "stream_idx", [])) if self.offloader is not None else set()
+            if not managed_indices:
+                swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
+                managed_indices = set(range(swap_start, len(self.transformer_blocks)))
+            else:
+                swap_start = min(managed_indices)
             cpu_device = torch.device("cpu")
             target_device = torch.device(device)
             for idx, block in enumerate(self.transformer_blocks):
-                if idx >= swap_start:
+                if idx in managed_indices:
                     block.to(cpu_device)
                 else:
                     block.to(target_device)
             last_block = len(self.transformer_blocks) - 1
-            print(f"[BLOCK_SWAP] blocks 0-{swap_start - 1} on GPU, blocks {swap_start}-{last_block} on CPU | {_vram_summary()}")
+            managed_desc = (
+                f"{swap_start}-{last_block}"
+                if managed_indices == set(range(swap_start, len(self.transformer_blocks)))
+                else ",".join(str(idx) for idx in sorted(managed_indices))
+            )
+            print(f"[BLOCK_SWAP] managed CPU block weights: {managed_desc}; other blocks on {device} | {_vram_summary()}")
         else:
             print(f"[BLOCK_SWAP] all blocks on {device} | {_vram_summary()}")
 

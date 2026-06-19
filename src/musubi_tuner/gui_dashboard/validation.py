@@ -518,6 +518,38 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         )
 
+    if t.block_swap_h2d_only:
+        if t.blocks_to_swap in (None, 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.block_swap_h2d_only",
+                    "H2D-only block swap requires Blocks To Swap to be greater than 0.",
+                    label="H2D-only Block Swap",
+                    page="training",
+                )
+            )
+        if not (t.gradient_checkpointing or t.blockwise_checkpointing):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.block_swap_h2d_only",
+                    "H2D-only block swap requires gradient checkpointing for training.",
+                    label="H2D-only Block Swap",
+                    page="training",
+                )
+            )
+        if t.block_swap_ring_size < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.block_swap_ring_size",
+                    "Block swap ring size must be at least 1.",
+                    label="Block Swap Ring Size",
+                    page="training",
+                )
+            )
+
     if t.ltx2_model_parallel:
         if t.ltx2_remote_stage:
             message = "LTX2 Model Parallel and LTX2 Remote Stage cannot be enabled together."

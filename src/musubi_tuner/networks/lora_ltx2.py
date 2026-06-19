@@ -15,6 +15,7 @@ from musubi_tuner.ltx_2.components.patchifiers import get_pixel_coords
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
 from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -322,12 +323,16 @@ class LTX2Wrapper(nn.Module):
     def enable_block_swap(
         self,
         blocks_to_swap: int,
-        device: torch.device,
-        supports_backward: bool,
+        config: BlockSwapConfig | torch.device,
+        supports_backward: bool | None = None,
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
     ):
-        return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory, swap_norms=swap_norms)
+        if isinstance(config, BlockSwapConfig):
+            return self.model.enable_block_swap(blocks_to_swap, config, swap_norms=swap_norms)
+        if supports_backward is None:
+            raise TypeError("supports_backward is required when enable_block_swap is called without BlockSwapConfig")
+        return self.model.enable_block_swap(blocks_to_swap, config, supports_backward, use_pinned_memory, swap_norms=swap_norms)
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         return self.model.move_to_device_except_swap_blocks(device)

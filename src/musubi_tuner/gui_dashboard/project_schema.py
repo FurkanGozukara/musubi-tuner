@@ -349,6 +349,8 @@ class TrainingConfig(BaseModel):
     ffn_chunk_target: Optional[str] = None
     ffn_chunk_size: int = 0
     use_pinned_memory_for_block_swap: bool = False
+    block_swap_h2d_only: bool = False
+    block_swap_ring_size: int = 2
     img_in_txt_in_offloading: bool = False
 
     # Compile

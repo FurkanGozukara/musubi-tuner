@@ -13,6 +13,7 @@ from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
     params_to_device,
 )
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import set_block_swap_active
+from musubi_tuner.modules.custom_offloading_utils import LoRAStreamOffloader
 
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
@@ -182,11 +183,13 @@ def _mark_swap_weight_offload(block: nn.Module, enabled: bool) -> None:
     for module in block.modules():
         # Mark Linear, RMSNorm, LayerNorm, and other modules that have weights
         class_name = module.__class__.__name__
-        if (class_name.endswith("Linear") or
-            class_name.endswith("RMSNorm") or
-            class_name.endswith("LayerNorm") or
-            class_name.endswith("GroupNorm") or
-            class_name.endswith("BatchNorm")):
+        if (
+            class_name.endswith("Linear")
+            or class_name.endswith("RMSNorm")
+            or class_name.endswith("LayerNorm")
+            or class_name.endswith("GroupNorm")
+            or class_name.endswith("BatchNorm")
+        ):
             setattr(module, "swap_weight_offload", bool(enabled))
 
 
@@ -299,9 +302,7 @@ class LTX2BlockSwapManager:
         block_indices = list(range(depth - blocks_to_swap, depth))
         return cls(block_indices, offload_device)
 
-    def activate(
-        self, blocks: Iterable[nn.Module], compute_device: torch.device, grad_enabled: bool
-    ) -> bool:
+    def activate(self, blocks: Iterable[nn.Module], compute_device: torch.device, grad_enabled: bool) -> bool:
         if compute_device == self.offload_device:
             return False
         blocks_list = list(blocks)
@@ -336,9 +337,7 @@ class LTX2BlockSwapManager:
         self._backward_hooks.clear()
         self._backward_hook_device = None
 
-    def _ensure_backward_hooks(
-        self, blocks: List[nn.Module], compute_device: torch.device, grad_enabled: bool
-    ) -> None:
+    def _ensure_backward_hooks(self, blocks: List[nn.Module], compute_device: torch.device, grad_enabled: bool) -> None:
         if not grad_enabled:
             return
         if self._backward_hook_device == compute_device and self._backward_hooks:
@@ -375,6 +374,27 @@ class LTX2BlockSwapManager:
             module.to(device)
 
 
+class LTX2H2DModelOffloader(LoRAStreamOffloader):
+    """LTX-owned H2D-only offloader for frozen-base LoRA-style block swap."""
+
+    def __init__(self, *args, swap_norms: bool = False, **kwargs):
+        self.swap_norms = swap_norms
+        self._swap_mask = _swap_mask_tokens()
+        super().__init__(*args, **kwargs)
+
+    def _swap_modules(self, block: nn.Module) -> list[nn.Module]:
+        mods = []
+        for name, module in block.named_modules():
+            if not module.__class__.__name__.endswith("Linear"):
+                continue
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            if _should_skip_swap(name) or not _module_matches_swap_mask(name, self._swap_mask):
+                continue
+            mods.append(module)
+        return mods
+
+
 class LTX2ModelOffloader(ModelOffloader):
     """LTX-2 local offloader that avoids GPU preloading for swap blocks."""
 
@@ -390,7 +410,7 @@ class LTX2ModelOffloader(ModelOffloader):
         This hook only handles unloading after each block's backward is complete.
         """
         # Remove existing backward hooks from base class
-        if hasattr(self, 'remove_handles'):
+        if hasattr(self, "remove_handles"):
             for handle in self.remove_handles:
                 try:
                     handle.remove()
@@ -421,6 +441,7 @@ class LTX2ModelOffloader(ModelOffloader):
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     return None
+
                 return post_hook
 
             # Register post-hook to unload after backward
@@ -454,7 +475,7 @@ class LTX2ModelOffloader(ModelOffloader):
 
         # Full block swap mode: move ALL params to CPU for swapped blocks (maximum VRAM savings)
         if _swap_full_block_enabled():
-            logger.info(f"LTX-2 swap: FULL BLOCK MODE - blocks 0-{split_idx-1} to GPU, {split_idx}-{len(blocks)-1} to CPU")
+            logger.info(f"LTX-2 swap: FULL BLOCK MODE - blocks 0-{split_idx - 1} to GPU, {split_idx}-{len(blocks) - 1} to CPU")
             _log_cuda_memory("full_block_swap_START")
 
             # Debug: count params on each device before
@@ -462,7 +483,7 @@ class LTX2ModelOffloader(ModelOffloader):
             cpu_params_before = sum(1 for b in blocks for p in b.parameters() if not p.is_cuda)
             logger.info(f"BEFORE swap: GPU params={gpu_params_before}, CPU params={cpu_params_before}")
 
-            for idx, block in enumerate(blocks[0 : split_idx]):
+            for idx, block in enumerate(blocks[0:split_idx]):
                 _mark_swap_weight_offload(block, False)
                 block.to(self.device)
                 params_to_device(
@@ -472,9 +493,9 @@ class LTX2ModelOffloader(ModelOffloader):
                     use_pinned=use_pinned,
                     skip_trainable=skip_trainable,
                 )
-            _log_cuda_memory(f"full_block_swap_AFTER_GPU_blocks_0_to_{split_idx-1}")
+            _log_cuda_memory(f"full_block_swap_AFTER_GPU_blocks_0_to_{split_idx - 1}")
 
-            for idx, block in enumerate(blocks[split_idx :], start=split_idx):
+            for idx, block in enumerate(blocks[split_idx:], start=split_idx):
                 _mark_swap_weight_offload(block, True)
                 if swap_mask == {"all"}:
                     block.to(cpu_device)
@@ -499,7 +520,7 @@ class LTX2ModelOffloader(ModelOffloader):
                         mask_tokens=swap_mask,
                         skip_trainable=skip_trainable,
                     )
-            _log_cuda_memory(f"full_block_swap_AFTER_CPU_blocks_{split_idx}_to_{len(blocks)-1}")
+            _log_cuda_memory(f"full_block_swap_AFTER_CPU_blocks_{split_idx}_to_{len(blocks) - 1}")
 
             # Debug: count params on each device after
             gpu_params_after = sum(1 for b in blocks for p in b.parameters() if p.is_cuda)
@@ -507,12 +528,12 @@ class LTX2ModelOffloader(ModelOffloader):
             logger.info(f"AFTER swap: GPU params={gpu_params_after}, CPU params={cpu_params_after}")
         else:
             # Partial swap: keep non-linear params on GPU (faster but uses more VRAM)
-            for block in blocks[0 : split_idx]:
+            for block in blocks[0:split_idx]:
                 _mark_swap_weight_offload(block, False)
                 block.to(self.device)
                 weighs_to_device(block, self.device, use_pinned=use_pinned, skip_trainable=skip_trainable)
 
-            for block in blocks[split_idx :]:
+            for block in blocks[split_idx:]:
                 _mark_swap_weight_offload(block, True)
                 if swap_mask != {"all"}:
                     if not _LOGGED_SWAP_MASK:
@@ -577,6 +598,7 @@ class LTX2ModelOffloader(ModelOffloader):
                 get_pinned_slab_pool,
                 init_pinned_slab_pool,
             )
+
             pool = get_pinned_slab_pool()
             if pool is None:
                 pool = init_pinned_slab_pool()
@@ -620,4 +642,3 @@ class LTX2ModelOffloader(ModelOffloader):
                 _summarize_block_tensors(blocks[keep_idx], "after_keep_block")
                 if swap_idx < len(blocks):
                     _summarize_block_tensors(blocks[swap_idx], "after_swap_block")
-

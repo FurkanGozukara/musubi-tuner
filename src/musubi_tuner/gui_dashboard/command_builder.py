@@ -252,6 +252,15 @@ def _compile_dynamic_value(value) -> str | None:
     return None
 
 
+def _append_h2d_block_swap_args(cmd: list[str], settings) -> None:
+    if not getattr(settings, "block_swap_h2d_only", False):
+        return
+    cmd.append("--block_swap_h2d_only")
+    ring_size = int(getattr(settings, "block_swap_ring_size", 2) or 2)
+    if ring_size != 2:
+        cmd += ["--block_swap_ring_size", str(ring_size)]
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
@@ -1001,6 +1010,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--ffn_chunk_size", str(t.ffn_chunk_size)]
     if t.use_pinned_memory_for_block_swap:
         cmd.append("--use_pinned_memory_for_block_swap")
+    _append_h2d_block_swap_args(cmd, t)
     if t.img_in_txt_in_offloading:
         cmd.append("--img_in_txt_in_offloading")
 
@@ -2300,6 +2310,9 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.gradient_checkpointing:
         cmd.append("--gradient_checkpointing")
+    if t.use_pinned_memory_for_block_swap:
+        cmd.append("--use_pinned_memory_for_block_swap")
+    _append_h2d_block_swap_args(cmd, t)
 
     # Output — dir from training, name from slider
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
@@ -2364,6 +2377,7 @@ def _rl_common_model_args(config: ProjectConfig) -> list[str]:
         args += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.use_pinned_memory_for_block_swap:
         args.append("--use_pinned_memory_for_block_swap")
+    _append_h2d_block_swap_args(args, t)
     if t.gradient_checkpointing:
         args.append("--gradient_checkpointing")
     if t.seed is not None:

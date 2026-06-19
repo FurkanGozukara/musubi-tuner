@@ -132,6 +132,8 @@ def construct_ui():
                         gr.update(),
                         gr.update(),
                         gr.update(),
+                        gr.update(),
+                        gr.update(),
                     )
                 try:
                     os.makedirs(os.path.join(path, "training"), exist_ok=True)
@@ -158,6 +160,8 @@ def construct_ui():
                     new_flow = settings.get("discrete_flow_shift", 2.0)
                     new_swap = settings.get("block_swap", 0)
                     new_use_pinned_memory_for_block_swap = settings.get("use_pinned_memory_for_block_swap", False)
+                    new_block_swap_h2d_only = settings.get("block_swap_h2d_only", False)
+                    new_block_swap_ring_size = settings.get("block_swap_ring_size", 2)
                     new_prec = settings.get("mixed_precision", "bf16")
                     new_grad_cp = settings.get("gradient_checkpointing", True)
                     new_fp8_s = settings.get("fp8_scaled", True)
@@ -209,6 +213,8 @@ def construct_ui():
                         new_flow,
                         new_swap,
                         new_use_pinned_memory_for_block_swap,
+                        new_block_swap_h2d_only,
+                        new_block_swap_ring_size,
                         new_prec,
                         new_grad_cp,
                         new_fp8_s,
@@ -226,6 +232,8 @@ def construct_ui():
                 except Exception as e:
                     return (
                         f"Error initializing project: {str(e)}",
+                        gr.update(),
+                        gr.update(),
                         gr.update(),
                         gr.update(),
                         gr.update(),
@@ -384,6 +392,8 @@ num_repeats = 1
                 flow = defaults.get("discrete_flow_shift", 2.0)
                 swap = defaults.get("block_swap", 0)
                 use_pinned_memory_for_block_swap = defaults.get("use_pinned_memory_for_block_swap", False)
+                block_swap_h2d_only = defaults.get("block_swap_h2d_only", False)
+                block_swap_ring_size = defaults.get("block_swap_ring_size", 2)
                 prec = defaults.get("mixed_precision", "bf16")
                 grad_cp = defaults.get("gradient_checkpointing", True)
                 fp8_s = defaults.get("fp8_scaled", True)
@@ -402,6 +412,8 @@ num_repeats = 1
                         discrete_flow_shift=flow,
                         block_swap=swap,
                         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
+                        block_swap_h2d_only=block_swap_h2d_only,
+                        block_swap_ring_size=block_swap_ring_size,
                         mixed_precision=prec,
                         gradient_checkpointing=grad_cp,
                         fp8_scaled=fp8_s,
@@ -421,6 +433,8 @@ num_repeats = 1
                     flow,
                     swap,
                     use_pinned_memory_for_block_swap,
+                    block_swap_h2d_only,
+                    block_swap_ring_size,
                     prec,
                     grad_cp,
                     fp8_s,
@@ -616,6 +630,12 @@ num_repeats = 1
                         label=i18n("lbl_use_pinned_memory_for_block_swap"),
                         value=False,
                     )
+                with gr.Row():
+                    block_swap_h2d_only = gr.Checkbox(
+                        label=i18n("lbl_block_swap_h2d_only"),
+                        value=False,
+                    )
+                    block_swap_ring_size = gr.Number(label=i18n("lbl_block_swap_ring_size"), value=2, precision=0)
 
                 with gr.Accordion(i18n("accordion_advanced"), open=False):
                     gr.Markdown(i18n("desc_training_detailed"))
@@ -716,6 +736,8 @@ num_repeats = 1
             flow_shift,
             swap,
             use_pinned_memory_for_block_swap,
+            block_swap_h2d_only,
+            block_swap_ring_size,
             prec,
             grad_cp,
             fp8_s,
@@ -740,6 +762,12 @@ num_repeats = 1
                 return "Error: VAE Path not set (configure in Preprocessing). / VAEのパスが設定されていません (Preprocessingで設定してください)。"
             if not te1:
                 return "Error: Text Encoder 1 Path not set (configure in Preprocessing). / Text Encoder 1のパスが設定されていません (Preprocessingで設定してください)。"
+            if block_swap_h2d_only and not (swap and swap > 0):
+                return "Error: H2D-only Block Swap requires Block Swap > 0. / H2D-only Block SwapにはBlock Swap > 0が必要です。"
+            if block_swap_h2d_only and not grad_cp:
+                return "Error: H2D-only Block Swap requires Gradient Checkpointing. / H2D-only Block SwapにはGradient Checkpointingが必要です。"
+            if block_swap_h2d_only and int(block_swap_ring_size or 0) < 1:
+                return "Error: Block Swap Ring Size must be at least 1. / Block Swap Ring Sizeは1以上にしてください。"
 
             dataset_config = os.path.join(project_path, "dataset_config.toml")
             if not os.path.exists(dataset_config):
@@ -760,6 +788,8 @@ num_repeats = 1
                 discrete_flow_shift=flow_shift,
                 block_swap=swap,
                 use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
+                block_swap_h2d_only=block_swap_h2d_only,
+                block_swap_ring_size=block_swap_ring_size,
                 mixed_precision=prec,
                 gradient_checkpointing=grad_cp,
                 fp8_scaled=fp8_s,
@@ -902,6 +932,11 @@ num_repeats = 1
                 inner_cmd.extend(["--blocks_to_swap", str(int(swap))])
                 if use_pinned_memory_for_block_swap:
                     inner_cmd.append("--use_pinned_memory_for_block_swap")
+                if block_swap_h2d_only:
+                    inner_cmd.append("--block_swap_h2d_only")
+                    ring_size = int(block_swap_ring_size or 2)
+                    if ring_size != 2:
+                        inner_cmd.extend(["--block_swap_ring_size", str(ring_size)])
 
             inner_cmd.append("--sdpa")
             inner_cmd.append("--split_attn")
@@ -968,6 +1003,8 @@ num_repeats = 1
                 discrete_flow_shift,
                 block_swap,
                 use_pinned_memory_for_block_swap,
+                block_swap_h2d_only,
+                block_swap_ring_size,
                 mixed_precision,
                 gradient_checkpointing,
                 fp8_scaled,
@@ -1033,6 +1070,8 @@ num_repeats = 1
                 discrete_flow_shift,
                 block_swap,
                 use_pinned_memory_for_block_swap,
+                block_swap_h2d_only,
+                block_swap_ring_size,
                 mixed_precision,
                 gradient_checkpointing,
                 fp8_scaled,
@@ -1093,6 +1132,8 @@ num_repeats = 1
                 discrete_flow_shift,
                 block_swap,
                 use_pinned_memory_for_block_swap,
+                block_swap_h2d_only,
+                block_swap_ring_size,
                 mixed_precision,
                 gradient_checkpointing,
                 fp8_scaled,

@@ -3589,6 +3589,11 @@ def main() -> None:
 
     # model
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
+    if blocks_to_swap > 0 and bool(getattr(args, "block_swap_h2d_only", False)):
+        raise ValueError(
+            "--block_swap_h2d_only is only supported for LTX-2/2.3 LoRA-style frozen-base training. "
+            "Full fine-tuning must use the regular LTX block swap path."
+        )
     trainer.blocks_to_swap = blocks_to_swap
     remote_prune_local_blocks = ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_prune_local_blocks", False))
     qgalore_load_device = str(getattr(args, "qgalore_load_device", "cuda") or "cuda").lower()
