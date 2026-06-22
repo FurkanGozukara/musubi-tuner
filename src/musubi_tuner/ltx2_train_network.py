@@ -3421,6 +3421,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         reset_audio_supervision_state(self._audio_supervision_state)
 
+        # LTX-2 declarative conditioning recipe (prototype): lower its [video]/[audio] condition blocks
+        # onto the --ltx2_* flags (and, for a reference recipe, args.ic_lora_strategy) BEFORE the
+        # strategy resolution below reads it. No-op / idempotent when --ltx2_conditioning_config is unset.
+        apply_conditioning_config(args)
+
         ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
         if ic_lora_strategy not in IC_LORA_STRATEGIES:
             raise ValueError(f"ic_lora_strategy must be one of {list(IC_LORA_STRATEGIES)}. Got: {ic_lora_strategy}")
@@ -3448,10 +3453,6 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 ref_probability,
                 ic_lora_strategy,
             )
-        # LTX-2 declarative conditioning recipe (prototype): lower a [[conditions]] list onto the
-        # individual --ltx2_* flags BEFORE the per-feature validators run. No-op / idempotent when
-        # --ltx2_conditioning_config is unset.
-        apply_conditioning_config(args)
         # LTX-2 conditioning validators (shared helper; runs after ic_lora_strategy is resolved).
         # Each is a no-op when its feature is off; otherwise hard-errors on mode mismatch, IC-LoRA
         # combination, out-of-range probability/threshold, negative spans, and the directional

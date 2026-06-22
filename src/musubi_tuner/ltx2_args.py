@@ -15,7 +15,7 @@ from musubi_tuner.ltx2_extend import add_ltx2_extend_args
 from musubi_tuner.ltx2_audio_extend import add_ltx2_audio_extend_args
 from musubi_tuner.ltx2_audio_inpaint import add_ltx2_audio_inpaint_mask_args
 from musubi_tuner.ltx2_train_direction import add_ltx2_train_direction_args
-from musubi_tuner.ltx2_conditioning import add_ltx2_conditioning_args
+from musubi_tuner.ltx2_conditioning import add_ltx2_conditioning_args, apply_conditioning_config
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx2_lycoris_runtime import (
     apply_lycoris_preset_before_network_creation,
@@ -1582,6 +1582,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     return parser
 
 
+def resolve_ic_lora_target_preset(args, explicit_lora_preset: bool, uses_lycoris_module: bool):
+    """LoRA target preset implied by the resolved ic_lora_strategy / mode, or None to leave it unset.
+
+    Keyed off the FINAL args.ic_lora_strategy (after any conditioning recipe has resolved it), so a
+    recipe-derived strategy injects the same preset as the equivalent --ic_lora_strategy flag. An
+    explicit --lora_target_preset, a LyCORIS module, or an explicit include_patterns leaves the preset
+    untouched (returns None). Audio mode takes precedence (the audio preset) over the strategy.
+    """
+    if explicit_lora_preset or uses_lycoris_module:
+        return None
+    if args.network_args and any(a.startswith("include_patterns=") for a in args.network_args):
+        return None
+    if str(getattr(args, "ltx_mode", "video") or "video").lower() == "audio":
+        return "audio"
+    strategy = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
+    if strategy in ("audio_ref_ic", "av_ic", "video_ref_only_av", "v2v"):
+        return strategy
+    return None
+
+
 def main() -> None:
     """Main training entry point"""
     parser = setup_parser_common()
@@ -1644,39 +1664,22 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
+    # Resolve a conditioning-recipe-derived ic_lora_strategy BEFORE deriving the LoRA target preset,
+    # so a reference recipe injects the same preset as the equivalent --ic_lora_strategy flag.
+    # Idempotent: the later apply_conditioning_config() in handle_model_specific_args is a no-op.
+    apply_conditioning_config(args)
+
     uses_lycoris_module = is_lycoris_requested(args)
     requested_ic_strategy = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
 
     # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
-    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
+    _ic_lora_target_preset = resolve_ic_lora_target_preset(args, explicit_lora_preset, uses_lycoris_module)
+    if _ic_lora_target_preset is not None:
         if args.network_args is None:
             args.network_args = []
-        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "audio"
-    elif requested_ic_strategy == "audio_ref_ic" and not explicit_lora_preset and not uses_lycoris_module:
-        if args.network_args is None:
-            args.network_args = []
-        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "audio_ref_ic"
-            logger.info("Using lora_target_preset=audio_ref_ic for --ic_lora_strategy audio_ref_ic")
-    elif requested_ic_strategy == "av_ic" and not explicit_lora_preset and not uses_lycoris_module:
-        if args.network_args is None:
-            args.network_args = []
-        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "av_ic"
-            logger.info("Using lora_target_preset=av_ic for --ic_lora_strategy av_ic")
-    elif requested_ic_strategy == "video_ref_only_av" and not explicit_lora_preset and not uses_lycoris_module:
-        if args.network_args is None:
-            args.network_args = []
-        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "video_ref_only_av"
-            logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
-    elif requested_ic_strategy == "v2v" and not explicit_lora_preset and not uses_lycoris_module:
-        if args.network_args is None:
-            args.network_args = []
-        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "v2v"
-            logger.info("Using lora_target_preset=v2v for --ic_lora_strategy v2v")
+        args.lora_target_preset = _ic_lora_target_preset
+        if _ic_lora_target_preset == requested_ic_strategy:
+            logger.info("Using lora_target_preset=%s for --ic_lora_strategy %s", _ic_lora_target_preset, requested_ic_strategy)
 
     if (
         explicit_ic_strategy
