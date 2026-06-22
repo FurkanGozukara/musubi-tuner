@@ -192,12 +192,6 @@
 							<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
 						</div>
 					{/if}
-					<button
-						type="button"
-						onclick={() => addDataset(false)}
-						class="px-3 py-1 text-[11px] font-medium"
-						style="color: var(--accent); border: 1px solid var(--accent-muted); border-radius: var(--radius-full); background: var(--accent-subtle-bg);"
-					>+ Add</button>
 				</div>
 			</div>
 			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
@@ -211,23 +205,24 @@
 						onchange={(nextEntry) => updateDataset(i, nextEntry, false)}
 					/>
 				{/each}
+				<button
+					type="button"
+					onclick={() => addDataset(false)}
+					class="flex flex-col items-center justify-center gap-2 py-8 text-[13px] font-semibold"
+					style="min-height: 116px; color: var(--accent); background: var(--accent-subtle-bg); border: 2px dashed var(--accent-muted); border-radius: var(--radius-md);"
+					onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.filter = 'brightness(1.05)'; }}
+					onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--accent-muted)'; e.currentTarget.style.filter = 'none'; }}
+				>
+					<svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+					Add dataset
+				</button>
 			</div>
-			{#if datasets.length === 0}
-				<div class="text-center py-8 text-[12px]" style="border: 1px dashed var(--border); border-radius: var(--radius-sm); color: var(--text-muted);">
-					No datasets. Click "+ Add" to start.
-				</div>
-			{/if}
 		</div>
 
 		<!-- Validation Datasets -->
 		<div>
 			<div class="flex items-center justify-between mb-2">
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Validation</span>
-				<button
-					onclick={() => addDataset(true)}
-					class="px-3 py-1 text-[11px] font-medium"
-					style="color: var(--accent); border: 1px solid var(--accent-muted); border-radius: var(--radius-full); background: var(--accent-subtle-bg);"
-				>+ Add</button>
 			</div>
 			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
 				{#each validationDatasets as entry, i}
@@ -239,10 +234,18 @@
 						onchange={(nextEntry) => updateDataset(i, nextEntry, true)}
 					/>
 				{/each}
+				<button
+					type="button"
+					onclick={() => addDataset(true)}
+					class="flex flex-col items-center justify-center gap-2 py-6 text-[12px] font-semibold"
+					style="min-height: 96px; color: var(--accent); background: var(--accent-subtle-bg); border: 2px dashed var(--accent-muted); border-radius: var(--radius-md);"
+					onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.filter = 'brightness(1.05)'; }}
+					onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--accent-muted)'; e.currentTarget.style.filter = 'none'; }}
+				>
+					<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+					Add validation dataset
+				</button>
 			</div>
-			{#if validationDatasets.length === 0}
-				<div class="text-center py-3 text-[11px]" style="color: var(--text-muted);">None</div>
-			{/if}
 		</div>
 
 		<!-- Bottom -->
