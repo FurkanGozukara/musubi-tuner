@@ -311,6 +311,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--reference_frames", str(c.reference_frames)]
     if c.reference_downscale != 1:
         cmd += ["--reference_downscale", str(c.reference_downscale)]
+    if getattr(c, "reference_temporal_scale", 1) != 1:
+        cmd += ["--reference_temporal_scale", str(c.reference_temporal_scale)]
 
     # Audio source options
     if c.ltx2_mode in ("av", "audio"):
@@ -607,6 +609,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no-sample_i2v_token_timestep_mask")
     if s.reference_downscale != 1:
         cmd += ["--reference_downscale", str(s.reference_downscale)]
+    if getattr(s, "reference_temporal_scale", 1) != 1:
+        cmd += ["--reference_temporal_scale", str(s.reference_temporal_scale)]
     if s.reference_frames != 1:
         cmd += ["--reference_frames", str(s.reference_frames)]
     if s.sample_include_reference:
@@ -817,6 +821,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no_save_original_lora")
     if t.ic_lora_strategy != "auto":
         cmd += ["--ic_lora_strategy", t.ic_lora_strategy]
+    if getattr(t, "ic_lora_ref_probability", 1.0) != 1.0:
+        cmd += ["--ic_lora_ref_probability", str(t.ic_lora_ref_probability)]
     if t.av_cross_attention_mode != "both":
         cmd += ["--av_cross_attention_mode", t.av_cross_attention_mode]
     if t.av_multi_ref:
@@ -1146,6 +1152,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--sample_include_reference")
     if t.reference_downscale != 1:
         cmd += ["--reference_downscale", str(t.reference_downscale)]
+    if getattr(t, "reference_temporal_scale", 1) != 1:
+        cmd += ["--reference_temporal_scale", str(t.reference_temporal_scale)]
     if t.reference_frames != 1:
         cmd += ["--reference_frames", str(t.reference_frames)]
 
@@ -1610,6 +1618,46 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
         cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
         cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
+    if getattr(t, "ltx2_spatial_crop", False):
+        # Region is dataset-level (spatial_crop_region in the dataset config); only the
+        # master flag / probability / invert are CLI args.
+        cmd += ["--ltx2_spatial_crop"]
+        cmd += ["--ltx2_spatial_crop_p", str(getattr(t, "ltx2_spatial_crop_probability", 0.0))]
+        if getattr(t, "ltx2_spatial_crop_invert", False):
+            cmd += ["--ltx2_spatial_crop_invert"]
+    if getattr(t, "ltx2_inpaint_mask", False):
+        # The mask comes from the dataset's loss_mask_directory (binarized as a conditioning mask);
+        # only the master flag / probability / invert / threshold are CLI args.
+        cmd += ["--ltx2_inpaint_mask"]
+        cmd += ["--ltx2_inpaint_mask_p", str(getattr(t, "ltx2_inpaint_mask_probability", 0.0))]
+        if getattr(t, "ltx2_inpaint_mask_invert", False):
+            cmd += ["--ltx2_inpaint_mask_invert"]
+        cmd += ["--ltx2_inpaint_mask_threshold", str(getattr(t, "ltx2_inpaint_mask_threshold", 0.5))]
+    if getattr(t, "ltx2_audio_inpaint_mask", False):
+        # Audio mask comes from the dataset's audio_cond_mask_directory; only the flags are CLI args.
+        cmd += ["--ltx2_audio_inpaint_mask"]
+        cmd += ["--ltx2_audio_inpaint_mask_p", str(getattr(t, "ltx2_audio_inpaint_mask_probability", 0.0))]
+        if getattr(t, "ltx2_audio_inpaint_mask_invert", False):
+            cmd += ["--ltx2_audio_inpaint_mask_invert"]
+        cmd += ["--ltx2_audio_inpaint_mask_threshold", str(getattr(t, "ltx2_audio_inpaint_mask_threshold", 0.5))]
+    _ext_prefix = int(getattr(t, "ltx2_extend_prefix_frames", 0) or 0)
+    _ext_suffix = int(getattr(t, "ltx2_extend_suffix_frames", 0) or 0)
+    if _ext_prefix > 0 or _ext_suffix > 0:
+        # Auto-derived from the target latents; only the spans + probability are CLI args.
+        cmd += ["--ltx2_extend_prefix_frames", str(_ext_prefix)]
+        cmd += ["--ltx2_extend_suffix_frames", str(_ext_suffix)]
+        cmd += ["--ltx2_extend_p", str(getattr(t, "ltx2_extend_probability", 1.0))]
+    _aext_prefix = int(getattr(t, "ltx2_audio_extend_prefix_frames", 0) or 0)
+    _aext_suffix = int(getattr(t, "ltx2_audio_extend_suffix_frames", 0) or 0)
+    if _aext_prefix > 0 or _aext_suffix > 0:
+        # Audio extension; auto-derived from the target audio latents.
+        cmd += ["--ltx2_audio_extend_prefix_frames", str(_aext_prefix)]
+        cmd += ["--ltx2_audio_extend_suffix_frames", str(_aext_suffix)]
+        cmd += ["--ltx2_audio_extend_p", str(getattr(t, "ltx2_audio_extend_probability", 1.0))]
+    _train_direction = str(getattr(t, "ltx2_train_direction", "joint") or "joint")
+    if _train_direction != "joint":
+        # Directional AV training (requires --ltx2_mode av); "joint" emits nothing (default).
+        cmd += ["--ltx2_train_direction", _train_direction]
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
@@ -1966,6 +2014,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--sample_include_reference")
     if t.reference_downscale != 1:
         cmd += ["--reference_downscale", str(t.reference_downscale)]
+    if getattr(t, "reference_temporal_scale", 1) != 1:
+        cmd += ["--reference_temporal_scale", str(t.reference_temporal_scale)]
     if t.reference_frames != 1:
         cmd += ["--reference_frames", str(t.reference_frames)]
 

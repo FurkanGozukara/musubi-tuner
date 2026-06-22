@@ -788,6 +788,59 @@
 									</div>
 								{/if}
 							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Spatial Crop Conditioning</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">
+									Mark a rectangular spatial region of the video latents as clean conditioning (timestep 0, excluded from loss) so the model learns to outpaint the surrounding content. The region is set per dataset (<code>spatial_crop_region = [y1, x1, y2, x2]</code> in pixels, in the dataset config). All fields are no-ops while the master toggle is off.
+								</p>
+								<FormToggle fieldPath="training.ltx2_spatial_crop" checked={t.ltx2_spatial_crop ?? false} onchange={(e) => update('ltx2_spatial_crop', e.target.checked)} tooltip="Master enable for spatial-crop region conditioning (video outpaint). When off, nothing is emitted to the CLI and the per-sample draw is skipped." />
+								{#if t.ltx2_spatial_crop}
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="training.ltx2_spatial_crop_probability" value={t.ltx2_spatial_crop_probability ?? 0.0} oninput={(e) => update('ltx2_spatial_crop_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the spatial-crop region as clean conditioning." />
+										<FormToggle fieldPath="training.ltx2_spatial_crop_invert" checked={t.ltx2_spatial_crop_invert ?? false} onchange={(e) => update('ltx2_spatial_crop_invert', e.target.checked)} tooltip="Condition OUTSIDE the rectangle instead of inside." />
+									</div>
+								{/if}
+							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Inpaint / Outpaint Mask Conditioning</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">
+									Reuse the dataset's <code>loss_mask_directory</code> mask as a clean conditioning region (timestep 0, excluded from loss): the mask is binarized at the threshold so the masked area stays clean while the model generates the rest (inpaint), or the surround when inverted (outpaint). While on, that mask is treated as conditioning, not a loss weight. All fields are no-ops while the master toggle is off.
+								</p>
+								<FormToggle fieldPath="training.ltx2_inpaint_mask" checked={t.ltx2_inpaint_mask ?? false} onchange={(e) => update('ltx2_inpaint_mask', e.target.checked)} tooltip="Master enable for on-disk mask conditioning (inpaint/outpaint). When off, nothing is emitted to the CLI and the per-sample draw is skipped." />
+								{#if t.ltx2_inpaint_mask}
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="training.ltx2_inpaint_mask_probability" value={t.ltx2_inpaint_mask_probability ?? 0.0} oninput={(e) => update('ltx2_inpaint_mask_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the mask as clean conditioning." />
+										<FormField type="number" fieldPath="training.ltx2_inpaint_mask_threshold" value={t.ltx2_inpaint_mask_threshold ?? 0.5} oninput={(e) => update('ltx2_inpaint_mask_threshold', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Binarization threshold (strict >). Mask values above this are conditioned (kept clean)." />
+										<FormToggle fieldPath="training.ltx2_inpaint_mask_invert" checked={t.ltx2_inpaint_mask_invert ?? false} onchange={(e) => update('ltx2_inpaint_mask_invert', e.target.checked)} tooltip="Condition the COMPLEMENT of the mask (generate the masked region instead of keeping it clean)." />
+									</div>
+								{/if}
+							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Extension (prefix / suffix)</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">
+									Keep the first N (prefix) and/or last N (suffix) latent frames clean as conditioning so the model learns to extend a clip forward / backward. Auto-derived from the target &mdash; no dataset needed. A span of 0 disables that side; both 0 = off.
+								</p>
+								<div class="grid grid-cols-3 gap-2">
+									<FormField type="number" fieldPath="training.ltx2_extend_prefix_frames" value={t.ltx2_extend_prefix_frames ?? 0} oninput={(e) => update('ltx2_extend_prefix_frames', Number(e.target.value))} step="1" min={0} tooltip="Number of leading latent frames kept clean (forward extension). 0 = off." />
+									<FormField type="number" fieldPath="training.ltx2_extend_suffix_frames" value={t.ltx2_extend_suffix_frames ?? 0} oninput={(e) => update('ltx2_extend_suffix_frames', Number(e.target.value))} step="1" min={0} tooltip="Number of trailing latent frames kept clean (backward extension). 0 = off." />
+									<FormField type="number" fieldPath="training.ltx2_extend_probability" value={t.ltx2_extend_probability ?? 1.0} oninput={(e) => update('ltx2_extend_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of applying extension conditioning when enabled." />
+								</div>
+							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Directional Training (A2V / V2A)</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">
+									Train a dedicated directional model by freezing one modality as clean conditioning (requires AV mode). "a2v" freezes audio and generates video; "v2a" freezes video and generates audio (foley); "joint" = normal joint AV (default). Distinct from Cross-Task Synergy, which adds directional losses on top of joint training.
+								</p>
+								<FormSelect fieldPath="training.ltx2_train_direction" value={t.ltx2_train_direction || 'joint'} options={[{ value: 'joint', label: 'joint (normal AV)' }, { value: 'a2v', label: 'a2v (freeze audio, generate video)' }, { value: 'v2a', label: 'v2a (freeze video, generate audio / foley)' }]} onchange={(e) => update('ltx2_train_direction', e.target.value)} tooltip="Directional AV training mode. Requires --ltx2_mode av. Mutually exclusive with IC-LoRA, Self-Flow, TREAD, CTS, the G2D freezer, audio loss balancing, DCR, TARP; v2a also excludes intrinsic video conditioners." />
+							</div>
 						</div>
 						{#if $advancedMode}
 							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">

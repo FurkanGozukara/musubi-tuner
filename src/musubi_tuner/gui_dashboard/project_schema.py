@@ -126,6 +126,7 @@ class CachingConfig(BaseModel):
     # Reference (V2V)
     reference_frames: int = 1
     reference_downscale: int = 1
+    reference_temporal_scale: int = 1
     # Audio
     ltx2_audio_source: Literal["video", "audio_files"] = "video"
     ltx2_audio_dir: str = ""
@@ -243,6 +244,7 @@ class TrainingConfig(BaseModel):
     train_connectors: bool = False
     save_original_lora: bool = True
     ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_ic", "av_ic", "video_ref_only_av"] = "auto"
+    ic_lora_ref_probability: float = 1.0
     av_cross_attention_mode: Literal["both", "a2v_only", "v2a_only", "none"] = "both"
     av_multi_ref: bool = False
     audio_ref_use_negative_positions: bool = False
@@ -424,6 +426,7 @@ class TrainingConfig(BaseModel):
     sample_audio_subprocess: bool = True
     sample_include_reference: bool = False
     reference_downscale: int = 1
+    reference_temporal_scale: int = 1
     reference_frames: int = 1
 
     # Validation
@@ -668,6 +671,37 @@ class TrainingConfig(BaseModel):
     video_anchor_probability: float = 0.5
     video_anchor_count: int = 1
     video_anchor_strategy: Literal["endpoints", "random", "endpoints_random"] = "endpoints_random"
+    # Spatial-crop region conditioning (outpaint via a clean rectangular region).
+    # The region itself is set per dataset (spatial_crop_region in the dataset config);
+    # only the master flag / probability / invert are CLI args.
+    ltx2_spatial_crop: bool = False
+    ltx2_spatial_crop_probability: float = 0.0
+    ltx2_spatial_crop_invert: bool = False
+    # Inpaint/outpaint mask conditioning. Reuses the dataset's loss_mask_directory mask: while on,
+    # the mask is binarized and used as a clean conditioning region (not a loss weight). Only the
+    # master flag / probability / invert / threshold are CLI args.
+    ltx2_inpaint_mask: bool = False
+    ltx2_inpaint_mask_probability: float = 0.0
+    ltx2_inpaint_mask_invert: bool = False
+    ltx2_inpaint_mask_threshold: float = 0.5
+    # Audio inpaint conditioning (audio analog; mask from the dataset's audio_cond_mask_directory).
+    ltx2_audio_inpaint_mask: bool = False
+    ltx2_audio_inpaint_mask_probability: float = 0.0
+    ltx2_audio_inpaint_mask_invert: bool = False
+    ltx2_audio_inpaint_mask_threshold: float = 0.5
+    # Video extension conditioning. Enabled when prefix or suffix frames > 0; the first/last N
+    # latent frames are kept clean (auto-derived from the target). The frame counts are the opt-in.
+    ltx2_extend_prefix_frames: int = 0
+    ltx2_extend_suffix_frames: int = 0
+    ltx2_extend_probability: float = 1.0
+    # Audio extension conditioning (audio analog of the video extension above; requires an
+    # audio-bearing mode). First/last N audio latent timesteps kept clean (auto-derived).
+    ltx2_audio_extend_prefix_frames: int = 0
+    ltx2_audio_extend_suffix_frames: int = 0
+    ltx2_audio_extend_probability: float = 1.0
+    # Directional training mode (requires --ltx2_mode av). "joint" = normal joint AV (default);
+    # "a2v" freezes audio and generates video; "v2a" freezes video and generates audio (foley).
+    ltx2_train_direction: str = "joint"
     accelerate_extra_args: str = ""
     extra_args: str = ""
 
@@ -862,6 +896,7 @@ class InferenceConfig(BaseModel):
     gemma_fp8_weight_offload: bool = True
     sample_i2v_token_timestep_mask: bool = True
     reference_downscale: int = 1
+    reference_temporal_scale: int = 1
     reference_frames: int = 1
     sample_include_reference: bool = False
     reference_image: str = ""

@@ -350,6 +350,24 @@ def _align_audio_latents_to_video(audio_latents: torch.Tensor, expected_length: 
     return torch.cat([audio_latents, padding], dim=1).contiguous()
 
 
+def _audio_intervals_to_binary_mask(time_steps, latents_per_second, effective_steps, intervals):
+    """Convert per-item time intervals (seconds) into a per-timestep ``[time_steps]`` float mask.
+
+    1.0 inside any ``[start, end)`` interval (latent indices via ``latents_per_second``), 0.0 elsewhere;
+    timesteps past ``effective_steps`` (padding) are zeroed. Shared shape for the audio conditioning mask
+    and identical to the inline audio-loss-mask conversion.
+    """
+    mask = torch.zeros((time_steps,), dtype=torch.float32)
+    for start_s, end_s in intervals:
+        start_idx = max(0, min(time_steps, int(math.floor(float(start_s) * latents_per_second))))
+        end_idx = max(start_idx, min(time_steps, int(math.ceil(float(end_s) * latents_per_second))))
+        if end_idx > start_idx:
+            mask[start_idx:end_idx] = 1.0
+    if effective_steps < time_steps:
+        mask[int(effective_steps) :] = 0.0
+    return mask
+
+
 def encode_and_save_audio_cache(
     encoder,
     processor,
@@ -541,6 +559,21 @@ def encode_and_save_audio_cache(
         if effective_steps < time_steps:
             audio_loss_mask[int(effective_steps) :] = 0.0
 
+    # Audio CONDITIONING mask (separate channel from the loss mask; 1.0 = conditioned/kept clean). Same
+    # interval->[T] conversion. Written only when intervals are present, so the cache is byte-identical
+    # for datasets without audio_cond_mask_directory.
+    audio_cond_mask = None
+    cond_mask_intervals = getattr(item_info, "audio_cond_mask_intervals", None)
+    if cond_mask_intervals is not None:
+        cond_waveform_seconds = float(waveform.shape[-1]) / max(float(sample_rate), 1.0)
+        if original_steps > 0 and cond_waveform_seconds > 0:
+            cond_latents_per_second = float(original_steps) / cond_waveform_seconds
+        else:
+            cond_latents_per_second = (
+                float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
+            )
+        audio_cond_mask = _audio_intervals_to_binary_mask(time_steps, cond_latents_per_second, effective_steps, cond_mask_intervals)
+
     dtype_str = (
         cache_latents.dtype_to_str(dtype)
         if hasattr(cache_latents, "dtype_to_str")
@@ -558,6 +591,8 @@ def encode_and_save_audio_cache(
     }
     if audio_loss_mask is not None:
         sd["audio_loss_mask"] = audio_loss_mask
+    if audio_cond_mask is not None:
+        sd["audio_cond_mask"] = audio_cond_mask
 
     metadata = {
         "architecture": "ltx2_v1",
@@ -835,6 +870,26 @@ def encode_and_save_latent_guides(
             )
 
 
+def _reference_temporal_geometry(num_frames: int, temporal_scale: int, target_pixel_frames: int) -> tuple[int, int]:
+    """Latent frame counts a temporally-subsampled reference and its target will encode to.
+
+    Mirrors the cache encode path exactly: the reference keeps frame 0 then every ``temporal_scale``-th
+    frame, both reference and target are padded so ``(frames - 1) % 8 == 0`` before the VAE packs 8
+    pixel frames into 1 latent frame (frame 0 standalone). Returns ``(ref_latent_frames,
+    target_latent_frames)`` so the geometry can be validated against ``_infer_reference_temporal_scale``
+    before encoding (and from tests, without a VAE).
+    """
+    if temporal_scale > 1 and num_frames > 1:
+        sub_count = len([0, *range(1, num_frames, temporal_scale)])
+    else:
+        sub_count = num_frames
+    ref_padded = sub_count + ((8 - (sub_count - 1) % 8) % 8)
+    ref_latent_frames = (ref_padded - 1) // 8 + 1
+    tgt_padded = target_pixel_frames + ((8 - (target_pixel_frames - 1) % 8) % 8)
+    tgt_latent_frames = (tgt_padded - 1) // 8 + 1
+    return ref_latent_frames, tgt_latent_frames
+
+
 def encode_and_save_reference_latents(
     vae,
     datasets: Sequence[BaseDataset],
@@ -845,6 +900,7 @@ def encode_and_save_reference_latents(
     """Encode reference files and save as latent caches for IC-LoRA / v2v training."""
     default_num_frames = max(1, int(getattr(args, "reference_frames", 1) or 1))
     downscale_factor = max(1, getattr(args, "reference_downscale", 1))
+    temporal_scale = max(1, int(getattr(args, "reference_temporal_scale", 1) or 1))
     skip_existing = getattr(args, "skip_existing", False)
     atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
@@ -919,14 +975,63 @@ def encode_and_save_reference_latents(
                 # bucket_size is (width, height, frame_count, ...); extract spatial dims
                 bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
 
+                # Validate reference temporal geometry against this target BEFORE encoding (and outside
+                # the per-item try below, which only warns). Train/inference infer the temporal scale
+                # from latent frame counts; if a subsampled reference does not divide the target's
+                # temporal groups by exactly temporal_scale, that rescale would mis-align or raise on the
+                # first training step. Fail here, at cache time, with an actionable message.
+                if temporal_scale > 1 and num_frames > 1 and item_info.bucket_size is not None and len(item_info.bucket_size) >= 3:
+                    from musubi_tuner.ltx2_sampling import _infer_reference_temporal_scale
+
+                    ref_lf, tgt_lf = _reference_temporal_geometry(num_frames, temporal_scale, int(item_info.bucket_size[2]))
+                    hint = (
+                        "Set --reference_frames to 8*k+1 (e.g. 9, 17, 25, 33, ...) with "
+                        "--reference_temporal_scale dividing k, and make the reference span the same "
+                        "number of frames as the target."
+                    )
+                    try:
+                        inferred_scale = _infer_reference_temporal_scale(ref_lf, tgt_lf)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"--reference_temporal_scale {temporal_scale}: reference for '{stem}' encodes "
+                            f"to {ref_lf} latent frame(s), which do not align to the target's {tgt_lf} "
+                            f"latent frame(s). {hint}"
+                        ) from exc
+                    if inferred_scale != temporal_scale:
+                        raise ValueError(
+                            f"--reference_temporal_scale {temporal_scale}: reference geometry for '{stem}' "
+                            f"({ref_lf} reference vs {tgt_lf} target latent frames) implies a temporal "
+                            f"scale of {inferred_scale}, not {temporal_scale}. {hint}"
+                        )
+
                 try:
                     ref_cache_paths = getattr(
                         item_info, "reference_latent_cache_paths", None
                     ) or ds.get_reference_latent_cache_paths(item_info)
                     for ref_idx, (ref_dir, ref_cache_path) in enumerate(zip(ref_dirs, ref_cache_paths)):
                         if skip_existing and os.path.exists(ref_cache_path):
-                            skipped_count += 1
-                            continue
+                            if temporal_scale > 1 and num_frames > 1:
+                                # The cache encodes the temporal subsample, so a cache written at a
+                                # different --reference_temporal_scale is stale: its frame_count no longer
+                                # matches the requested subsample. Re-encode instead of silently reusing
+                                # the wrong frame count (which would train as if unsubsampled).
+                                expected_frames = len([0, *range(1, num_frames, temporal_scale)])
+                                stored_frames = None
+                                try:
+                                    from safetensors import safe_open
+
+                                    with safe_open(ref_cache_path, framework="pt") as _f:
+                                        _stored = (_f.metadata() or {}).get("frame_count")
+                                    stored_frames = int(_stored) if _stored is not None else None
+                                except Exception:
+                                    stored_frames = None
+                                if stored_frames == expected_frames:
+                                    skipped_count += 1
+                                    continue
+                                # stale or unreadable -> fall through and re-encode
+                            else:
+                                skipped_count += 1
+                                continue
 
                         ref_path = _find_reference_file(ref_dir, stem)
                         if ref_path is None:
@@ -942,6 +1047,14 @@ def encode_and_save_reference_latents(
                         contents = contents.permute(0, 4, 1, 2, 3).contiguous()
                         contents = contents.to(device=device, dtype=vae_dtype)
                         contents = contents / 127.5 - 1.0
+
+                        # Reference temporal subsample (opt-in; default 1 = no-op). Keep frame 0 (the
+                        # VAE's standalone first frame), then every Nth frame, so the reference is stored
+                        # at a lower temporal resolution; train/inference rescale its positions to the
+                        # target. The (frames-1)%8 pad below re-aligns the shortened sequence to the VAE.
+                        if temporal_scale > 1 and contents.shape[2] > 1:
+                            sub_idx = [0, *range(1, contents.shape[2], temporal_scale)]
+                            contents = contents[:, :, sub_idx, :, :].contiguous()
 
                         frames = contents.shape[2]
                         remainder = (frames - 1) % 8
@@ -965,7 +1078,9 @@ def encode_and_save_reference_latents(
                             item_info.bucket_size,
                         )
                         ref_item_info.latent_cache_path = ref_cache_path
-                        ref_item_info.frame_count = num_frames
+                        # Pre-pad frame count (== num_frames when no temporal subsample; the reduced
+                        # count when --reference_temporal_scale > 1).
+                        ref_item_info.frame_count = frames
                         save_latent_cache_ltx2(ref_item_info, ref_latent, atomic=atomic_cache_writes)
                         cached_count += 1
 
@@ -1866,6 +1981,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=1,
         help="Spatial downscale factor for references (1=same res, 2=half). Must be >= 1.",
+    )
+    parser.add_argument(
+        "--reference_temporal_scale",
+        type=int,
+        default=1,
+        help="Temporal subsample factor for references (1=same frame rate, 2=keep every other frame "
+        "after the first). Stored at lower temporal resolution; positions are rescaled at train/inference.",
     )
     parser.add_argument(
         "--ltx_version",

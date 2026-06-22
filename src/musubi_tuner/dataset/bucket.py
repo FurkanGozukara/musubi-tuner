@@ -38,6 +38,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _stack_audio_cond_masks(masks_per_item, item_count: int, target_t: int, device) -> Optional[torch.Tensor]:
+    """Stack per-item audio conditioning masks into ``[B, target_t]``.
+
+    Items lacking a mask default to ZEROS (no conditioning) — unlike the audio loss mask, which defaults
+    to ones. Returns None when no item has a mask, so the batch key is omitted (off-path byte-identical).
+    """
+    if not any(isinstance(m, torch.Tensor) for m in masks_per_item):
+        return None
+    rows = []
+    for i in range(item_count):
+        m = masks_per_item[i]
+        out = torch.zeros((target_t,), device=device, dtype=torch.float32)
+        if isinstance(m, torch.Tensor):
+            use_t = min(int(m.shape[0]), target_t)
+            if use_t > 0:
+                out[:use_t] = m[:use_t].to(device=device, dtype=torch.float32)
+        rows.append(out)
+    return torch.stack(rows)
+
+
 class BucketSelector:
     RESOLUTION_STEPS_HUNYUAN = 16
     RESOLUTION_STEPS_WAN = 16
@@ -289,9 +309,13 @@ class BucketBatchManager:
         audio_latents_per_item = []
         audio_lengths_per_item = []
         audio_loss_masks_per_item = []
+        audio_cond_masks_per_item = []
         ref_audio_latents_per_item = []
         ref_audio_lengths_per_item = []
         dino_features_per_item = []
+        # LTX-2 spatial-crop regions (plain per-item list; never stacked). Stays free
+        # of regions unless an item carries one (only when --ltx2_spatial_crop is on).
+        spatial_crop_regions_per_item = []
         collect_item_keys = os.getenv("LTX2_COLLECT_BATCH_ITEM_KEYS", "0") == "1" or os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
         latent_cache_paths = []
@@ -311,6 +335,8 @@ class BucketBatchManager:
                 dino_features_per_item.append(sd_dino["dino_features"])  # [T_pixel, N_patches, D_dino]
             else:
                 dino_features_per_item.append(None)
+
+            spatial_crop_regions_per_item.append(getattr(item_info, "spatial_crop_region", None))
 
             reference_latent_cache_paths = getattr(item_info, "reference_latent_cache_paths", None)
             if not reference_latent_cache_paths:
@@ -405,6 +431,7 @@ class BucketBatchManager:
             item_audio_latents = None
             item_audio_lengths = None
             item_audio_loss_mask = None
+            item_audio_cond_mask = None
             item_ref_audio_latents: dict[int, torch.Tensor] = {}
             item_ref_audio_lengths: dict[int, torch.Tensor] = {}
             for key, value in sorted(sd.items()):
@@ -414,6 +441,8 @@ class BucketBatchManager:
                     item_audio_lengths = value
                 elif key == "audio_loss_mask":
                     item_audio_loss_mask = value
+                elif key == "audio_cond_mask":
+                    item_audio_cond_mask = value
                 elif key.startswith("ref_audio_latents_"):
                     ref_suffix = key[len("ref_audio_latents_") :]
                     ref_index = 0
@@ -433,6 +462,7 @@ class BucketBatchManager:
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
             audio_loss_masks_per_item.append(item_audio_loss_mask)
+            audio_cond_masks_per_item.append(item_audio_cond_mask)
             ref_audio_latents_per_item.append(
                 [item_ref_audio_latents[idx] for idx in sorted(item_ref_audio_latents.keys())] if item_ref_audio_latents else None
             )
@@ -453,6 +483,7 @@ class BucketBatchManager:
                     key.startswith("audio_latents_")
                     or key.startswith("audio_lengths_")
                     or key == "audio_loss_mask"
+                    or key == "audio_cond_mask"
                     or key.startswith("ref_audio_latents_")
                     or key.startswith("ref_audio_lengths_")
                 ):
@@ -548,6 +579,11 @@ class BucketBatchManager:
                     )
                     if has_audio_loss_masks:
                         batch_tensor_data["audio_loss_mask"] = torch.stack(truncated_masks)
+                    _cond_stacked = _stack_audio_cond_masks(
+                        audio_cond_masks_per_item, len(audio_latents_per_item), quantized_t, device
+                    )
+                    if _cond_stacked is not None:
+                        batch_tensor_data["audio_cond_mask"] = _cond_stacked
                 else:
                     # Pad mode (default): pad shorter clips to max_t and store actual lengths.
                     lengths = []
@@ -610,6 +646,9 @@ class BucketBatchManager:
                     batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
                     if has_audio_loss_masks:
                         batch_tensor_data["audio_loss_mask"] = torch.stack(padded_masks)
+                    _cond_stacked = _stack_audio_cond_masks(audio_cond_masks_per_item, len(audio_latents_per_item), max_t, device)
+                    if _cond_stacked is not None:
+                        batch_tensor_data["audio_cond_mask"] = _cond_stacked
 
             else:
                 # Skip allocating placeholder audio tensors when the batch has no audio.
@@ -885,6 +924,11 @@ class BucketBatchManager:
             batch_tensor_data["latent_cache_paths"] = latent_cache_paths
             batch_tensor_data["audio_cache_paths"] = audio_cache_paths
             batch_tensor_data["text_cache_paths"] = text_cache_paths
+        # LTX-2: attach per-item spatial-crop regions as a plain Python list (never
+        # stacked). Key is absent unless some item carries a region (only when the
+        # dataset's spatial_crop_enabled flag is set), so off-mode is byte-identical.
+        if any(r is not None for r in spatial_crop_regions_per_item):
+            batch_tensor_data["spatial_crop_region"] = spatial_crop_regions_per_item
         batch_tensor_data["captions"] = captions
 
         return batch_tensor_data

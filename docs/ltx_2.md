@@ -114,6 +114,13 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
       - [IC-LoRA Compatibility Matrix](#ic-lora-compatibility-matrix)
       - [Endpoint Keyframe Training](#endpoint-keyframe-training)
       - [Video Anchor Training](#video-anchor-training)
+      - [Spatial-Crop Region Conditioning (outpaint)](#spatial-crop-region-conditioning-outpaint)
+      - [On-Disk Mask Conditioning (inpaint/outpaint)](#on-disk-mask-conditioning-inpaintoutpaint)
+      - [Video Extension (prefix/suffix)](#video-extension-prefixsuffix)
+      - [Audio Extension (prefix/suffix)](#audio-extension-prefixsuffix)
+      - [Audio Inpaint / Mask Conditioning](#audio-inpaint--mask-conditioning)
+      - [Composable Conditioning Recipe](#composable-conditioning-recipe)
+      - [Directional Training (A2V / V2A)](#directional-training-a2v--v2a)
       - [Sample Prompt Flags](#sample-prompt-flags)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
@@ -290,6 +297,7 @@ python ltx2_cache_latents.py ^
 - `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
 - `--reference_frames`: Number of reference frames to cache for IC-LoRA / V2V (default: `1`).
 - `--reference_downscale`: Spatial downscale factor for cached reference latents (default: `1`).
+- `--reference_temporal_scale`: Temporal subsample factor for cached references (default: `1`). `2` keeps the first frame then every other frame, storing the reference at a lower temporal resolution; its time positions are rescaled to the target at train/inference. Requires `--reference_frames` = `8*k + 1` with the factor dividing `k`, and the reference must span the same number of frames as the target. Validated at cache time.
 - `--atomic_cache_writes`: Opt-in safety mode. Writes cache files to a temporary sibling file first, then replaces the final cache path only after a successful save.
 
 ### Latent Cache Output Files
@@ -1880,6 +1888,20 @@ python ltx2_cache_latents.py ^
 
 `--reference_downscale 2` encodes references at half spatial resolution (e.g., 384px for 768px target). Position embeddings on the reference spatial axes are scaled by the factor so they map into the target coordinate space. When downscaling is enabled, LTX2 buckets are aligned to `32 * reference_downscale` pixels so cached reference dimensions remain exact `/32` latent-grid multiples instead of being rounded down.
 
+**Temporally-subsampled references** (`--reference_temporal_scale`):
+```bash
+python ltx2_cache_latents.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --reference_frames 193 ^
+  --reference_temporal_scale 2 ^
+  --device cuda
+```
+
+`--reference_temporal_scale 2` stores the reference at half its temporal resolution — it keeps the first frame, then every other frame — and rescales the reference's time positions so each reference frame aligns to a real target frame at train and inference time. Use it when the reference can be represented at a lower frame rate than the target, to reduce the reference token count.
+
+The reference must subsample cleanly onto the target's temporal grid (the VAE packs 8 frames into one temporal latent, with the first frame standalone): `--reference_frames` must be `8*k + 1` (e.g. 9, 17, 25, 193) with the factor dividing `k`, and the reference must span the same number of frames as the target. Incompatible combinations are rejected at cache time with the required values. Pass the same `--reference_temporal_scale` during training so the factor is recorded in the checkpoint metadata. Not combinable with multiple references (the streams are concatenated along time).
+
 ##### Step 4: Cache Text Encoder Outputs
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -1921,9 +1943,10 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx2_ic_lora
 ```
 
-If you used `--reference_downscale` during caching, also pass it during training:
+If you used `--reference_downscale` or `--reference_temporal_scale` during caching, also pass them during training:
 ```bash
   --reference_downscale 2
+  --reference_temporal_scale 2
 ```
 
 ##### Step 6: Sample Prompts
@@ -1944,8 +1967,10 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--reference_downscale` | 1 | Spatial downscale factor for references (1=same res, 2=half) |
+| `--reference_temporal_scale` | 1 | Temporal subsample factor for references (1=same frame rate, 2=half). Pass the same value used at caching |
 | `--reference_frames` | 1 | Number of reference frames for V2V (images are repeated to fill this count) |
 | `--ltx2_first_frame_conditioning_p` | 0.1 | Probability of also conditioning on the first target frame during training. No effect for single-frame (image) samples |
+| `--ic_lora_ref_probability` | 1.0 | Probability the reference is applied each step (`v2v` / `av_ic` / `video_ref_only_av`). Below 1.0, the whole reference is randomly dropped that step so the model also learns to generate without it. Must be in `[0, 1]` |
 | `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
 | `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
 
@@ -1968,7 +1993,9 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 - **Multi-reference datasets**: `av_ic` can consume multiple references directly from dataset TOML via `reference_directories` + `reference_cache_directories` (and the audio equivalents below). The list lengths must match. `--av_multi_ref` exposes that intent in training metadata/UI.
 - **Multi-subject references**: The VAE compresses 8 frames into 1 temporal latent via `SpaceToDepthDownsample`, which pairs consecutive frames and averages their features. Subjects sharing the same 8-frame group are blended and lose individual identity. To keep N subjects separated, structure your reference video as: frame 1 = Subject A, frames 2–9 = Subject B (repeated 8×), frames 10–17 = Subject C (repeated 8×), etc. Total frames: `1 + 8×(N−1)`. Set `--reference_frames` to match. Frame 1 gets its own latent due to causal padding in the encoder; each subsequent 8-frame block produces one additional latent.
 - **v2v is video-only**: the `v2v` IC-LoRA strategy requires `--ltx2_mode video` (audio-video mode is rejected for v2v reference conditioning). Audio-video reference IC-LoRA uses the `av_ic` / `video_ref_only_av` strategies (which require `--ltx2_mode av`) and `audio_ref_ic` (which requires `--ltx2_mode av` or `audio`).
-- **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
+- **Reference dropout** (`--ic_lora_ref_probability`): Below 1.0, the reference conditioning is randomly dropped for a fraction of training steps (a single batch-wide draw per step, since concatenation changes the sequence length), so the model also learns to generate without the reference. Default 1.0 always applies the reference. Only affects the reference-video strategies (`v2v` / `av_ic` / `video_ref_only_av`). Recorded as `ss_ic_lora_ref_probability` when < 1.
+- **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor`, plus `reference_downscale_factor` and `reference_spatial_scale_factor`, when factor != 1.
+- **Temporal scale factor metadata**: Saved as `ss_reference_temporal_scale_factor` and `reference_temporal_scale_factor` when the factor != 1. Training and inference infer the actual scale from the cached/target latent frame counts, so the reference cache and target must keep the geometry the factor implies (`--reference_frames` = `8*k + 1`, factor dividing `k`, reference spanning the target length). Changing `--reference_temporal_scale` between cache runs re-encodes affected references even with `--skip_existing`.
 - **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
 
 #### Audio-Reference IC-LoRA
@@ -2316,6 +2343,184 @@ Caveats and tradeoffs:
 - **Random strategy needs anchors**: `--video_anchor_strategy random` requires `--video_anchor_count >= 1`; use `endpoints` if you only want first/last-frame anchors.
 - **No inference behavior is added**: this is training-only.
 - **No guaranteed quality gain**: evaluate against your target prompts and sampling workflow before using it as a default.
+
+##### Spatial-Crop Region Conditioning (outpaint)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Optional training-time conditioning that marks a rectangular spatial region of the video latents as clean conditioning (timestep 0, excluded from the loss), so the model learns to generate the surrounding content (outpaint). Off by default; enable with `--ltx2_spatial_crop`.
+
+The region is set **per dataset** in the dataset config as `spatial_crop_region = [y1, x1, y2, x2]` in **pixel** coordinates; it is floor-divided by the VAE per-axis scale factors to the latent grid at training time.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_spatial_crop` | off | Master enable. When unset, training is unchanged and nothing is emitted. |
+| `--ltx2_spatial_crop_p` | `0.0` | Per-sample probability that the region is applied to a given sample (a batch mixes conditioned and unconditioned samples). |
+| `--ltx2_spatial_crop_invert` | off | Condition the area **outside** the rectangle instead of inside. |
+
+Example dataset entry:
+```toml
+[[datasets]]
+video_directory = "..."
+spatial_crop_region = [0, 0, 256, 512]   # y1, x1, y2, x2 in pixels
+```
+
+Caveats:
+
+- **Video target required**: `--ltx2_spatial_crop` is rejected for `--ltx2_mode audio` (there are no video latents to crop).
+- **Not combinable with IC-LoRA**: `--ltx2_spatial_crop` is rejected together with `--ic_lora_strategy` (`v2v`/`av_ic`/`video_ref_only_av`/`audio_ref_ic`); the reference paths build their own conditioning and loss masks.
+- **Empty region**: a region that floor-divides to less than one latent cell is logged as a warning and conditions no tokens.
+- **Training-only**: no inference behavior is added.
+
+##### On-Disk Mask Conditioning (inpaint/outpaint)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Optional training-time conditioning that uses a per-item mask to mark part of the video latents as clean conditioning (timestep 0, excluded from the loss), so the model learns to fill the rest (inpaint) or generate the surround (outpaint). Off by default; enable with `--ltx2_inpaint_mask`.
+
+The mask is supplied through the dataset's existing `loss_mask_directory` (stem-matched per item, bucket-cropped and resized to the latent grid like any loss mask). While `--ltx2_inpaint_mask` is on, that mask is **binarized** at the threshold and used as a **conditioning** mask rather than a loss weight. **Convention:** white / `1` = conditioned (kept clean); use `--ltx2_inpaint_mask_invert` if your mask instead marks the region to generate.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_inpaint_mask` | off | Master enable. When unset, training is unchanged and nothing is emitted. |
+| `--ltx2_inpaint_mask_p` | `0.0` | Per-sample probability the mask is applied as conditioning (a batch mixes conditioned and unconditioned samples). With `0.0` the feature never applies. |
+| `--ltx2_inpaint_mask_invert` | off | Condition the **complement** of the mask (generate the masked region instead of keeping it clean). |
+| `--ltx2_inpaint_mask_threshold` | `0.5` | Binarization threshold (strict `>`); mask values above it are conditioned. |
+
+Example dataset entry (the mask is a loss-mask directory):
+```toml
+[[datasets]]
+video_directory = "..."
+loss_mask_directory = "/path/to/masks"   # stem-matched per clip; white = conditioned region
+```
+
+Caveats:
+
+- **Shares the loss-mask channel**: while `--ltx2_inpaint_mask` is on, the `loss_mask_directory` mask is consumed as a conditioning mask, **not** as a loss weight — you cannot use a separate soft loss-weight mask and an inpaint mask in the same dataset at once.
+- **`--ltx2_inpaint_mask_p 0.0`**: the feature never applies and the mask falls back to a standard loss weight; a warning is logged. Set `p > 0` to use it.
+- **Video target required**: rejected for `--ltx2_mode audio`.
+- **Not combinable with IC-LoRA**: rejected together with `--ic_lora_strategy` (`v2v`/`av_ic`/`video_ref_only_av`/`audio_ref_ic`).
+- **Training-only**: no inference behavior is added.
+
+##### Video Extension (prefix/suffix)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Optional training-time conditioning that keeps the first N (prefix) and/or last N (suffix) **latent** frames clean (timestep 0, excluded from the loss), auto-derived from the target latents (no dataset, no cache), so the model learns to extend a clip forward (from a prefix) or backward (from a suffix). Off by default; enabled when a span is set.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_extend_prefix_frames` | `0` | Leading latent frames kept clean (forward extension). 0 = off. |
+| `--ltx2_extend_suffix_frames` | `0` | Trailing latent frames kept clean (backward extension). 0 = off. |
+| `--ltx2_extend_p` | `1.0` | Per-sample probability of applying the extension when enabled. |
+
+Caveats:
+
+- **Latent frames, not pixels**: a span of N latent frames covers `1 + 8*(N-1)` pixel frames (the causal VAE encodes the first frame on its own, then groups of 8).
+- **Video target required**: rejected for `--ltx2_mode audio`.
+- **Not combinable with IC-LoRA**: rejected together with `--ic_lora_strategy`.
+- **Training-only**: no inference behavior is added.
+
+##### Audio Extension (prefix/suffix)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+The audio analog of video extension: keeps the first N (prefix) and/or last N (suffix) **audio latent timesteps** clean (timestep 0, excluded from the loss), auto-derived from the target audio latents (no dataset, no cache), so the model learns to continue audio forward or backward. Works in both audio-video (`--ltx2_mode av`) and audio-only (`--ltx2_mode audio`) training. Off by default; enabled when a span is set.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_audio_extend_prefix_frames` | `0` | Leading audio latent timesteps kept clean (forward extension). 0 = off. |
+| `--ltx2_audio_extend_suffix_frames` | `0` | Trailing audio latent timesteps kept clean (backward extension). 0 = off. |
+| `--ltx2_audio_extend_p` | `1.0` | Per-sample probability of applying the extension when enabled. |
+
+Caveats:
+
+- **Audio latent timesteps**: the spans count audio latent timesteps (one conditioning token each), not seconds or video frames.
+- **Audio target required**: rejected for `--ltx2_mode video`.
+- **Not combinable with IC-LoRA**: rejected together with `--ic_lora_strategy`.
+- **Training-only**: no inference behavior is added.
+
+##### Audio Inpaint / Mask Conditioning
+<sub>[↑ contents](#table-of-contents)</sub>
+
+The audio analog of the video inpaint mask: a per-item audio mask marks which **audio latent timesteps** are kept clean (timestep 0, excluded from the loss), so the model learns to generate the complement (audio inpaint). The mask is supplied through a dataset `audio_cond_mask_directory` of per-item time intervals (seconds), cached to a per-timestep binary mask — a **separate channel from the audio loss mask** (which has the opposite convention). Works in both `--ltx2_mode av` and `--ltx2_mode audio`. Off by default.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_audio_inpaint_mask` | off | Enable audio inpaint conditioning (requires `audio_cond_mask_directory` in the dataset). |
+| `--ltx2_audio_inpaint_mask_p` | `0.0` | Per-sample probability of applying the mask when present. 0 = never. |
+| `--ltx2_audio_inpaint_mask_invert` | off | Condition the COMPLEMENT of the mask (generate the masked region instead). |
+| `--ltx2_audio_inpaint_mask_threshold` | `0.5` | Binarization threshold (strict `>`). |
+
+The dataset option `audio_cond_mask_directory` points to per-item interval files (`.json` with a `cond_mask_intervals`/`audio_cond_mask_intervals`/`intervals` key, or a `.txt` of `start end` seconds per line), matched by filename stem. Mask convention: 1 = conditioned (kept clean). Re-cache audio latents after adding/changing the directory. Set it on the **audio dataset** entry (the audio dataset reads it; it is ignored on video/image dataset entries, like `audio_loss_mask` intervals).
+
+Caveats:
+
+- **Audio target required**: rejected for `--ltx2_mode video`.
+- **Not combinable with IC-LoRA**: rejected together with `--ic_lora_strategy`.
+- **Separate from the loss mask**: the conditioning mask is its own directory/channel; it does not reuse `loss_mask_directory`.
+- **Training-only**: no inference behavior is added.
+
+##### Composable Conditioning Recipe
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--ltx2_conditioning_config <file.toml>` is an optional recipe that selects which conditions are active and how often, lowering each entry onto the individual `--ltx2_*` flags above so conditions compose. It does not replace the training mode; it layers intrinsic conditioning on top. Condition-specific data (the spatial-crop region, the mask directory) stays in the dataset config.
+
+```toml
+[[conditions]]
+type = "first_frame"      # keep frame 0 clean (on by default at 0.1; list it to keep/retune)
+probability = 0.9
+
+[[conditions]]
+type = "spatial_crop"     # outpaint via a clean rectangle (region in the dataset config)
+probability = 0.3
+invert = true
+
+[[conditions]]
+type = "inpaint"          # on-disk mask conditioning (alias: "mask")
+probability = 0.5
+threshold = 0.5
+
+[[conditions]]
+type = "extend"           # forward/backward video extension (auto-derived from the target)
+prefix = 2
+probability = 1.0
+```
+
+Notes:
+
+- The recipe is authoritative: a condition declared both in the recipe and as an explicit CLI flag is governed by the recipe (the CLI flag is overridden, logged at WARNING).
+- Supports `first_frame`, `spatial_crop`, `inpaint` (alias `mask`), `extend`, `audio_extend`, and `audio_inpaint` (alias `audio_mask`); not combinable with `--ic_lora_strategy` (except `first_frame`, which composes with IC-LoRA reference strategies as usual). The `audio_*` types require an audio-bearing mode (`--ltx2_mode av` or `audio`).
+- A recipe is the complete declarative set: an intrinsic you do not list is off. `first_frame` is the only one that is otherwise on by default (`--ltx2_first_frame_conditioning_p` 0.1), so a recipe that omits it disables first-frame conditioning — add a `first_frame` condition (with an optional `probability`) to keep it.
+
+Each recipe `type` lowers onto the matching CLI flags (so the recipe and the flags are two ways to set the same thing); condition data that is inherently per-item stays in the dataset config:
+
+| Conditioning | recipe `type` | keys | CLI flags it lowers to | per-item data |
+|---|---|---|---|---|
+| Keep first frame clean (I2V) | `first_frame` | `probability` | `--ltx2_first_frame_conditioning_p` | — |
+| Outpaint (clean rectangle) | `spatial_crop` | `probability`, `invert` | `--ltx2_spatial_crop` `_p` `_invert` | `spatial_crop_region` |
+| Inpaint (on-disk mask) | `inpaint` (alias `mask`) | `probability`, `invert`, `threshold` | `--ltx2_inpaint_mask` `_p` `_invert` `_threshold` | `loss_mask_directory` |
+| Video extend (fwd/back) | `extend` | `prefix`, `suffix`, `probability` | `--ltx2_extend_prefix_frames` `_suffix_frames` `_p` | — (auto from target) |
+| Audio extend (fwd/back) | `audio_extend` | `prefix`, `suffix`, `probability` | `--ltx2_audio_extend_prefix_frames` `_suffix_frames` `_p` | — (auto from target) |
+| Audio inpaint | `audio_inpaint` (alias `audio_mask`) | `probability`, `invert`, `threshold` | `--ltx2_audio_inpaint_mask` `_p` `_invert` `_threshold` | `audio_cond_mask_directory` |
+
+The effective conditioning of a run is recorded in the checkpoint metadata (LoRA and full fine-tune) under `ss_ltx2_*` keys (only when non-default), regardless of whether it came from the recipe or the CLI flags.
+
+##### Directional Training (A2V / V2A)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Trains a dedicated directional model by freezing one whole modality as clean conditioning (timestep 0, sigma 0, excluded from the loss) while the other is generated. Requires `--ltx2_mode av`. Off by default (`joint`).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ltx2_train_direction` | `joint` | `joint` = normal joint AV denoising; `a2v` = freeze audio, generate video; `v2a` = freeze video, generate audio (foley). |
+
+Both modality streams still run, so the frozen-clean one conditions the generated one through cross-attention. The frozen modality contributes no loss; its `loss_v` / `loss_a` logs as `n/a`.
+
+This differs from **Cross-Task Synergy** (`--cts_lambda_*`): CTS adds directional losses *on top of* joint training (extra forwards per step; the model stays joint-capable), whereas `--ltx2_train_direction` *replaces* the main loss for a dedicated directional model (one forward per step). Use CTS for a joint model with directional regularization; use `--ltx2_train_direction` to train a foley (`v2a`) or A2V model.
+
+Caveats:
+
+- **AV mode required**: rejected for `--ltx2_mode video` / `audio`.
+- **Standalone mode**: rejected together with IC-LoRA, `--self_flow`, `--tread`, Cross-Task Synergy, the G2D modality freezer (`--modality_freeze_*`), audio loss balancing (`--audio_loss_balance_mode`), `--dcr`, and `--tarp`.
+- **`v2a` excludes intrinsic video conditioners** (`--ltx2_spatial_crop` / `--ltx2_inpaint_mask` / `--ltx2_extend_*`) because the whole video is frozen. `a2v` allows them (the video is generated).
+- **Training-only**: no inference behavior is added (inference-time A2V/V2A guidance is the separate `--video_modality_scale` / `--audio_modality_scale`).
 
 ##### Sample Prompt Flags
 <sub>[↑ contents](#table-of-contents)</sub>

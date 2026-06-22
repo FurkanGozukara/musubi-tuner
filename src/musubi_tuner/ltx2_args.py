@@ -9,6 +9,13 @@ import logging
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_model_parallel import add_ltx2_model_parallel_args
 from musubi_tuner.ltx2_remote_stage import add_ltx2_remote_stage_args
+from musubi_tuner.ltx2_intrinsic_cond import add_ltx2_intrinsic_cond_args
+from musubi_tuner.ltx2_inpaint_mask import add_ltx2_inpaint_mask_args
+from musubi_tuner.ltx2_extend import add_ltx2_extend_args
+from musubi_tuner.ltx2_audio_extend import add_ltx2_audio_extend_args
+from musubi_tuner.ltx2_audio_inpaint import add_ltx2_audio_inpaint_mask_args
+from musubi_tuner.ltx2_train_direction import add_ltx2_train_direction_args
+from musubi_tuner.ltx2_conditioning import add_ltx2_conditioning_args
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx2_lycoris_runtime import (
     apply_lycoris_preset_before_network_creation,
@@ -120,6 +127,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
     add_ltx2_model_parallel_args(parser)
     add_ltx2_remote_stage_args(parser)
+    add_ltx2_intrinsic_cond_args(parser)
+    add_ltx2_inpaint_mask_args(parser)
+    add_ltx2_extend_args(parser)
+    add_ltx2_audio_extend_args(parser)
+    add_ltx2_audio_inpaint_mask_args(parser)
+    add_ltx2_train_direction_args(parser)
+    add_ltx2_conditioning_args(parser)
     parser.add_argument(
         "--split_attn_target",
         type=str,
@@ -213,6 +227,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "use --av_cross_attention_mode / --av_multi_ref for AV variants). "
             "'video_ref_only_av' uses reference-video conditioning while still training target AV generation "
             "(requires --ltx2_mode av)."
+        ),
+    )
+    parser.add_argument(
+        "--ic_lora_ref_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "Probability of applying the reference conditioning on each training step for the "
+            "reference-video IC-LoRA strategies (v2v / av_ic / video_ref_only_av). 1.0 (default) always "
+            "applies the reference (unchanged). Below 1.0, the whole reference is randomly dropped that "
+            "step (one batch-wide draw, since concatenation changes the sequence length) so the model "
+            "also learns to generate without the reference. Does not affect the audio_ref_ic audio "
+            "reference (a separate path with no dropout support). Must be in [0, 1]."
         ),
     )
     parser.add_argument(
@@ -1088,6 +1115,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=1,
         help="Spatial downscale factor for V2V references (1=same res, 2=half). Must be >= 1.",
+    )
+    parser.add_argument(
+        "--reference_temporal_scale",
+        type=int,
+        default=1,
+        help="Temporal subsample factor for V2V/IC-LoRA references at cache time (1=same frame rate, "
+        "2=half). The reference's time positions are rescaled to the target at train time. Must be >= 1.",
     )
     parser.add_argument(
         "--reference_frames",

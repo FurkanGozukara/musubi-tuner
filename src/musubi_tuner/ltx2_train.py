@@ -73,6 +73,7 @@ from musubi_tuner.ltx2_fsdp import (
     is_ltx2_fsdp_enabled,
     validate_ltx2_fsdp_setup,
 )
+from musubi_tuner.ltx2_intrinsic_cond import is_spatial_crop_enabled
 from musubi_tuner.ltx2_remote_stage import (
     enable_ltx2_remote_stage,
     is_ltx2_remote_stage_enabled,
@@ -124,6 +125,31 @@ def _all_manifest_datasets_are_audio(manifest: dict) -> bool:
         return False
 
     return all(entry.get("dataset_type") == "audio" for entry in declared_datasets)
+
+
+def _any_dataset_declares_spatial_crop(args) -> bool:
+    """True if any (train/validation) dataset block declares a non-empty spatial_crop_region.
+
+    Friendly belt-and-suspenders for the column-present-flag-off hard error; the dataset
+    construction flag (spatial_crop_enabled) is the load-bearing gate. Per-item JSONL-only
+    regions are not visible here, which is fine — they require the master flag on to be read.
+    """
+    try:
+        if getattr(args, "dataset_manifest", None) is not None:
+            config = config_utils.load_dataset_manifest(args.dataset_manifest)
+        elif getattr(args, "dataset_config", None) is not None:
+            config = config_utils.load_user_config(args.dataset_config)
+        else:
+            return False
+    except Exception:
+        return False
+    for section_name in ("datasets", "validation_datasets"):
+        section = config.get(section_name, []) if isinstance(config, dict) else []
+        if isinstance(section, list):
+            for ds in section:
+                if isinstance(ds, dict) and ds.get("spatial_crop_region"):
+                    return True
+    return False
 
 
 def _is_attention_geometry_param(param_name: str) -> bool:
@@ -3196,6 +3222,10 @@ def main() -> None:
 
     _apply_image_prior_ft_defaults(args)
 
+    # LTX-2: friendly hard-error if a dataset declares spatial_crop_region while the
+    # flag is off. (Belt-and-suspenders; the dataset construction flag is the real gate.)
+    args._dataset_has_spatial_crop_region = _any_dataset_declares_spatial_crop(args)
+
     trainer.handle_model_specific_args(args)
     if getattr(args, "ltx_mode", "video") == "av" and not getattr(args, "av_use_video_prompt_embeds", False):
         logger.info("Enabling av_use_video_prompt_embeds for AV mode compatibility when batches have no audio latents.")
@@ -3340,6 +3370,10 @@ def main() -> None:
             # FSDP-native activation checkpointing; disable the model's own gradient checkpointing
             # to avoid double-wrapping the transformer blocks.
             args.gradient_checkpointing = False
+    # The conditioning recipe is lowered and ALL conditioning validators run inside
+    # trainer.handle_model_specific_args(args) above (apply_conditioning_config +
+    # validate_ltx2_conditioning_setup); nothing between there and here mutates the conditioning
+    # args, so no second pass is needed.
     if ltx2_remote_stage:
         if int(getattr(accelerator, "num_processes", 1)) != 1:
             raise RuntimeError("LTX2 remote stage is single-process only; use accelerate --num_processes 1")
@@ -3384,6 +3418,7 @@ def main() -> None:
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=is_spatial_crop_enabled(args),
         )
         if train_dataset_group is None:
             raise ValueError("dataset manifest contains no training datasets")
@@ -3395,6 +3430,7 @@ def main() -> None:
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=is_spatial_crop_enabled(args),
         )
     else:
         user_config = config_utils.load_user_config(args.dataset_config)
@@ -3405,6 +3441,7 @@ def main() -> None:
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=is_spatial_crop_enabled(args),
         )
 
     if train_dataset_group.num_train_items == 0:
@@ -3542,6 +3579,7 @@ def main() -> None:
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=is_spatial_crop_enabled(args),
         )
         if val_dataset_group.num_train_items > 0:
             val_collator = collator_class(current_epoch, val_dataset_group if args.max_data_loader_n_workers == 0 else None)
@@ -4266,6 +4304,7 @@ def main() -> None:
                 num_timestep_buckets=args.num_timestep_buckets,
                 shared_epoch=current_epoch,
                 reference_downscale=getattr(args, "reference_downscale", 1),
+                spatial_crop_enabled=is_spatial_crop_enabled(args),
             )
             if _dg.num_train_items <= 0:
                 logger.warning("validation_extra_configs[%s]: no items, skipping.", _cat)

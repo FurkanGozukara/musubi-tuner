@@ -169,6 +169,44 @@ def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
     return mode
 
 
+def _infer_reference_temporal_scale(ref_frames: int, tgt_frames: int) -> int:
+    """Temporal scale factor S between a reference and the target, from LATENT frame counts.
+
+    The VAE keeps the first frame standalone, so the temporal "groups" of a latent are
+    ``num_frames - 1``. S is the ratio of target groups to reference groups, and must be an exact
+    integer (a non-divisible multi-frame reference is an error). A single-frame (image) reference or
+    an equal frame count yields S == 1 (no temporal rescale). Shared by training (call_dit) and
+    inference (the reference position blocks) so train/infer alignment matches.
+    """
+    ref_groups = int(ref_frames) - 1
+    tgt_groups = int(tgt_frames) - 1
+    if ref_groups <= 0 or tgt_groups <= 0 or tgt_groups == ref_groups:
+        return 1
+    if tgt_groups % ref_groups != 0:
+        raise ValueError(
+            f"Reference temporal mismatch: target latent groups ({tgt_groups}) is not evenly "
+            f"divisible by reference latent groups ({ref_groups}). The reference must have "
+            f"(target_frames - 1) divisible by (reference_frames - 1). If you supplied multiple "
+            f"references, note they are concatenated along time before this check, so multi-reference "
+            f"temporal subsampling is not supported."
+        )
+    return tgt_groups // ref_groups
+
+
+def _apply_reference_temporal_scale(positions: "torch.Tensor", scale: int, frame_rate: float) -> "torch.Tensor":
+    """Rewrite the time axis of reference token positions for a temporally-subsampled reference.
+
+    Scale-then-causal-shift, clamped to 0: lands each reference frame on a real target frame slot
+    (the VAE keeps frame 0 standalone, so latent frame f sits at pixel slot 8f-7). ``positions`` has
+    already been divided by ``frame_rate``, so the causal shift constant is ``(scale - 1) / frame_rate``.
+    Returns a fresh tensor (clone); callers guard with ``scale == 1`` to keep the off-path byte-identical.
+    Shared by all training (call_dit) and inference reference-position blocks so they align identically.
+    """
+    positions = positions.clone()
+    positions[:, 0, ...] = (positions[:, 0, ...] * scale - (scale - 1) / float(frame_rate)).clamp(min=0)
+    return positions
+
+
 class LTX2SamplingMixin:
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
@@ -3736,6 +3774,11 @@ class LTX2SamplingMixin:
             ref_positions = ref_positions.clone()
             ref_positions[:, 1, ...] *= reference_downscale_factor
             ref_positions[:, 2, ...] *= reference_downscale_factor
+        # Reference temporal scale: mirror the train-time rewrite so a temporally-subsampled reference
+        # aligns at inference exactly as it did during training. S == 1 is a no-op (byte-identical).
+        ref_temporal_scale = _infer_reference_temporal_scale(ref_frames, tgt_frames)
+        if ref_temporal_scale != 1:
+            ref_positions = _apply_reference_temporal_scale(ref_positions, ref_temporal_scale, frame_rate_v2v)
 
         tgt_coords = patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(
@@ -4054,6 +4097,10 @@ class LTX2SamplingMixin:
             ref_video_pos = ref_video_pos.clone()
             ref_video_pos[:, 1, ...] *= reference_downscale_factor
             ref_video_pos[:, 2, ...] *= reference_downscale_factor
+        # Reference temporal scale: mirror the train-time rewrite (S == 1 is a no-op).
+        ref_temporal_scale = _infer_reference_temporal_scale(ref_frames, tgt_frames)
+        if ref_temporal_scale != 1:
+            ref_video_pos = _apply_reference_temporal_scale(ref_video_pos, ref_temporal_scale, frame_rate_sample)
 
         tgt_video_coords = video_patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(

@@ -208,6 +208,7 @@ def train(self, args):
             num_timestep_buckets=self.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=bool(getattr(args, "ltx2_spatial_crop", False)),
         )
         if train_dataset_group is None:
             raise ValueError("dataset manifest contains no training datasets")
@@ -219,6 +220,7 @@ def train(self, args):
             num_timestep_buckets=self.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=bool(getattr(args, "ltx2_spatial_crop", False)),
         )
     else:
         blueprint_generator = BlueprintGenerator(ConfigSanitizer())
@@ -231,6 +233,7 @@ def train(self, args):
             num_timestep_buckets=self.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
+            spatial_crop_enabled=bool(getattr(args, "ltx2_spatial_crop", False)),
         )
         if user_config.get("validation_datasets"):
             logger.info("Load validation datasets from dataset config")
@@ -245,6 +248,7 @@ def train(self, args):
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
                 reference_downscale=getattr(args, "reference_downscale", 1),
+                spatial_crop_enabled=bool(getattr(args, "ltx2_spatial_crop", False)),
             )
 
     if train_dataset_group.num_train_items == 0:

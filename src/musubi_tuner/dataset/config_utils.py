@@ -79,6 +79,13 @@ class BaseDatasetParams:
     default_loss_mask_path: Optional[str] = None
     loss_mask_use_alpha: bool = False
     loss_mask_invert: bool = False
+    # LTX-2 audio inpaint conditioning mask (opt-in via --ltx2_audio_inpaint_mask). Per-item time
+    # intervals (seconds) marking the audio latent timesteps to keep clean; separate from the loss mask.
+    audio_cond_mask_directory: Optional[str] = None
+    # LTX-2 spatial-crop region conditioning (opt-in via --ltx2_spatial_crop).
+    # Region in PIXEL coords [y1, x1, y2, x2]; legal-but-inert for non-LTX-2
+    # architectures (read only by LTX-2 when the master flag is on). Default None.
+    spatial_crop_region: Optional[Sequence[int]] = None
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
@@ -198,6 +205,11 @@ class ConfigSanitizer:
         "default_loss_mask_path": str,
         "loss_mask_use_alpha": bool,
         "loss_mask_invert": bool,
+        "audio_cond_mask_directory": str,
+        # LTX-2 spatial-crop region conditioning. [int] = variable-length int
+        # list (length-4 [y1,x1,y2,x2] checked in app code), matching the
+        # keyframe_guide_extra_* / target_frames idiom; returns a list.
+        "spatial_crop_region": [int],
         "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
@@ -326,9 +338,7 @@ class BlueprintGenerator:
         # Keep CLI reference_frames as a cache-time fallback; only TOML/general should populate dataset overrides.
         dataset_local_arg_exclusions = {"reference_frames"}
         argparse_config = {
-            k: v
-            for k, v in vars(sanitized_argparse_namespace).items()
-            if v is not None and k not in dataset_local_arg_exclusions
+            k: v for k, v in vars(sanitized_argparse_namespace).items() if v is not None and k not in dataset_local_arg_exclusions
         }
         general_config = sanitized_user_config.get("general", {})
 
@@ -462,6 +472,7 @@ def generate_dataset_group_by_blueprint(
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
     reference_downscale: int = 1,
+    spatial_crop_enabled: bool = False,
 ) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset, AudioDataset]] = []
 
@@ -483,14 +494,20 @@ def generate_dataset_group_by_blueprint(
     for dataset in datasets:
         if getattr(dataset, "architecture", None) in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
             dataset.reference_downscale = reference_downscale
+            dataset.spatial_crop_enabled = bool(spatial_crop_enabled)
 
     # warn about missing data directories
     for i, dataset in enumerate(datasets):
-        data_dir = getattr(dataset, "image_directory", None) or getattr(dataset, "video_directory", None) or getattr(dataset, "audio_directory", None)
+        data_dir = (
+            getattr(dataset, "image_directory", None)
+            or getattr(dataset, "video_directory", None)
+            or getattr(dataset, "audio_directory", None)
+        )
         if data_dir is not None and not os.path.isdir(data_dir):
             logger.warning(
                 "Dataset [%d]: data directory does not exist: %s — this dataset will produce zero items",
-                i, data_dir,
+                i,
+                data_dir,
             )
 
     # assertion
@@ -517,7 +534,7 @@ def generate_dataset_group_by_blueprint(
         video_loss_weight: {getattr(dataset, "video_loss_weight", None)}
         audio_loss_weight: {getattr(dataset, "audio_loss_weight", None)}
         caption_extension: "{dataset.caption_extension}"
-        caption_field: "{getattr(dataset, 'caption_field', None)}"
+        caption_field: "{getattr(dataset, "caption_field", None)}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
@@ -529,7 +546,7 @@ def generate_dataset_group_by_blueprint(
         reference_downscale: {getattr(dataset, "reference_downscale", 1)}
         reference_frames: {getattr(dataset, "reference_frames", None)}
         cache_directory: "{dataset.cache_directory}"
-        reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
+        reference_cache_directory: "{getattr(dataset, "reference_cache_directory", None)}"
         reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}
         debug_dataset: {dataset.debug_dataset}
     """
@@ -572,11 +589,11 @@ def generate_dataset_group_by_blueprint(
         video_directory: "{dataset.video_directory}"
         video_jsonl_file: "{dataset.video_jsonl_file}"
         control_directory: "{dataset.control_directory}"
-        reference_directory: "{getattr(dataset, 'reference_directory', None)}"
+        reference_directory: "{getattr(dataset, "reference_directory", None)}"
         reference_directories: {getattr(dataset, "reference_directories", None)}
-        reference_audio_directory: "{getattr(dataset, 'reference_audio_directory', None)}"
+        reference_audio_directory: "{getattr(dataset, "reference_audio_directory", None)}"
         reference_audio_directories: {getattr(dataset, "reference_audio_directories", None)}
-        reference_audio_cache_directory: "{getattr(dataset, 'reference_audio_cache_directory', None)}"
+        reference_audio_cache_directory: "{getattr(dataset, "reference_audio_cache_directory", None)}"
         reference_audio_cache_directories: {getattr(dataset, "reference_audio_cache_directories", None)}
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
@@ -770,6 +787,7 @@ def generate_dataset_group_by_manifest(
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
     reference_downscale: int = 1,
+    spatial_crop_enabled: bool = False,
 ) -> Optional[DatasetGroup]:
     if split not in {"train", "validation"}:
         raise ValueError(f"invalid manifest split: {split}")
@@ -787,6 +805,7 @@ def generate_dataset_group_by_manifest(
         num_timestep_buckets=num_timestep_buckets,
         shared_epoch=shared_epoch,
         reference_downscale=reference_downscale,
+        spatial_crop_enabled=spatial_crop_enabled,
     )
 
 

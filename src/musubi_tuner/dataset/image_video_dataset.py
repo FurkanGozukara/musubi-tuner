@@ -278,6 +278,30 @@ def load_audio_loss_mask_intervals(mask_path: str) -> Optional[list[tuple[float,
     return intervals
 
 
+def load_audio_cond_mask_intervals(mask_path: str) -> Optional[list[tuple[float, float]]]:
+    """Load per-item audio CONDITIONING mask time intervals (seconds). Same JSON/txt format as the
+    audio loss-mask intervals; a separate channel because conditioning has the opposite convention."""
+    ext = os.path.splitext(mask_path)[1].lower()
+    if ext == ".json":
+        with open(mask_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("cond_mask_intervals", data.get("audio_cond_mask_intervals", data.get("intervals")))
+        return normalize_loss_mask_intervals(data)
+
+    intervals: list[tuple[float, float]] = []
+    with open(mask_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p for p in stripped.replace(",", " ").split() if p]
+            if len(parts) < 2:
+                raise ValueError(f"Audio cond mask interval line must contain start and end seconds: {line!r}")
+            intervals.append((float(parts[0]), float(parts[1])))
+    return intervals
+
+
 def normalize_loss_mask_intervals(value: Any) -> Optional[list[tuple[float, float]]]:
     if value is None:
         return None
@@ -389,7 +413,10 @@ class ItemInfo:
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
         self.loss_mask_content: Optional[np.ndarray] = None
         self.loss_mask_path: Optional[str] = None
+        # LTX-2 spatial-crop region: PIXEL coords (y1, x1, y2, x2). None when unset/off.
+        self.spatial_crop_region: Optional[tuple[int, int, int, int]] = None
         self.audio_loss_mask_intervals: Optional[list[tuple[float, float]]] = None
+        self.audio_cond_mask_intervals: Optional[list[tuple[float, float]]] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -1957,6 +1984,8 @@ class BaseDataset(torch.utils.data.Dataset):
         keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
         keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -2024,9 +2053,21 @@ class BaseDataset(torch.utils.data.Dataset):
         self.default_loss_mask_path = default_loss_mask_path
         self.loss_mask_use_alpha = loss_mask_use_alpha
         self.loss_mask_invert = loss_mask_invert
+        self.audio_cond_mask_directory = audio_cond_mask_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.reference_downscale = 1
+        # LTX-2 spatial-crop region conditioning. The dataset-level region (PIXEL
+        # coords [y1, x1, y2, x2]) is read only when spatial_crop_enabled is set
+        # post-construction (LTX-2 only, from --ltx2_spatial_crop). Off by default.
+        if spatial_crop_region:
+            _scr = tuple(int(v) for v in spatial_crop_region)
+            if len(_scr) != 4:
+                raise ValueError(f"spatial_crop_region must have exactly 4 ints [y1, x1, y2, x2]; got {list(spatial_crop_region)}")
+            self.spatial_crop_region = _scr
+        else:
+            self.spatial_crop_region = None
+        self.spatial_crop_enabled = False
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -2381,6 +2422,8 @@ class ImageDataset(BaseDataset):
         keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
         keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -2417,6 +2460,8 @@ class ImageDataset(BaseDataset):
             keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
             keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -2738,6 +2783,9 @@ class ImageDataset(BaseDataset):
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+            # LTX-2: attach the dataset-level spatial-crop region to the TRAINING item.
+            if self.spatial_crop_enabled and self.spatial_crop_region is not None:
+                item_info.spatial_crop_region = self.spatial_crop_region
 
             dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
             item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
@@ -2860,6 +2908,8 @@ class AudioDataset(BaseDataset):
         keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
         keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
     ):
         super(AudioDataset, self).__init__(
             resolution,
@@ -2896,6 +2946,8 @@ class AudioDataset(BaseDataset):
             keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
             keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
@@ -2986,6 +3038,15 @@ class AudioDataset(BaseDataset):
                     if loss_mask_intervals is None and self.default_loss_mask_path:
                         loss_mask_intervals = load_audio_loss_mask_intervals(self.default_loss_mask_path)
                     item_info.audio_loss_mask_intervals = loss_mask_intervals
+                    # Audio conditioning mask intervals (opt-in; separate directory + channel from the
+                    # loss mask). None when audio_cond_mask_directory is unset -> no cond mask cached.
+                    cond_mask_intervals = None
+                    if getattr(self, "audio_cond_mask_directory", None):
+                        cond_stem = os.path.splitext(os.path.basename(audio_path))[0]
+                        cond_mask_path = find_stem_matched_file(self.audio_cond_mask_directory, cond_stem, MASK_METADATA_EXTENSIONS)
+                        if cond_mask_path is not None and os.path.isfile(cond_mask_path):
+                            cond_mask_intervals = load_audio_cond_mask_intervals(cond_mask_path)
+                    item_info.audio_cond_mask_intervals = cond_mask_intervals
                     data.append(item_info)
                     futures.remove(future)
 
@@ -3221,6 +3282,8 @@ class VideoDataset(BaseDataset):
         keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
         keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -3257,6 +3320,8 @@ class VideoDataset(BaseDataset):
             keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
             keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -3616,6 +3681,9 @@ class VideoDataset(BaseDataset):
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+            # LTX-2: attach the dataset-level spatial-crop region to the training item.
+            if self.spatial_crop_enabled and self.spatial_crop_region is not None:
+                item_info.spatial_crop_region = self.spatial_crop_region
 
             dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
             item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
