@@ -101,6 +101,8 @@ ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
 ARCHITECTURE_HIDREAM_O1 = "ho1"
 ARCHITECTURE_HIDREAM_O1_FULL = "hidream_o1_image"
+ARCHITECTURE_IDEOGRAM4 = "i4"
+ARCHITECTURE_IDEOGRAM4_FULL = "ideogram4"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -890,6 +892,8 @@ from musubi_tuner.dataset import cache_io as _cache_io  # noqa: E402
 save_latent_cache_ltx2 = _cache_io.save_latent_cache_ltx2  # noqa: F811
 save_text_encoder_output_cache_ltx2 = _cache_io.save_text_encoder_output_cache_ltx2  # noqa: F811
 save_text_encoder_output_cache_ltx2_gemma = _cache_io.save_text_encoder_output_cache_ltx2_gemma  # noqa: F811
+save_latent_cache_ideogram4 = _cache_io.save_latent_cache_ideogram4  # noqa: F811
+save_text_encoder_output_cache_ideogram4 = _cache_io.save_text_encoder_output_cache_ideogram4  # noqa: F811
 
 
 from musubi_tuner.dataset import bucket as _bucket  # noqa: E402
