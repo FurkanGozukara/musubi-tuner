@@ -47,7 +47,23 @@ def add_ltx2_extend_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--ltx2_extend_p",
         type=float,
         default=1.0,
-        help="per-sample Bernoulli probability of applying extension conditioning when enabled. Default 1.0 (always).",
+        help="per-sample Bernoulli probability of applying extension conditioning when enabled. Default 1.0 (always). "
+        "Shared by prefix and suffix in a single draw unless --ltx2_extend_prefix_p / --ltx2_extend_suffix_p are set.",
+    )
+    parser.add_argument(
+        "--ltx2_extend_prefix_p",
+        type=float,
+        default=None,
+        help="opt-in: per-sample probability for the PREFIX span, drawn independently of the suffix. When either "
+        "this or --ltx2_extend_suffix_p is set, prefix and suffix use independent draws (a sample can get prefix-only, "
+        "suffix-only, both, or neither); the unset side falls back to --ltx2_extend_p. Default unset (single shared draw).",
+    )
+    parser.add_argument(
+        "--ltx2_extend_suffix_p",
+        type=float,
+        default=None,
+        help="opt-in: per-sample probability for the SUFFIX span, drawn independently of the prefix. See "
+        "--ltx2_extend_prefix_p. Default unset (single shared draw).",
     )
     return parser
 
@@ -62,9 +78,9 @@ def is_extend_enabled(args: argparse.Namespace) -> bool:
 def validate_extend_setup(args: argparse.Namespace, accelerator=None) -> None:
     """Raise on incompatible video-extension setup. No-op when disabled.
 
-    MUST run AFTER ltx_mode normalization and after ``args.ic_lora_strategy`` is resolved.
-    Hard errors: audio-only mode (no video latents to extend); negative spans; out-of-range
-    probability; IC-LoRA reference strategies (they build their own conditioning/loss masks).
+    MUST run AFTER ltx_mode normalization. Hard errors: audio-only mode (no video latents to
+    extend); negative spans; out-of-range probability. Composes with the IC-LoRA reference
+    strategies (the extension mask is OR-merged into the reference target conditioning mask).
     """
     if not is_extend_enabled(args):
         return
@@ -78,12 +94,13 @@ def validate_extend_setup(args: argparse.Namespace, accelerator=None) -> None:
     p = float(getattr(args, "ltx2_extend_p", 1.0) or 0.0)
     if not (0.0 <= p <= 1.0):
         raise RuntimeError(f"--ltx2_extend_p must be in [0, 1]. Got: {p}")
-    ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-    if ic_strategy in ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic"):
-        raise RuntimeError(
-            f"--ltx2_extend_* is not supported together with --ic_lora_strategy {ic_strategy} "
-            "(the IC-LoRA reference path builds its own conditioning/loss masks). Disable one of them."
-        )
+    for _name in ("ltx2_extend_prefix_p", "ltx2_extend_suffix_p"):
+        _v = getattr(args, _name, None)
+        if _v is not None and not (0.0 <= float(_v) <= 1.0):
+            raise RuntimeError(f"--{_name} must be in [0, 1]. Got: {_v}")
+    # Video extension composes with the IC-LoRA reference strategies: the clean prefix/suffix frames
+    # ride the target video tokens and the per-token mask is OR-merged into each reference branch's
+    # target conditioning mask (timestep 0 + loss exclusion). No strategy restriction.
 
 
 def build_extend_token_mask(

@@ -730,12 +730,25 @@ def _append_ltx2_conditioning(cmd: list[str], t) -> None:
         cmd += ["--ltx2_extend_prefix_frames", str(_ext_prefix)]
         cmd += ["--ltx2_extend_suffix_frames", str(_ext_suffix)]
         cmd += ["--ltx2_extend_p", str(getattr(t, "ltx2_extend_probability", 1.0))]
+        # Optional independent per-side probabilities (omit for the shared single draw).
+        _ext_pp = getattr(t, "ltx2_extend_prefix_p", None)
+        if _ext_pp is not None and str(_ext_pp).strip() != "":
+            cmd += ["--ltx2_extend_prefix_p", str(_ext_pp)]
+        _ext_sp = getattr(t, "ltx2_extend_suffix_p", None)
+        if _ext_sp is not None and str(_ext_sp).strip() != "":
+            cmd += ["--ltx2_extend_suffix_p", str(_ext_sp)]
     _aext_prefix = int(getattr(t, "ltx2_audio_extend_prefix_frames", 0) or 0)
     _aext_suffix = int(getattr(t, "ltx2_audio_extend_suffix_frames", 0) or 0)
     if not recipe and (_aext_prefix > 0 or _aext_suffix > 0):
         cmd += ["--ltx2_audio_extend_prefix_frames", str(_aext_prefix)]
         cmd += ["--ltx2_audio_extend_suffix_frames", str(_aext_suffix)]
         cmd += ["--ltx2_audio_extend_p", str(getattr(t, "ltx2_audio_extend_probability", 1.0))]
+        _aext_pp = getattr(t, "ltx2_audio_extend_prefix_p", None)
+        if _aext_pp is not None and str(_aext_pp).strip() != "":
+            cmd += ["--ltx2_audio_extend_prefix_p", str(_aext_pp)]
+        _aext_sp = getattr(t, "ltx2_audio_extend_suffix_p", None)
+        if _aext_sp is not None and str(_aext_sp).strip() != "":
+            cmd += ["--ltx2_audio_extend_suffix_p", str(_aext_sp)]
     _train_direction = str(getattr(t, "ltx2_train_direction", "joint") or "joint")
     if not recipe and _train_direction != "joint":
         # Directional AV training (requires --ltx2_mode av); "joint" emits nothing (default).

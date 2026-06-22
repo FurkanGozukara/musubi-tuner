@@ -65,9 +65,10 @@ def apply_loss_mask_per_sample(
     ``apply_loss_mask`` does. A fully-masked sample (no active elements) contributes ~0 via the eps
     clamp, degrading safely instead of reverting to an unmasked mean.
 
-    Opt-in: the default path keeps ``apply_loss_mask`` (batch-global) for byte-identity; this is used
-    only when ``--ltx2_per_sample_loss`` is set. The mask-broadcast block is duplicated from
-    ``apply_loss_mask`` on purpose, so that function stays byte-for-byte unchanged for the off-path.
+    The default path keeps ``apply_loss_mask`` (batch-global) for byte-identity; this is used when
+    ``ltx2_per_sample_loss`` is set, which is auto-enabled whenever LTX-2 conditioning is active and a
+    no-op for a plain run. The mask-broadcast block is duplicated from ``apply_loss_mask`` on purpose,
+    so that function stays byte-for-byte unchanged for the off-path.
     """
     if mask is None:
         return per_elem.mean(), {}

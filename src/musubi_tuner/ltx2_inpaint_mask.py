@@ -78,10 +78,10 @@ def is_inpaint_mask_enabled(args: argparse.Namespace) -> bool:
 def validate_inpaint_mask_setup(args: argparse.Namespace, accelerator=None) -> None:
     """Raise on incompatible inpaint-mask setup. No-op when disabled.
 
-    MUST run AFTER ltx_mode normalization and after ``args.ic_lora_strategy`` is resolved.
-    Hard errors: audio-only mode (no video latents to condition); out-of-range probability or
-    threshold; IC-LoRA reference strategies (they build their own conditioning/loss masks and
-    return before the inpaint mask is applied).
+    MUST run AFTER ltx_mode normalization. Hard errors: audio-only mode (no video latents to
+    condition); out-of-range probability or threshold. Composes with the IC-LoRA reference
+    strategies (the mask is OR-merged into the reference target conditioning mask, and consumed as
+    conditioning rather than a loss weight when live).
     """
     if not is_inpaint_mask_enabled(args):
         return
@@ -100,12 +100,10 @@ def validate_inpaint_mask_setup(args: argparse.Namespace, accelerator=None) -> N
     threshold = float(getattr(args, "ltx2_inpaint_mask_threshold", 0.5))
     if not (0.0 <= threshold <= 1.0):
         raise RuntimeError(f"--ltx2_inpaint_mask_threshold must be in [0, 1]. Got: {threshold}")
-    ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-    if ic_strategy in ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic"):
-        raise RuntimeError(
-            f"--ltx2_inpaint_mask is not supported together with --ic_lora_strategy {ic_strategy} "
-            "(the IC-LoRA reference path builds its own conditioning/loss masks). Disable one of them."
-        )
+    # Inpaint-mask composes with the IC-LoRA reference strategies: the clean-latent paste rides the
+    # target video tokens, the per-token mask is OR-merged into each reference branch's target
+    # conditioning mask, and when live the cached mask is consumed as conditioning (not a loss
+    # weight) on every path. No strategy restriction.
 
 
 def build_inpaint_token_mask(

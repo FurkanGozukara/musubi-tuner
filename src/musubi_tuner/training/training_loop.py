@@ -1444,8 +1444,8 @@ def train(self, args):
                                 per_elem, _ = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
                             elif tag == "audio":
                                 per_elem, _ = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
-                            # Per-sample mask renorm only when --ltx2_per_sample_loss is set; otherwise
-                            # the batch-global reducer (byte-identical off-path).
+                            # Per-sample mask renorm when ltx2_per_sample_loss is set (auto-enabled for
+                            # active LTX-2 conditioning); otherwise the batch-global reducer (byte-identical off-path).
                             loss, _ = reduce_masked_loss(per_elem, mask, per_sample=getattr(args, "ltx2_per_sample_loss", False))
                             return loss
 
@@ -1887,10 +1887,10 @@ def train(self, args):
                             per_elem, modifier_metrics = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
                             for k, v in modifier_metrics.items():
                                 mask_metrics[k] = v
-                        # Per-sample mask renorm only when --ltx2_per_sample_loss is set; otherwise the
-                        # batch-global reducer (byte-identical off-path). The HFATO x0 video-loss path
-                        # (used when --hfato is active) keeps its own reduction and is not
-                        # per-sample-renormalized.
+                        # Per-sample mask renorm when ltx2_per_sample_loss is set (auto-enabled for active
+                        # LTX-2 conditioning); otherwise the batch-global reducer (byte-identical off-path).
+                        # The HFATO x0 video-loss path (used when --hfato is active) keeps its own
+                        # reduction and is not per-sample-renormalized.
                         loss, metrics = reduce_masked_loss(per_elem, mask, per_sample=getattr(args, "ltx2_per_sample_loss", False))
                         if tag is not None and metrics:
                             for k, v in metrics.items():

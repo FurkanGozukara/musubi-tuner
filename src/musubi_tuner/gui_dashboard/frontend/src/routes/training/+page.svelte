@@ -507,6 +507,7 @@
 									{ value: 'av_ic', label: 'av_ic' },
 									{ value: 'video_ref_only_av', label: 'video_ref_only_av' },
 								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} disabled={recipeActive} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
+								<FormField type="number" fieldPath="training.ic_lora_ref_probability" value={t.ic_lora_ref_probability ?? 1.0} oninput={(e) => update('ic_lora_ref_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Reference-dropout dial for the IC-LoRA reference strategies (v2v / av_ic / video_ref_only_av / audio_ref_ic): per-sample probability that the reference is KEPT. 1.0 = always use the reference; lower values drop it on some samples for classifier-free-guidance-style training." />
 							</div>
 							{#if t.ic_lora_strategy === 'audio_ref_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_ic' || t.lora_target_preset === 'av_ic'))}
 								<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
@@ -843,6 +844,43 @@
 									<FormField type="number" fieldPath="training.ltx2_extend_suffix_frames" value={t.ltx2_extend_suffix_frames ?? 0} oninput={(e) => update('ltx2_extend_suffix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Number of trailing latent frames kept clean (backward extension). 0 = off." />
 									<FormField type="number" fieldPath="training.ltx2_extend_probability" value={t.ltx2_extend_probability ?? 1.0} oninput={(e) => update('ltx2_extend_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Per-sample probability of applying extension conditioning when enabled." />
 								</div>
+								{#if (t.ltx2_extend_prefix_frames > 0 || t.ltx2_extend_suffix_frames > 0) && !recipeActive}
+								<div class="grid grid-cols-2 gap-2">
+									<FormField type="number" fieldPath="training.ltx2_extend_prefix_p" value={t.ltx2_extend_prefix_p ?? ''} oninput={(e) => update('ltx2_extend_prefix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the PREFIX side. Setting either per-side probability makes prefix and suffix independent draws. Blank = use the shared probability." />
+									<FormField type="number" fieldPath="training.ltx2_extend_suffix_p" value={t.ltx2_extend_suffix_p ?? ''} oninput={(e) => update('ltx2_extend_suffix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the SUFFIX side. Blank = use the shared probability." />
+								</div>
+								{/if}
+							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Audio Extension (prefix / suffix)</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">Audio analog of video extension (requires an audio-bearing mode &mdash; av / audio). Keep the first N (prefix) and/or last N (suffix) audio latent timesteps clean. A span of 0 disables that side; both 0 = off. Composes with the audio-bearing reference strategies.</p>
+								<div class="grid grid-cols-3 gap-2">
+									<FormField type="number" fieldPath="training.ltx2_audio_extend_prefix_frames" value={t.ltx2_audio_extend_prefix_frames ?? 0} oninput={(e) => update('ltx2_audio_extend_prefix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Leading audio latent timesteps kept clean (forward audio extension). 0 = off." />
+									<FormField type="number" fieldPath="training.ltx2_audio_extend_suffix_frames" value={t.ltx2_audio_extend_suffix_frames ?? 0} oninput={(e) => update('ltx2_audio_extend_suffix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Trailing audio latent timesteps kept clean (backward audio extension). 0 = off." />
+									<FormField type="number" fieldPath="training.ltx2_audio_extend_probability" value={t.ltx2_audio_extend_probability ?? 1.0} oninput={(e) => update('ltx2_audio_extend_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Per-sample probability of applying audio-extension conditioning (shared by prefix and suffix unless the per-side probabilities below are set)." />
+								</div>
+								{#if (t.ltx2_audio_extend_prefix_frames > 0 || t.ltx2_audio_extend_suffix_frames > 0) && !recipeActive}
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="training.ltx2_audio_extend_prefix_p" value={t.ltx2_audio_extend_prefix_p ?? ''} oninput={(e) => update('ltx2_audio_extend_prefix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the audio PREFIX side. Blank = shared." />
+										<FormField type="number" fieldPath="training.ltx2_audio_extend_suffix_p" value={t.ltx2_audio_extend_suffix_p ?? ''} oninput={(e) => update('ltx2_audio_extend_suffix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the audio SUFFIX side. Blank = shared." />
+									</div>
+								{/if}
+							</div>
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Audio Inpaint Mask</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">Audio analog of inpaint (requires an audio-bearing mode). Reuses the dataset audio mask as a clean conditioning region (timestep 0, excluded from loss). Composes with the audio-bearing reference strategies. All fields are no-ops while the master toggle is off.</p>
+								<FormToggle fieldPath="training.ltx2_audio_inpaint_mask" checked={t.ltx2_audio_inpaint_mask ?? false} onchange={(e) => update('ltx2_audio_inpaint_mask', e.target.checked)} disabled={recipeActive} tooltip="Master enable for audio on-disk mask conditioning. When off, nothing is emitted and the per-sample draw is skipped." />
+								{#if t.ltx2_audio_inpaint_mask && !recipeActive}
+									<div class="grid grid-cols-3 gap-2">
+										<FormField type="number" fieldPath="training.ltx2_audio_inpaint_mask_probability" value={t.ltx2_audio_inpaint_mask_probability ?? 0.0} oninput={(e) => update('ltx2_audio_inpaint_mask_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the audio mask as clean conditioning." />
+										<FormField type="number" fieldPath="training.ltx2_audio_inpaint_mask_threshold" value={t.ltx2_audio_inpaint_mask_threshold ?? 0.5} oninput={(e) => update('ltx2_audio_inpaint_mask_threshold', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Binarization threshold (strict >). Values above this are conditioned (kept clean)." />
+										<FormToggle fieldPath="training.ltx2_audio_inpaint_mask_invert" checked={t.ltx2_audio_inpaint_mask_invert ?? false} onchange={(e) => update('ltx2_audio_inpaint_mask_invert', e.target.checked)} tooltip="Condition the COMPLEMENT of the mask (generate the masked timesteps instead of keeping them clean)." />
+									</div>
+								{/if}
 							</div>
 							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
 								<div class="flex items-center justify-between">

@@ -43,10 +43,14 @@ alone -> ``v2v``; ``[video]`` + ``[audio]`` references -> ``av_ic``; a ``[video]
 video reference -> ``audio_ref_ic``. An optional ``probability`` on the ``[video]`` reference sets the
 reference-dropout dial (``--ic_lora_ref_probability``); the audio reference takes no parameters. The
 reference video/audio data itself stays in the dataset config; the recipe only selects the strategy.
-Because a reference strategy bypasses the intrinsic funnel, a reference may not be combined with a
-gated intrinsic (``spatial_crop`` / ``inpaint`` / ``extend``) in the same recipe; ``first_frame``
-composes with IC-LoRA and is exempt, so it is left at its CLI/default value (not auto-disabled) in a
-reference recipe. Each block also accepts ``is_generated`` (bool, default true). Setting exactly one
+The ``[video]`` intrinsics (``spatial_crop`` / ``inpaint`` / ``extend``) and ``first_frame`` compose
+with a reference strategy: their clean latents ride the target video tokens and their masks are
+OR-merged into the reference target conditioning mask, so they are left at their CLI/default values
+(not auto-disabled) in a reference recipe. The ``[audio]`` intrinsics (``extend`` / ``inpaint``)
+compose with the audio-bearing reference strategies (``av_ic`` / ``video_ref_only_av`` /
+``audio_ref_ic``): the conditioned audio timesteps are clean-pasted into the generated audio target
+and excluded from the audio loss, with the audio reference (if any) concatenated in front. Each block
+also accepts ``is_generated`` (bool, default true). Setting exactly one
 modality's ``is_generated = false`` freezes it as clean conditioning and trains directionally:
 ``[audio]`` ``is_generated = false`` -> ``a2v`` (freeze audio, generate video); ``[video]``
 ``is_generated = false`` -> ``v2a`` (freeze video, generate audio/foley). This lowers onto
@@ -67,6 +71,10 @@ import toml
 logger = logging.getLogger(__name__)
 
 _SENTINEL = "_ltx2_conditioning_applied"
+
+# Marks that the loss-reduction policy was chosen EXPLICITLY (a recipe ``per_sample_loss`` key, true or
+# false). When set, the automatic per-sample upgrade for active conditioning leaves the choice alone.
+_PER_SAMPLE_LOSS_EXPLICIT = "_ltx2_per_sample_loss_set"
 
 
 def _parser_has_option(parser: argparse.ArgumentParser, option: str) -> bool:
@@ -93,8 +101,10 @@ def add_ltx2_conditioning_args(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ltx2_per_sample_loss",
         action="store_true",
         help="Renormalize the masked loss per sample (each batch element weighted equally regardless "
-        "of how much of it is masked in) instead of using the batch-global mask denominator. Off by "
-        "default; set on the command line, or via a recipe top-level 'per_sample_loss = true'.",
+        "of how much of it is masked in) instead of using the batch-global mask denominator. Enabled "
+        "automatically whenever conditioning is active (intrinsics, a reference strategy, or directional "
+        "training), and a no-op for a plain run. Use this flag to force it on otherwise, or set a recipe "
+        "top-level 'per_sample_loss = false' to force the batch-global denominator even under conditioning.",
     )
     return parser
 
@@ -112,6 +122,20 @@ def _resolve_probability(cond: dict, ctype: str, default: float) -> float:
         raise RuntimeError(f"conditioning recipe: condition '{ctype}' probability must be a number. Got: {value!r}")
     if not (0.0 <= p <= 1.0):
         raise RuntimeError(f"conditioning recipe: condition '{ctype}' probability must be in [0, 1]. Got: {p}")
+    return p
+
+
+def _optional_probability(cond: dict, key: str, ctype: str):
+    """Validated probability for an optional per-side key (e.g. prefix_p / suffix_p); None when absent."""
+    if key not in cond:
+        return None
+    value = cond[key]
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"conditioning recipe: condition '{ctype}' key '{key}' must be a number. Got: {value!r}")
+    if not (0.0 <= p <= 1.0):
+        raise RuntimeError(f"conditioning recipe: condition '{ctype}' key '{key}' must be in [0, 1]. Got: {p}")
     return p
 
 
@@ -175,7 +199,7 @@ def _lower_video_condition(args: argparse.Namespace, cond: dict, ctype: str, pat
             raise RuntimeError(f"conditioning recipe: [video] 'inpaint' threshold must be in [0, 1]. Got: {threshold}")
         args.ltx2_inpaint_mask_threshold = threshold
     elif ctype == "extend":
-        _reject_unknown_keys(cond, {"type", "probability", "p", "prefix", "suffix"}, ctype)
+        _reject_unknown_keys(cond, {"type", "probability", "p", "prefix", "suffix", "prefix_p", "suffix_p"}, ctype)
         _warn_cli_override(
             int(getattr(args, "ltx2_extend_prefix_frames", 0) or 0) > 0
             or int(getattr(args, "ltx2_extend_suffix_frames", 0) or 0) > 0,
@@ -185,6 +209,13 @@ def _lower_video_condition(args: argparse.Namespace, cond: dict, ctype: str, pat
         args.ltx2_extend_prefix_frames = _int_key(cond, "prefix", ctype)
         args.ltx2_extend_suffix_frames = _int_key(cond, "suffix", ctype)
         args.ltx2_extend_p = _resolve_probability(cond, ctype, 1.0)
+        # Optional independent per-side draws: setting either makes prefix/suffix independent.
+        _pp = _optional_probability(cond, "prefix_p", ctype)
+        if _pp is not None:
+            args.ltx2_extend_prefix_p = _pp
+        _sp = _optional_probability(cond, "suffix_p", ctype)
+        if _sp is not None:
+            args.ltx2_extend_suffix_p = _sp
         if args.ltx2_extend_prefix_frames <= 0 and args.ltx2_extend_suffix_frames <= 0:
             raise RuntimeError("conditioning recipe: [video] 'extend' requires prefix > 0 or suffix > 0.")
     elif ctype == "first_frame":
@@ -214,7 +245,7 @@ def _lower_audio_condition(args: argparse.Namespace, cond: dict, ctype: str, pat
     if ctype == "extend":
         # Lowers onto --ltx2_audio_extend_*. Requires an audio-bearing mode; enforced downstream by
         # validate_audio_extend_setup, not here.
-        _reject_unknown_keys(cond, {"type", "probability", "p", "prefix", "suffix"}, ctype)
+        _reject_unknown_keys(cond, {"type", "probability", "p", "prefix", "suffix", "prefix_p", "suffix_p"}, ctype)
         _warn_cli_override(
             int(getattr(args, "ltx2_audio_extend_prefix_frames", 0) or 0) > 0
             or int(getattr(args, "ltx2_audio_extend_suffix_frames", 0) or 0) > 0,
@@ -224,6 +255,12 @@ def _lower_audio_condition(args: argparse.Namespace, cond: dict, ctype: str, pat
         args.ltx2_audio_extend_prefix_frames = _int_key(cond, "prefix", ctype)
         args.ltx2_audio_extend_suffix_frames = _int_key(cond, "suffix", ctype)
         args.ltx2_audio_extend_p = _resolve_probability(cond, ctype, 1.0)
+        _pp = _optional_probability(cond, "prefix_p", ctype)
+        if _pp is not None:
+            args.ltx2_audio_extend_prefix_p = _pp
+        _sp = _optional_probability(cond, "suffix_p", ctype)
+        if _sp is not None:
+            args.ltx2_audio_extend_suffix_p = _sp
         if args.ltx2_audio_extend_prefix_frames <= 0 and args.ltx2_audio_extend_suffix_frames <= 0:
             raise RuntimeError("conditioning recipe: [audio] 'extend' requires prefix > 0 or suffix > 0.")
     elif ctype in ("inpaint", "mask"):
@@ -301,28 +338,20 @@ def derive_train_direction(video_generated: bool, audio_generated: bool) -> str:
 
 
 def validate_recipe_cross_conditions(path: str, seen_video: set, seen_audio: set, has_reference: bool) -> None:
-    """Reject a reference combined with a gated intrinsic in the same recipe (a recipe-structure error).
+    """No-op: every intrinsic now composes with the reference strategies, so a 'reference' marker has no
+    forbidden intrinsic combination to reject at the recipe level.
 
-    A 'reference' selects an IC-LoRA strategy whose path builds its own conditioning/loss masks, so the
-    intrinsic validators hard-error on a gated intrinsic + that strategy. Catching it here names the
-    offending recipe entries instead of a CLI flag the recipe author never set. This fires only where
-    ``validate_ltx2_conditioning_setup`` would also raise after lowering, so a recipe is never rejected
-    for a combination the equivalent CLI flags accept. ``first_frame`` composes with IC-LoRA (absent
-    from those validators) and is exempt. Mode legality (an audio intrinsic in --ltx2_mode video, a
-    video intrinsic in --ltx2_mode audio) is left to those same validators, which run on both paths.
+    Video intrinsics (spatial_crop / inpaint / extend) compose with every reference strategy: the train
+    loop pastes their clean latents onto the target video tokens and OR-merges their masks into the
+    reference target conditioning mask. Audio intrinsics (audio extend / inpaint) compose with the
+    audio-bearing reference strategies (av_ic / video_ref_only_av / audio_ref_ic): the conditioned audio
+    timesteps are clean-pasted into the generated audio target and excluded from the audio loss, with the
+    audio reference (if any) concatenated in front. A recipe that lists an audio intrinsic necessarily has
+    an [audio] block, which never derives the video-only v2v strategy, so an audio intrinsic in a recipe
+    is always audio-bearing and legal. Mode legality (an audio intrinsic under --ltx2_mode video) is left
+    to the per-feature validators. Kept as a stable hook in case a future condition type needs gating.
     """
-    if not has_reference:
-        return
-    gated = sorted(
-        (seen_video & {"spatial_crop", "inpaint", "extend"}) | {f"audio.{c}" for c in (seen_audio & {"extend", "inpaint"})}
-    )
-    if gated:
-        raise RuntimeError(
-            f"--ltx2_conditioning_config {path}: a 'reference' condition selects an IC-LoRA strategy "
-            f"that cannot be combined with gated intrinsic(s) {gated} in the same recipe (the reference "
-            "path builds its own conditioning/loss masks). Remove the reference or the intrinsic(s). "
-            "first_frame composes with IC-LoRA and is exempt."
-        )
+    return
 
 
 def apply_conditioning_config(args: argparse.Namespace) -> None:
@@ -483,17 +512,21 @@ def apply_conditioning_config(args: argparse.Namespace) -> None:
             )
         args.ltx2_first_frame_conditioning_p = 0.0
 
-    # Per-sample loss is a top-level loss policy (not a per-condition entry). The recipe owns it like
-    # any other dial: set from the recipe top-level 'per_sample_loss' (default False when omitted),
-    # overriding a CLI --ltx2_per_sample_loss with a warning. A recipe therefore never IMPLICITLY
-    # changes the loss reduction; per-sample loss is opt-in here exactly as it is on the command line.
-    _warn_cli_override(bool(getattr(args, "ltx2_per_sample_loss", False)), "per_sample_loss", "--ltx2_per_sample_loss")
-    ps_loss = data.get("per_sample_loss", False)
-    if not isinstance(ps_loss, bool):
-        raise RuntimeError(
-            f"--ltx2_conditioning_config {path}: top-level 'per_sample_loss' must be a boolean (true/false). Got: {ps_loss!r}"
-        )
-    args.ltx2_per_sample_loss = ps_loss
+    # Per-sample loss is a top-level loss policy (not a per-condition entry). When the recipe states
+    # 'per_sample_loss' it is AUTHORITATIVE (overriding a CLI --ltx2_per_sample_loss with a warning) and
+    # marks the choice explicit, so the automatic per-sample upgrade for active conditioning leaves it
+    # alone -- this is the escape hatch to force the batch-global denominator even under conditioning.
+    # When the key is OMITTED the recipe leaves the policy unset and per-sample renorm is enabled
+    # automatically wherever the recipe's conditioning is active (resolved in handle_model_specific_args).
+    ps_loss = data.get("per_sample_loss", None)
+    if ps_loss is not None:
+        if not isinstance(ps_loss, bool):
+            raise RuntimeError(
+                f"--ltx2_conditioning_config {path}: top-level 'per_sample_loss' must be a boolean (true/false). Got: {ps_loss!r}"
+            )
+        _warn_cli_override(bool(getattr(args, "ltx2_per_sample_loss", False)), "per_sample_loss", "--ltx2_per_sample_loss")
+        args.ltx2_per_sample_loss = ps_loss
+        setattr(args, _PER_SAMPLE_LOSS_EXPLICIT, True)
 
     setattr(args, _SENTINEL, True)
     logger.info("Applied conditioning recipe from %s: video=%s audio=%s", path, sorted(seen_video), sorted(seen_audio))

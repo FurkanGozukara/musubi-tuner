@@ -77,7 +77,7 @@ from musubi_tuner.ltx2_train_direction import (
     resolve_train_direction,
     validate_train_direction_setup,
 )
-from musubi_tuner.ltx2_conditioning import apply_conditioning_config
+from musubi_tuner.ltx2_conditioning import _PER_SAMPLE_LOSS_EXPLICIT, apply_conditioning_config
 from musubi_tuner.ltx2_av_attention_loss import (
     AVAttentionLossConfig,
     apply_av_attention_loss_weighting,
@@ -126,6 +126,48 @@ def validate_ltx2_conditioning_setup(args, accelerator=None):
     validate_train_direction_setup(args, accelerator)
 
 
+# IC-LoRA reference strategies that concatenate reference tokens (any of them makes the run conditioning).
+_REFERENCE_IC_LORA_STRATEGIES = ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic")
+
+
+def resolve_ltx2_per_sample_loss(args, ic_lora_strategy: str, train_direction: str) -> None:
+    """Choose the effective masked-loss reduction policy for an LTX-2 run.
+
+    Renormalize the masked loss per sample (each batch element weighted by its OWN active fraction)
+    whenever any conditioning is active, so heterogeneous per-sample masked fractions -- the regime
+    intrinsics/references create via their per-sample probability draws -- weight every sample equally.
+    A plain run keeps the batch-global denominator, byte-identical to the pre-conditioning path.
+
+    An explicit choice always wins: ``--ltx2_per_sample_loss`` on the CLI, or a ``per_sample_loss`` key
+    in the recipe (which can force the batch-global denominator back on even under conditioning).
+
+    first-frame conditioning at its default probability is part of the standard baseline (on by default),
+    so it does NOT by itself trigger the per-sample reducer -- triggering on it would flip every plain
+    run and break the byte-identical baseline. A first-frame-only run that wants per-sample
+    renormalization can pass ``--ltx2_per_sample_loss`` explicitly.
+
+    Must run after ``apply_conditioning_config`` and after ``ic_lora_strategy`` / ``train_direction`` are
+    resolved, and before the training loop reads ``args.ltx2_per_sample_loss``.
+    """
+    if getattr(args, _PER_SAMPLE_LOSS_EXPLICIT, False):
+        return  # recipe set 'per_sample_loss' explicitly (true or false) -> honor it
+    if bool(getattr(args, "ltx2_per_sample_loss", False)):
+        return  # set on the CLI -> already explicit
+    strategy = str(ic_lora_strategy or "none").lower()
+    conditioning_active = (
+        getattr(args, "ltx2_conditioning_config", None) is not None
+        or is_spatial_crop_enabled(args)
+        or is_inpaint_mask_enabled(args)
+        or is_extend_enabled(args)
+        or is_audio_extend_enabled(args)
+        or is_audio_inpaint_mask_enabled(args)
+        or strategy in _REFERENCE_IC_LORA_STRATEGIES
+        or str(train_direction or "joint").lower() != "joint"
+    )
+    if conditioning_active:
+        args.ltx2_per_sample_loss = True
+
+
 def _intrinsic_conditioning_metadata(args) -> Dict[str, Any]:
     """``ss_`` provenance for the EFFECTIVE intrinsic conditioning of a run.
 
@@ -152,12 +194,20 @@ def _intrinsic_conditioning_metadata(args) -> Dict[str, Any]:
         md["ss_ltx2_extend_prefix_frames"] = ext_prefix
         md["ss_ltx2_extend_suffix_frames"] = ext_suffix
         md["ss_ltx2_extend_p"] = float(getattr(args, "ltx2_extend_p", 1.0))
+        if getattr(args, "ltx2_extend_prefix_p", None) is not None:
+            md["ss_ltx2_extend_prefix_p"] = float(args.ltx2_extend_prefix_p)
+        if getattr(args, "ltx2_extend_suffix_p", None) is not None:
+            md["ss_ltx2_extend_suffix_p"] = float(args.ltx2_extend_suffix_p)
     aud_prefix = int(getattr(args, "ltx2_audio_extend_prefix_frames", 0) or 0)
     aud_suffix = int(getattr(args, "ltx2_audio_extend_suffix_frames", 0) or 0)
     if aud_prefix > 0 or aud_suffix > 0:
         md["ss_ltx2_audio_extend_prefix_frames"] = aud_prefix
         md["ss_ltx2_audio_extend_suffix_frames"] = aud_suffix
         md["ss_ltx2_audio_extend_p"] = float(getattr(args, "ltx2_audio_extend_p", 1.0))
+        if getattr(args, "ltx2_audio_extend_prefix_p", None) is not None:
+            md["ss_ltx2_audio_extend_prefix_p"] = float(args.ltx2_audio_extend_prefix_p)
+        if getattr(args, "ltx2_audio_extend_suffix_p", None) is not None:
+            md["ss_ltx2_audio_extend_suffix_p"] = float(args.ltx2_audio_extend_suffix_p)
     if bool(getattr(args, "ltx2_audio_inpaint_mask", False)):
         md["ss_ltx2_audio_inpaint_mask_p"] = float(getattr(args, "ltx2_audio_inpaint_mask_p", 0.0))
         md["ss_ltx2_audio_inpaint_mask_threshold"] = float(getattr(args, "ltx2_audio_inpaint_mask_threshold", 0.5))
@@ -171,14 +221,14 @@ def _intrinsic_conditioning_metadata(args) -> Dict[str, Any]:
     return md
 
 
-def _guide_intrinsic_overlaps(args, total_frames: int, guide_start: int, guide_len: int, ic_lora_strategy: str) -> List[str]:
+def _guide_intrinsic_overlaps(args, total_frames: int, guide_start: int, guide_len: int) -> List[str]:
     """Names of enabled video intrinsics whose conditioned frames overlap a latent_idx-guide slot.
 
     The guide latent is pasted last and owns its frame slot (it supplies the clean conditioning
     content and excludes the slot from loss for every sample), so an intrinsic that also conditions
-    those frames is silently overridden there. Used only to warn. The gates mirror the runtime ones:
-    intrinsics require ``ic_lora_strategy == 'none'``; first_frame composes with IC-LoRA, so it is
-    checked regardless.
+    those frames is silently overridden there. Used only to warn. Video intrinsics run on every
+    strategy now (they compose with the IC-LoRA reference branches), so they are checked regardless
+    of ``ic_lora_strategy``; first_frame composes with IC-LoRA too and is always checked.
     """
     g0, g1 = guide_start, guide_start + guide_len
 
@@ -188,17 +238,16 @@ def _guide_intrinsic_overlaps(args, total_frames: int, guide_start: int, guide_l
     hits: List[str] = []
     if float(getattr(args, "ltx2_first_frame_conditioning_p", 0.1) or 0.0) > 0.0 and total_frames > 0 and _overlaps(0, 1):
         hits.append("first_frame")
-    if ic_lora_strategy == "none":
-        if is_spatial_crop_enabled(args) and _overlaps(0, total_frames):
-            hits.append("spatial_crop")
-        if bool(getattr(args, "ltx2_inpaint_mask", False)) and _overlaps(0, total_frames):
-            hits.append("inpaint")
-        prefix = int(getattr(args, "ltx2_extend_prefix_frames", 0) or 0)
-        suffix = int(getattr(args, "ltx2_extend_suffix_frames", 0) or 0)
-        if prefix > 0 and _overlaps(0, min(prefix, total_frames)):
-            hits.append("extend(prefix)")
-        if suffix > 0 and _overlaps(max(0, total_frames - suffix), total_frames):
-            hits.append("extend(suffix)")
+    if is_spatial_crop_enabled(args) and _overlaps(0, total_frames):
+        hits.append("spatial_crop")
+    if bool(getattr(args, "ltx2_inpaint_mask", False)) and _overlaps(0, total_frames):
+        hits.append("inpaint")
+    prefix = int(getattr(args, "ltx2_extend_prefix_frames", 0) or 0)
+    suffix = int(getattr(args, "ltx2_extend_suffix_frames", 0) or 0)
+    if prefix > 0 and _overlaps(0, min(prefix, total_frames)):
+        hits.append("extend(prefix)")
+    if suffix > 0 and _overlaps(max(0, total_frames - suffix), total_frames):
+        hits.append("extend(suffix)")
     return hits
 
 
@@ -570,6 +619,27 @@ def _frame_mask_to_loss_mask(frame_mask: torch.Tensor, *, use_5d: bool, device: 
     return frame_loss_mask
 
 
+def _or_intrinsic_video_token_masks(
+    target_cond_mask: torch.Tensor,
+    *token_masks: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """OR the per-sample video intrinsic token masks (spatial_crop / inpaint / extend) into a
+    reference-branch target conditioning mask.
+
+    Each ``token_masks`` entry is ``[B, target_seq_len]`` bool or ``None`` (the early intrinsic
+    blocks leave it ``None`` when the feature is off or no sample was drawn). Marking a token in
+    the conditioning mask zeroes its timestep (clean conditioning) and excludes it from loss
+    (the reference branches build loss from ``~target_cond_mask``), composing intrinsics with
+    reference concatenation. No-op when every mask is ``None`` — i.e. byte-identical to a
+    reference run without intrinsics. The intrinsic clean-paste into ``model_noisy_video``
+    (which becomes the target tokens) happens earlier, before the reference patchify.
+    """
+    for _m in token_masks:
+        if _m is not None:
+            target_cond_mask = target_cond_mask | _m
+    return target_cond_mask
+
+
 def _apply_video_anchor_training(
     *,
     enabled: bool,
@@ -692,7 +762,7 @@ def _apply_audio_intrinsic_conditioning(
     ``cond_mask_bt`` is the FINAL ``[B, T]`` bool conditioning mask (the per-sample Bernoulli is already
     folded in). For the masked audio latent timesteps: paste the clean latent (``audio_latents``), zero the
     per-token audio timestep (the model reads timestep==0 as a clean conditioning token), and exclude them
-    from ``audio_loss_mask``. Mirrors the video intrinsics and upstream ``_apply_intrinsic_condition``.
+    from ``audio_loss_mask``. Mirrors the video intrinsic application.
 
     Returns ``(noisy_audio, audio_timestep, audio_loss_mask)``. No-op (inputs returned unchanged, audio
     timestep keeping its original ``[B, 1]`` shape) when the mask selects nothing, so a draw that picks no
@@ -727,16 +797,36 @@ def _maybe_apply_audio_extend(args, *, audio_latents, noisy_audio, audio_timeste
     bsz = audio_latents.shape[0]
     frames = int(audio_latents.shape[2])
     p = float(getattr(args, "ltx2_audio_extend_p", 1.0))
-    apply_per_sample = torch.rand((bsz,), device=device) < p
-    if not bool(apply_per_sample.any()):
-        return noisy_audio, audio_timestep, audio_loss_mask
-    cond_mask = build_audio_extend_token_mask(
-        frames=frames,
-        prefix=int(getattr(args, "ltx2_audio_extend_prefix_frames", 0) or 0),
-        suffix=int(getattr(args, "ltx2_audio_extend_suffix_frames", 0) or 0),
-        device=device,
-    )
-    cond_mask_bt = cond_mask.view(1, frames).expand(bsz, frames) & apply_per_sample.view(bsz, 1)
+    prefix_n = int(getattr(args, "ltx2_audio_extend_prefix_frames", 0) or 0)
+    suffix_n = int(getattr(args, "ltx2_audio_extend_suffix_frames", 0) or 0)
+    _pre_p_raw = getattr(args, "ltx2_audio_extend_prefix_p", None)
+    _suf_p_raw = getattr(args, "ltx2_audio_extend_suffix_p", None)
+    if _pre_p_raw is None and _suf_p_raw is None:
+        # Default: a single shared per-sample draw over the combined prefix+suffix span (byte-identical
+        # to the pre-split behavior; one torch.rand, one geometry mask).
+        apply_per_sample = torch.rand((bsz,), device=device) < p
+        if not bool(apply_per_sample.any()):
+            return noisy_audio, audio_timestep, audio_loss_mask
+        cond_mask = build_audio_extend_token_mask(frames=frames, prefix=prefix_n, suffix=suffix_n, device=device)
+        cond_mask_bt = cond_mask.view(1, frames).expand(bsz, frames) & apply_per_sample.view(bsz, 1)
+    else:
+        # Independent prefix/suffix draws (opt-in): a sample can get prefix-only, suffix-only, both, or
+        # neither. The unset side falls back to --ltx2_audio_extend_p.
+        _pre_p = float(_pre_p_raw) if _pre_p_raw is not None else p
+        _suf_p = float(_suf_p_raw) if _suf_p_raw is not None else p
+        cond_mask_bt = torch.zeros((bsz, frames), device=device, dtype=torch.bool)
+        for _is_prefix, _side_n, _side_p in ((True, prefix_n, _pre_p), (False, suffix_n, _suf_p)):
+            if frames <= 0 or _side_n <= 0 or _side_p <= 0.0:
+                continue
+            _apply = torch.rand((bsz,), device=device) < _side_p
+            if not bool(_apply.any()):
+                continue
+            _m = build_audio_extend_token_mask(
+                frames=frames, prefix=_side_n if _is_prefix else 0, suffix=0 if _is_prefix else _side_n, device=device
+            )
+            cond_mask_bt = cond_mask_bt | (_m.view(1, frames).expand(bsz, frames) & _apply.view(bsz, 1))
+        if not bool(cond_mask_bt.any()):
+            return noisy_audio, audio_timestep, audio_loss_mask
     return _apply_audio_intrinsic_conditioning(
         cond_mask_bt=cond_mask_bt,
         audio_latents=audio_latents,
@@ -922,7 +1012,9 @@ def _compose_audio_ref_ic_loss_mask(
             )
         audio_lengths = audio_lengths.to(device=device, dtype=torch.int64).clamp(min=0, max=target_seq_len)
         t = torch.arange(target_seq_len, device=device).view(1, -1)
-        target_audio_loss_mask = t < audio_lengths.view(-1, 1)
+        # AND (not overwrite) so a passed target mask — e.g. audio-intrinsic loss-exclusion — survives the
+        # length-mask combine. Byte-identical for the historical None default (ones & length == length).
+        target_audio_loss_mask = target_audio_loss_mask & (t < audio_lengths.view(-1, 1))
     target_audio_loss_mask = _combine_loss_masks(target_audio_loss_mask, cached_audio_loss_mask)
     ref_audio_loss_mask = torch.zeros(
         (batch_size, ref_seq_len),
@@ -3460,6 +3552,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         validate_ltx2_conditioning_setup(args)
         self._train_direction = resolve_train_direction(args)
         self._frozen_modality = frozen_modality_for_direction(self._train_direction)
+        # Match the conditioning loss reduction to the official per-sample renormalization whenever any
+        # conditioning is active; a plain run keeps the batch-global denominator (byte-identical path).
+        resolve_ltx2_per_sample_loss(args, self._ic_lora_strategy, self._train_direction)
         args.av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
         args.av_multi_ref = bool(getattr(args, "av_multi_ref", False))
         args.audio_ref_use_negative_positions = bool(getattr(args, "audio_ref_use_negative_positions", False))
@@ -4723,7 +4818,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # since there are no subsequent frames to generate from frame 0
         num_frames = latents.shape[2]
         if first_frame_p > 0.0 and num_frames > 1:
-            # Per-sample Bernoulli (matches the official LTX-2 recipe): each sample is
+            # Per-sample Bernoulli: each sample is
             # independently conditioned, so a batch mixes conditioned/unconditioned items
             # instead of toggling all-or-nothing. Downstream indexing already supports a
             # per-sample boolean mask. Collapse to None when nothing is selected so the
@@ -4756,11 +4851,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # AV-list re-sync is needed.
         sc_token_mask = None  # [B, seq_len] bool, OR-merged after the anchor block
         sc_region_5d = None  # [B, 1, F, H, W] bool, drives clean-paste + loss
-        # Defensive: spatial-crop targets the standard path only. The IC-LoRA branches build
-        # their own masks and return early; engaging it there would feed clean latents without
-        # loss exclusion. validate_intrinsic_cond_setup hard-errors on this combo at startup;
-        # this gate degrades to off if that guard is ever bypassed.
-        if is_spatial_crop_enabled(args) and self._ic_lora_strategy == "none":
+        # The clean-paste below lands in model_noisy_video, which becomes the target tokens on
+        # every path: the standard ("none") path OR-merges sc_token_mask into the per-token
+        # conditioning mask after the anchor block, and the IC-LoRA reference branches OR it into
+        # their target conditioning mask before concatenating the reference. So spatial-crop
+        # composes with reference strategies too (intrinsic first, reference in front).
+        if is_spatial_crop_enabled(args):
             sc_regions = batch.get("spatial_crop_region") if isinstance(batch, dict) else None
             sc_prob = float(getattr(args, "ltx2_spatial_crop_p", 0.0) or 0.0)
             sc_invert = bool(getattr(args, "ltx2_spatial_crop_invert", False))
@@ -4828,10 +4924,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # cached mask stays a standard loss weight => byte-identical to main. Computed from args (not
         # the per-sample draw) so the mask's role is consistent across batches.
         im_live = is_inpaint_mask_enabled(args) and float(getattr(args, "ltx2_inpaint_mask_p", 0.0) or 0.0) > 0.0
-        # Defensive: targets the standard (non-IC-LoRA) path only; the IC-LoRA branches build their
-        # own masks and return early. validate_inpaint_mask_setup hard-errors on that combo at
-        # startup; this gate degrades to off if that guard is ever bypassed.
-        if is_inpaint_mask_enabled(args) and self._ic_lora_strategy == "none":
+        # Composes with reference strategies: the clean-paste lands in model_noisy_video (the target
+        # tokens on every path), the standard path OR-merges im_token_mask after the anchor block,
+        # and the IC-LoRA reference branches OR it into their target conditioning mask. When inpaint
+        # is live the cached mask is the CONDITIONING source, so its loss-weight consumption is
+        # suppressed on every path (standard path + each reference branch) via `im_live`.
+        if is_inpaint_mask_enabled(args):
             im_src = batch.get("video_loss_mask") if isinstance(batch, dict) else None
             im_p = float(getattr(args, "ltx2_inpaint_mask_p", 0.0) or 0.0)
             im_invert = bool(getattr(args, "ltx2_inpaint_mask_invert", False))
@@ -4895,43 +4993,82 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # dataset, no cache) and kept clean so the model learns to extend the clip forward/backward.
         ext_token_mask = None  # [B, seq_len] bool, OR-merged after the anchor block
         ext_region_5d = None  # [B, 1, F, H, W] bool, drives clean-paste + loss
-        if is_extend_enabled(args) and self._ic_lora_strategy == "none":
+        # Composes with reference strategies (same funnel as spatial-crop / inpaint): the clean-paste
+        # lands in model_noisy_video, and ext_token_mask is OR-merged into the per-token conditioning
+        # mask on the standard path or into the reference branches' target conditioning mask.
+        if is_extend_enabled(args):
             ext_prefix = int(getattr(args, "ltx2_extend_prefix_frames", 0) or 0)
             ext_suffix = int(getattr(args, "ltx2_extend_suffix_frames", 0) or 0)
             ext_p = float(getattr(args, "ltx2_extend_p", 1.0) or 0.0)
+            _ext_prefix_p_raw = getattr(args, "ltx2_extend_prefix_p", None)
+            _ext_suffix_p_raw = getattr(args, "ltx2_extend_suffix_p", None)
+            _ext_independent = _ext_prefix_p_raw is not None or _ext_suffix_p_raw is not None
             bsz_ex, _c_ex, frames_ex, height_ex, width_ex = latents.shape
             patch_size_ex = 1
-            if ext_p > 0.0 and frames_ex > 0 and (ext_prefix > 0 or ext_suffix > 0):
-                apply_ex = torch.rand((bsz_ex,), device=accelerator.device) < ext_p
+            H_tok_ex = height_ex // patch_size_ex
+            W_tok_ex = width_ex // patch_size_ex
+            seq_len_ex = frames_ex * H_tok_ex * W_tok_ex
+            if not _ext_independent:
+                # Default: a single shared per-sample draw over the combined prefix+suffix span
+                # (byte-identical to the pre-split behavior; one torch.rand, one geometry mask).
+                if ext_p > 0.0 and frames_ex > 0 and (ext_prefix > 0 or ext_suffix > 0):
+                    apply_ex = torch.rand((bsz_ex,), device=accelerator.device) < ext_p
+                else:
+                    apply_ex = torch.zeros((bsz_ex,), device=accelerator.device, dtype=torch.bool)
+                if bool(apply_ex.any()):
+                    # The prefix/suffix span is geometry-only (identical for every applied row); build
+                    # once, then assign to the apply-selected rows (un-applied rows stay all-False).
+                    _tok_ex, _reg_ex = build_extend_token_mask(
+                        frames=frames_ex,
+                        height=height_ex,
+                        width=width_ex,
+                        patch_size=patch_size_ex,
+                        prefix=ext_prefix,
+                        suffix=ext_suffix,
+                        device=accelerator.device,
+                    )
+                    ext_token_mask = torch.zeros((bsz_ex, seq_len_ex), device=accelerator.device, dtype=torch.bool)
+                    ext_region_5d = torch.zeros(
+                        (bsz_ex, 1, frames_ex, H_tok_ex, W_tok_ex), device=accelerator.device, dtype=torch.bool
+                    )
+                    for _b in range(bsz_ex):
+                        if not bool(apply_ex[_b]):
+                            continue
+                        ext_token_mask[_b] = _tok_ex
+                        ext_region_5d[_b] = _reg_ex
             else:
-                apply_ex = torch.zeros((bsz_ex,), device=accelerator.device, dtype=torch.bool)
-            if bool(apply_ex.any()):
-                H_tok_ex = height_ex // patch_size_ex
-                W_tok_ex = width_ex // patch_size_ex
-                seq_len_ex = frames_ex * H_tok_ex * W_tok_ex
-                # The prefix/suffix span is geometry-only (identical for every applied row); build
-                # once, then assign to the apply-selected rows (un-applied rows stay all-False).
-                _tok_ex, _reg_ex = build_extend_token_mask(
-                    frames=frames_ex,
-                    height=height_ex,
-                    width=width_ex,
-                    patch_size=patch_size_ex,
-                    prefix=ext_prefix,
-                    suffix=ext_suffix,
-                    device=accelerator.device,
-                )
+                # Independent prefix/suffix draws (opt-in): a sample can get prefix-only, suffix-only,
+                # both, or neither. The unset side falls back to --ltx2_extend_p. Each side is its own
+                # geometry mask OR-merged per sample.
+                _pre_p = float(_ext_prefix_p_raw) if _ext_prefix_p_raw is not None else ext_p
+                _suf_p = float(_ext_suffix_p_raw) if _ext_suffix_p_raw is not None else ext_p
                 ext_token_mask = torch.zeros((bsz_ex, seq_len_ex), device=accelerator.device, dtype=torch.bool)
                 ext_region_5d = torch.zeros((bsz_ex, 1, frames_ex, H_tok_ex, W_tok_ex), device=accelerator.device, dtype=torch.bool)
-                for _b in range(bsz_ex):
-                    if not bool(apply_ex[_b]):
+                for _is_prefix, _side_n, _side_p in ((True, ext_prefix, _pre_p), (False, ext_suffix, _suf_p)):
+                    if frames_ex <= 0 or _side_n <= 0 or _side_p <= 0.0:
                         continue
-                    ext_token_mask[_b] = _tok_ex
-                    ext_region_5d[_b] = _reg_ex
-                # Clean-paste the target's own prefix/suffix frames. torch.where returns a fresh
-                # tensor (no in-place mutation), so no clone is needed even when composing.
-                if bool(ext_region_5d.any()):
-                    _paste_ex = ext_region_5d.expand(-1, model_noisy_video.shape[1], -1, -1, -1)
-                    model_noisy_video = torch.where(_paste_ex, latents, model_noisy_video)
+                    _apply = torch.rand((bsz_ex,), device=accelerator.device) < _side_p
+                    if not bool(_apply.any()):
+                        continue
+                    _tok_s, _reg_s = build_extend_token_mask(
+                        frames=frames_ex,
+                        height=height_ex,
+                        width=width_ex,
+                        patch_size=patch_size_ex,
+                        prefix=_side_n if _is_prefix else 0,
+                        suffix=0 if _is_prefix else _side_n,
+                        device=accelerator.device,
+                    )
+                    for _b in range(bsz_ex):
+                        if not bool(_apply[_b]):
+                            continue
+                        ext_token_mask[_b] = ext_token_mask[_b] | _tok_s
+                        ext_region_5d[_b] = ext_region_5d[_b] | _reg_s
+            # Clean-paste the target's own prefix/suffix frames. torch.where returns a fresh
+            # tensor (no in-place mutation), so no clone is needed even when composing.
+            if ext_region_5d is not None and bool(ext_region_5d.any()):
+                _paste_ex = ext_region_5d.expand(-1, model_noisy_video.shape[1], -1, -1, -1)
+                model_noisy_video = torch.where(_paste_ex, latents, model_noisy_video)
         # --- end video extension selection + clean-paste ---
 
         # Apply latent_idx guides to model_noisy_video before the IC-LoRA branches
@@ -4970,7 +5107,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 model_noisy_video[:, :, _gfi : _gfi + gT, :, :] = _gl
                 latent_idx_guide_slot = (_gfi, gT)
                 if not getattr(self, "_warned_guide_intrinsic_overlap", False):
-                    _overlaps = _guide_intrinsic_overlaps(args, frames_g, _gfi, gT, self._ic_lora_strategy)
+                    _overlaps = _guide_intrinsic_overlaps(args, frames_g, _gfi, gT)
                     if _overlaps:
                         self._warned_guide_intrinsic_overlap = True
                         logger.warning(
@@ -5095,6 +5232,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     tokens_per_frame=_tokens_per_frame,
                     device=accelerator.device,
                 )
+            # Compose video intrinsics (spatial_crop / inpaint / extend) onto the target side: the
+            # clean latents were already pasted into model_noisy_video (so they ride the target
+            # tokens), and OR-ing the token masks here zeroes their timesteps and excludes them from
+            # the target loss (target_loss_mask = ~target_conditioning_mask below).
+            target_conditioning_mask = _or_intrinsic_video_token_masks(
+                target_conditioning_mask, sc_token_mask, im_token_mask, ext_token_mask
+            )
             conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
             combined_timesteps = sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
@@ -5230,7 +5374,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             target_pred_tokens = pred_tokens[:, ref_seq_len : ref_seq_len + target_seq_len, :]
             target_velocity = patchifier.patchify(noise - latents)
             target_loss_mask = ~target_conditioning_mask
-            target_loss_mask = _combine_loss_masks(target_loss_mask, _cached_video_loss_mask(as_tokens=True))
+            # When inpaint is live the cached video_loss_mask is consumed as the inpaint CONDITIONING
+            # source (im_token_mask above), not a loss weight — the conventions are opposite, so
+            # combining it here would also zero the generated region's loss. Mirrors the standard path.
+            if not im_live:
+                target_loss_mask = _combine_loss_masks(target_loss_mask, _cached_video_loss_mask(as_tokens=True))
 
             out_v2v: Dict[str, Any] = {
                 "video_pred": target_pred_tokens,
@@ -5279,6 +5427,34 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             av_ic_sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             av_ic_noisy_audio = (1.0 - av_ic_sigma_audio) * av_ic_audio_latents + av_ic_sigma_audio * av_ic_audio_noise
             av_ic_audio_target_raw = av_ic_audio_noise - av_ic_audio_latents  # velocity target
+
+            # --- Audio intrinsic conditioning (extend / inpaint) composes with av_ic ---
+            # Clean-paste the conditioned audio timesteps into the target, zero their per-token timestep,
+            # and exclude them from the audio loss; the audio reference is still concatenated in front
+            # below (intrinsic-then-reference, mirroring the video side). No-op + byte-identical (no RNG)
+            # when no audio intrinsic is enabled: the helpers return their inputs unchanged, so
+            # av_ic_audio_ts stays == audio_model_timesteps and av_ic_audio_loss_mask stays all-True.
+            _av_ic_audio_bsz = int(av_ic_audio_latents.shape[0])
+            _av_ic_audio_frames = int(av_ic_audio_latents.shape[2])
+            av_ic_audio_ts = audio_model_timesteps
+            av_ic_audio_loss_mask = torch.ones((_av_ic_audio_bsz, _av_ic_audio_frames), device=accelerator.device, dtype=torch.bool)
+            av_ic_noisy_audio, av_ic_audio_ts, av_ic_audio_loss_mask = _maybe_apply_audio_extend(
+                args,
+                audio_latents=av_ic_audio_latents,
+                noisy_audio=av_ic_noisy_audio,
+                audio_timestep=av_ic_audio_ts,
+                audio_loss_mask=av_ic_audio_loss_mask,
+                device=accelerator.device,
+            )
+            av_ic_noisy_audio, av_ic_audio_ts, av_ic_audio_loss_mask = _maybe_apply_audio_inpaint(
+                args,
+                audio_cond_mask_raw=batch.get("audio_cond_mask"),
+                audio_latents=av_ic_audio_latents,
+                noisy_audio=av_ic_noisy_audio,
+                audio_timestep=av_ic_audio_ts,
+                audio_loss_mask=av_ic_audio_loss_mask,
+                device=accelerator.device,
+            )
 
             # --- Audio reference latents: retrieve & validate ---
             av_ic_ref_audio = _merge_reference_tensors(
@@ -5332,6 +5508,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     tokens_per_frame=_tokens_per_frame,
                     device=accelerator.device,
                 )
+            # Compose video intrinsics (spatial_crop / inpaint / extend) onto the target side; the
+            # clean latents already ride the target tokens (pasted into model_noisy_video), and the
+            # OR zeroes their timesteps and excludes them from the video loss (~tgt_video_cond_mask).
+            tgt_video_cond_mask = _or_intrinsic_video_token_masks(tgt_video_cond_mask, sc_token_mask, im_token_mask, ext_token_mask)
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -5462,11 +5642,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ref_audio_seq_len = ref_audio_tokens.shape[1]
             tgt_audio_seq_len = tgt_audio_tokens.shape[1]
 
-            # Audio timesteps: ref=0, target=audio_sigma
+            # Audio timesteps: ref=0, target=audio_sigma (intrinsic-conditioned target timesteps are 0
+            # via av_ic_audio_ts; == audio_model_timesteps when no audio intrinsic is active).
             tgt_audio_ts = (
-                audio_model_timesteps
-                if audio_model_timesteps.shape[1] == tgt_audio_seq_len
-                else audio_model_timesteps[:, :1].expand(bsz, tgt_audio_seq_len)
+                av_ic_audio_ts
+                if av_ic_audio_ts.shape[1] == tgt_audio_seq_len
+                else av_ic_audio_ts[:, :1].expand(bsz, tgt_audio_seq_len)
             )
             ref_audio_ts = torch.zeros((bsz, ref_audio_seq_len), device=accelerator.device, dtype=network_dtype)
             audio_combined_ts = torch.cat([ref_audio_ts, tgt_audio_ts], dim=1)
@@ -5595,12 +5776,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_velocity = video_patchifier.patchify(noise - latents)
             audio_velocity = audio_patchifier.patchify(av_ic_audio_target_raw)
 
-            video_loss_mask = _combine_loss_masks(
-                ~tgt_video_cond_mask,
-                _cached_video_loss_mask(as_tokens=True),
-            )
+            video_loss_mask = ~tgt_video_cond_mask
+            # When inpaint is live the cached video_loss_mask is the inpaint CONDITIONING source, not
+            # a loss weight (conventions are opposite); skip combining it. Mirrors the standard path.
+            if not im_live:
+                video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=True))
             audio_loss_mask = _compose_target_audio_loss_mask(
-                None,
+                av_ic_audio_loss_mask,  # excludes intrinsic-conditioned audio timesteps (all-True when off)
                 _cached_audio_loss_mask(tgt_audio_seq_len, bsz),
                 batch_size=bsz,
                 target_seq_len=tgt_audio_seq_len,
@@ -5980,6 +6162,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     tokens_per_frame=_tokens_per_frame,
                     device=accelerator.device,
                 )
+            # Compose video intrinsics (spatial_crop / inpaint / extend) onto the target side; the
+            # clean latents already ride the target tokens (pasted into model_noisy_video), and the
+            # OR zeroes their timesteps and excludes them from the video loss (~tgt_video_cond_mask).
+            tgt_video_cond_mask = _or_intrinsic_video_token_masks(tgt_video_cond_mask, sc_token_mask, im_token_mask, ext_token_mask)
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -6104,10 +6290,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             target_audio_tokens = audio_patchifier.patchify(noisy_audio)
             tgt_audio_seq_len = target_audio_tokens.shape[1]
+            # Use the intrinsic-aware timestep: _maybe_apply_audio_extend/inpaint (run in the AV block
+            # above) zero the conditioned audio timesteps in audio_timestep_for_model and clean-paste
+            # them into noisy_audio. When no audio intrinsic is active audio_timestep_for_model is just
+            # audio_model_timesteps, so this is byte-identical off-path.
+            _tgt_audio_ts_src = audio_timestep_for_model if audio_timestep_for_model is not None else audio_model_timesteps
             target_audio_ts = (
-                audio_model_timesteps
-                if audio_model_timesteps.shape[1] == tgt_audio_seq_len
-                else audio_model_timesteps[:, :1].expand(bsz, tgt_audio_seq_len)
+                _tgt_audio_ts_src
+                if _tgt_audio_ts_src.shape[1] == tgt_audio_seq_len
+                else _tgt_audio_ts_src[:, :1].expand(bsz, tgt_audio_seq_len)
             )
             channels_audio = int(audio_latents.shape[1])
             mel_bins = int(audio_latents.shape[3])
@@ -6212,10 +6403,16 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
             )
 
+            video_loss_mask = ~tgt_video_cond_mask
+            # When inpaint is live the cached video_loss_mask is the inpaint CONDITIONING source, not
+            # a loss weight (conventions are opposite); skip combining it. Mirrors the standard path.
+            if not im_live:
+                video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=True))
+
             out_video_ref_av: Dict[str, Any] = {
                 "video_pred": target_video_pred,
                 "video_target": video_velocity,
-                "video_loss_mask": _combine_loss_masks(~tgt_video_cond_mask, _cached_video_loss_mask(as_tokens=True)),
+                "video_loss_mask": video_loss_mask,
                 "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
                 "audio_pred": target_audio_pred,
                 "audio_target": audio_velocity,

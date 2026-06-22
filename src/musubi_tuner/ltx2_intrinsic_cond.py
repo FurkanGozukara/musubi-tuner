@@ -86,17 +86,10 @@ def validate_intrinsic_cond_setup(args: argparse.Namespace, accelerator=None) ->
     p = float(getattr(args, "ltx2_spatial_crop_p", 0.0) or 0.0)
     if not (0.0 <= p <= 1.0):
         raise RuntimeError(f"--ltx2_spatial_crop_p must be in [0, 1]. Got: {p}")
-    # Spatial-crop targets the standard (non-IC-LoRA) training path. The IC-LoRA
-    # reference branches (v2v / av_ic / video_ref_only_av / audio_ref_ic) build their own
-    # conditioning + loss masks and return before the spatial-crop mask is applied, so the
-    # region would be fed as clean latents without being excluded from loss. Block the
-    # combination. (args.ic_lora_strategy is already resolved by handle_model_specific_args.)
-    ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-    if ic_strategy in ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic"):
-        raise RuntimeError(
-            f"--ltx2_spatial_crop is not supported together with --ic_lora_strategy {ic_strategy} "
-            "(the IC-LoRA reference path builds its own conditioning/loss masks). Disable one of them."
-        )
+    # Spatial-crop composes with the IC-LoRA reference strategies: the clean-latent paste rides the
+    # target video tokens, and the per-token mask is OR-merged into each reference branch's target
+    # conditioning mask (timestep 0 + loss exclusion), the same way it feeds the standard path. No
+    # strategy restriction.
 
 
 def build_spatial_token_mask(

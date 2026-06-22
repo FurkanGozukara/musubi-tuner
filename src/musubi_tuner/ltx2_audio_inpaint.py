@@ -67,15 +67,22 @@ def is_audio_inpaint_mask_enabled(args: argparse.Namespace) -> bool:
 def validate_audio_inpaint_mask_setup(args: argparse.Namespace, accelerator=None) -> None:
     """Raise on incompatible audio inpaint-mask setup. No-op when disabled.
 
-    MUST run AFTER ltx_mode normalization and after ``args.ic_lora_strategy`` is resolved.
-    Hard errors: video-only mode (no audio latents to condition); out-of-range probability or threshold;
-    IC-LoRA reference strategies (they build their own conditioning/loss masks).
+    MUST run AFTER ltx_mode normalization. Hard errors: video-only mode (no audio latents to
+    condition); out-of-range probability or threshold. Composes with the audio-bearing IC-LoRA
+    reference strategies (av_ic / video_ref_only_av / audio_ref_ic): the masked audio timesteps are
+    clean-pasted into the generated audio target and excluded from the audio loss, with the audio
+    reference (if any) concatenated in front.
     """
     if not is_audio_inpaint_mask_enabled(args):
         return
     mode = str(getattr(args, "ltx_mode", "video") or "video").lower()
     if mode == "video":
         raise RuntimeError("--ltx2_audio_inpaint_mask requires an audio-bearing mode (got --ltx2_mode video).")
+    # v2v is the video-only reference strategy: it has no audio target, so an audio intrinsic would be
+    # silently ignored. The audio-bearing reference strategies (av_ic / video_ref_only_av / audio_ref_ic)
+    # do compose and are allowed. (Reachable only via raw CLI flags; a recipe never derives v2v with audio.)
+    if str(getattr(args, "ic_lora_strategy", "none") or "none").lower() == "v2v":
+        raise RuntimeError("--ltx2_audio_inpaint_mask has no effect with --ic_lora_strategy v2v (video-only; no audio target).")
     p = float(getattr(args, "ltx2_audio_inpaint_mask_p", 0.0) or 0.0)
     if not (0.0 <= p <= 1.0):
         raise RuntimeError(f"--ltx2_audio_inpaint_mask_p must be in [0, 1]. Got: {p}")
@@ -87,12 +94,10 @@ def validate_audio_inpaint_mask_setup(args: argparse.Namespace, accelerator=None
     threshold = float(getattr(args, "ltx2_audio_inpaint_mask_threshold", 0.5))
     if not (0.0 <= threshold <= 1.0):
         raise RuntimeError(f"--ltx2_audio_inpaint_mask_threshold must be in [0, 1]. Got: {threshold}")
-    ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-    if ic_strategy in ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic"):
-        raise RuntimeError(
-            f"--ltx2_audio_inpaint_mask is not supported together with --ic_lora_strategy {ic_strategy} "
-            "(the IC-LoRA reference path builds its own conditioning/loss masks). Disable one of them."
-        )
+    # Audio inpaint composes with the audio-bearing IC-LoRA reference strategies (av_ic /
+    # video_ref_only_av / audio_ref_ic): the masked audio timesteps are clean-pasted into the generated
+    # audio target and excluded from the audio loss, with the audio reference (if any) concatenated in
+    # front. v2v is video-only and already rejected by the audio-bearing-mode check above.
 
 
 def build_audio_inpaint_token_mask(

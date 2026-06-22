@@ -46,7 +46,23 @@ def add_ltx2_audio_extend_args(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ltx2_audio_extend_p",
         type=float,
         default=1.0,
-        help="per-sample Bernoulli probability of applying audio-extension conditioning when enabled. Default 1.0 (always).",
+        help="per-sample Bernoulli probability of applying audio-extension conditioning when enabled. Default 1.0 (always). "
+        "Shared by prefix and suffix in a single draw unless --ltx2_audio_extend_prefix_p / --ltx2_audio_extend_suffix_p are set.",
+    )
+    parser.add_argument(
+        "--ltx2_audio_extend_prefix_p",
+        type=float,
+        default=None,
+        help="opt-in: per-sample probability for the audio PREFIX span, drawn independently of the suffix. When either "
+        "this or --ltx2_audio_extend_suffix_p is set, prefix and suffix use independent draws; the unset side falls "
+        "back to --ltx2_audio_extend_p. Default unset (single shared draw).",
+    )
+    parser.add_argument(
+        "--ltx2_audio_extend_suffix_p",
+        type=float,
+        default=None,
+        help="opt-in: per-sample probability for the audio SUFFIX span, drawn independently of the prefix. See "
+        "--ltx2_audio_extend_prefix_p. Default unset (single shared draw).",
     )
     return parser
 
@@ -61,15 +77,22 @@ def is_audio_extend_enabled(args: argparse.Namespace) -> bool:
 def validate_audio_extend_setup(args: argparse.Namespace, accelerator=None) -> None:
     """Raise on incompatible audio-extension setup. No-op when disabled.
 
-    MUST run AFTER ltx_mode normalization and after ``args.ic_lora_strategy`` is resolved.
-    Hard errors: video-only mode (no audio latents to extend); negative spans; out-of-range
-    probability; IC-LoRA reference strategies (they build their own conditioning/loss masks).
+    MUST run AFTER ltx_mode normalization. Hard errors: video-only mode (no audio latents to
+    extend); negative spans; out-of-range probability. Composes with the audio-bearing IC-LoRA
+    reference strategies (av_ic / video_ref_only_av / audio_ref_ic): the conditioned audio timesteps
+    are clean-pasted into the generated audio target and excluded from the audio loss, with the audio
+    reference (if any) concatenated in front.
     """
     if not is_audio_extend_enabled(args):
         return
     mode = str(getattr(args, "ltx_mode", "video") or "video").lower()
     if mode == "video":
         raise RuntimeError("--ltx2_audio_extend_* requires an audio-bearing mode (got --ltx2_mode video).")
+    # v2v is the video-only reference strategy: it has no audio target, so an audio intrinsic would be
+    # silently ignored. The audio-bearing reference strategies (av_ic / video_ref_only_av / audio_ref_ic)
+    # do compose and are allowed. (Reachable only via raw CLI flags; a recipe never derives v2v with audio.)
+    if str(getattr(args, "ic_lora_strategy", "none") or "none").lower() == "v2v":
+        raise RuntimeError("--ltx2_audio_extend_* has no effect with --ic_lora_strategy v2v (video-only; no audio target).")
     prefix = int(getattr(args, "ltx2_audio_extend_prefix_frames", 0) or 0)
     suffix = int(getattr(args, "ltx2_audio_extend_suffix_frames", 0) or 0)
     if prefix < 0 or suffix < 0:
@@ -77,12 +100,15 @@ def validate_audio_extend_setup(args: argparse.Namespace, accelerator=None) -> N
     p = float(getattr(args, "ltx2_audio_extend_p", 1.0) or 0.0)
     if not (0.0 <= p <= 1.0):
         raise RuntimeError(f"--ltx2_audio_extend_p must be in [0, 1]. Got: {p}")
-    ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-    if ic_strategy in ("v2v", "av_ic", "video_ref_only_av", "audio_ref_ic"):
-        raise RuntimeError(
-            f"--ltx2_audio_extend_* is not supported together with --ic_lora_strategy {ic_strategy} "
-            "(the IC-LoRA reference path builds its own conditioning/loss masks). Disable one of them."
-        )
+    for _name in ("ltx2_audio_extend_prefix_p", "ltx2_audio_extend_suffix_p"):
+        _v = getattr(args, _name, None)
+        if _v is not None and not (0.0 <= float(_v) <= 1.0):
+            raise RuntimeError(f"--{_name} must be in [0, 1]. Got: {_v}")
+    # Audio extension composes with the audio-bearing IC-LoRA reference strategies (av_ic /
+    # video_ref_only_av / audio_ref_ic): the prefix/suffix audio timesteps are clean-pasted into the
+    # generated audio target and OR'd into the audio loss-exclusion, with the audio reference (if any)
+    # concatenated in front. v2v is video-only and is already rejected by the audio-bearing-mode check
+    # above, so no strategy restriction is needed here.
 
 
 def build_audio_extend_token_mask(

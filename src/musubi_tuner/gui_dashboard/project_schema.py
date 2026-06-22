@@ -701,11 +701,18 @@ class TrainingConfig(BaseModel):
     ltx2_extend_prefix_frames: int = 0
     ltx2_extend_suffix_frames: int = 0
     ltx2_extend_probability: float = 1.0
+    # Optional independent per-side probabilities. When either is set the prefix and suffix are drawn
+    # independently (a sample can get prefix-only / suffix-only / both / neither); the unset side falls
+    # back to the shared probability. Leave blank (None) for a single shared draw.
+    ltx2_extend_prefix_p: Optional[float] = None
+    ltx2_extend_suffix_p: Optional[float] = None
     # Audio extension conditioning (audio analog of the video extension above; requires an
     # audio-bearing mode). First/last N audio latent timesteps kept clean (auto-derived).
     ltx2_audio_extend_prefix_frames: int = 0
     ltx2_audio_extend_suffix_frames: int = 0
     ltx2_audio_extend_probability: float = 1.0
+    ltx2_audio_extend_prefix_p: Optional[float] = None
+    ltx2_audio_extend_suffix_p: Optional[float] = None
     # Directional training mode (requires --ltx2_mode av). "joint" = normal joint AV (default);
     # "a2v" freezes audio and generates video; "v2a" freezes video and generates audio (foley).
     ltx2_train_direction: str = "joint"
