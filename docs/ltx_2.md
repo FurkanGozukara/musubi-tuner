@@ -50,6 +50,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Training Your First LoRA](#training-your-first-lora)
     - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
     - [Standard LoRA Training](#standard-lora-training)
+    - [Audio-Only Training](#audio-only-training)
 - [Part II — Core Workflows](#part-ii--core-workflows)
   - [Sampling, Checkpoints & Resuming](#sampling-checkpoints--resuming)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
@@ -103,7 +104,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Per-Module LoRA Rank](#per-module-lora-rank)
     - [Adaptive LoRA Rank](#adaptive-lora-rank)
     - [Per-Module LoRA Dropout](#per-module-lora-dropout)
-    - [Standalone Inference Overrides](#standalone-inference-overrides)
+    - [Standalone Inference](#standalone-inference)
     - [Audio Quality Metrics](#audio-quality-metrics)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
@@ -142,7 +143,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
       - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
     - [Directional Training (A2V / V2A)](#directional-training-a2v--v2a)
     - [Latent Guides](#latent-guides)
-      - [Dataset Config Options](#dataset-config-options-2)
+      - [Dataset Config Options](#latent-guide-dataset-config-options)
       - [IC-LoRA Compatibility Matrix](#ic-lora-compatibility-matrix)
       - [Endpoint Keyframe Training](#endpoint-keyframe-training)
       - [Video Anchor Training](#video-anchor-training)
@@ -168,7 +169,6 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Tips](#tips-1)
     - [Writing a custom reward](#writing-a-custom-reward)
   - [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning)
-    - [Full-Parameter Fine-Tuning Overview](#full-parameter-fine-tuning-overview)
     - [Dataset Preparation](#dataset-preparation)
     - [Dense bf16 (Adafactor)](#dense-bf16-adafactor)
     - [BAdam Block-Coordinate](#badam-block-coordinate)
@@ -199,14 +199,11 @@ For a Windows-focused community setup example for this fork (tested environment 
 The PyTorch install command must use a CUDA version compatible with your GPU. Adjust the `--index-url` accordingly:
 
 ```bash
-# Default (most GPUs, including RTX 30xx/40xx):
-pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-
-# RTX 5090 / 50xx series (Blackwell):
+# Most GPUs — RTX 30xx / 40xx / 50xx (matches the installer default, cu128):
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
+RTX 50xx (Blackwell) requires cu128 on Windows; cu126 is not supported on those GPUs. Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
 
 ### Downloading Required Models
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -244,7 +241,7 @@ A minimal end-to-end run. Each step links to its full reference.
 3. **Cache latents**: run `ltx2_cache_latents.py` over the dataset — see [Caching Latents](#caching-latents).
 4. **Cache text encoder outputs**: run `ltx2_cache_text_encoder_outputs.py` — see [Caching Text Encoder Outputs](#caching-text-encoder-outputs).
 5. **Train**: launch `ltx2_train_network.py` with the standard LoRA command — see [Training Your First LoRA](#training-your-first-lora).
-6. **Sample** during or after training — see [Sampling, Checkpoints & Resuming](#sampling-checkpoints--resuming).
+6. **Sample** during training, or run your finished LoRA standalone — see [Sampling, Checkpoints & Resuming](#sampling-checkpoints--resuming) and [Standalone Inference](#standalone-inference).
 
 Everything beyond a basic LoRA run — quantization, optimizers, regularizers, conditioning (IC-LoRA, latent guides), sliders, RL, and full-parameter fine-tuning — is in [Part III — Advanced](#part-iii--advanced).
 
@@ -471,6 +468,7 @@ python ltx2_cache_latents.py ^
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
+- `--audio_only_sequence_resolution`: Virtual square pixel resolution used to derive the audio-only sequence length for `shifted_logit_normal` timestep sampling in `--ltx2_mode audio` (default: `64`; set `0` to use the cached virtual geometry instead). See [Timestep Sampling](#timestep-sampling).
 - `--audio_only_target_resolution`: Optional square override for audio-only latent geometry. Only takes effect when `--audio_only_sequence_resolution 0`; otherwise the fixed sequence resolution is used instead.
 - `--audio_only_target_fps`: Target FPS used to derive audio-only frame counts from audio duration (default: `25`).
 - `--audio_video_latent_channels`: Optional override for audio-only video latent channels (auto-detected from checkpoint by default).
@@ -667,9 +665,16 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --sample_vae_temporal_tile_size 48 ^
   --sample_vae_temporal_tile_overlap 8 ^
   --sample_merge_audio ^
+  --max_train_steps 2000 ^
+  --save_every_n_epochs 5 ^
+  --save_last_n_epochs 5 ^
+  --save_state ^
+  --save_state_on_train_end ^
   --output_dir output ^
   --output_name ltx23_lora
 ```
+
+`--max_train_steps` sets the run length (otherwise it defaults to 1600). `--save_every_n_epochs` writes intermediate checkpoints; `--save_state` (with `--save_state_on_train_end`) additionally writes resumable training state so a run can continue with `--resume` — see [Resuming Training](#resuming-training). To run the finished LoRA on its own afterwards, see [Standalone Inference](#standalone-inference).
 
 Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) are supported — `--fp8_base --fp8_scaled` works the same as with standard checkpoints (weights are dequantized to bf16 first, then re-quantized).
 
@@ -679,15 +684,29 @@ For LTX-2 checkpoints, replace:
 
 > For DoRA, LyCORIS, quantization, optimizers, per-module settings, regularizers, conditioning (IC-LoRA / latent guides), and every other option, see [Part III — Advanced](#part-iii--advanced).
 
+### Audio-Only Training
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Audio-only training fits a LoRA on an audio-only dataset — the model generates audio with no video target. The flow mirrors standard LoRA training with `--ltx2_mode audio` end to end:
+
+1. **Dataset**: build an audio-only dataset — see [Audio Dataset Options](#audio-dataset-options).
+2. **Cache latents**: run `ltx2_cache_latents.py` with `--ltx2_mode audio` (and `--ltx2_checkpoint`, which is required in audio mode). The audio-only sequence length used for timestep sampling comes from `--audio_only_sequence_resolution` (default `64`) — see [Caching Latents](#caching-latents).
+3. **Cache text encoder outputs**: same as any run — see [Caching Text Encoder Outputs](#caching-text-encoder-outputs).
+4. **Train**: use the [Standard LoRA](#standard-lora-training) command with `--ltx2_mode audio` instead of `av`. Select the audio modules with `--lora_target_preset` — see [LoRA Targets](#lora-targets) — and tune audio supervision with the [Additional Audio Training Flags](#additional-audio-training-flags).
+
+Sampling produces audio-only previews (`--sample_audio_only`). Audio-only timestep sampling uses `shifted_logit_normal` with the virtual geometry described under [Timestep Sampling](#timestep-sampling).
+
 # Part II — Core Workflows
 
 ## Sampling, Checkpoints & Resuming
 <sub>[↑ contents](#table-of-contents)</sub>
 
+This section covers sampling **during** training plus checkpoint and resume handling. To run a finished LoRA on its own, see [Standalone Inference](#standalone-inference). Conditioning-specific sample inputs (reference / latent-guide / anchor paths in prompt files) are documented with their features in [Part III — Advanced](#part-iii--advanced).
+
 ### Sampling with Tiled VAE
 <sub>[↑ contents](#table-of-contents)</sub>
 
-The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt-line options. Put these options after the prompt text.
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference), `--ra <path>` (audio-reference IC-LoRA), and `--im <path>` / `--ii <0|1>` / `--it <float>` (inpaint mask / invert / threshold, composed with a `--v` reference — see [Step 6: Sample Prompts](#step-6-sample-prompts)) prompt-line options. Put these options after the prompt text.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -706,7 +725,7 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. For `--ltx_version 2.3`, this resolves to the LTX-2.3 defaults (`30` steps, `768x512`, `121` frames, CFG/STG defaults, CFG rescale `0.7`). Use `legacy` only to bypass preset defaults |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq` (full-quality LTX-2.3), and `distilled_two_stage` (distilled two-stage sampling, see [Two-Stage Sampling](#two-stage-sampling)). For `--ltx_version 2.3`, `defaults` resolves to the LTX-2.3 defaults (`30` steps, `768x512`, `121` frames, CFG/STG defaults, CFG rescale `0.7`) |
 | `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
@@ -1125,7 +1144,7 @@ When audio overfits before video, combine a lower audio LR/rank with `ema_mag`:
 --audio_silence_regularizer --audio_silence_regularizer_weight 0.5
 ```
 
-`--audio_dop` and `--audio_silence_regularizer` are mutually exclusive. Prefer checking sampler balance and `loss_a` first, because both add extra audio supervision.
+`--audio_dop` and `--audio_silence_regularizer` should not be combined; if both are set, the trainer warns (it does not error) and you should pick one. Prefer checking sampler balance and `loss_a` first, because both add extra audio supervision.
 
 **7. Drop modality text conditioning independently.** Per-modality caption dropout can regularize AV conditioning and train mixed conditional states:
 ```bash
@@ -1499,7 +1518,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
 - Reduce `--sample_vae_temporal_tile_size` to 24 or lower
-- Use `--use_pinned_memory_for_block_swap` - faster transfers
+- `--use_pinned_memory_for_block_swap` speeds up block-swap transfers, but it is optional: remove it if you hit a block-swap crash (see [Troubleshooting](#troubleshooting), especially on RTX 5090 / 50xx)
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -1951,10 +1970,35 @@ Result:
 
 Precedence is: `cross_modal_dropout` override > `audio_dropout` override for audio-only modules > `video_dropout` override for video-only modules > global `--network_dropout`.
 
-### Standalone Inference Overrides
+### Standalone Inference
 <sub>[↑ contents](#table-of-contents)</sub>
 
-`ltx2_generate_video.py` accepts a few standalone-inference-only overrides that are not part of the training sample table:
+To generate with a trained LoRA outside of training, run `ltx2_generate_video.py` with the base checkpoint, Gemma, a prompt, and the LoRA weights:
+
+```bash
+python ltx2_generate_video.py ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --ltx_version 2.3 ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --lora_weight output/ltx23_lora.safetensors ^
+  --lora_multiplier 1.0 ^
+  --prompt "a corgi running on the beach at sunset" ^
+  --height 512 ^
+  --width 768 ^
+  --frame_rate 25 ^
+  --sample_steps 30 ^
+  --guidance_scale 3.0 ^
+  --seed 42 ^
+  --sdpa ^
+  --fp8_base ^
+  --fp8_scaled ^
+  --output_dir output/inference
+```
+
+`--prompt` (or `--sample_prompts <file>`) and `--gemma_root` (or `--gemma_safetensors`) are required; omit `--lora_weight` to sample the base model. For LTX-2.0, pass the 2.0 checkpoint with `--ltx_version 2.0`.
+
+`ltx2_generate_video.py` also accepts a few standalone-inference-only overrides that are not part of the training sample table:
 
 - `--vae`: Use a separate VAE checkpoint for inference. If omitted, `--ltx2_checkpoint` is used for both DiT and VAE loading.
 - `--vae_dtype`: Override the VAE runtime dtype for inference. If omitted, the script uses its default VAE dtype (`bfloat16`).
@@ -2005,7 +2049,7 @@ CLAP model is lazy-loaded on first sample, offloaded to CPU between uses.
 
 See also the [timestep bucketing documentation](./advanced_config.md) for advanced timestep bucketing options.
 
-- `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed from latent sequence length. In normal video/AV training this means `latent_frames × latent_height × latent_width`; only `--ltx2_mode audio` uses the audio-only sequence-length path described below.
+- `--timestep_sampling shifted_logit_normal`: Recommended LTX-2 method — pass it explicitly (the argparse default is `sigma`; every example command above sets it). Uses a shifted logit-normal distribution where the shift is computed from latent sequence length. In normal video/AV training this means `latent_frames × latent_height × latent_width`; only `--ltx2_mode audio` uses the audio-only sequence-length path described below.
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints. By default LTX-2 scales the sampled sigma into this range; with `--preserve_distribution_shape`, it rejection-samples from the original distribution and keeps only values inside the range.
@@ -2570,7 +2614,7 @@ An ordinary LoRA (style, subject, motion) uses no conditions — that is the bas
 | Foley (video → audio) | `[video]` `is_generated = false` → `v2a` | — | — |
 | Audio-driven video (a2v) | `[audio]` `is_generated = false` → `a2v` | — | — |
 
-> A recipe is the *complete* set: any conditioner not listed is off. `first_frame` is the only one otherwise on by default (probability 0.1), so a recipe that omits a `[video]` `first_frame` **turns first-frame conditioning off**; add a `first_frame` condition to keep it. Without a recipe, `--ltx2_first_frame_conditioning_p` keeps its `0.1` default, so plain video training is text-to-video with first-frame (I2V) conditioning on 10% of samples; set it to `0`, or use a generate-only recipe, for pure text-to-video.
+> A recipe is the *complete* set: any conditioner not listed is off. `first_frame` is the only one otherwise on by default (probability 0.1), so a recipe that omits a `[video]` `first_frame` **turns first-frame conditioning off** — except under a reference strategy or directional training, where `first_frame` is left at its default instead (see [Reference Conditioning (IC-LoRA)](#reference-conditioning-ic-lora) below). Add a `first_frame` condition to keep or retune it. Without a recipe, `--ltx2_first_frame_conditioning_p` keeps its `0.1` default, so plain video training is text-to-video with first-frame (I2V) conditioning on 10% of samples; set it to `0`, or use a generate-only recipe, for pure text-to-video.
 
 `--ltx2_conditioning_config <file.toml>` is an optional recipe that drives three things from one file: (a) it enables the intrinsic conditioners (the in-clip clean-region conditioners — `first_frame`, `spatial_crop`, `inpaint`, `extend` — that need no external media), lowering each entry onto (i.e. setting) the individual `--ltx2_*` flags above so they compose; (b) a `reference` condition selects an IC-LoRA reference strategy (lowered onto `--ic_lora_strategy`); and (c) `is_generated = false` selects directional training (lowered onto `--ltx2_train_direction`). For the intrinsic conditioners it sets the same values as the individual flags rather than replacing the training mode. Condition data (the spatial-crop region, the mask directory, the reference media) stays in the dataset config.
 
@@ -2634,7 +2678,6 @@ The mask lives in the dataset; the recipe turns it into a clean conditioning reg
 Notes:
 
 - The recipe is authoritative: a condition declared both in the recipe and as an explicit CLI flag is governed by the recipe (the CLI flag is overridden, logged at WARNING).
-- A recipe is the complete declarative set: an intrinsic you do not list is off. `first_frame` is the only one that is otherwise on by default (`--ltx2_first_frame_conditioning_p` 0.1), so a recipe that omits a `[video]` `first_frame` disables first-frame conditioning — add one (with an optional `probability`) to keep it.
 - Conditions must live under `[video]`/`[audio]` blocks; a top-level `[[conditions]]` list is rejected with a migration hint.
 
 A `reference` condition selects an IC-LoRA reference strategy instead of an intrinsic flag. Its presence in a block is a zero-data marker; the strategy is derived from the recipe structure and lowered onto `--ic_lora_strategy`:
@@ -3011,6 +3054,18 @@ A cat sitting on a windowsill --v references/scene_002.mp4 --n distorted
 
 The `--sample_include_reference` flag shows the reference side-by-side with the generated output in validation videos.
 
+**Inpaint (composable with the `--v` reference).** Append `--im <mask_path>` to a prompt line to regenerate only a masked region while clean-pasting the rest from the `--v` source — the inference-time form of the training-side `inpaint` condition. The same LoRA handles both maskless prompts (no `--im`) and masked ones. The inpaint source defaults to the `--v` reference (so only the mask is required), and `--im` composes with `--i` (first-frame anchor) on the pure v2v path. `--im` is composed only on the pure v2v path; it is ignored (with a warning) on the audio-bearing `av_ic` / `video_ref_only_av` strategies.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--im <path>` | — | Inpaint mask (image or video), resized to latent geometry. White = conditioned (kept clean) unless inverted |
+| `--ii <0\|1>` | 0 | Invert: condition the complement of the mask (generate the masked region instead of keeping it) |
+| `--it <float>` | 0.5 | Mask binarization threshold (strict `>`) |
+
+```
+A man in a park --v src.mp4 --i edited_frame0.png --im edit_mask.mp4 --ii 1 --it 0.5
+```
+
 ##### IC-LoRA Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -3024,7 +3079,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
 | `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
 
-##### Dataset Config Options
+##### IC-LoRA Dataset Config Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
 | Option | Type | Description |
@@ -3228,7 +3283,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens (`av_ic`: currently unsupported and ignored) |
 | `--audio_ref_identity_guidance_scale` | 0.0 | Identity guidance scale for `audio_ref_ic` sampling. When > 0, runs an extra forward pass without reference audio and amplifies the speaker-identity contribution (`audio_x0 += scale·(cond_with_ref − cond_without_ref)`). 0.0 disables it; reference suggests ~3.0 |
 
-##### Dataset Config Options
+##### Audio-Reference Dataset Config Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
 | Option | Type | Description |
@@ -3288,7 +3343,7 @@ Both can be set independently and per-dataset.
 
 When a `latent_idx` guide and an intrinsic (`first_frame` / `spatial_crop` / `inpaint` / `extend`) condition the same frames, the guide takes precedence: it is pasted last and supplies the clean conditioning content for its slot (with the slot excluded from loss), so the intrinsic's target content is overridden in the overlapping frames. The trainer logs a one-time warning naming the overlapping intrinsic. `keyframe` guides append tokens instead of replacing a slot, so they never override an intrinsic.
 
-#### Dataset Config Options
+#### Latent Guide Dataset Config Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
 | Option | Type | Default | Description |
@@ -4012,11 +4067,6 @@ The same LTX-2 modality paths used by LoRA training are available in full-parame
 Reference-conditioned runs use `--ic_lora_strategy`: `v2v` for video-to-video/reference-video training in video mode, `audio_ref_ic` for reference-audio conditioning in AV or audio mode, `av_ic` for combined video+audio reference conditioning in AV mode, and `video_ref_only_av` for reference-video conditioning with target AV loss in AV mode. These strategies are implemented in `ltx2_train.py` and route the corresponding conditioning and loss path. For full-parameter commands, set `--ic_lora_strategy` explicitly; `--lora_target_preset` is not used to choose full-parameter trainable layers.
 
 Use `ltx2_train.py` for these commands. `ltx2_train_network.py` is the LoRA/network trainer entry point.
-
-### Full-Parameter Fine-Tuning Overview
-<sub>[↑ contents](#table-of-contents)</sub>
-
-Full-parameter fine-tuning updates LTX-2 transformer checkpoint weights directly, without attaching or saving a LoRA adapter. Use `ltx2_train.py` for these runs; `ltx2_train_network.py` is the LoRA/network trainer entry point. Detailed optimizer recipes, VRAM notes, and benchmark tables are in [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning).
 
 ### Dataset Preparation
 <sub>[↑ contents](#table-of-contents)</sub>
