@@ -22,6 +22,46 @@ LTX2RemoteActivationCodec = Literal["none", "int8", "int4", "aq-int8", "aq-int4"
 LTX2RemoteAqKeyMode = Literal["sample", "sample_timestep", "sample_timestep_noise", "off"]
 LTX2RemoteTrainableScope = Literal["auto", "lora", "blocks"]
 
+ConditioningType = Literal["first_frame", "spatial_crop", "inpaint", "extend", "reference"]
+
+
+class ConditioningCondition(BaseModel):
+    """One composable conditioning entry (a [[video.conditions]] / [[audio.conditions]] recipe row).
+
+    Only the keys relevant to ``type`` are serialized; ``probability=None`` means "use the feature
+    default". Audio supports extend / inpaint / reference only (validated by the trainer on launch).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    type: ConditioningType = "first_frame"
+    probability: Optional[float] = None  # all types (None -> feature default)
+    invert: bool = False  # spatial_crop / inpaint
+    threshold: float = 0.5  # inpaint
+    prefix: int = 0  # extend
+    suffix: int = 0  # extend
+    prefix_p: Optional[float] = None  # extend (independent per-side draw)
+    suffix_p: Optional[float] = None  # extend
+
+
+class ConditioningModality(BaseModel):
+    """A [video] / [audio] recipe block: a list of conditions and whether the modality is generated."""
+
+    model_config = ConfigDict(extra="ignore")
+    is_generated: bool = True  # false freezes this modality (directional a2v / v2a)
+    conditions: list[ConditioningCondition] = Field(default_factory=list)
+
+
+class ConditioningRecipe(BaseModel):
+    """Structured composable-conditioning recipe built in the GUI; serialized to a TOML recipe and
+    passed as --ltx2_conditioning_config. Inactive (no command change) unless ``enabled`` with at least
+    one condition or a frozen modality."""
+
+    model_config = ConfigDict(extra="ignore")
+    enabled: bool = False
+    per_sample_loss: Literal["auto", "on", "off"] = "auto"
+    video: ConditioningModality = Field(default_factory=ConditioningModality)
+    audio: ConditioningModality = Field(default_factory=ConditioningModality)
+
 
 class GeneralConfig(BaseModel):
     enable_bucket: bool = True
@@ -666,6 +706,10 @@ class TrainingConfig(BaseModel):
     # audio variants, train_direction). --ltx2_mode, reference dirs, keyframe and video-anchor still
     # apply. Empty = use the individual controls.
     ltx2_conditioning_config: str = ""
+    # Structured recipe built in the GUI Conditioning tab. When enabled (and non-empty) it is serialized
+    # to a TOML recipe and used as --ltx2_conditioning_config (authoritative), taking priority over the
+    # ltx2_conditioning_config path above. Disabled by default -> no command change.
+    conditioning_recipe: ConditioningRecipe = Field(default_factory=ConditioningRecipe)
     ltx2_first_frame_conditioning_p: float = 0.1
     # Endpoint-keyframe training (orthogonal to --ic_lora_strategy)
     keyframe_endpoint_training: bool = False

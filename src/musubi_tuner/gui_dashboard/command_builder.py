@@ -21,6 +21,8 @@ from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.gui_dashboard.toml_export import (
     _write_slider_toml,
     build_slider_toml_path,
+    conditioning_recipe_is_active,
+    export_conditioning_toml,
     export_dataset_toml,
 )
 
@@ -680,18 +682,30 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
     return cmd
 
 
-def _append_ltx2_conditioning(cmd: list[str], t) -> None:
+def _append_ltx2_conditioning(cmd: list[str], t, config, recipe_filename: str = "conditioning_config.toml") -> None:
     """Emit the LTX-2 intrinsic / directional / recipe conditioning args (shared by the LoRA and
     full-finetune builders). A conditioning recipe (--ltx2_conditioning_config) is authoritative and
     mutually exclusive with the individual conditioning flags: when set, only the recipe is emitted and
     the flags it owns are skipped. Keyframe / video-anchor (orthogonal latent guides) always apply.
     --lora_target_preset / --ic_lora_strategy are LoRA-only and emitted by the LoRA builder, not here.
+
+    Recipe source priority: the structured GUI recipe (serialized to a TOML here) wins; otherwise the
+    explicit ltx2_conditioning_config path; otherwise the individual flags below.
     """
-    recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip()
-    if recipe:
-        cmd += ["--ltx2_conditioning_config", recipe]
+    # The structured recipe is built once on the (training-scoped) Conditioning tab and applies to both
+    # LoRA and full fine-tune, so always source it from config.training rather than the section `t`
+    # (full_finetune inherits the field but the GUI never writes it there).
+    builder_recipe = getattr(config.training, "conditioning_recipe", None)
+    if conditioning_recipe_is_active(builder_recipe):
+        recipe_path = export_conditioning_toml(config, builder_recipe, recipe_filename)
+        cmd += ["--ltx2_conditioning_config", str(recipe_path)]
+        recipe = "recipe"  # truthy sentinel: the recipe owns the conditioning flags below
     else:
-        cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
+        recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip()
+        if recipe:
+            cmd += ["--ltx2_conditioning_config", recipe]
+        else:
+            cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
 
     if getattr(t, "keyframe_endpoint_training", False):
         cmd += ["--keyframe_endpoint_training"]
@@ -762,7 +776,21 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # Conditioning recipe (authoritative + mutually exclusive). When set, emit only
     # --ltx2_conditioning_config and skip the conditioning flags it owns (--lora_target_preset,
     # --ic_lora_strategy / --ic_lora_ref_probability, and the intrinsic + directional flags below).
-    _cond_recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip()
+    # Active when an explicit recipe path is set OR the structured GUI builder is active (both lower to
+    # --ltx2_conditioning_config in _append_ltx2_conditioning); truthy string for the `if not` gates.
+    _cond_recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip() or (
+        "builder" if conditioning_recipe_is_active(getattr(config.training, "conditioning_recipe", None)) else ""
+    )
+    # Only a REFERENCE recipe derives the LoRA target preset (from its IC-LoRA strategy); an intrinsic-only
+    # or directional recipe does not, so the user's --lora_target_preset must still apply for those.
+    _builder_recipe = getattr(config.training, "conditioning_recipe", None)
+    if conditioning_recipe_is_active(_builder_recipe):
+        _recipe_derives_preset = any(c.type == "reference" for c in _builder_recipe.video.conditions) or any(
+            c.type == "reference" for c in _builder_recipe.audio.conditions
+        )
+    else:
+        # An external recipe file cannot be introspected here; preserve the prior "recipe governs preset" behavior.
+        _recipe_derives_preset = bool(str(getattr(t, "ltx2_conditioning_config", "") or "").strip())
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
@@ -867,9 +895,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
-    if not _cond_recipe:
-        # A reference recipe derives the preset from its strategy; an explicit --lora_target_preset
-        # would suppress that derivation, so the recipe governs the preset (omit it here).
+    if not _recipe_derives_preset:
+        # A reference recipe derives the preset from its strategy; an explicit --lora_target_preset would
+        # suppress that derivation, so omit it ONLY then. Intrinsic-only / directional recipes keep it.
         cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.train_connectors:
         cmd.append("--train_connectors")
@@ -1687,7 +1715,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
     if t.persistent_data_loader_workers:
         cmd.append("--persistent_data_loader_workers")
-    _append_ltx2_conditioning(cmd, t)
+    _append_ltx2_conditioning(cmd, t, config)
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
@@ -2172,7 +2200,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
 
     # Conditioning (recipe / intrinsic / directional). --lora_target_preset / --ic_lora_strategy are
     # LoRA-only and not emitted for full fine-tune; a recipe's reference still derives the strategy.
-    _append_ltx2_conditioning(cmd, t)
+    _append_ltx2_conditioning(cmd, t, config, "conditioning_config.fft.toml")
 
     cmd += _split_cli_args(t.extra_args)
     return cmd

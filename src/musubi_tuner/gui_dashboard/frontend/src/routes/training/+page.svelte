@@ -76,7 +76,24 @@
 	let t = $derived($projectConfig?.training || {});
 	// A conditioning recipe is authoritative + mutually exclusive: when set, the individual
 	// conditioning controls are disabled (and the command builder omits the flags it owns).
-	let recipeActive = $derived(((t.ltx2_conditioning_config || '').trim().length > 0));
+	let recipeActive = $derived(
+		(t.ltx2_conditioning_config || '').trim().length > 0 ||
+		(t.conditioning_recipe?.enabled && (
+			(t.conditioning_recipe.video?.conditions?.length > 0) ||
+			(t.conditioning_recipe.audio?.conditions?.length > 0) ||
+			t.conditioning_recipe.video?.is_generated === false ||
+			t.conditioning_recipe.audio?.is_generated === false
+		))
+	);
+	// Only a REFERENCE recipe derives the LoRA target preset; an intrinsic-only / directional recipe
+	// leaves the user's preset in effect, so the control must stay enabled for those.
+	let recipeDerivesPreset = $derived(
+		(t.ltx2_conditioning_config || '').trim().length > 0 ||
+		(t.conditioning_recipe?.enabled && (
+			(t.conditioning_recipe.video?.conditions || []).some((c) => c.type === 'reference') ||
+			(t.conditioning_recipe.audio?.conditions || []).some((c) => c.type === 'reference')
+		))
+	);
 	let rl = $derived($projectConfig?.remote_stage_launcher || {});
 	let rs = $derived($projectConfig?.remote_stage_server || {});
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
@@ -490,53 +507,20 @@
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
-							]} onchange={(e) => updateLoraTargetPreset(e.target.value)} disabled={recipeActive} tooltip="Target layers (governed by the conditioning recipe when one is set)" />
+							]} onchange={(e) => updateLoraTargetPreset(e.target.value)} disabled={recipeDerivesPreset} tooltip="Target layers. A reference conditioning recipe sets this automatically; an intrinsic-only / directional recipe leaves it to you." />
 						</div>
+						{#if recipeDerivesPreset}
+							<div class="flex items-start gap-1.5 px-2 py-1.5 text-[11px]" style="background: var(--accent-subtle-bg); border: 1px solid var(--accent-muted); border-radius: var(--radius-sm); color: var(--text-secondary);">
+								<svg class="w-3.5 h-3.5 flex-shrink-0 mt-px" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+								<span>A reference conditioning recipe (set on the <strong>Conditioning</strong> tab) selects the LoRA target preset automatically, so it is disabled here.</span>
+							</div>
+						{/if}
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle label="DoRA / DokR" fieldPath="training.use_dora" checked={t.use_dora ?? false} onchange={(e) => update('use_dora', e.target.checked)} tooltip="Train LoRA or LoKr with a separate magnitude vector. Passed as use_dora=true in network args." />
 							<FormToggle label="DoRA-OFT / DoKr-OFT" fieldPath="training.use_dora_oft" checked={t.use_dora_oft ?? false} onchange={(e) => update('use_dora_oft', e.target.checked)} tooltip="Train native LoRA or LoKr with OFT rotation plus DoRA-style magnitude scaling. Passed as use_dora_oft=true in network args." />
 							<FormToggle label="rsLoRA" fieldPath="training.use_rslora" checked={t.use_rslora ?? false} onchange={(e) => update('use_rslora', e.target.checked)} tooltip="Use rank-stabilized LoRA scaling alpha/sqrt(rank). Native LoRA backend only; exported alpha is saved in standard-loader-compatible form." />
 						</div>
 						{#if $advancedMode}
-							<div class="grid grid-cols-2 gap-2">
-								<FormSelect fieldPath="training.ic_lora_strategy" value={t.ic_lora_strategy || 'auto'} options={[
-									{ value: 'auto', label: 'auto' },
-									{ value: 'none', label: 'none' },
-									{ value: 'v2v', label: 'v2v' },
-									{ value: 'audio_ref_ic', label: 'audio_ref_ic' },
-									{ value: 'av_ic', label: 'av_ic' },
-									{ value: 'video_ref_only_av', label: 'video_ref_only_av' },
-								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} disabled={recipeActive} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
-								<FormField type="number" fieldPath="training.ic_lora_ref_probability" value={t.ic_lora_ref_probability ?? 1.0} oninput={(e) => update('ic_lora_ref_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Reference-dropout dial for the IC-LoRA reference strategies (v2v / av_ic / video_ref_only_av / audio_ref_ic): per-sample probability that the reference is KEPT. 1.0 = always use the reference; lower values drop it on some samples for classifier-free-guidance-style training." />
-							</div>
-							{#if t.ic_lora_strategy === 'audio_ref_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_ic' || t.lora_target_preset === 'av_ic'))}
-								<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-									<span class="text-[11px] font-medium" style="color: var(--text-muted);">Audio-Reference IC-LoRA</span>
-									{#if t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic')}
-										<div class="grid grid-cols-2 gap-2">
-											<FormSelect fieldPath="training.av_cross_attention_mode" value={t.av_cross_attention_mode || 'both'} options={[
-												{ value: 'both', label: 'both' },
-												{ value: 'a2v_only', label: 'a2v_only' },
-												{ value: 'v2a_only', label: 'v2a_only' },
-												{ value: 'none', label: 'none' },
-											]} onchange={(e) => update('av_cross_attention_mode', e.target.value)} tooltip="AV IC cross-modal direction control. 'both' = default AV IC, 'a2v_only' = audio-to-video only, 'v2a_only' = video-to-audio only, 'none' = disable both cross-modal directions." />
-											<FormToggle fieldPath="training.av_multi_ref" checked={t.av_multi_ref ?? false} onchange={(e) => update('av_multi_ref', e.target.checked)} tooltip="Mark this AV IC run as multi-reference. Backend multi-reference support uses the plural dataset reference fields." />
-										</div>
-									{/if}
-									<div class="grid grid-cols-3 gap-x-4 gap-y-1">
-										<FormToggle fieldPath="training.audio_ref_use_negative_positions" checked={t.audio_ref_use_negative_positions ?? false} onchange={(e) => update('audio_ref_use_negative_positions', e.target.checked)} tooltip="Place reference-audio token positions in negative time" />
-										<FormToggle fieldPath="training.audio_ref_mask_cross_attention_to_reference" checked={t.audio_ref_mask_cross_attention_to_reference ?? false} onchange={(e) => update('audio_ref_mask_cross_attention_to_reference', e.target.checked)} tooltip="Video attends only to target audio, not reference-audio tokens" />
-										<FormToggle fieldPath="training.audio_ref_mask_reference_from_text_attention" checked={t.audio_ref_mask_reference_from_text_attention ?? false} onchange={(e) => update('audio_ref_mask_reference_from_text_attention', e.target.checked)} tooltip={t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic') ? 'Not supported in AV IC Modality-path mode; the trainer warns and ignores this flag.' : 'Block reference-audio tokens from attending to text tokens'} />
-									</div>
-									<FormField type="number" fieldPath="training.audio_ref_identity_guidance_scale" value={t.audio_ref_identity_guidance_scale ?? 0.0} oninput={(e) => update('audio_ref_identity_guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="Extra forward pass without reference to isolate and amplify speaker identity (0 = disabled, recommended: 3.0)" />
-									<div class="grid grid-cols-3 items-end gap-x-4 gap-y-1">
-										<FormToggle fieldPath="training.av_bimodal_cfg" checked={t.av_bimodal_cfg ?? false} onchange={(e) => update('av_bimodal_cfg', e.target.checked)} tooltip="Extra forward pass with cross-modal attention disabled to strengthen independent audio/video generation" />
-										{#if t.av_bimodal_cfg}
-											<FormField type="number" fieldPath="training.av_bimodal_scale" value={t.av_bimodal_scale ?? 3.0} oninput={(e) => update('av_bimodal_scale', Number(e.target.value))} step="0.1" min={1} tooltip="Bimodal guidance strength. Applied as (scale-1) × delta. Default: 3.0" />
-										{/if}
-									</div>
-								</div>
-							{/if}
 							<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 								<FormToggle label="AV Cross Grad Surgery" fieldPath="training.av_cross_grad_surgery" checked={t.av_cross_grad_surgery ?? false} onchange={(e) => update('av_cross_grad_surgery', e.target.checked)} tooltip="Scale gradients through AV cross-modal K/V projections by block. Requires LTX2 mode av." />
 								{#if t.av_cross_grad_surgery}
@@ -609,14 +593,6 @@
 					</div>
 				</FormGroup>
 
-				<FormGroup title="Conditioning">
-					<div class="space-y-2 pt-2">
-						<p class="text-[11px]" style="color: var(--text-muted);">
-							Optional declarative conditioning recipe (TOML). When set it is <strong>authoritative</strong>: the recipe governs the IC-LoRA strategy, intrinsic conditioning (first-frame, spatial-crop, inpaint, extend) and directional training, and the individual conditioning controls (in the LoRA and Memory groups) are disabled and not emitted. <code>--ltx2_mode</code>, references and the orthogonal keyframe / video-anchor features still apply. Leave empty to use the individual controls instead.
-						</p>
-						<PathInput fieldPath="training.ltx2_conditioning_config" value={t.ltx2_conditioning_config || ''} oninput={(e) => update('ltx2_conditioning_config', e.target.value)} showFiles tooltip="Path to a TOML conditioning recipe with [video]/[audio] blocks (type = first_frame | spatial_crop | inpaint | extend | reference; plus is_generated for directional). Authoritative and mutually exclusive with the individual conditioning controls." />
-					</div>
-				</FormGroup>
 
 				{#if $advancedMode}
 					<FormGroup title="Quantization">
@@ -761,137 +737,11 @@
 							<FormToggle fieldPath="training.persistent_data_loader_workers" checked={t.persistent_data_loader_workers ?? false} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} tooltip="Keep workers between epochs" />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.ltx2_first_frame_conditioning_p" value={t.ltx2_first_frame_conditioning_p ?? 0.1} oninput={(e) => update('ltx2_first_frame_conditioning_p', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="First frame conditioning prob" />
 							{#if t.ltx2_mode === 'audio'}
 								<FormField type="number" fieldPath="training.audio_only_sequence_resolution" value={t.audio_only_sequence_resolution ?? 64} oninput={(e) => update('audio_only_sequence_resolution', Number(e.target.value))} min={0} tooltip="Virtual pixel resolution for shifted_logit_normal in audio-only mode (0 = use cached geometry)" />
 							{/if}
 						</div>
 
-						<!-- Endpoint-keyframe training (orthogonal to IC-LoRA strategy) -->
-						<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-							<div class="flex items-center justify-between">
-								<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Endpoint Keyframe Training</span>
-							</div>
-							<p class="text-[11px]" style="color: var(--text-muted);">
-								Extract first / last / random-interior latent frames of the target as clean keyframe tokens at training time.
-								Composes with any <code>--ic_lora_strategy</code>. All sub-fields are no-ops while the master toggle is off.
-							</p>
-							<FormToggle fieldPath="training.keyframe_endpoint_training" checked={t.keyframe_endpoint_training ?? false} onchange={(e) => update('keyframe_endpoint_training', e.target.checked)} tooltip="Master enable for endpoint-keyframe training. When off, the four probabilities below are not emitted to the CLI." />
-							{#if t.keyframe_endpoint_training}
-								<div class="grid grid-cols-2 gap-2">
-									<FormField type="number" fieldPath="training.keyframe_first_frame_p" value={t.keyframe_first_frame_p ?? 1.0} oninput={(e) => update('keyframe_first_frame_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending the first latent frame as a clean keyframe at frame_idx=0 (independent Bernoulli per item in the batch)." />
-									<FormField type="number" fieldPath="training.keyframe_last_frame_p" value={t.keyframe_last_frame_p ?? 1.0} oninput={(e) => update('keyframe_last_frame_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending the last latent frame at frame_idx=(T-1)*VIDEO_SCALE_FACTORS.time (pixel-frame units)." />
-									<FormField type="number" fieldPath="training.keyframe_random_interior_p" value={t.keyframe_random_interior_p ?? 0.0} oninput={(e) => update('keyframe_random_interior_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending random interior latent frames as keyframes (interior indices are shared across the batch; only the dropout decision is per-sample)." />
-									<FormField type="number" fieldPath="training.keyframe_max_random_interior" value={t.keyframe_max_random_interior ?? 0} oninput={(e) => update('keyframe_max_random_interior', Number(e.target.value))} step="1" min={0} tooltip="Cap on number of random interior keyframes per batch when keyframe_random_interior_p triggers." />
-								</div>
-							{/if}
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Anchor Training</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">
-									Replace selected target frames in the noisy input with the clean target latent, zero their timesteps, and exclude them from loss.
-								</p>
-								<FormToggle fieldPath="training.video_anchor_training" checked={t.video_anchor_training ?? false} onchange={(e) => update('video_anchor_training', e.target.checked)} tooltip="Master enable for video-anchor training. When off, the fields below are not emitted to the CLI." />
-								{#if t.video_anchor_training}
-									<div class="grid grid-cols-3 gap-2">
-										<FormField type="number" fieldPath="training.video_anchor_probability" value={t.video_anchor_probability ?? 0.5} oninput={(e) => update('video_anchor_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of applying anchor training." />
-										<FormField type="number" fieldPath="training.video_anchor_count" value={t.video_anchor_count ?? 1} oninput={(e) => update('video_anchor_count', Number(e.target.value))} step="1" min={0} tooltip="Number of random anchors to add per sample when random anchors are enabled." />
-										<FormSelect fieldPath="training.video_anchor_strategy" value={t.video_anchor_strategy || 'endpoints_random'} options={[{value:'endpoints',label:'Endpoints'},{value:'random',label:'Random'},{value:'endpoints_random',label:'Endpoints + Random'}]} onchange={(e) => update('video_anchor_strategy', e.target.value)} tooltip="Anchor placement strategy." />
-									</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Spatial Crop Conditioning</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">
-									Mark a rectangular spatial region of the video latents as clean conditioning (timestep 0, excluded from loss) so the model learns to outpaint the surrounding content. The region is set per dataset (<code>spatial_crop_region = [y1, x1, y2, x2]</code> in pixels, in the dataset config). All fields are no-ops while the master toggle is off.
-								</p>
-								<FormToggle fieldPath="training.ltx2_spatial_crop" checked={t.ltx2_spatial_crop ?? false} onchange={(e) => update('ltx2_spatial_crop', e.target.checked)} disabled={recipeActive} tooltip="Master enable for spatial-crop region conditioning (video outpaint). When off, nothing is emitted to the CLI and the per-sample draw is skipped." />
-								{#if t.ltx2_spatial_crop && !recipeActive}
-									<div class="grid grid-cols-2 gap-2">
-										<FormField type="number" fieldPath="training.ltx2_spatial_crop_probability" value={t.ltx2_spatial_crop_probability ?? 0.0} oninput={(e) => update('ltx2_spatial_crop_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the spatial-crop region as clean conditioning." />
-										<FormToggle fieldPath="training.ltx2_spatial_crop_invert" checked={t.ltx2_spatial_crop_invert ?? false} onchange={(e) => update('ltx2_spatial_crop_invert', e.target.checked)} tooltip="Condition OUTSIDE the rectangle instead of inside." />
-									</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Inpaint / Outpaint Mask Conditioning</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">
-									Reuse the dataset's <code>loss_mask_directory</code> mask as a clean conditioning region (timestep 0, excluded from loss): the mask is binarized at the threshold so the masked area stays clean while the model generates the rest (inpaint), or the surround when inverted (outpaint). While on, that mask is treated as conditioning, not a loss weight. All fields are no-ops while the master toggle is off.
-								</p>
-								<FormToggle fieldPath="training.ltx2_inpaint_mask" checked={t.ltx2_inpaint_mask ?? false} onchange={(e) => update('ltx2_inpaint_mask', e.target.checked)} disabled={recipeActive} tooltip="Master enable for on-disk mask conditioning (inpaint/outpaint). When off, nothing is emitted to the CLI and the per-sample draw is skipped." />
-								{#if t.ltx2_inpaint_mask && !recipeActive}
-									<div class="grid grid-cols-2 gap-2">
-										<FormField type="number" fieldPath="training.ltx2_inpaint_mask_probability" value={t.ltx2_inpaint_mask_probability ?? 0.0} oninput={(e) => update('ltx2_inpaint_mask_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the mask as clean conditioning." />
-										<FormField type="number" fieldPath="training.ltx2_inpaint_mask_threshold" value={t.ltx2_inpaint_mask_threshold ?? 0.5} oninput={(e) => update('ltx2_inpaint_mask_threshold', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Binarization threshold (strict >). Mask values above this are conditioned (kept clean)." />
-										<FormToggle fieldPath="training.ltx2_inpaint_mask_invert" checked={t.ltx2_inpaint_mask_invert ?? false} onchange={(e) => update('ltx2_inpaint_mask_invert', e.target.checked)} tooltip="Condition the COMPLEMENT of the mask (generate the masked region instead of keeping it clean)." />
-									</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Extension (prefix / suffix)</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">
-									Keep the first N (prefix) and/or last N (suffix) latent frames clean as conditioning so the model learns to extend a clip forward / backward. Auto-derived from the target &mdash; no dataset needed. A span of 0 disables that side; both 0 = off.
-								</p>
-								<div class="grid grid-cols-3 gap-2">
-									<FormField type="number" fieldPath="training.ltx2_extend_prefix_frames" value={t.ltx2_extend_prefix_frames ?? 0} oninput={(e) => update('ltx2_extend_prefix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Number of leading latent frames kept clean (forward extension). 0 = off." />
-									<FormField type="number" fieldPath="training.ltx2_extend_suffix_frames" value={t.ltx2_extend_suffix_frames ?? 0} oninput={(e) => update('ltx2_extend_suffix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Number of trailing latent frames kept clean (backward extension). 0 = off." />
-									<FormField type="number" fieldPath="training.ltx2_extend_probability" value={t.ltx2_extend_probability ?? 1.0} oninput={(e) => update('ltx2_extend_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Per-sample probability of applying extension conditioning when enabled." />
-								</div>
-								{#if (t.ltx2_extend_prefix_frames > 0 || t.ltx2_extend_suffix_frames > 0) && !recipeActive}
-								<div class="grid grid-cols-2 gap-2">
-									<FormField type="number" fieldPath="training.ltx2_extend_prefix_p" value={t.ltx2_extend_prefix_p ?? ''} oninput={(e) => update('ltx2_extend_prefix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the PREFIX side. Setting either per-side probability makes prefix and suffix independent draws. Blank = use the shared probability." />
-									<FormField type="number" fieldPath="training.ltx2_extend_suffix_p" value={t.ltx2_extend_suffix_p ?? ''} oninput={(e) => update('ltx2_extend_suffix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the SUFFIX side. Blank = use the shared probability." />
-								</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Audio Extension (prefix / suffix)</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">Audio analog of video extension (requires an audio-bearing mode &mdash; av / audio). Keep the first N (prefix) and/or last N (suffix) audio latent timesteps clean. A span of 0 disables that side; both 0 = off. Composes with the audio-bearing reference strategies.</p>
-								<div class="grid grid-cols-3 gap-2">
-									<FormField type="number" fieldPath="training.ltx2_audio_extend_prefix_frames" value={t.ltx2_audio_extend_prefix_frames ?? 0} oninput={(e) => update('ltx2_audio_extend_prefix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Leading audio latent timesteps kept clean (forward audio extension). 0 = off." />
-									<FormField type="number" fieldPath="training.ltx2_audio_extend_suffix_frames" value={t.ltx2_audio_extend_suffix_frames ?? 0} oninput={(e) => update('ltx2_audio_extend_suffix_frames', Number(e.target.value))} step="1" min={0} disabled={recipeActive} tooltip="Trailing audio latent timesteps kept clean (backward audio extension). 0 = off." />
-									<FormField type="number" fieldPath="training.ltx2_audio_extend_probability" value={t.ltx2_audio_extend_probability ?? 1.0} oninput={(e) => update('ltx2_audio_extend_probability', Number(e.target.value))} step="0.05" min={0} max={1} disabled={recipeActive} tooltip="Per-sample probability of applying audio-extension conditioning (shared by prefix and suffix unless the per-side probabilities below are set)." />
-								</div>
-								{#if (t.ltx2_audio_extend_prefix_frames > 0 || t.ltx2_audio_extend_suffix_frames > 0) && !recipeActive}
-									<div class="grid grid-cols-2 gap-2">
-										<FormField type="number" fieldPath="training.ltx2_audio_extend_prefix_p" value={t.ltx2_audio_extend_prefix_p ?? ''} oninput={(e) => update('ltx2_audio_extend_prefix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the audio PREFIX side. Blank = shared." />
-										<FormField type="number" fieldPath="training.ltx2_audio_extend_suffix_p" value={t.ltx2_audio_extend_suffix_p ?? ''} oninput={(e) => update('ltx2_audio_extend_suffix_p', e.target.value === '' ? null : Number(e.target.value))} step="0.05" min={0} max={1} placeholder="shared" tooltip="Optional: independent per-sample probability for the audio SUFFIX side. Blank = shared." />
-									</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Audio Inpaint Mask</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">Audio analog of inpaint (requires an audio-bearing mode). Reuses the dataset audio mask as a clean conditioning region (timestep 0, excluded from loss). Composes with the audio-bearing reference strategies. All fields are no-ops while the master toggle is off.</p>
-								<FormToggle fieldPath="training.ltx2_audio_inpaint_mask" checked={t.ltx2_audio_inpaint_mask ?? false} onchange={(e) => update('ltx2_audio_inpaint_mask', e.target.checked)} disabled={recipeActive} tooltip="Master enable for audio on-disk mask conditioning. When off, nothing is emitted and the per-sample draw is skipped." />
-								{#if t.ltx2_audio_inpaint_mask && !recipeActive}
-									<div class="grid grid-cols-3 gap-2">
-										<FormField type="number" fieldPath="training.ltx2_audio_inpaint_mask_probability" value={t.ltx2_audio_inpaint_mask_probability ?? 0.0} oninput={(e) => update('ltx2_audio_inpaint_mask_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample Bernoulli probability of applying the audio mask as clean conditioning." />
-										<FormField type="number" fieldPath="training.ltx2_audio_inpaint_mask_threshold" value={t.ltx2_audio_inpaint_mask_threshold ?? 0.5} oninput={(e) => update('ltx2_audio_inpaint_mask_threshold', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Binarization threshold (strict >). Values above this are conditioned (kept clean)." />
-										<FormToggle fieldPath="training.ltx2_audio_inpaint_mask_invert" checked={t.ltx2_audio_inpaint_mask_invert ?? false} onchange={(e) => update('ltx2_audio_inpaint_mask_invert', e.target.checked)} tooltip="Condition the COMPLEMENT of the mask (generate the masked timesteps instead of keeping them clean)." />
-									</div>
-								{/if}
-							</div>
-							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
-								<div class="flex items-center justify-between">
-									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Directional Training (A2V / V2A)</span>
-								</div>
-								<p class="text-[11px]" style="color: var(--text-muted);">
-									Train a dedicated directional model by freezing one modality as clean conditioning (requires AV mode). "a2v" freezes audio and generates video; "v2a" freezes video and generates audio (foley); "joint" = normal joint AV (default). Distinct from Cross-Task Synergy, which adds directional losses on top of joint training.
-								</p>
-								<FormSelect fieldPath="training.ltx2_train_direction" value={t.ltx2_train_direction || 'joint'} options={[{ value: 'joint', label: 'joint (normal AV)' }, { value: 'a2v', label: 'a2v (freeze audio, generate video)' }, { value: 'v2a', label: 'v2a (freeze video, generate audio / foley)' }]} onchange={(e) => update('ltx2_train_direction', e.target.value)} disabled={recipeActive} tooltip="Directional AV training mode. Requires --ltx2_mode av. Mutually exclusive with IC-LoRA, Self-Flow, TREAD, CTS, the G2D freezer, audio loss balancing, DCR, TARP; v2a also excludes intrinsic video conditioners." />
-							</div>
-						</div>
 						{#if $advancedMode}
 							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
 								<div class="grid grid-cols-3 gap-x-4 gap-y-1">

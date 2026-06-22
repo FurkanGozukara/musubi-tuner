@@ -12,6 +12,7 @@
 		{ href: '/dataset', label: 'Dataset', group: 'Workflow', icon: 'M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M4 7c0-2 1-3 3-3h10c2 0 3 1 3 3M4 7h16M9 11h6' },
 		{ href: '/caching', label: 'Caching', group: 'Workflow', icon: 'M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M9 3v4M15 3v4M4 11h16', processTypes: ['cache_latents', 'cache_text'] },
 		{ href: '/samples', label: 'Samples', group: 'Tools', icon: 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
+		{ href: '/training/conditioning', label: 'Conditioning', group: 'Workflow', icon: 'M12 2l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5' },
 		{ href: '/training', label: 'Training', group: 'Workflow', icon: 'M13 10V3L4 14h7v7l9-11h-7z', processTypes: ['training', 'remote_stage_launcher', 'remote_stage_server'] },
 		{ href: '/training/techniques', label: 'Methods', group: 'Advanced', icon: 'M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z', processTypes: ['slider_training'], advancedOnly: true },
 		{ href: '/training/full-finetune', label: 'Fine-tuning', group: 'Advanced', icon: 'M4 4h16v16H4z M8 8h8 M8 12h8 M8 16h5', processTypes: ['full_finetune'], advancedOnly: true },

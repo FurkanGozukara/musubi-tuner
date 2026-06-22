@@ -262,9 +262,7 @@ def build_dataset_toml_document(config: ProjectConfig) -> dict:
     }
 
     if config.dataset.validation_datasets:
-        doc["validation_datasets"] = [
-            _dataset_entry_to_dict(e) for e in config.dataset.validation_datasets
-        ]
+        doc["validation_datasets"] = [_dataset_entry_to_dict(e) for e in config.dataset.validation_datasets]
 
     return doc
 
@@ -285,6 +283,113 @@ def build_dataset_toml_path(config: ProjectConfig) -> Path:
 
 def export_dataset_toml(config: ProjectConfig) -> Path:
     return _write_dataset_toml(config, build_dataset_toml_path(config))
+
+
+# ---- Conditioning recipe (composable [video]/[audio] conditions built in the GUI) ----
+
+
+def conditioning_recipe_is_active(recipe) -> bool:
+    """True when the structured recipe should drive --ltx2_conditioning_config.
+
+    A recipe needs at least one condition or a frozen modality; ``enabled`` alone (or only a
+    per_sample_loss override) is not enough, since the trainer requires a [video]/[audio] block.
+    """
+    if recipe is None or not getattr(recipe, "enabled", False):
+        return False
+    for mod in (recipe.video, recipe.audio):
+        if mod.conditions or not mod.is_generated:
+            return True
+    return False
+
+
+def _condition_to_dict(c, modality: str = "video") -> dict:
+    """One condition -> a TOML-ready dict, emitting only the keys that apply to its type."""
+    d: dict = {"type": c.type}
+    if c.type == "extend":
+        d["prefix"] = int(c.prefix or 0)
+        d["suffix"] = int(c.suffix or 0)
+        if c.probability is not None:
+            d["probability"] = float(c.probability)
+        if c.prefix_p is not None:
+            d["prefix_p"] = float(c.prefix_p)
+        if c.suffix_p is not None:
+            d["suffix_p"] = float(c.suffix_p)
+    elif c.type == "inpaint":
+        if c.probability is not None:
+            d["probability"] = float(c.probability)
+        if c.invert:
+            d["invert"] = True
+        if float(c.threshold) != 0.5:
+            d["threshold"] = float(c.threshold)
+    elif c.type == "spatial_crop":
+        if c.probability is not None:
+            d["probability"] = float(c.probability)
+        if c.invert:
+            d["invert"] = True
+    else:  # first_frame, reference
+        # An audio reference takes no parameters (the reference-dropout dial is video-only); emitting a
+        # probability on it makes the parser reject the recipe ("unknown key").
+        if c.probability is not None and not (modality == "audio" and c.type == "reference"):
+            d["probability"] = float(c.probability)
+    return d
+
+
+def build_conditioning_toml_document(recipe) -> dict:
+    """Structured recipe -> a recipe-TOML document ({per_sample_loss?, video?, audio?})."""
+    doc: dict = {}
+    psl = getattr(recipe, "per_sample_loss", "auto")
+    if psl == "on":
+        doc["per_sample_loss"] = True
+    elif psl == "off":
+        doc["per_sample_loss"] = False
+    for name, mod in (("video", recipe.video), ("audio", recipe.audio)):
+        block: dict = {}
+        if not mod.is_generated:
+            block["is_generated"] = False
+        conds = [_condition_to_dict(c, name) for c in mod.conditions]
+        if conds:
+            block["conditions"] = conds
+        if block:
+            doc[name] = block
+    return doc
+
+
+def render_conditioning_toml(doc: dict) -> str:
+    """Render a recipe document to TOML (dedicated renderer for the nested array-of-tables; no
+    tomli_w dependency so the recipe writes correctly regardless of the optional package)."""
+    lines: list[str] = []
+    for k, v in doc.items():
+        if k in ("video", "audio"):
+            continue
+        lines.append(f"{k} = {_toml_value(v)}")
+    if lines:
+        lines.append("")
+    for name in ("video", "audio"):
+        block = doc.get(name)
+        if not block:
+            continue
+        lines.append(f"[{name}]")
+        if "is_generated" in block:
+            lines.append(f"is_generated = {_toml_value(block['is_generated'])}")
+        lines.append("")
+        for cond in block.get("conditions", []):
+            lines.append(f"[[{name}.conditions]]")
+            lines.append(f"type = {_toml_value(cond['type'])}")
+            for ck, cv in cond.items():
+                if ck == "type":
+                    continue
+                lines.append(f"{ck} = {_toml_value(cv)}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def export_conditioning_toml(config: ProjectConfig, recipe, filename: str = "conditioning_config.toml") -> Path:
+    """Serialize the structured recipe to ``<project_dir>/<filename>`` and return the path."""
+    doc = build_conditioning_toml_document(recipe)
+    path = Path(config.project_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_conditioning_toml(doc), encoding="utf-8")
+    return path
 
 
 def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:

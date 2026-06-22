@@ -19,6 +19,7 @@
 		'/tools': 'Tools',
 		'/samples': 'Samples',
 		'/training': 'Training',
+		'/training/conditioning': 'Conditioning',
 		'/training/techniques': 'Methods',
 		'/training/full-finetune': 'Fine-tuning',
 		'/training/dashboard': 'Monitor',
