@@ -28,6 +28,9 @@
 			fs: 5.0,
 			n: '',
 			i: '',
+			im: '',
+			ii: '',
+			it: '',
 			guides: []
 		};
 	}
@@ -114,6 +117,9 @@
 		if (entry.fs != null && entry.fs !== 5.0) line += ` --fs ${entry.fs}`;
 		if (entry.n) line += ` --n "${entry.n}"`;
 		if (entry.i) line += ` --i ${entry.i}`;
+		if (entry.im) line += ` --im ${entry.im}`;
+		if (entry.ii !== null && entry.ii !== '') line += ` --ii ${entry.ii}`;
+		if (entry.it !== null && entry.it !== '') line += ` --it ${entry.it}`;
 		for (const g of entry.guides || []) {
 			if (!g || !g.path) continue;
 			const flag = g.type === 'gk' ? '--gk' : '--gl';
@@ -148,6 +154,9 @@
 			else if (key === 'fs') entry.fs = parseFloat(value) || 5.0;
 			else if (key === 'n') entry.n = value;
 			else if (key === 'i') entry.i = value;
+			else if (key === 'im') entry.im = value;
+			else if (key === 'ii') entry.ii = parseInt(value);
+			else if (key === 'it') entry.it = parseFloat(value);
 			else if (key === 'gl' || key === 'gk') {
 				const spec = parseGuideSpec(value);
 				if (spec) entry.guides.push({ type: key, ...spec });
@@ -405,6 +414,12 @@
 
 						<div>
 							<FormField label="I2V Image (optional)" value={entry.i} oninput={(e) => updateEntry(i, 'i', e.target.value)} placeholder="path/to/first_frame.jpg" tooltip="Image-to-Video: path to conditioning image for first frame" />
+						</div>
+
+						<div class="grid grid-cols-3 gap-2 mb-2">
+							<FormField label="Inpaint Mask (optional)" value={entry.im} oninput={(e) => updateEntry(i, 'im', e.target.value)} placeholder="path/to/mask.mp4" tooltip="Inpaint mask (image or video), composed with the --v reference on the pure v2v path. White = kept clean unless inverted; source defaults to --v." />
+							<FormField label="Inpaint Invert (0/1)" type="number" value={entry.ii} oninput={(e) => updateEntry(i, 'ii', e.target.value === '' ? '' : Number(e.target.value))} min={0} max={1} step={1} placeholder="0" tooltip="0 = mask as-is (white kept clean); 1 = condition the complement (generate the masked region instead)." />
+							<FormField label="Inpaint Threshold" type="number" value={entry.it} oninput={(e) => updateEntry(i, 'it', e.target.value === '' ? '' : Number(e.target.value))} min={0} max={1} step="0.01" placeholder="0.5" tooltip="Mask binarization threshold (strict >). Default 0.5." />
 						</div>
 
 						{#if (entry.guides || []).length > 0}

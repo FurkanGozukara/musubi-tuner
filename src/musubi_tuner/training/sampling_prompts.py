@@ -108,6 +108,21 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["one_frame"] = m.group(1).strip()
                 continue
 
+            m = re.match(r"im (.+)", parg, re.IGNORECASE)
+            if m:  # inpaint mask path (composes with the v2v reference on the pure v2v path)
+                prompt_dict["inpaint_mask_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"ii (\d)", parg, re.IGNORECASE)
+            if m:  # inpaint invert (0/1): condition the complement of the mask
+                prompt_dict["inpaint_invert"] = bool(int(m.group(1)))
+                continue
+
+            m = re.match(r"it ([\d.]+)", parg, re.IGNORECASE)
+            if m:  # inpaint mask binarization threshold (default 0.5)
+                prompt_dict["inpaint_threshold"] = float(m.group(1))
+                continue
+
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)

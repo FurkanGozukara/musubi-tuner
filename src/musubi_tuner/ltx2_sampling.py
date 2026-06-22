@@ -1511,6 +1511,56 @@ class LTX2SamplingMixin:
 
         return latent
 
+    def _load_inpaint_mask(
+        self,
+        mask_path: str,
+        latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Load an inpaint mask (video or image) and resize to LATENT geometry.
+
+        Returns a float tensor ``[F_latent, H_latent, W_latent]`` in [0, 1] (grayscale). The
+        downstream ``build_inpaint_token_mask`` binarizes it (threshold/invert). Convention matches
+        training: white / 1 = conditioned (kept clean); pass --inpaint_invert to condition the
+        complement (generate the masked region instead).
+        """
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Inpaint mask not found: {mask_path}")
+
+        from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+
+        ext = os.path.splitext(mask_path)[1].lower()
+        is_video = ext in {e.lower() for e in VIDEO_EXTENSIONS}
+
+        frames = []
+        if is_video:
+            import av
+
+            container = av.open(mask_path)
+            for frame in container.decode(video=0):
+                frames.append(TF.to_tensor(frame.to_image().convert("L")))  # [1, H, W]
+            container.close()
+            if not frames:
+                raise ValueError(f"No frames decoded from inpaint mask video: {mask_path}")
+        else:
+            frames.append(TF.to_tensor(Image.open(mask_path).convert("L")))
+
+        mask = torch.stack(frames, dim=0)[:, 0].to(device=device, dtype=torch.float32)  # [F, H, W] in [0,1]
+        # Resize to latent geometry (trilinear over F,H,W). A single-frame mask broadcasts to all frames.
+        mask = torch.nn.functional.interpolate(
+            mask.unsqueeze(0).unsqueeze(0),  # [1, 1, F, H, W]
+            size=(latent_frames, latent_height, latent_width),
+            mode="trilinear",
+            align_corners=False,
+        )[0, 0]  # [F_latent, H_latent, W_latent]
+        logger.info("Inpaint mask loaded: %s → %s", mask_path, tuple(mask.shape))
+        return mask
+
     def _load_and_encode_conditioning_image(
         self,
         image_path: str,
@@ -1999,6 +2049,57 @@ class LTX2SamplingMixin:
         height = (height // spatial_factor) * spatial_factor
         frame_count = (frame_count - 1) // temporal_factor * temporal_factor + 1
 
+        # ---- Inpaint conditioning (mask + source) for the composable v2v path (--im / --ii / --it) ----
+        # Loads the mask at latent geometry and encodes the source video (defaults to the v2v
+        # reference --v) at the TARGET shape, so _do_v2v_denoising can clean-paste the kept region.
+        # Only relevant when a v2v reference is present (the inpaint path runs inside _do_v2v_denoising);
+        # harmless otherwise. Failure degrades to a plain (maskless) run, never aborts sampling.
+        inpaint_mask_path = sample_parameter.get("inpaint_mask_path")
+        if inpaint_mask_path and sample_parameter.get("inpaint_mask") is None:
+            try:
+                inpaint_source_path = sample_parameter.get("inpaint_source_path") or sample_parameter.get("v2v_ref_path")
+                if not inpaint_source_path:
+                    raise ValueError("inpaint mask (--im) needs a source video (--v) to clean-paste the kept region from")
+                inpaint_vae_ckpt = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+                if not inpaint_vae_ckpt:
+                    raise ValueError("VAE checkpoint required for inpaint source encoding (--vae or --ltx2_checkpoint)")
+                latent_frames = (frame_count - 1) // temporal_factor + 1
+                sample_parameter["inpaint_mask"] = self._load_inpaint_mask(
+                    mask_path=inpaint_mask_path,
+                    latent_frames=latent_frames,
+                    latent_height=height // spatial_factor,
+                    latent_width=width // spatial_factor,
+                    device=accelerator.device,
+                )
+                src_lat = self._load_and_encode_v2v_reference(
+                    ref_path=inpaint_source_path,
+                    target_height=height,
+                    target_width=width,
+                    vae_checkpoint_path=inpaint_vae_ckpt,
+                    device=accelerator.device,
+                    dtype=dit_dtype,
+                    max_frames=frame_count,
+                )
+                # Normalize source latent frames to the target so VideoConditionByMask shapes match
+                # (a source shorter than frame_count would otherwise crash the v2v denoiser).
+                src_f = int(src_lat.shape[2])
+                if src_f < latent_frames:
+                    pad = src_lat[:, :, -1:].expand(-1, -1, latent_frames - src_f, -1, -1)
+                    src_lat = torch.cat([src_lat, pad], dim=2)
+                    logger.warning(
+                        "Inpaint source has %d latent frames < target %d; padded by repeating the last frame.",
+                        src_f,
+                        latent_frames,
+                    )
+                elif src_f > latent_frames:
+                    src_lat = src_lat[:, :, :latent_frames]
+                sample_parameter["inpaint_source_latent"] = src_lat
+                logger.info("Inpaint conditioning ready: mask=%s source=%s", inpaint_mask_path, inpaint_source_path)
+            except Exception as e:
+                logger.error("Inpaint conditioning failed (%s); proceeding maskless: %s", inpaint_mask_path, e)
+                sample_parameter.pop("inpaint_mask", None)
+                sample_parameter.pop("inpaint_source_latent", None)
+
         loaded_text_encoder = False
         strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
             getattr(args, "precache_sample_prompts", False)
@@ -2479,17 +2580,29 @@ class LTX2SamplingMixin:
             generator=generator,
         )
 
-        # Reference-video IC-LoRA helpers (v2v / av_ic / video_ref_only_av) call base_model directly and
-        # bypass the first-frame / latent_idx / keyframe guide-append path used during training. Composing
-        # those guides here is unsupported, so fail fast instead of silently diverging from a guide-trained LoRA.
-        if v2v_ref_latents is not None and (conditioning_latent is not None or latent_idx_guides or keyframe_guides):
+        # Reference-video IC-LoRA helpers call base_model directly and bypass the latent_idx / keyframe
+        # guide-append path used during training, so composing THOSE guides here is unsupported -> fail fast.
+        # first_frame (conditioning_latent) and inpaint masks are supported on the PURE v2v path via
+        # composable target conditioning (_do_v2v_denoising builds them through the ltx_2 ConditioningItem
+        # API + our OR-merge); they are not supported on the audio-bearing av_ic / video_ref_only_av paths.
+        _pure_v2v = v2v_ref_latents is not None and not av_ic_sampling and not video_ref_only_av_sampling
+        if v2v_ref_latents is not None and (
+            latent_idx_guides or keyframe_guides or (conditioning_latent is not None and not _pure_v2v)
+        ):
             raise ValueError(
-                "Reference-video IC-LoRA sampling (v2v / av_ic / video_ref_only_av) does not compose first-frame "
-                "(conditioning_latent / --i), latent_idx, or keyframe guides at inference: the dedicated denoising "
-                "helpers bypass the guide-append path used in training, so results would diverge from a "
-                "guide-trained LoRA. Sample without these guides, or use --ic_lora_strategy audio_ref_ic / none "
-                "(which run through the wrapper path that composes guides)."
+                "Reference-video IC-LoRA sampling does not compose latent_idx or keyframe guides at inference "
+                "(the dedicated denoising helpers bypass the guide-append path used in training), and the "
+                "audio-bearing av_ic / video_ref_only_av paths do not compose first-frame conditioning. "
+                "Drop the latent_idx/keyframe guides (first-frame + inpaint ARE supported on the pure v2v path), "
+                "or use --ic_lora_strategy audio_ref_ic / none."
             )
+
+        # Inpaint conditioning is only composed on the pure v2v denoiser; warn + drop it on the
+        # audio-bearing reference paths so it is never a silent no-op.
+        if sample_parameter.get("inpaint_mask") is not None and v2v_ref_latents is not None and not _pure_v2v:
+            logger.warning("Inpaint mask (--im) is only composed on the pure v2v path; ignored on av_ic / video_ref_only_av.")
+            sample_parameter.pop("inpaint_mask", None)
+            sample_parameter.pop("inpaint_source_latent", None)
 
         # ===== AV_IC: combined video+audio IC-LoRA sampling path =====
         if av_ic_sampling and v2v_ref_latents is not None and isinstance(ref_audio_latents, torch.Tensor):
@@ -2567,6 +2680,11 @@ class LTX2SamplingMixin:
                 restore_transformer_device=restore_transformer_device,
                 decode_video=decode_video,
                 attention_overrides=attention_overrides,
+                conditioning_latent=conditioning_latent,
+                inpaint_mask=sample_parameter.get("inpaint_mask"),
+                inpaint_source_latent=sample_parameter.get("inpaint_source_latent"),
+                inpaint_invert=bool(sample_parameter.get("inpaint_invert", False)),
+                inpaint_threshold=float(sample_parameter.get("inpaint_threshold", 0.5)),
             )
             return video, audio_waveform
 
@@ -3701,6 +3819,11 @@ class LTX2SamplingMixin:
         restore_transformer_device: bool = True,
         decode_video: bool = True,
         attention_overrides=None,
+        conditioning_latent: Optional[torch.Tensor] = None,
+        inpaint_mask: Optional[torch.Tensor] = None,
+        inpaint_source_latent: Optional[torch.Tensor] = None,
+        inpaint_invert: bool = False,
+        inpaint_threshold: float = 0.5,
     ):
         """V2V / IC-LoRA denoising: concatenate reference + target tokens with per-token timesteps.
 
@@ -3816,11 +3939,92 @@ class LTX2SamplingMixin:
             sampling_preset=sampling_preset,
         ).to(device=transformer_device, dtype=torch.float32)
 
+        # ---- Composable target-side conditioning (first_frame + inpaint) ----
+        # Built through the ltx_2 ConditioningItem API + our OR-merge mask item, mirroring the training
+        # composition in call_dit (ref ∪ first_frame ∪ inpaint). The reference stays the ref-FIRST prefix
+        # above; this only pins TARGET tokens clean. Gated on inputs => byte-identical to a plain v2v run
+        # when none are supplied (regression invariant). bsz is 1 for inference; mask builder is per-sample.
+        cond_region_5d = None  # [B, 1, F, H, W] bool: True where the target token is pinned clean
+        clean_target_5d = None  # [B, C, F, H, W]: clean content for the pinned region (frame0 edit / source bg)
+        target_cond_tokens = None  # [B, tgt_seq] bool: pinned-clean tokens -> timestep 0, excluded from denoise
+        _has_ff = conditioning_latent is not None
+        _has_inpaint = inpaint_mask is not None and inpaint_source_latent is not None
+        if _has_ff or _has_inpaint:
+            from musubi_tuner.ltx_2.tools import VideoLatentTools
+            from musubi_tuner.ltx_2.conditioning.types.latent_cond import VideoConditionByLatentIndex
+            from musubi_tuner.ltx2_inference_conditioning import VideoConditionByMask
+
+            cond_tools = VideoLatentTools(
+                patchifier=patchifier,
+                target_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=int(latents.shape[1]),
+                    frames=tgt_frames,
+                    height=tgt_height,
+                    width=tgt_width,
+                ),
+                fps=frame_rate_v2v,
+            )
+            cond_state = cond_tools.create_initial_state(device=transformer_device, dtype=dit_dtype)
+            if _has_ff:
+                # first_frame is a single-frame anchor (matches training's frame-0-only first_frame);
+                # take frame 0 if a multi-frame conditioning latent was supplied.
+                ff_latent = conditioning_latent.to(device=transformer_device, dtype=dit_dtype)
+                if ff_latent.shape[2] != 1:
+                    ff_latent = ff_latent[:, :, :1]
+                cond_state = VideoConditionByLatentIndex(
+                    latent=ff_latent,
+                    strength=1.0,
+                    latent_idx=0,
+                ).apply_to(cond_state, cond_tools)
+            if _has_inpaint:
+                from musubi_tuner.ltx2_inpaint_mask import build_inpaint_token_mask
+
+                _inpaint_tok, _ = build_inpaint_token_mask(
+                    inpaint_mask,
+                    frames=tgt_frames,
+                    height=tgt_height,
+                    width=tgt_width,
+                    patch_size=1,
+                    invert=bool(inpaint_invert),
+                    threshold=float(inpaint_threshold),
+                    device=transformer_device,
+                )
+                cond_state = VideoConditionByMask(
+                    clean_latent=inpaint_source_latent.to(device=transformer_device, dtype=dit_dtype),
+                    token_mask=_inpaint_tok,
+                    strength=1.0,
+                ).apply_to(cond_state, cond_tools)
+            # The denoise→timestep bridge is binary (pinned tokens get timestep 0); we only build
+            # conditions at strength 1.0. Fail fast if a partial denoise value leaks in — it would be
+            # silently dropped by the `<= 0` checks rather than partially conditioned.
+            _dm = cond_state.denoise_mask
+            if not bool(((_dm <= 0) | (_dm >= 1)).all().item()):
+                raise ValueError(
+                    "Composable v2v conditioning produced partial denoise-mask values; only strength=1.0 "
+                    "is supported on the timestep-bridge inference path (no partial conditioning)."
+                )
+            target_cond_tokens = (cond_state.denoise_mask.squeeze(-1) <= 0).to(device=transformer_device)
+            cond_state_5d = cond_tools.unpatchify(cond_state)
+            cond_region_5d = cond_state_5d.denoise_mask <= 0
+            clean_target_5d = cond_state_5d.clean_latent.to(dtype=latents.dtype)
+            logger.info(
+                "V2V composable conditioning: %d/%d target tokens pinned clean (first_frame=%s, inpaint=%s)",
+                int(target_cond_tokens.sum().item()),
+                int(target_cond_tokens.shape[1]),
+                _has_ff,
+                _has_inpaint,
+            )
+
         # V2V denoising loop
         logger.info("V2V sampling: %d steps, ref_frames=%d, target_frames=%d", sample_steps, ref_frames, tgt_frames)
         with torch.no_grad():
             for step_idx in tqdm(range(len(sigmas) - 1), desc="V2V preview", leave=False):
                 sigma = sigmas[step_idx]
+
+                # Keep the pinned region clean before every forward (the previous Euler step moved it).
+                if cond_region_5d is not None:
+                    latents = torch.where(cond_region_5d.expand(-1, latents.shape[1], -1, -1, -1), clean_target_5d, latents)
 
                 # Patchify current noisy target
                 target_tokens = patchifier.patchify(latents.to(dtype=dit_dtype))
@@ -3829,8 +4033,12 @@ class LTX2SamplingMixin:
                 # Concatenate ref + target
                 combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
 
-                # Target conditioning mask (all False = all denoised)
-                target_conditioning_mask = torch.zeros((bsz, target_seq_len), device=transformer_device, dtype=torch.bool)
+                # Target conditioning mask: pinned-clean tokens (first_frame / inpaint) ride timestep 0;
+                # all-False (plain v2v) when no composable conditioning was supplied.
+                if target_cond_tokens is not None:
+                    target_conditioning_mask = target_cond_tokens
+                else:
+                    target_conditioning_mask = torch.zeros((bsz, target_seq_len), device=transformer_device, dtype=torch.bool)
                 conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
                 # Per-token timesteps: ref=0, target=sigma
@@ -3934,6 +4142,11 @@ class LTX2SamplingMixin:
 
                 # Euler step
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
+
+            # Final clean-paste so the pinned region in the returned latent is exactly the conditioned
+            # content (frame0 edit / source background), not the last Euler estimate.
+            if cond_region_5d is not None:
+                latents = torch.where(cond_region_5d.expand(-1, latents.shape[1], -1, -1, -1), clean_target_5d, latents)
 
         # Offload transformer for VAE decode
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
