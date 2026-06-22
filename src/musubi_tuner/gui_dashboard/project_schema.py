@@ -659,6 +659,13 @@ class TrainingConfig(BaseModel):
     separate_audio_buckets: bool = False
     max_data_loader_n_workers: Optional[int] = None
     persistent_data_loader_workers: bool = False
+    # Composable conditioning recipe (TOML path). When set it is AUTHORITATIVE and mutually exclusive
+    # with the individual conditioning controls below: the command builder emits only
+    # --ltx2_conditioning_config and omits the flags the recipe owns (--lora_target_preset,
+    # --ic_lora_strategy / --ic_lora_ref_probability, first_frame, spatial_crop, inpaint, extend,
+    # audio variants, train_direction). --ltx2_mode, reference dirs, keyframe and video-anchor still
+    # apply. Empty = use the individual controls.
+    ltx2_conditioning_config: str = ""
     ltx2_first_frame_conditioning_p: float = 0.1
     # Endpoint-keyframe training (orthogonal to --ic_lora_strategy)
     keyframe_endpoint_training: bool = False

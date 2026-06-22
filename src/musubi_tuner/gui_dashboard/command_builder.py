@@ -680,10 +680,76 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
     return cmd
 
 
+def _append_ltx2_conditioning(cmd: list[str], t) -> None:
+    """Emit the LTX-2 intrinsic / directional / recipe conditioning args (shared by the LoRA and
+    full-finetune builders). A conditioning recipe (--ltx2_conditioning_config) is authoritative and
+    mutually exclusive with the individual conditioning flags: when set, only the recipe is emitted and
+    the flags it owns are skipped. Keyframe / video-anchor (orthogonal latent guides) always apply.
+    --lora_target_preset / --ic_lora_strategy are LoRA-only and emitted by the LoRA builder, not here.
+    """
+    recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip()
+    if recipe:
+        cmd += ["--ltx2_conditioning_config", recipe]
+    else:
+        cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
+
+    if getattr(t, "keyframe_endpoint_training", False):
+        cmd += ["--keyframe_endpoint_training"]
+        cmd += ["--keyframe_first_frame_p", str(getattr(t, "keyframe_first_frame_p", 1.0))]
+        cmd += ["--keyframe_last_frame_p", str(getattr(t, "keyframe_last_frame_p", 1.0))]
+        cmd += ["--keyframe_random_interior_p", str(getattr(t, "keyframe_random_interior_p", 0.0))]
+        cmd += ["--keyframe_max_random_interior", str(int(getattr(t, "keyframe_max_random_interior", 0)))]
+    if getattr(t, "video_anchor_training", False):
+        cmd += ["--video_anchor_training"]
+        cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
+        cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
+        cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
+    if not recipe and getattr(t, "ltx2_spatial_crop", False):
+        # Region is dataset-level (spatial_crop_region); only the master flag / probability / invert.
+        cmd += ["--ltx2_spatial_crop"]
+        cmd += ["--ltx2_spatial_crop_p", str(getattr(t, "ltx2_spatial_crop_probability", 0.0))]
+        if getattr(t, "ltx2_spatial_crop_invert", False):
+            cmd += ["--ltx2_spatial_crop_invert"]
+    if not recipe and getattr(t, "ltx2_inpaint_mask", False):
+        # Mask comes from the dataset's loss_mask_directory; only the flags are CLI args.
+        cmd += ["--ltx2_inpaint_mask"]
+        cmd += ["--ltx2_inpaint_mask_p", str(getattr(t, "ltx2_inpaint_mask_probability", 0.0))]
+        if getattr(t, "ltx2_inpaint_mask_invert", False):
+            cmd += ["--ltx2_inpaint_mask_invert"]
+        cmd += ["--ltx2_inpaint_mask_threshold", str(getattr(t, "ltx2_inpaint_mask_threshold", 0.5))]
+    if not recipe and getattr(t, "ltx2_audio_inpaint_mask", False):
+        # Audio mask comes from the dataset's audio_cond_mask_directory; only the flags are CLI args.
+        cmd += ["--ltx2_audio_inpaint_mask"]
+        cmd += ["--ltx2_audio_inpaint_mask_p", str(getattr(t, "ltx2_audio_inpaint_mask_probability", 0.0))]
+        if getattr(t, "ltx2_audio_inpaint_mask_invert", False):
+            cmd += ["--ltx2_audio_inpaint_mask_invert"]
+        cmd += ["--ltx2_audio_inpaint_mask_threshold", str(getattr(t, "ltx2_audio_inpaint_mask_threshold", 0.5))]
+    _ext_prefix = int(getattr(t, "ltx2_extend_prefix_frames", 0) or 0)
+    _ext_suffix = int(getattr(t, "ltx2_extend_suffix_frames", 0) or 0)
+    if not recipe and (_ext_prefix > 0 or _ext_suffix > 0):
+        cmd += ["--ltx2_extend_prefix_frames", str(_ext_prefix)]
+        cmd += ["--ltx2_extend_suffix_frames", str(_ext_suffix)]
+        cmd += ["--ltx2_extend_p", str(getattr(t, "ltx2_extend_probability", 1.0))]
+    _aext_prefix = int(getattr(t, "ltx2_audio_extend_prefix_frames", 0) or 0)
+    _aext_suffix = int(getattr(t, "ltx2_audio_extend_suffix_frames", 0) or 0)
+    if not recipe and (_aext_prefix > 0 or _aext_suffix > 0):
+        cmd += ["--ltx2_audio_extend_prefix_frames", str(_aext_prefix)]
+        cmd += ["--ltx2_audio_extend_suffix_frames", str(_aext_suffix)]
+        cmd += ["--ltx2_audio_extend_p", str(getattr(t, "ltx2_audio_extend_probability", 1.0))]
+    _train_direction = str(getattr(t, "ltx2_train_direction", "joint") or "joint")
+    if not recipe and _train_direction != "joint":
+        # Directional AV training (requires --ltx2_mode av); "joint" emits nothing (default).
+        cmd += ["--ltx2_train_direction", _train_direction]
+
+
 def build_training_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for training via accelerate launch."""
     toml_path = export_dataset_toml(config)
     t = config.training
+    # Conditioning recipe (authoritative + mutually exclusive). When set, emit only
+    # --ltx2_conditioning_config and skip the conditioning flags it owns (--lora_target_preset,
+    # --ic_lora_strategy / --ic_lora_ref_probability, and the intrinsic + directional flags below).
+    _cond_recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip()
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
@@ -788,7 +854,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
-    cmd += ["--lora_target_preset", t.lora_target_preset]
+    if not _cond_recipe:
+        # A reference recipe derives the preset from its strategy; an explicit --lora_target_preset
+        # would suppress that derivation, so the recipe governs the preset (omit it here).
+        cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.train_connectors:
         cmd.append("--train_connectors")
     if network_args_parts:
@@ -819,9 +888,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--audio_caption_dropout_rate", str(t.audio_caption_dropout_rate)]
     if not t.save_original_lora:
         cmd.append("--no_save_original_lora")
-    if t.ic_lora_strategy != "auto":
+    if not _cond_recipe and t.ic_lora_strategy != "auto":
         cmd += ["--ic_lora_strategy", t.ic_lora_strategy]
-    if getattr(t, "ic_lora_ref_probability", 1.0) != 1.0:
+    if not _cond_recipe and getattr(t, "ic_lora_ref_probability", 1.0) != 1.0:
         cmd += ["--ic_lora_ref_probability", str(t.ic_lora_ref_probability)]
     if t.av_cross_attention_mode != "both":
         cmd += ["--av_cross_attention_mode", t.av_cross_attention_mode]
@@ -1605,59 +1674,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
     if t.persistent_data_loader_workers:
         cmd.append("--persistent_data_loader_workers")
-    cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
-
-    if getattr(t, "keyframe_endpoint_training", False):
-        cmd += ["--keyframe_endpoint_training"]
-        cmd += ["--keyframe_first_frame_p", str(getattr(t, "keyframe_first_frame_p", 1.0))]
-        cmd += ["--keyframe_last_frame_p", str(getattr(t, "keyframe_last_frame_p", 1.0))]
-        cmd += ["--keyframe_random_interior_p", str(getattr(t, "keyframe_random_interior_p", 0.0))]
-        cmd += ["--keyframe_max_random_interior", str(int(getattr(t, "keyframe_max_random_interior", 0)))]
-    if getattr(t, "video_anchor_training", False):
-        cmd += ["--video_anchor_training"]
-        cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
-        cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
-        cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
-    if getattr(t, "ltx2_spatial_crop", False):
-        # Region is dataset-level (spatial_crop_region in the dataset config); only the
-        # master flag / probability / invert are CLI args.
-        cmd += ["--ltx2_spatial_crop"]
-        cmd += ["--ltx2_spatial_crop_p", str(getattr(t, "ltx2_spatial_crop_probability", 0.0))]
-        if getattr(t, "ltx2_spatial_crop_invert", False):
-            cmd += ["--ltx2_spatial_crop_invert"]
-    if getattr(t, "ltx2_inpaint_mask", False):
-        # The mask comes from the dataset's loss_mask_directory (binarized as a conditioning mask);
-        # only the master flag / probability / invert / threshold are CLI args.
-        cmd += ["--ltx2_inpaint_mask"]
-        cmd += ["--ltx2_inpaint_mask_p", str(getattr(t, "ltx2_inpaint_mask_probability", 0.0))]
-        if getattr(t, "ltx2_inpaint_mask_invert", False):
-            cmd += ["--ltx2_inpaint_mask_invert"]
-        cmd += ["--ltx2_inpaint_mask_threshold", str(getattr(t, "ltx2_inpaint_mask_threshold", 0.5))]
-    if getattr(t, "ltx2_audio_inpaint_mask", False):
-        # Audio mask comes from the dataset's audio_cond_mask_directory; only the flags are CLI args.
-        cmd += ["--ltx2_audio_inpaint_mask"]
-        cmd += ["--ltx2_audio_inpaint_mask_p", str(getattr(t, "ltx2_audio_inpaint_mask_probability", 0.0))]
-        if getattr(t, "ltx2_audio_inpaint_mask_invert", False):
-            cmd += ["--ltx2_audio_inpaint_mask_invert"]
-        cmd += ["--ltx2_audio_inpaint_mask_threshold", str(getattr(t, "ltx2_audio_inpaint_mask_threshold", 0.5))]
-    _ext_prefix = int(getattr(t, "ltx2_extend_prefix_frames", 0) or 0)
-    _ext_suffix = int(getattr(t, "ltx2_extend_suffix_frames", 0) or 0)
-    if _ext_prefix > 0 or _ext_suffix > 0:
-        # Auto-derived from the target latents; only the spans + probability are CLI args.
-        cmd += ["--ltx2_extend_prefix_frames", str(_ext_prefix)]
-        cmd += ["--ltx2_extend_suffix_frames", str(_ext_suffix)]
-        cmd += ["--ltx2_extend_p", str(getattr(t, "ltx2_extend_probability", 1.0))]
-    _aext_prefix = int(getattr(t, "ltx2_audio_extend_prefix_frames", 0) or 0)
-    _aext_suffix = int(getattr(t, "ltx2_audio_extend_suffix_frames", 0) or 0)
-    if _aext_prefix > 0 or _aext_suffix > 0:
-        # Audio extension; auto-derived from the target audio latents.
-        cmd += ["--ltx2_audio_extend_prefix_frames", str(_aext_prefix)]
-        cmd += ["--ltx2_audio_extend_suffix_frames", str(_aext_suffix)]
-        cmd += ["--ltx2_audio_extend_p", str(getattr(t, "ltx2_audio_extend_probability", 1.0))]
-    _train_direction = str(getattr(t, "ltx2_train_direction", "joint") or "joint")
-    if _train_direction != "joint":
-        # Directional AV training (requires --ltx2_mode av); "joint" emits nothing (default).
-        cmd += ["--ltx2_train_direction", _train_direction]
+    _append_ltx2_conditioning(cmd, t)
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
@@ -2139,6 +2156,10 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
         if args_parts:
             cmd += ["--tread_args"] + args_parts
+
+    # Conditioning (recipe / intrinsic / directional). --lora_target_preset / --ic_lora_strategy are
+    # LoRA-only and not emitted for full fine-tune; a recipe's reference still derives the strategy.
+    _append_ltx2_conditioning(cmd, t)
 
     cmd += _split_cli_args(t.extra_args)
     return cmd

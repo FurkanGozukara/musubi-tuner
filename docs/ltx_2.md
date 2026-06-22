@@ -2198,7 +2198,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 - **Attention masks are training-only**: `--audio_ref_mask_cross_attention_to_reference` and `--audio_ref_mask_reference_from_text_attention` are applied only during training. They are automatically disabled during sampling/inference to match the ID-LoRA reference (which explicitly sets both to `false` during validation). Negative position overrides are always applied.
 - **`av_ic` limitation**: `--audio_ref_mask_reference_from_text_attention` is not currently supported in `av_ic` because the Modality API uses a 2D `context_mask`; the trainer warns and ignores this flag.
 - **AV cross-attention modes**: `--av_cross_attention_mode both` is the default `av_ic` behavior. Use `a2v_only` for audio-to-video only, `v2a_only` for video-to-audio only, or `none` to disable AV cross-modal attention while keeping the rest of `av_ic` intact. All require `--ltx2_mode av`.
-- **Multi-reference `av_ic`**: accepts multiple reference latents when they are provided as stacked tensors or extra `ref_*` entries, and concatenates them before conditioning. This keeps the implementation compatible with the existing single-reference path while allowing richer identity/style aggregation. `--av_multi_ref` does not change training behavior (multiple reference tensors are concatenated automatically); it only records multi-reference intent in run metadata/UI.
+- **Multi-reference `av_ic`**: concatenates multiple reference latents before conditioning. `--av_multi_ref` does not change training behavior; it only records multi-reference intent in run metadata/UI.
 - **`video_ref_only_av`**: requires `--ltx2_mode av`, uses reference video only, and keeps the audio branch target-only. This is useful when you want identity/motion conditioning from video without requiring reference audio for every sample.
 - **First-frame conditioning**: for identity-sensitive AV IC-LoRA, `--ltx2_first_frame_conditioning_p 0.9` is the documented starting point. Without it, identity transfer from the target first frame is often weak. A warning is emitted in AV mode if `--ltx2_first_frame_conditioning_p` is effectively off (below ~0.01).
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
@@ -2462,7 +2462,7 @@ Caveats:
 ##### Composable Conditioning Recipe
 <sub>[↑ contents](#table-of-contents)</sub>
 
-`--ltx2_conditioning_config <file.toml>` is an optional recipe that selects which conditions are active and how often, lowering each entry onto the individual `--ltx2_*` flags above so conditions compose. It does not replace the training mode; it layers intrinsic conditioning on top. Condition-specific data (the spatial-crop region, the mask directory) stays in the dataset config.
+`--ltx2_conditioning_config <file.toml>` is an optional recipe that drives three things from one file: (a) it enables the intrinsic conditioners, lowering each entry onto the individual `--ltx2_*` flags above so they compose; (b) a `reference` condition selects an IC-LoRA reference strategy (lowered onto `--ic_lora_strategy`); and (c) `is_generated = false` selects directional training (lowered onto `--ltx2_train_direction`). For the intrinsic conditioners it sets the same values as the individual flags rather than replacing the training mode. Condition data (the spatial-crop region, the mask directory, the reference media) stays in the dataset config.
 
 Conditions live under `[video]` and/or `[audio]` blocks, each a list of `[[video.conditions]]` / `[[audio.conditions]]` tables:
 
@@ -2490,12 +2490,34 @@ Conditions live under `[video]` and/or `[audio]` blocks, each a list of `[[video
   suffix = 8
 ```
 
+I2V (keep frame 0 clean):
+
+```toml
+[video]
+
+  [[video.conditions]]
+  type = "first_frame"
+  probability = 0.9
+```
+
+Inpaint (on-disk mask):
+
+```toml
+[video]
+
+  [[video.conditions]]
+  type = "inpaint"          # alias: mask
+  probability = 0.5
+  threshold = 0.5
+```
+
+The mask comes from the dataset's `loss_mask_directory`.
+
 Notes:
 
 - The recipe is authoritative: a condition declared both in the recipe and as an explicit CLI flag is governed by the recipe (the CLI flag is overridden, logged at WARNING).
-- `[video]` supports `first_frame`, `spatial_crop`, `inpaint` (alias `mask`), `extend`, `reference`. `[audio]` supports `extend`, `inpaint` (alias `mask`), `reference` — the intrinsic audio types lower onto the `--ltx2_audio_*` flags and require an audio-bearing mode (`--ltx2_mode av` or `audio`). Intrinsics are not combinable with `--ic_lora_strategy` (except `first_frame`, which composes with IC-LoRA reference strategies as usual); `reference` is the marker that selects an IC-LoRA strategy (see below).
 - A recipe is the complete declarative set: an intrinsic you do not list is off. `first_frame` is the only one that is otherwise on by default (`--ltx2_first_frame_conditioning_p` 0.1), so a recipe that omits a `[video]` `first_frame` disables first-frame conditioning — add one (with an optional `probability`) to keep it.
-- The legacy flat top-level `[[conditions]]` list is no longer accepted (the parser errors with a migration hint).
+- Conditions must live under `[video]`/`[audio]` blocks; a top-level `[[conditions]]` list is rejected with a migration hint.
 
 A `reference` condition selects an IC-LoRA reference strategy instead of an intrinsic flag. Its presence in a block is a zero-data marker; the strategy is derived from the recipe structure and lowered onto `--ic_lora_strategy`:
 
@@ -2514,7 +2536,36 @@ A `reference` condition selects an IC-LoRA reference strategy instead of an intr
   probability = 0.1         # optional: reference dropout -> --ic_lora_ref_probability
 ```
 
-An optional `probability` on the `[video]` reference sets `--ic_lora_ref_probability` (reference dropout); the audio reference takes no parameters. The reference video/audio itself comes from the dataset config (`reference_directory` / the plural `reference_*_directories`), exactly as for the equivalent `--ic_lora_strategy` CLI run — the recipe only selects the strategy. A `reference` cannot be combined with a gated intrinsic (`spatial_crop` / `inpaint` / `extend`) in the same recipe; `first_frame` composes with IC-LoRA and is exempt, and a reference recipe leaves it at its default rather than disabling it. The derived strategy still requires the matching `--ltx2_mode` (`av_ic` / `video_ref_only_av` need `av`; `audio_ref_ic` needs `av` or `audio`).
+An optional `probability` on the `[video]` reference sets `--ic_lora_ref_probability` (reference dropout); the audio reference takes no parameters. A `reference` cannot be combined with a gated intrinsic (`spatial_crop` / `inpaint` / `extend`) in the same recipe; `first_frame` is exempt and a reference recipe leaves it at its default rather than disabling it. The derived strategy requires the matching `--ltx2_mode` (`v2v` needs `video`; `av_ic` / `video_ref_only_av` need `av`; `audio_ref_ic` needs `av` or `audio`). The reference media itself comes from the dataset config, exactly as for the equivalent `--ic_lora_strategy` CLI run — the recipe only selects the strategy.
+
+A reference recipe auto-selects the matching LoRA target preset; do **not** also pass `--lora_target_preset` with a reference recipe (an explicit preset suppresses the auto-selection). Set `--lora_target_preset` only when **not** using a recipe.
+
+`av_ic` (`[video]` reference + `[audio]` reference):
+
+```toml
+[video]
+
+  [[video.conditions]]
+  type = "reference"
+
+[audio]
+
+  [[audio.conditions]]
+  type = "reference"
+```
+
+Run with `--ltx2_mode av`. The reference video and audio are set in the dataset TOML (see [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)).
+
+`audio_ref_ic` (`[audio]` reference, no video reference):
+
+```toml
+[audio]
+
+  [[audio.conditions]]
+  type = "reference"
+```
+
+Run with `--ltx2_mode av` or `audio`. The reference audio is set in the dataset TOML (see [Audio-Reference IC-LoRA](#audio-reference-ic-lora)).
 
 Each block also accepts `is_generated` (bool, default `true`). Setting exactly one modality's `is_generated = false` freezes it as clean conditioning and trains [directionally](#directional-training-a2v--v2a): `[audio]` `is_generated = false` → `a2v` (freeze audio, generate video); `[video]` `is_generated = false` → `v2a` (freeze video, generate audio/foley). This lowers onto `--ltx2_train_direction` and requires `--ltx2_mode av` (enforced downstream, with the same feature-conflict rules as the flag). Setting both to `false` is an error (nothing is generated), and a `reference` cannot be combined with directional training.
 
@@ -2522,6 +2573,13 @@ Each block also accepts `is_generated` (bool, default `true`). Setting exactly o
 [audio]
 is_generated = false   # freeze audio, generate video  ->  --ltx2_train_direction a2v
 ```
+
+```toml
+[video]
+is_generated = false   # freeze video, generate audio (foley)  ->  --ltx2_train_direction v2a
+```
+
+`v2a` auto-disables first-frame conditioning (see [Directional Training](#directional-training-a2v--v2a)).
 
 Each recipe condition lowers onto the matching CLI flags (so the recipe and the flags are two ways to set the same thing); condition data that is inherently per-item stays in the dataset config:
 
@@ -2533,11 +2591,15 @@ Each recipe condition lowers onto the matching CLI flags (so the recipe and the 
 | Video extend (fwd/back) | `[video]` `extend` | `prefix`, `suffix`, `probability` | `--ltx2_extend_prefix_frames` `_suffix_frames` `_p` | — (auto from target) |
 | Audio extend (fwd/back) | `[audio]` `extend` | `prefix`, `suffix`, `probability` | `--ltx2_audio_extend_prefix_frames` `_suffix_frames` `_p` | — (auto from target) |
 | Audio inpaint | `[audio]` `inpaint` (alias `mask`) | `probability`, `invert`, `threshold` | `--ltx2_audio_inpaint_mask` `_p` `_invert` `_threshold` | `audio_cond_mask_directory` |
-| Reference IC-LoRA | `[video]` / `[audio]` `reference` | `probability` (video only) | `--ic_lora_strategy` (derived) `--ic_lora_ref_probability` | `reference_directory` / `reference_*_directories` |
+| Reference IC-LoRA | `[video]` / `[audio]` `reference` | `probability` (video only) | `--ic_lora_strategy` (derived) `--ic_lora_ref_probability` | video: `reference_directory` / `reference_directories`; audio: `reference_audio_directory` / `reference_audio_directories` |
 
-Per-sample loss (`--ltx2_per_sample_loss`, or the recipe top-level key `per_sample_loss = true`) is off by default. When off, the masked loss uses a batch-global denominator (every in-mask element weighted equally across the batch). When on, the loss is renormalized per sample — each batch element is weighted equally regardless of how much of it is masked in, so a heavily-conditioned sample is not down-weighted relative to a lightly-conditioned one. It is a top-level recipe key, not a `[[conditions]]` entry; a recipe that omits it leaves per-sample loss off (the recipe never switches it on implicitly).
+`probability` may be written `p`; `inpaint` may be written `mask`; setting both `probability` and `p` on one condition is an error. Audio inpaint reads its mask from `audio_cond_mask_directory` (not `loss_mask_directory`).
+
+Per-sample loss (`--ltx2_per_sample_loss`, or the recipe top-level key `per_sample_loss = true`) is off by default. When off, the masked loss uses a batch-global denominator (every in-mask element weighted equally across the batch); when on, each batch element is weighted equally regardless of how much of it is masked in. It is a top-level recipe key, not a `[[conditions]]` entry, and is never enabled implicitly. It is not exposed in the dashboard.
 
 The effective conditioning of a run is recorded in the checkpoint metadata (LoRA and full fine-tune) under `ss_ltx2_*` keys (only when non-default), regardless of whether it came from the recipe or the CLI flags.
+
+In the dashboard, the Training tab has a Conditioning group with a recipe-path field. Setting a recipe disables the individual conditioning controls (recipe and individual controls are mutually exclusive) and the dashboard emits only `--ltx2_conditioning_config` (`--ltx2_mode`, the reference directories, and keyframe/anchor settings still apply). Leave the field empty to use the individual controls instead.
 
 ##### Directional Training (A2V / V2A)
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -2550,13 +2612,14 @@ Trains a dedicated directional model by freezing one whole modality as clean con
 
 Both modality streams still run, so the frozen-clean one conditions the generated one through cross-attention. The frozen modality contributes no loss; its `loss_v` / `loss_a` logs as `n/a`.
 
-This differs from **Cross-Task Synergy** (`--cts_lambda_*`): CTS adds directional losses *on top of* joint training (extra forwards per step; the model stays joint-capable), whereas `--ltx2_train_direction` *replaces* the main loss for a dedicated directional model (one forward per step). Use CTS for a joint model with directional regularization; use `--ltx2_train_direction` to train a foley (`v2a`) or A2V model.
+This differs from **Cross-Task Synergy** (`--cts_lambda_*`): CTS adds directional losses *on top of* joint training (extra forwards per step; the model stays joint-capable), whereas `--ltx2_train_direction` *replaces* the main loss for a dedicated directional model (one forward per step).
 
 Caveats:
 
 - **AV mode required**: rejected for `--ltx2_mode video` / `audio`.
 - **Standalone mode**: rejected together with IC-LoRA, `--self_flow`, `--tread`, Cross-Task Synergy, the G2D modality freezer (`--modality_freeze_*`), audio loss balancing (`--audio_loss_balance_mode`), `--dcr`, and `--tarp`.
 - **`v2a` excludes video-side conditioners** because the whole video is frozen. First-frame conditioning (`--ltx2_first_frame_conditioning_p`, on by default at 0.1) is **auto-disabled with a warning** under `v2a` (it is redundant when the whole video is clean), so a plain `--ltx2_mode av --ltx2_train_direction v2a` runs as-is. Explicitly enabled video conditioners are rejected (disable one): `--ltx2_spatial_crop`, `--ltx2_inpaint_mask`, `--ltx2_extend_*`, `--video_anchor_training`, `--hfato`. `a2v` allows video conditioners (the video is generated).
+- **`a2v` excludes `--independent_audio_timestep`**: audio is frozen at sigma 0, so a separately sampled audio timestep is discarded.
 - **Training-only**: no inference behavior is added (inference-time A2V/V2A guidance is the separate `--video_modality_scale` / `--audio_modality_scale`).
 
 ##### Sample Prompt Flags
