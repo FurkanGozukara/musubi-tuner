@@ -38,7 +38,7 @@ from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, collator_class, prepare_accelerator
-from musubi_tuner.training.losses import apply_loss_mask, per_element_loss as _per_element_loss
+from musubi_tuner.training.losses import per_element_loss as _per_element_loss, reduce_masked_loss
 from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.metadata import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
@@ -1444,7 +1444,9 @@ def train(self, args):
                                 per_elem, _ = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
                             elif tag == "audio":
                                 per_elem, _ = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
-                            loss, _ = apply_loss_mask(per_elem, mask)
+                            # Per-sample mask renorm only when --ltx2_per_sample_loss is set; otherwise
+                            # the batch-global reducer (byte-identical off-path).
+                            loss, _ = reduce_masked_loss(per_elem, mask, per_sample=getattr(args, "ltx2_per_sample_loss", False))
                             return loss
 
                         video_pred = out["video_pred"]
@@ -1885,7 +1887,11 @@ def train(self, args):
                             per_elem, modifier_metrics = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
                             for k, v in modifier_metrics.items():
                                 mask_metrics[k] = v
-                        loss, metrics = apply_loss_mask(per_elem, mask)
+                        # Per-sample mask renorm only when --ltx2_per_sample_loss is set; otherwise the
+                        # batch-global reducer (byte-identical off-path). The HFATO x0 video-loss path
+                        # (used when --hfato is active) keeps its own reduction and is not
+                        # per-sample-renormalized.
+                        loss, metrics = reduce_masked_loss(per_elem, mask, per_sample=getattr(args, "ltx2_per_sample_loss", False))
                         if tag is not None and metrics:
                             for k, v in metrics.items():
                                 mask_metrics[f"{tag}_{k}"] = v

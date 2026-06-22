@@ -192,6 +192,19 @@ def validate_train_direction_setup(args: argparse.Namespace, accelerator=None) -
         from musubi_tuner.ltx2_inpaint_mask import is_inpaint_mask_enabled
         from musubi_tuner.ltx2_intrinsic_cond import is_spatial_crop_enabled
 
+        # first_frame conditioning is ON BY DEFAULT (p=0.1), so a plain v2a invocation would otherwise
+        # hard-error below. It is redundant under v2a (the whole video is already frozen-clean), so
+        # auto-disable it with a warning instead of erroring -- `--ltx2_mode av --ltx2_train_direction
+        # v2a` then runs out of the box. The explicitly opt-in conditioners below stay hard errors.
+        first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0) or 0.0)
+        if first_frame_p > 0.0:
+            logger.warning(
+                "--ltx2_train_direction v2a freezes the whole video; disabling first-frame conditioning "
+                "(--ltx2_first_frame_conditioning_p %.3f -> 0.0), redundant under v2a.",
+                first_frame_p,
+            )
+            args.ltx2_first_frame_conditioning_p = 0.0
+
         conflicting = []
         if is_spatial_crop_enabled(args):
             conflicting.append("--ltx2_spatial_crop")
@@ -199,8 +212,6 @@ def validate_train_direction_setup(args: argparse.Namespace, accelerator=None) -
             conflicting.append("--ltx2_inpaint_mask")
         if is_extend_enabled(args):
             conflicting.append("--ltx2_extend_prefix_frames/_suffix_frames")
-        if float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0) or 0.0) > 0.0:
-            conflicting.append("--ltx2_first_frame_conditioning_p")
         if bool(getattr(args, "video_anchor_training", False)):
             conflicting.append("--video_anchor_training")
         if bool(getattr(args, "hfato", False)):

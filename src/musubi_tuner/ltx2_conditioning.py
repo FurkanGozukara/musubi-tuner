@@ -66,6 +66,13 @@ def add_ltx2_conditioning_args(parser: argparse.ArgumentParser) -> argparse.Argu
         "intrinsic not listed is disabled (this includes first_frame, which is otherwise on by "
         "default at 0.1). Off by default.",
     )
+    parser.add_argument(
+        "--ltx2_per_sample_loss",
+        action="store_true",
+        help="Renormalize the masked loss per sample (each batch element weighted equally regardless "
+        "of how much of it is masked in) instead of using the batch-global mask denominator. Off by "
+        "default; set on the command line, or via a recipe top-level 'per_sample_loss = true'.",
+    )
     return parser
 
 
@@ -117,6 +124,12 @@ def apply_conditioning_config(args: argparse.Namespace) -> None:
         return
     path = getattr(args, "ltx2_conditioning_config", None)
     if not path:
+        # Normalize a falsy-but-non-None path (e.g. --ltx2_conditioning_config "" from an unset shell
+        # variable) to None, so every recipe-active gate downstream agrees this is a no-recipe run.
+        # Without this the loss-reducer gate (`is not None`) disagrees with the parser/metadata
+        # (truthiness) and silently switches to per-sample renorm with no recipe actually active.
+        if path is not None:
+            setattr(args, "ltx2_conditioning_config", None)
         setattr(args, _SENTINEL, True)
         return
 
@@ -229,6 +242,13 @@ def apply_conditioning_config(args: argparse.Namespace) -> None:
                 prev,
             )
         args.ltx2_first_frame_conditioning_p = 0.0
+
+    # Per-sample loss is a top-level loss policy (not a per-condition entry). The recipe owns it like
+    # any other dial: set from the recipe top-level 'per_sample_loss' (default False when omitted),
+    # overriding a CLI --ltx2_per_sample_loss with a warning. A recipe therefore never IMPLICITLY
+    # changes the loss reduction; per-sample loss is opt-in here exactly as it is on the command line.
+    _warn_cli_override(bool(getattr(args, "ltx2_per_sample_loss", False)), "per_sample_loss", "--ltx2_per_sample_loss")
+    args.ltx2_per_sample_loss = bool(data.get("per_sample_loss", False))
 
     setattr(args, _SENTINEL, True)
     logger.info("Applied conditioning recipe from %s: %s", path, sorted(seen))

@@ -163,10 +163,43 @@ def _intrinsic_conditioning_metadata(args) -> Dict[str, Any]:
         md["ss_ltx2_audio_inpaint_mask_threshold"] = float(getattr(args, "ltx2_audio_inpaint_mask_threshold", 0.5))
         if bool(getattr(args, "ltx2_audio_inpaint_mask_invert", False)):
             md["ss_ltx2_audio_inpaint_mask_invert"] = True
+    if bool(getattr(args, "ltx2_per_sample_loss", False)):
+        md["ss_ltx2_per_sample_loss"] = True
     recipe_path = getattr(args, "ltx2_conditioning_config", None)
     if recipe_path:
         md["ss_ltx2_conditioning_config"] = os.path.basename(str(recipe_path))
     return md
+
+
+def _guide_intrinsic_overlaps(args, total_frames: int, guide_start: int, guide_len: int, ic_lora_strategy: str) -> List[str]:
+    """Names of enabled video intrinsics whose conditioned frames overlap a latent_idx-guide slot.
+
+    The guide latent is pasted last and owns its frame slot (it supplies the clean conditioning
+    content and excludes the slot from loss for every sample), so an intrinsic that also conditions
+    those frames is silently overridden there. Used only to warn. The gates mirror the runtime ones:
+    intrinsics require ``ic_lora_strategy == 'none'``; first_frame composes with IC-LoRA, so it is
+    checked regardless.
+    """
+    g0, g1 = guide_start, guide_start + guide_len
+
+    def _overlaps(a: int, b: int) -> bool:
+        return a < g1 and g0 < b  # half-open [a, b) intersects [g0, g1)
+
+    hits: List[str] = []
+    if float(getattr(args, "ltx2_first_frame_conditioning_p", 0.1) or 0.0) > 0.0 and total_frames > 0 and _overlaps(0, 1):
+        hits.append("first_frame")
+    if ic_lora_strategy == "none":
+        if is_spatial_crop_enabled(args) and _overlaps(0, total_frames):
+            hits.append("spatial_crop")
+        if bool(getattr(args, "ltx2_inpaint_mask", False)) and _overlaps(0, total_frames):
+            hits.append("inpaint")
+        prefix = int(getattr(args, "ltx2_extend_prefix_frames", 0) or 0)
+        suffix = int(getattr(args, "ltx2_extend_suffix_frames", 0) or 0)
+        if prefix > 0 and _overlaps(0, min(prefix, total_frames)):
+            hits.append("extend(prefix)")
+        if suffix > 0 and _overlaps(max(0, total_frames - suffix), total_frames):
+            hits.append("extend(suffix)")
+    return hits
 
 
 def _network_has_av_cross_projection_lora(network: torch.nn.Module, projections: Tuple[str, ...]) -> bool:
@@ -4935,6 +4968,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 model_noisy_video = model_noisy_video.clone()
                 model_noisy_video[:, :, _gfi : _gfi + gT, :, :] = _gl
                 latent_idx_guide_slot = (_gfi, gT)
+                if not getattr(self, "_warned_guide_intrinsic_overlap", False):
+                    _overlaps = _guide_intrinsic_overlaps(args, frames_g, _gfi, gT, self._ic_lora_strategy)
+                    if _overlaps:
+                        self._warned_guide_intrinsic_overlap = True
+                        logger.warning(
+                            "latent_idx_guide occupies frames [%d, %d); it takes precedence over %s "
+                            "conditioning in the overlapping frames (the guide latent is the clean "
+                            "conditioning content there, not the intrinsic's target content).",
+                            _gfi,
+                            _gfi + gT,
+                            ", ".join(_overlaps),
+                        )
         if isinstance(keyframe_guide_entry, dict):
             _kgl = keyframe_guide_entry.get("latents")
             _kgfi = int(keyframe_guide_entry.get("frame_idx", -1))

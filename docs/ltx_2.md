@@ -2217,6 +2217,8 @@ Two kinds, mirroring upstream Lightricks `VideoConditionByLatentIndex` / `VideoC
 
 Both can be set independently and per-dataset.
 
+When a `latent_idx` guide and an intrinsic (`first_frame` / `spatial_crop` / `inpaint` / `extend`) condition the same frames, the guide takes precedence: it is pasted last and supplies the clean conditioning content for its slot (with the slot excluded from loss), so the intrinsic's target content is overridden in the overlapping frames. The trainer logs a one-time warning naming the overlapping intrinsic. `keyframe` guides append tokens instead of replacing a slot, so they never override an intrinsic.
+
 ##### Dataset Config Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -2500,6 +2502,8 @@ Each recipe `type` lowers onto the matching CLI flags (so the recipe and the fla
 | Audio extend (fwd/back) | `audio_extend` | `prefix`, `suffix`, `probability` | `--ltx2_audio_extend_prefix_frames` `_suffix_frames` `_p` | — (auto from target) |
 | Audio inpaint | `audio_inpaint` (alias `audio_mask`) | `probability`, `invert`, `threshold` | `--ltx2_audio_inpaint_mask` `_p` `_invert` `_threshold` | `audio_cond_mask_directory` |
 
+Per-sample loss (`--ltx2_per_sample_loss`, or the recipe top-level key `per_sample_loss = true`) is off by default. When off, the masked loss uses a batch-global denominator (every in-mask element weighted equally across the batch). When on, the loss is renormalized per sample — each batch element is weighted equally regardless of how much of it is masked in, so a heavily-conditioned sample is not down-weighted relative to a lightly-conditioned one. It is a top-level recipe key, not a `[[conditions]]` entry; a recipe that omits it leaves per-sample loss off (the recipe never switches it on implicitly).
+
 The effective conditioning of a run is recorded in the checkpoint metadata (LoRA and full fine-tune) under `ss_ltx2_*` keys (only when non-default), regardless of whether it came from the recipe or the CLI flags.
 
 ##### Directional Training (A2V / V2A)
@@ -2519,7 +2523,7 @@ Caveats:
 
 - **AV mode required**: rejected for `--ltx2_mode video` / `audio`.
 - **Standalone mode**: rejected together with IC-LoRA, `--self_flow`, `--tread`, Cross-Task Synergy, the G2D modality freezer (`--modality_freeze_*`), audio loss balancing (`--audio_loss_balance_mode`), `--dcr`, and `--tarp`.
-- **`v2a` excludes intrinsic video conditioners** (`--ltx2_spatial_crop` / `--ltx2_inpaint_mask` / `--ltx2_extend_*`) because the whole video is frozen. `a2v` allows them (the video is generated).
+- **`v2a` excludes video-side conditioners** because the whole video is frozen. First-frame conditioning (`--ltx2_first_frame_conditioning_p`, on by default at 0.1) is **auto-disabled with a warning** under `v2a` (it is redundant when the whole video is clean), so a plain `--ltx2_mode av --ltx2_train_direction v2a` runs as-is. Explicitly enabled video conditioners are rejected (disable one): `--ltx2_spatial_crop`, `--ltx2_inpaint_mask`, `--ltx2_extend_*`, `--video_anchor_training`, `--hfato`. `a2v` allows video conditioners (the video is generated).
 - **Training-only**: no inference behavior is added (inference-time A2V/V2A guidance is the separate `--video_modality_scale` / `--audio_modality_scale`).
 
 ##### Sample Prompt Flags
