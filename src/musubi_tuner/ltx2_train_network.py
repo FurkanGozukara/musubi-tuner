@@ -154,9 +154,11 @@ def resolve_ltx2_per_sample_loss(args, ic_lora_strategy: str, train_direction: s
     if bool(getattr(args, "ltx2_per_sample_loss", False)):
         return  # set on the CLI -> already explicit
     strategy = str(ic_lora_strategy or "none").lower()
+    # A recipe lowers its conditions onto these flags BEFORE this runs, so the specific predicates cover
+    # every genuinely-active recipe. Do NOT trigger on the recipe path alone: a first-frame-only recipe
+    # lowers only first_frame (excluded above as the on-by-default baseline) and must stay batch-global.
     conditioning_active = (
-        getattr(args, "ltx2_conditioning_config", None) is not None
-        or is_spatial_crop_enabled(args)
+        is_spatial_crop_enabled(args)
         or is_inpaint_mask_enabled(args)
         or is_extend_enabled(args)
         or is_audio_extend_enabled(args)
@@ -636,6 +638,14 @@ def _or_intrinsic_video_token_masks(
     """
     for _m in token_masks:
         if _m is not None:
+            if _m.shape != target_cond_mask.shape:
+                # The intrinsic token masks are built with patch_size==1, so their seq_len equals the
+                # target token seq_len. A mismatch means that invariant was broken upstream; fail loudly
+                # here instead of relying on broadcasting to silently misalign the conditioning.
+                raise ValueError(
+                    f"intrinsic token mask shape {tuple(_m.shape)} does not match the target conditioning "
+                    f"mask shape {tuple(target_cond_mask.shape)}."
+                )
             target_cond_mask = target_cond_mask | _m
     return target_cond_mask
 

@@ -292,6 +292,7 @@ def _masked_mse(
     loss_type: str = "mse",
     huber_delta: float = 1.0,
     per_elem_modifier: Optional[Callable[[torch.Tensor], tuple[torch.Tensor, dict[str, float]]]] = None,
+    per_sample: bool = False,
 ) -> torch.Tensor:
     if isinstance(tgt, torch.Tensor):
         pred = pred.to(device=tgt.device, dtype=dtype)
@@ -329,6 +330,14 @@ def _masked_mse(
         mask = mask.view(mask.shape[0], 1, 1)
 
     mask_f = mask.to(dtype=per_elem.dtype)
+    if per_sample:
+        # Per-sample renormalization (matches the LoRA path and the official trainer): each batch element
+        # is weighted by its OWN active fraction. Enabled by --ltx2_per_sample_loss (auto-on under
+        # conditioning), so a full fine-tune and a LoRA run reduce the masked loss identically.
+        mf = mask_f.expand_as(per_elem)
+        dims = tuple(range(1, per_elem.dim()))
+        active = mf.sum(dim=dims).clamp(min=1e-8)
+        return ((per_elem * mf).sum(dim=dims) / active).mean()
     denom = mask_f.mean()
     if denom.item() == 0:
         return per_elem.mean()
@@ -1149,6 +1158,7 @@ def _build_fisher_ewc_stats(
                     dtype=trainer.dit_dtype,
                     loss_type=_ewc_loss_type,
                     huber_delta=_ewc_huber_delta,
+                    per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                 ) * float(out.get("video_loss_weight", 1.0))
                 audio_pred = out.get("audio_pred")
                 audio_target = out.get("audio_target")
@@ -1161,6 +1171,7 @@ def _build_fisher_ewc_stats(
                         dtype=trainer.dit_dtype,
                         loss_type=_ewc_loss_type,
                         huber_delta=_ewc_huber_delta,
+                        per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                     ) * float(out.get("audio_loss_weight", 1.0))
             else:
                 _ewc_loss_type = getattr(args, "loss_type", "mse")
@@ -6212,6 +6223,7 @@ def main() -> None:
                         per_elem_modifier=lambda per_elem: trainer.modify_video_loss_per_element(
                             args, per_elem, out, trainer.dit_dtype
                         ),
+                        per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                     )
                     # Base weights: dataset config × CLI override.
                     video_weight = float(out.get("video_loss_weight", 1.0)) * cli_video_loss_weight
@@ -6234,6 +6246,7 @@ def main() -> None:
                             per_elem_modifier=lambda per_elem: trainer.modify_audio_loss_per_element(
                                 args, per_elem, out, trainer.dit_dtype
                             ),
+                            per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                         )
                         audio_weight = float(out.get("audio_loss_weight", 1.0)) * cli_audio_loss_weight
 
