@@ -445,11 +445,42 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
             errors.append(_make_issue("error", "training.adaptive_rank", message, label="Adaptive Rank", page="training"))
 
+    if getattr(t, "use_oft", False):
+        # Plain OFT is honored only by the native LoRA backend. The LoKr backend
+        # ignores use_oft and exposes OFT only through DoKr-OFT (use_dora_oft).
+        if lycoris_requested or network_module not in {
+            "networks.lora",
+            "networks.lora_ltx2",
+            "musubi_tuner.networks.lora",
+            "musubi_tuner.networks.lora_ltx2",
+        }:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.use_oft",
+                    "OFT is currently available only with the native LoRA backend. Use DoRA-OFT/DoKr-OFT for the LoKr backend.",
+                    label="OFT",
+                    page="training",
+                )
+            )
+        if t.use_dora_oft:
+            message = "OFT and DoRA-OFT/DoKr-OFT cannot be enabled together."
+            errors.append(_make_issue("error", "training.use_oft", message, label="OFT", page="training"))
+            errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
+        if t.use_dora:
+            message = "OFT and DoRA/DokR cannot be enabled together."
+            errors.append(_make_issue("error", "training.use_oft", message, label="OFT", page="training"))
+            errors.append(_make_issue("error", "training.use_dora", message, label="DoRA/DokR", page="training"))
+
     if getattr(t, "use_rslora", False):
         if t.use_dora_oft:
             message = "rsLoRA is not supported with DoRA-OFT/DoKr-OFT."
             errors.append(_make_issue("error", "training.use_rslora", message, label="rsLoRA", page="training"))
             errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
+        if getattr(t, "use_oft", False):
+            message = "rsLoRA is not supported with OFT."
+            errors.append(_make_issue("error", "training.use_rslora", message, label="rsLoRA", page="training"))
+            errors.append(_make_issue("error", "training.use_oft", message, label="OFT", page="training"))
         if lycoris_requested or network_module not in {
             "networks.lora",
             "networks.lora_ltx2",

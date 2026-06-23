@@ -269,6 +269,7 @@ class TrainingConfig(BaseModel):
     init_lokr_norm: Optional[float] = None
     use_dora: bool = False
     use_dora_oft: bool = False
+    use_oft: bool = False
     use_rslora: bool = False
     rank_dropout: Optional[float] = None
     module_dropout: Optional[float] = None

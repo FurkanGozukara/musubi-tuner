@@ -91,6 +91,7 @@ def _training_network_args_parts(t) -> list[str]:
     _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
     _append_network_arg(network_args_parts, "use_dora", t.use_dora)
     _append_network_arg(network_args_parts, "use_dora_oft", t.use_dora_oft)
+    _append_network_arg(network_args_parts, "use_oft", getattr(t, "use_oft", False))
     _append_network_arg(network_args_parts, "use_rslora", getattr(t, "use_rslora", False))
     _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
     _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
