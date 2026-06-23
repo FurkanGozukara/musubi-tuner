@@ -1,12 +1,1 @@
-# Merge strategy for files this fork maintains independently of the upstream remote.
-#
-# trainer_base.py was split here into thin hooks plus training/* helper modules that are
-# attached onto NetworkTrainer. The remote still keeps every method inline in one ~2k-line
-# file, so a 3-way merge tries to reconcile two structurally different files and explodes on
-# every upstream sync. Marking it `merge=ours` keeps our version on merge; any genuinely
-# useful change from the remote is ported into the matching training/* module by hand
-# (review it with: git log <prev>..<remote> -- src/musubi_tuner/training/trainer_base.py).
-#
-# `merge=ours` needs the driver defined locally once per clone (not carried in-tree):
-#     git config merge.ours.driver true
-src/musubi_tuner/training/trainer_base.py merge=ours
+# No repository-specific merge attributes.
