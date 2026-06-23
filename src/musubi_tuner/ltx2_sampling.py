@@ -3701,6 +3701,20 @@ class LTX2SamplingMixin:
                             )
                             if audio_cond_mask is not None:
                                 _stg_audio_ts = torch.where(audio_cond_mask, torch.zeros_like(_stg_audio_ts), _stg_audio_ts)
+                        elif audio_ref_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
+                            # audio_ref_ic perturbs only video self-attention (audio STG is disabled
+                            # above), but the AV model is bimodal: the audio modality must still be
+                            # present so the wrapper splits the joint [video|audio] text context into
+                            # per-modality dims. Without an audio latent the forward is video-only and
+                            # the 6144-d AV context is routed unsplit to the 4096-d video modality ->
+                            # "Context hidden size mismatch". Carry [target | reference] audio with the
+                            # reference frames clamped to t=0, matching the bimodal-CFG block.
+                            _stg_audio = torch.cat([audio_latents, ref_audio_latents_device], dim=2).to(dtype=dit_dtype)
+                            _stg_tgt_ts = (
+                                sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(device=transformer_device, dtype=dit_dtype)
+                            )
+                            _stg_ref_ts = torch.zeros((1, ref_audio_seq_len), device=transformer_device, dtype=dit_dtype)
+                            _stg_audio_ts = torch.cat([_stg_tgt_ts, _stg_ref_ts], dim=1)
 
                         _stg_input = [_stg_video, _stg_audio] if self._audio_video and _stg_audio is not None else _stg_video
 
@@ -4648,7 +4662,7 @@ class LTX2SamplingMixin:
                         timesteps=cfg_video_ts,
                         positions=cfg_video_pos,
                         context=cfg_video_ctx,
-                        sigma=sigma,
+                        sigma=sigma.expand(cfg_video_tokens.shape[0]),
                         context_mask=prompt_mask,
                         a2v_cross_attention_mask=cfg_a2v_mask,
                     )
@@ -4658,7 +4672,7 @@ class LTX2SamplingMixin:
                         timesteps=cfg_audio_ts,
                         positions=cfg_audio_pos,
                         context=cfg_audio_ctx,
-                        sigma=sigma,
+                        sigma=sigma.expand(cfg_audio_tokens.shape[0]),
                         context_mask=prompt_mask,
                         v2a_cross_attention_mask=cfg_v2a_mask,
                     )
@@ -4745,7 +4759,7 @@ class LTX2SamplingMixin:
                         timesteps=video_ts,
                         positions=video_combined_pos,
                         context=video_ctx,
-                        sigma=sigma,
+                        sigma=sigma.expand(video_tokens.shape[0]),
                         context_mask=prompt_mask,
                         a2v_cross_attention_mask=a2v_mask,
                     )
@@ -4755,7 +4769,7 @@ class LTX2SamplingMixin:
                         timesteps=audio_ts,
                         positions=audio_combined_pos,
                         context=audio_ctx,
-                        sigma=sigma,
+                        sigma=sigma.expand(audio_tokens.shape[0]),
                         context_mask=prompt_mask,
                         v2a_cross_attention_mask=v2a_mask,
                     )
