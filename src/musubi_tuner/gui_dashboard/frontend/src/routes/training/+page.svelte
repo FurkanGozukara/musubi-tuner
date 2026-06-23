@@ -94,6 +94,29 @@
 			(t.conditioning_recipe.audio?.conditions || []).some((c) => c.type === 'reference')
 		))
 	);
+	// Mirror derive_ic_lora_strategy() so a manual override can pre-seed the preset the recipe would
+	// derive. '' = no introspectable inline reference recipe (an external recipe file cannot be read here).
+	let recipeReferencePreset = $derived.by(() => {
+		const r = t.conditioning_recipe;
+		if (!r?.enabled) return '';
+		const v = r.video || {}, a = r.audio || {};
+		const vConds = v.conditions || [], aConds = a.conditions || [];
+		// A modality's TOML block exists iff it has a condition or is frozen (mirrors export_conditioning_toml).
+		const hasVideo = vConds.length > 0 || v.is_generated === false;
+		const hasAudio = aConds.length > 0 || a.is_generated === false;
+		const vHasRef = vConds.some((c) => c.type === 'reference');
+		const aHasRef = aConds.some((c) => c.type === 'reference');
+		const vRef = hasVideo && v.is_generated !== false && vHasRef;
+		const aRef = hasAudio && a.is_generated !== false && aHasRef;
+		let strat = 'none';
+		if (vRef && aRef) strat = 'av_ic';
+		else if (vRef && hasAudio && !aHasRef) strat = 'video_ref_only_av';
+		else if (vRef && !hasAudio) strat = 'v2v';
+		else if (aRef && !vHasRef) strat = 'audio_ref_ic';
+		if (strat === 'none') return '';
+		// Audio-only mode forces the 'audio' preset (mode precedence in resolve_ic_lora_target_preset).
+		return (t.ltx2_mode || 'video') === 'audio' ? 'audio' : strat;
+	});
 	let rl = $derived($projectConfig?.remote_stage_launcher || {});
 	let rs = $derived($projectConfig?.remote_stage_server || {});
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
@@ -377,6 +400,16 @@
 		update('lora_target_preset', value);
 		if (value === 'lycoris') enableLycorisMode();
 	}
+	function enableManualPreset() {
+		update('lora_target_preset_manual', true);
+		// Seed with the preset the recipe would have derived, so manual mode starts from the sensible value.
+		if (recipeReferencePreset && (t.lora_target_preset || 't2v') !== recipeReferencePreset) {
+			updateLoraTargetPreset(recipeReferencePreset);
+		}
+	}
+	function disableManualPreset() {
+		update('lora_target_preset_manual', false);
+	}
 	function updateLycorisAlgo(value) {
 		update('lycoris_algo', value);
 		if (value) enableLycorisMode();
@@ -507,17 +540,22 @@
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
-							]} onchange={(e) => updateLoraTargetPreset(e.target.value)} disabled={recipeDerivesPreset} tooltip="Target layers. A reference conditioning recipe sets this automatically; an intrinsic-only / directional recipe leaves it to you." />
+							]} onchange={(e) => updateLoraTargetPreset(e.target.value)} disabled={recipeDerivesPreset && !t.lora_target_preset_manual} tooltip="Target layers. A reference conditioning recipe sets this automatically; override it manually below, or an intrinsic-only / directional recipe leaves it to you." />
 						</div>
 						{#if recipeDerivesPreset}
 							<div class="flex items-start gap-1.5 px-2 py-1.5 text-[11px]" style="background: var(--accent-subtle-bg); border: 1px solid var(--accent-muted); border-radius: var(--radius-sm); color: var(--text-secondary);">
 								<svg class="w-3.5 h-3.5 flex-shrink-0 mt-px" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
-								<span>A reference conditioning recipe (set on the <strong>Conditioning</strong> tab) selects the LoRA target preset automatically, so it is disabled here.</span>
+								{#if t.lora_target_preset_manual}
+									<span>Manual override on — <strong>{t.lora_target_preset}</strong> is used (the recipe still sets the IC-LoRA strategy).{#if recipeReferencePreset && t.lora_target_preset !== recipeReferencePreset} The recipe targets <strong>{recipeReferencePreset}</strong>; your choice adapts different modules.{/if} <button type="button" onclick={disableManualPreset} class="underline font-medium" style="color: var(--accent);">Use recipe default</button></span>
+								{:else}
+									<span>A reference conditioning recipe (set on the <strong>Conditioning</strong> tab) selects the LoRA target preset automatically. <button type="button" onclick={enableManualPreset} class="underline font-medium" style="color: var(--accent);">Override manually</button></span>
+								{/if}
 							</div>
 						{/if}
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle label="DoRA / DokR" fieldPath="training.use_dora" checked={t.use_dora ?? false} onchange={(e) => update('use_dora', e.target.checked)} tooltip="Train LoRA or LoKr with a separate magnitude vector. Passed as use_dora=true in network args." />
 							<FormToggle label="DoRA-OFT / DoKr-OFT" fieldPath="training.use_dora_oft" checked={t.use_dora_oft ?? false} onchange={(e) => update('use_dora_oft', e.target.checked)} tooltip="Train native LoRA or LoKr with OFT rotation plus DoRA-style magnitude scaling. Passed as use_dora_oft=true in network args." />
+							<FormToggle label="OFT" fieldPath="training.use_oft" checked={t.use_oft ?? false} onchange={(e) => update('use_oft', e.target.checked)} tooltip="Train native LoRA with an orthogonal rotation (OFT) instead of an additive low-rank update. Block size is taken from Network Dim. Native LoRA backend only (use DoRA-OFT/DoKr-OFT for LoKr); not interchangeable with ComfyUI/kohya OFT — merge into the base model for external inference. Passed as use_oft=true in network args." />
 							<FormToggle label="rsLoRA" fieldPath="training.use_rslora" checked={t.use_rslora ?? false} onchange={(e) => update('use_rslora', e.target.checked)} tooltip="Use rank-stabilized LoRA scaling alpha/sqrt(rank). Native LoRA backend only; exported alpha is saved in standard-loader-compatible form." />
 						</div>
 						{#if $advancedMode}

@@ -932,9 +932,11 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
-    if not _recipe_derives_preset:
-        # A reference recipe derives the preset from its strategy; an explicit --lora_target_preset would
-        # suppress that derivation, so omit it ONLY then. Intrinsic-only / directional recipes keep it.
+    if not _recipe_derives_preset or getattr(t, "lora_target_preset_manual", False):
+        # A reference recipe normally derives the preset from its strategy, so the flag is omitted and the
+        # engine auto-selects it. lora_target_preset_manual overrides that: emit the chosen preset
+        # explicitly (the engine honors an explicit preset and still derives the strategy from the recipe).
+        # Intrinsic-only / directional recipes (and no recipe) always emit the user's preset.
         cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.train_connectors:
         cmd.append("--train_connectors")

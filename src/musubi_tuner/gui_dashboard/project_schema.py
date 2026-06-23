@@ -252,6 +252,10 @@ class TrainingConfig(BaseModel):
         "full",
         "lycoris",
     ] = "t2v"
+    # A reference conditioning recipe normally derives the LoRA target preset from its strategy. Set this
+    # true to override that and use lora_target_preset directly; the engine honors an explicit preset and
+    # still derives the IC-LoRA strategy from the recipe.
+    lora_target_preset_manual: bool = False
     network_args: str = ""
     network_weights: str = ""
     network_dropout: Optional[float] = None
