@@ -508,6 +508,46 @@
 				{/if}
 
 				{#if $advancedMode}
+					<FormGroup title="Composable Conditioning">
+						<div class="space-y-2 pt-2">
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect fieldPath="inference.ic_lora_strategy" value={s.ic_lora_strategy || 'auto'} options={['auto', 'none', 'v2v', 'av_ic', 'video_ref_only_av', 'audio_ref_ic']} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA inference strategy to drive a trained reference / audio-reference LoRA. auto infers from the LoRA target preset; av_ic / video_ref_only_av / audio_ref_ic need AV mode." />
+								<FormSelect fieldPath="inference.av_cross_attention_mode" value={s.av_cross_attention_mode || 'both'} options={['both', 'a2v_only', 'v2a_only', 'none']} onchange={(e) => update('av_cross_attention_mode', e.target.value)} tooltip="AV cross-attention direction within av_ic." />
+							</div>
+							<PathInput fieldPath="inference.reference_audio" value={s.reference_audio || ''} oninput={(e) => update('reference_audio', e.target.value)} showFiles tooltip="Reference audio clip for audio-reference conditioning (AV mode + ic_lora_strategy audio_ref_ic or av_ic)." />
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.inpaint_mask" value={s.inpaint_mask || ''} oninput={(e) => update('inpaint_mask', e.target.value)} showFiles tooltip="Inpaint mask (image/video) for masked V2V; needs an inpaint source." />
+								<PathInput fieldPath="inference.inpaint_source" value={s.inpaint_source || ''} oninput={(e) => update('inpaint_source', e.target.value)} showFiles tooltip="Source video the kept region is clean-pasted from. Defaults to the reference video." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormToggle fieldPath="inference.inpaint_invert" checked={s.inpaint_invert ?? false} onchange={(e) => update('inpaint_invert', e.target.checked ? true : null)} tooltip="Invert the inpaint mask polarity." />
+								<FormField type="number" fieldPath="inference.inpaint_threshold" value={s.inpaint_threshold ?? ''} oninput={(e) => update('inpaint_threshold', e.target.value ? Number(e.target.value) : null)} min={0} max={1} step="0.05" placeholder="0.5" tooltip="Inpaint mask binarization threshold." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.extend_prefix" value={s.extend_prefix || ''} oninput={(e) => update('extend_prefix', e.target.value)} showFiles tooltip="Prefix video to continue (extend): its first frames are locked, the rest generated." />
+								<FormField type="number" fieldPath="inference.extend_prefix_frames" value={s.extend_prefix_frames ?? ''} oninput={(e) => update('extend_prefix_frames', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="~half" tooltip="Pixel frames of the prefix to lock." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.outpaint_source" value={s.outpaint_source || ''} oninput={(e) => update('outpaint_source', e.target.value)} showFiles tooltip="Source video whose kept region is preserved during outpaint." />
+								<FormField fieldPath="inference.outpaint_region" value={s.outpaint_region || ''} oninput={(e) => update('outpaint_region', e.target.value)} placeholder="x,y,w,h" tooltip="Outpaint keep-region in pixels; the surrounding area is generated." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.drive_video" value={s.drive_video || ''} oninput={(e) => update('drive_video', e.target.value)} showFiles tooltip="Video-to-audio (v2a): lock this full video and generate its audio. Needs AV mode." />
+								<PathInput fieldPath="inference.drive_audio" value={s.drive_audio || ''} oninput={(e) => update('drive_audio', e.target.value)} showFiles tooltip="Audio-to-video (a2v): lock this full audio and generate video from it. Needs AV mode." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.audio_prefix" value={s.audio_prefix || ''} oninput={(e) => update('audio_prefix', e.target.value)} showFiles tooltip="Audio extend: lock the start of this audio, generate the continuation. Needs AV mode." />
+								<FormField type="number" fieldPath="inference.audio_prefix_seconds" value={s.audio_prefix_seconds ?? ''} oninput={(e) => update('audio_prefix_seconds', e.target.value ? Number(e.target.value) : null)} min={0} step="0.1" placeholder="~half" tooltip="Seconds of the audio prefix to lock." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.audio_inpaint_audio" value={s.audio_inpaint_audio || ''} oninput={(e) => update('audio_inpaint_audio', e.target.value)} showFiles tooltip="Audio inpaint: keep this audio except the interval below, which is regenerated. Needs AV mode." />
+								<FormField fieldPath="inference.audio_inpaint_interval" value={s.audio_inpaint_interval || ''} oninput={(e) => update('audio_inpaint_interval', e.target.value)} placeholder="start,end" tooltip="Seconds interval of audio to regenerate." />
+							</div>
+						</div>
+					</FormGroup>
+				{/if}
+
+				{#if $advancedMode}
 					<FormGroup title="Decode">
 						<div class="space-y-2 pt-2">
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">

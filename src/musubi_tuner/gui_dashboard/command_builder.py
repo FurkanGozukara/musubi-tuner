@@ -621,6 +621,42 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--reference_image", s.reference_image]
     if s.reference_video:
         cmd += ["--reference_video", s.reference_video]
+    if getattr(s, "reference_audio", ""):
+        cmd += ["--reference_audio", s.reference_audio]
+    if getattr(s, "ic_lora_strategy", "auto") not in ("", "auto"):
+        cmd += ["--ic_lora_strategy", s.ic_lora_strategy]
+    if getattr(s, "av_cross_attention_mode", "both") not in ("", "both"):
+        cmd += ["--av_cross_attention_mode", s.av_cross_attention_mode]
+    if getattr(s, "inpaint_mask", ""):
+        cmd += ["--inpaint_mask", s.inpaint_mask]
+    if getattr(s, "inpaint_source", ""):
+        cmd += ["--inpaint_source", s.inpaint_source]
+    if getattr(s, "inpaint_invert", None) is True:
+        cmd.append("--inpaint_invert")
+    elif getattr(s, "inpaint_invert", None) is False:
+        cmd.append("--no-inpaint_invert")
+    if getattr(s, "inpaint_threshold", None) is not None:
+        cmd += ["--inpaint_threshold", str(s.inpaint_threshold)]
+    if getattr(s, "extend_prefix", ""):
+        cmd += ["--extend_prefix", s.extend_prefix]
+    if getattr(s, "extend_prefix_frames", None) is not None:
+        cmd += ["--extend_prefix_frames", str(s.extend_prefix_frames)]
+    if getattr(s, "outpaint_region", ""):
+        cmd += ["--outpaint_region", s.outpaint_region]
+    if getattr(s, "outpaint_source", ""):
+        cmd += ["--outpaint_source", s.outpaint_source]
+    if getattr(s, "drive_video", ""):
+        cmd += ["--drive_video", s.drive_video]
+    if getattr(s, "drive_audio", ""):
+        cmd += ["--drive_audio", s.drive_audio]
+    if getattr(s, "audio_prefix", ""):
+        cmd += ["--audio_prefix", s.audio_prefix]
+    if getattr(s, "audio_prefix_seconds", None) is not None:
+        cmd += ["--audio_prefix_seconds", str(s.audio_prefix_seconds)]
+    if getattr(s, "audio_inpaint_audio", ""):
+        cmd += ["--audio_inpaint_audio", s.audio_inpaint_audio]
+    if getattr(s, "audio_inpaint_interval", ""):
+        cmd += ["--audio_inpaint_interval", s.audio_inpaint_interval]
 
     # Audio / decode
     if s.sample_disable_audio:

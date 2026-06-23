@@ -2008,6 +2008,18 @@ python ltx2_generate_video.py ^
 - Global `--reference_image` / `--reference_video` overrides replace conflicting per-prompt `image_path` / `v2v_ref_path` entries loaded from prompt files, and also clear any cached reference latents tied to those prompt entries before sampling.
 - If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
 
+#### Rendering Trained Conditioning
+<sub>[↑ contents](#table-of-contents)</sub>
+
+To render a LoRA trained with a conditioning recipe, pass the matching inference inputs below. Each is a global override applied to every prompt in the run; conditioning paths left unset stay off. Audio-video inputs require `--ltx2_mode av`.
+
+- **Reference / IC-LoRA**: `--ic_lora_strategy {auto,none,v2v,av_ic,video_ref_only_av,audio_ref_ic}` selects the trained reference strategy (`auto` infers it from `--lora_target_preset`). Supply the reference media with `--reference_video` (video reference) and/or `--reference_audio` (audio reference; requires `audio_ref_ic` or `av_ic`). `--av_cross_attention_mode {both,a2v_only,v2a_only,none}` selects the cross-attention direction inside `av_ic`.
+- **Inpaint**: `--inpaint_mask <image|video>` with a source video (`--inpaint_source`, or `--reference_video`) keeps the masked region from the source and regenerates the rest. `--inpaint_invert` flips the mask polarity; `--inpaint_threshold` sets the binarization threshold.
+- **Outpaint / spatial-crop**: `--outpaint_region x,y,w,h` keeps that pixel rectangle from `--outpaint_source` and generates the surrounding area.
+- **Extend**: `--extend_prefix <video>` locks the prefix and generates the continuation; `--extend_prefix_frames` sets how many pixel frames are locked.
+- **Directional**: `--drive_audio <audio>` (a2v) locks the full audio and generates video from it; `--drive_video <video>` (v2a) locks the full video and generates its audio. Pair with `--av_cross_attention_mode a2v_only` / `v2a_only`.
+- **Audio extend / inpaint**: `--audio_prefix <audio>` (with `--audio_prefix_seconds`) locks an audio prefix and generates the rest; `--audio_inpaint_audio <audio>` with `--audio_inpaint_interval start,end` (seconds) keeps the audio outside the interval and regenerates inside it.
+
 ### Audio Quality Metrics
 <sub>[↑ contents](#table-of-contents)</sub>
 
