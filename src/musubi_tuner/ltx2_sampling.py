@@ -162,6 +162,17 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
     return "none"
 
 
+def _align_audio_latent_frames(lat: "torch.Tensor", n: int) -> "torch.Tensor":
+    """Truncate or last-frame-pad an audio latent [B, C, T, F] so that T == n."""
+    t = int(lat.shape[2])
+    if t == n:
+        return lat
+    if t > n:
+        return lat[:, :, :n, :]
+    pad = lat[:, :, -1:, :].expand(-1, -1, n - t, -1)
+    return torch.cat([lat, pad], dim=2)
+
+
 def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
     mode = str(value or "both").lower()
     if mode not in {"both", "a2v_only", "v2a_only", "none"}:
@@ -1822,7 +1833,9 @@ class LTX2SamplingMixin:
         keyframe_guides_resolved = None
         latent_idx_specs = sample_parameter.get("latent_idx_guide_specs") or []
         keyframe_specs = sample_parameter.get("keyframe_guide_specs") or []
-        if latent_idx_specs or keyframe_specs:
+        extend_prefix_path = sample_parameter.get("extend_prefix_path")
+        drive_video_path = sample_parameter.get("drive_video_path")
+        if latent_idx_specs or keyframe_specs or extend_prefix_path or drive_video_path:
             from musubi_tuner.ltx2_inference import LatentIndexGuide, KeyframeGuide
 
             try:
@@ -1860,6 +1873,63 @@ class LTX2SamplingMixin:
                             )
                         except Exception as e:
                             logger.error("Failed to encode --gl guide %r: %s", spec.get("path"), e)
+                if extend_prefix_path:
+                    # Multi-frame "extend": encode the prefix video to N latent frames and pin [0:N]
+                    # via a strength-1 latent guide at index 0. Reuses the verified latent-guide lock
+                    # (no new denoise path). LTX-2 latent temporal factor = 8.
+                    try:
+                        fc = int(sample_parameter.get("frame_count") or 0)
+                        target_latent = ((fc - 1) // 8 + 1) if fc > 0 else 0
+                        epf = sample_parameter.get("extend_prefix_frames")
+                        max_px = int(epf) if epf else (fc // 2 if fc else 0)
+                        prefix_lat = self._load_and_encode_v2v_reference(
+                            ref_path=extend_prefix_path,
+                            target_height=height,
+                            target_width=width,
+                            vae_checkpoint_path=vae_checkpoint,
+                            device=device,
+                            dtype=dit_dtype,
+                            max_frames=(max_px or fc or 1),
+                        )
+                        if target_latent > 1 and prefix_lat.shape[2] >= target_latent:
+                            prefix_lat = prefix_lat[:, :, : target_latent - 1]
+                        if latent_idx_guides_resolved is None:
+                            latent_idx_guides_resolved = []
+                        latent_idx_guides_resolved.append(LatentIndexGuide(latent=prefix_lat, latent_idx=0, strength=1.0))
+                        logger.info(
+                            "Extend: locked %d prefix latent frame(s) at idx 0 (target latent %d).",
+                            int(prefix_lat.shape[2]),
+                            target_latent,
+                        )
+                    except Exception as e:
+                        logger.error("Extend: failed to encode prefix %r: %s", extend_prefix_path, e)
+                if drive_video_path:
+                    # v2a: lock the FULL driving video (every latent frame) and generate audio in av
+                    # mode. Reuses the latent-guide lock at strength 1 with no clamp (the whole video is
+                    # given; only audio is denoised). Pair with --ltx2_mode av.
+                    try:
+                        fc = int(sample_parameter.get("frame_count") or 0)
+                        target_latent = ((fc - 1) // 8 + 1) if fc > 0 else 0
+                        drive_lat = self._load_and_encode_v2v_reference(
+                            ref_path=drive_video_path,
+                            target_height=height,
+                            target_width=width,
+                            vae_checkpoint_path=vae_checkpoint,
+                            device=device,
+                            dtype=dit_dtype,
+                            max_frames=(fc or 1),
+                        )
+                        if target_latent > 0 and int(drive_lat.shape[2]) > target_latent:
+                            drive_lat = drive_lat[:, :, :target_latent]
+                        if latent_idx_guides_resolved is None:
+                            latent_idx_guides_resolved = []
+                        latent_idx_guides_resolved.append(LatentIndexGuide(latent=drive_lat, latent_idx=0, strength=1.0))
+                        logger.info(
+                            "v2a: locked %d driving-video latent frame(s); audio will be generated.",
+                            int(drive_lat.shape[2]),
+                        )
+                    except Exception as e:
+                        logger.error("v2a: failed to encode driving video %r: %s", drive_video_path, e)
                 if keyframe_specs:
                     keyframe_guides_resolved = []
                     for spec in keyframe_specs:
@@ -1922,6 +1992,23 @@ class LTX2SamplingMixin:
             except Exception as e:
                 logger.error("Audio-ref: failed to load reference audio '%s': %s", ref_audio_path, e)
                 ref_audio_latent = None
+
+        # Audio-lock (a2v / audio_extend / audio_inpaint): encode the given audio once so do_inference
+        # can seed it into the audio latents and pin its timesteps. No-op unless an audio-lock flag set.
+        _audio_lock_path = sample_parameter.get("audio_lock_audio_path")
+        if _audio_lock_path and not isinstance(sample_parameter.get("audio_lock_latent"), torch.Tensor):
+            try:
+                _lock_ckpt = getattr(args, "ltx2_checkpoint", None)
+                if not _lock_ckpt:
+                    raise ValueError("--ltx2_checkpoint is required for audio-lock encoding")
+                sample_parameter["audio_lock_latent"] = self._load_and_encode_reference_audio_latent(
+                    audio_path=_audio_lock_path,
+                    checkpoint_path=_lock_ckpt,
+                    device=accelerator.device,
+                    dtype=dit_dtype,
+                )
+            except Exception as e:
+                logger.error("Audio-lock: failed to encode '%s': %s", _audio_lock_path, e)
 
         lora_count = ensure_adapters_enabled_for_sampling(transformer)
         adapter_summary = summarize_active_adapters(transformer)
@@ -2979,6 +3066,8 @@ class LTX2SamplingMixin:
         audio_latents = None
         ref_audio_latents_device = None
         ref_audio_seq_len = 0
+        audio_cond_mask = None  # [1, audio_frames] bool: True = locked/clean (audio-lock primitive)
+        clean_audio_latent = None
         if enable_audio_preview or audio_ref_ic_sampling or video_ref_only_av_sampling:
             frame_rate = sample_parameter.get("frame_rate", 25)
             video_shape = VideoPixelShape(
@@ -3009,6 +3098,47 @@ class LTX2SamplingMixin:
                 device=transformer_device,
                 generator=generator,
             )
+
+            # Audio-lock: seed locked frames with the given audio and build a per-frame condition
+            # mask (True=locked clean / False=denoise). drive=all (a2v), prefix=first K (audio_extend),
+            # inpaint=all-but-interval (audio_inpaint). Off-path: stays None unless a lock flag is set.
+            _audio_lock_latent = sample_parameter.get("audio_lock_latent")
+            _audio_lock_mode = sample_parameter.get("audio_lock_mode")
+            if isinstance(_audio_lock_latent, torch.Tensor) and _audio_lock_mode:
+                try:
+                    if _audio_lock_latent.dim() == 3:
+                        _audio_lock_latent = _audio_lock_latent.unsqueeze(0)
+                    _af = int(audio_latents.shape[2])
+                    clean_audio_latent = _align_audio_latent_frames(
+                        _audio_lock_latent.to(device=transformer_device, dtype=audio_latents.dtype), _af
+                    )
+                    _mask = torch.zeros((1, _af), device=transformer_device, dtype=torch.bool)
+                    _fps = _af * float(sample_parameter.get("frame_rate", 25)) / max(int(frame_count), 1)
+                    if _audio_lock_mode == "drive":
+                        _mask[:] = True
+                    elif _audio_lock_mode == "prefix":
+                        _ksec = float(sample_parameter.get("audio_lock_seconds", 0.0) or 0.0)
+                        _k = int(round(_ksec * _fps)) if _ksec > 0 else _af // 2
+                        _mask[:, : max(1, min(_k, _af))] = True
+                    elif _audio_lock_mode == "inpaint":
+                        _s, _e = sample_parameter.get("audio_lock_interval", (0.0, 0.0))
+                        _si = max(0, min(_af, int(round(float(_s) * _fps))))
+                        _ei = max(0, min(_af, int(round(float(_e) * _fps))))
+                        _mask[:] = True
+                        if _ei > _si:
+                            _mask[:, _si:_ei] = False  # generate the interval, lock the rest
+                    audio_cond_mask = _mask
+                    audio_latents = torch.where(audio_cond_mask.view(1, 1, _af, 1), clean_audio_latent, audio_latents)
+                    logger.info(
+                        "Audio-lock[%s]: %d/%d audio latent frames locked.",
+                        _audio_lock_mode,
+                        int(audio_cond_mask.sum()),
+                        _af,
+                    )
+                except Exception as e:
+                    logger.error("Audio-lock setup failed: %s", e)
+                    audio_cond_mask = None
+                    clean_audio_latent = None
 
             if audio_ref_ic_sampling:
                 if ref_audio_latents is None:
@@ -3254,14 +3384,22 @@ class LTX2SamplingMixin:
                             torch.cat([audio_latents, audio_latents], dim=0) if do_classifier_free_guidance else audio_latents
                         )
                         audio_model_input = audio_model_input.to(dtype=dit_dtype)
-                        audio_timestep_for_model = (
-                            sigma.expand(audio_model_input.shape[0])
-                            .to(
-                                device=transformer_device,
-                                dtype=dit_dtype,
+                        if audio_cond_mask is not None:
+                            # Audio-lock: per-frame timesteps (0 at locked frames, sigma elsewhere).
+                            _af_ts = (
+                                sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(device=transformer_device, dtype=dit_dtype)
                             )
-                            .unsqueeze(1)
-                        )
+                            _af_ts = torch.where(audio_cond_mask, torch.zeros_like(_af_ts), _af_ts)
+                            audio_timestep_for_model = _af_ts.repeat(audio_model_input.shape[0], 1)
+                        else:
+                            audio_timestep_for_model = (
+                                sigma.expand(audio_model_input.shape[0])
+                                .to(
+                                    device=transformer_device,
+                                    dtype=dit_dtype,
+                                )
+                                .unsqueeze(1)
+                            )
 
                 # Prepare timestep (sigma in [0, 1])
                 timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
@@ -3461,6 +3599,8 @@ class LTX2SamplingMixin:
                                 dtype=dit_dtype,
                             )
                         )
+                        if audio_cond_mask is not None:
+                            bm_audio_ts = torch.where(audio_cond_mask, torch.zeros_like(bm_audio_ts), bm_audio_ts)
                     else:
                         bm_audio_input = None
                         bm_audio_ts = None
@@ -3559,6 +3699,8 @@ class LTX2SamplingMixin:
                                     dtype=dit_dtype,
                                 )
                             )
+                            if audio_cond_mask is not None:
+                                _stg_audio_ts = torch.where(audio_cond_mask, torch.zeros_like(_stg_audio_ts), _stg_audio_ts)
 
                         _stg_input = [_stg_video, _stg_audio] if self._audio_video and _stg_audio is not None else _stg_video
 
@@ -3657,6 +3799,10 @@ class LTX2SamplingMixin:
                         audio_latents = a_next
                     else:
                         audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
+                    if audio_cond_mask is not None and clean_audio_latent is not None:
+                        # Audio-lock: keep locked frames pinned to the given clean audio each step.
+                        _af_lock = int(audio_latents.shape[2])
+                        audio_latents = torch.where(audio_cond_mask.view(1, 1, _af_lock, 1), clean_audio_latent, audio_latents)
 
         # Free I2V conditioning tensors to reclaim memory before VAE decode
         if denoise_mask is not None or clean_latent is not None:

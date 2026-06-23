@@ -95,6 +95,128 @@ def _apply_reference_conditioning_overrides(
     return ref_path, use_v2v
 
 
+def _apply_composable_conditioning_overrides(prompts: list[dict], args: argparse.Namespace) -> None:
+    """Inject inference-time composable-conditioning inputs into each prompt dict.
+
+    Writes the per-prompt keys the sampler already reads (ref_audio_path / inpaint_mask_path /
+    v2v_ref_path / inpaint_invert / inpaint_threshold). No-op when the corresponding flag is unset,
+    so a run without these flags is byte-identical to prior behavior. Strategy and AV cross-attention
+    mode are consumed straight from args by handle_model_specific_args and need no per-prompt key.
+    """
+    reference_audio = getattr(args, "reference_audio", None)
+    inpaint_mask = getattr(args, "inpaint_mask", None)
+    inpaint_source = getattr(args, "inpaint_source", None) or getattr(args, "reference_video", None)
+    inpaint_invert = getattr(args, "inpaint_invert", None)
+    inpaint_threshold = getattr(args, "inpaint_threshold", None)
+    extend_prefix = getattr(args, "extend_prefix", None)
+    extend_prefix_frames = getattr(args, "extend_prefix_frames", None)
+    drive_video = getattr(args, "drive_video", None)
+
+    # Audio-lock (a2v / audio_extend / audio_inpaint) resolves to one (path, mode) the sampler pins.
+    audio_lock_path = audio_lock_mode = audio_lock_seconds = audio_lock_interval = None
+    if getattr(args, "drive_audio", None):
+        audio_lock_path, audio_lock_mode = args.drive_audio, "drive"
+    elif getattr(args, "audio_prefix", None):
+        audio_lock_path, audio_lock_mode = args.audio_prefix, "prefix"
+        audio_lock_seconds = getattr(args, "audio_prefix_seconds", None)
+    elif getattr(args, "audio_inpaint_audio", None):
+        audio_lock_path, audio_lock_mode = args.audio_inpaint_audio, "inpaint"
+        _iv = getattr(args, "audio_inpaint_interval", None)
+        if _iv:
+            try:
+                _s, _e = (float(v) for v in str(_iv).split(","))
+                audio_lock_interval = (_s, _e)
+            except Exception as exc:
+                raise ValueError(f"--audio_inpaint_interval must be 'start,end' seconds; got {_iv!r}") from exc
+    if audio_lock_path and not os.path.isfile(audio_lock_path):
+        raise FileNotFoundError(f"Audio-lock audio does not exist: {audio_lock_path}")
+
+    # Outpaint lowers onto the inpaint path: keep the region from the source, generate the surround.
+    outpaint_region = getattr(args, "outpaint_region", None)
+    if outpaint_region:
+        x, y, w, h = _parse_outpaint_region(outpaint_region)
+        outpaint_source = getattr(args, "outpaint_source", None) or inpaint_source
+        if not outpaint_source:
+            raise ValueError("--outpaint_region needs a source video via --outpaint_source (or --reference_video)")
+        if not os.path.isfile(outpaint_source):
+            raise FileNotFoundError(f"Outpaint source does not exist: {outpaint_source}")
+        os.makedirs(args.output_dir, exist_ok=True)
+        inpaint_mask = _build_outpaint_mask_png(
+            (x, y, w, h), int(args.width), int(args.height), os.path.join(args.output_dir, "outpaint_mask.png")
+        )
+        inpaint_source = outpaint_source
+
+    if reference_audio and not os.path.isfile(reference_audio):
+        raise FileNotFoundError(f"Reference audio does not exist: {reference_audio}")
+    if extend_prefix and not os.path.isfile(extend_prefix):
+        raise FileNotFoundError(f"Extend prefix does not exist: {extend_prefix}")
+    if drive_video and not os.path.isfile(drive_video):
+        raise FileNotFoundError(f"Driving video does not exist: {drive_video}")
+    if inpaint_mask:
+        if not os.path.isfile(inpaint_mask):
+            raise FileNotFoundError(f"Inpaint mask does not exist: {inpaint_mask}")
+        if not inpaint_source:
+            raise ValueError("--inpaint_mask needs a source video via --inpaint_source (or --reference_video)")
+        if not os.path.isfile(inpaint_source):
+            raise FileNotFoundError(f"Inpaint source does not exist: {inpaint_source}")
+
+    for prompt_dict in prompts:
+        if reference_audio:
+            prompt_dict["ref_audio_path"] = reference_audio
+        if inpaint_mask:
+            prompt_dict["inpaint_mask_path"] = inpaint_mask
+            # Inpaint runs inside the v2v denoiser, so the source must populate the v2v ref slot.
+            prompt_dict["v2v_ref_path"] = inpaint_source
+            if inpaint_invert is not None:
+                prompt_dict["inpaint_invert"] = bool(inpaint_invert)
+            if inpaint_threshold is not None:
+                prompt_dict["inpaint_threshold"] = float(inpaint_threshold)
+        if extend_prefix:
+            prompt_dict["extend_prefix_path"] = extend_prefix
+            if extend_prefix_frames is not None:
+                prompt_dict["extend_prefix_frames"] = int(extend_prefix_frames)
+        if drive_video:
+            prompt_dict["drive_video_path"] = drive_video
+        if audio_lock_mode:
+            prompt_dict["audio_lock_audio_path"] = audio_lock_path
+            prompt_dict["audio_lock_mode"] = audio_lock_mode
+            if audio_lock_seconds is not None:
+                prompt_dict["audio_lock_seconds"] = float(audio_lock_seconds)
+            if audio_lock_interval is not None:
+                prompt_dict["audio_lock_interval"] = audio_lock_interval
+
+
+def _parse_outpaint_region(spec: str) -> tuple[int, int, int, int]:
+    """Parse 'x,y,w,h' (pixels) into ints."""
+    try:
+        x, y, w, h = (int(round(float(v))) for v in spec.split(","))
+    except Exception as exc:
+        raise ValueError(f"--outpaint_region must be 'x,y,w,h' in pixels; got {spec!r}") from exc
+    if w <= 0 or h <= 0:
+        raise ValueError(f"--outpaint_region width/height must be positive; got {spec!r}")
+    return x, y, w, h
+
+
+def _build_outpaint_mask_png(region: tuple[int, int, int, int], width: int, height: int, out_path: str) -> str:
+    """Write a still keep-mask: white (kept) inside the region, black (generated) outside.
+
+    The inpaint clean-paste pins white-region tokens to the source and generates the rest, so a white
+    interior rectangle realizes outpaint (keep the crop, generate the surround). A still broadcasts to
+    every frame in the sampler.
+    """
+    import numpy as np
+    from PIL import Image
+
+    x, y, w, h = region
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(width, x + w), min(height, y + h)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if x1 > x0 and y1 > y0:
+        mask[y0:y1, x0:x1] = 255
+    Image.fromarray(mask, mode="L").save(out_path)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Arg parsing — mirrors training script arg names so configs are portable
 # ---------------------------------------------------------------------------
@@ -348,6 +470,125 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reference_video", type=str, default=None, help="Path to reference video file for V2V conditioning (multi-frame)."
+    )
+
+    # -- Composable conditioning (inference): surface the strategy/audio/inpaint knobs the sampler
+    #    already supports. All default to current behavior, so omitting them is byte-identical. --
+    parser.add_argument(
+        "--ic_lora_strategy",
+        type=str,
+        default="auto",
+        help="IC-LoRA inference strategy: auto|none|v2v|av_ic|video_ref_only_av|audio_ref_ic. "
+        "'auto' infers from --lora_target_preset (default -> none). Set explicitly to drive a trained "
+        "reference / audio-reference LoRA (e.g. av_ic, audio_ref_ic). av_ic/video_ref_only_av/audio_ref_ic "
+        "require --ltx2_mode av.",
+    )
+    parser.add_argument(
+        "--av_cross_attention_mode",
+        type=str,
+        default="both",
+        help="AV cross-attention direction inside av_ic: both|a2v_only|v2a_only|none. Selects which "
+        "modality attends across the other; only affects --ic_lora_strategy av_ic.",
+    )
+    parser.add_argument(
+        "--reference_audio",
+        type=str,
+        default=None,
+        help="Path to a reference audio clip for audio-reference conditioning (maps to ref_audio_path). "
+        "Requires --ltx2_mode av and --ic_lora_strategy audio_ref_ic (or av_ic); ignored otherwise.",
+    )
+    parser.add_argument(
+        "--inpaint_mask",
+        type=str,
+        default=None,
+        help="Path to an inpaint mask (image/video) for masked V2V generation (maps to inpaint_mask_path). "
+        "Needs a source video via --inpaint_source (or --reference_video) to clean-paste the kept region.",
+    )
+    parser.add_argument(
+        "--inpaint_source",
+        type=str,
+        default=None,
+        help="Source video the inpaint kept-region is clean-pasted from (drives the v2v slot). "
+        "Defaults to --reference_video when omitted.",
+    )
+    parser.add_argument(
+        "--inpaint_invert",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Invert the inpaint mask polarity at inference (maps to inpaint_invert).",
+    )
+    parser.add_argument(
+        "--inpaint_threshold",
+        type=float,
+        default=None,
+        help="Binarization threshold for the inpaint mask in [0,1] (maps to inpaint_threshold).",
+    )
+    parser.add_argument(
+        "--extend_prefix",
+        type=str,
+        default=None,
+        help="Path to a prefix video to continue (extend). Its first frames are encoded and locked at "
+        "the start of generation; the rest is generated. No-v2v path only (do not combine with "
+        "--reference_video).",
+    )
+    parser.add_argument(
+        "--extend_prefix_frames",
+        type=int,
+        default=None,
+        help="Pixel frames of --extend_prefix to lock (default: ~half of --frame_count). Must be < frame_count.",
+    )
+    parser.add_argument(
+        "--outpaint_region",
+        type=str,
+        default=None,
+        help="Outpaint keep-region 'x,y,w,h' in pixels: the region is kept from --outpaint_source and the "
+        "surrounding area is generated. Realized via the inpaint path (auto-built rectangular keep-mask).",
+    )
+    parser.add_argument(
+        "--outpaint_source",
+        type=str,
+        default=None,
+        help="Source video whose kept region is preserved during outpaint. Defaults to --reference_video.",
+    )
+    parser.add_argument(
+        "--drive_video",
+        type=str,
+        default=None,
+        help="Video-to-audio (v2a): lock this full video and generate its audio. Requires --ltx2_mode av "
+        "(optionally --av_cross_attention_mode v2a_only). Do not combine with --reference_video.",
+    )
+    parser.add_argument(
+        "--drive_audio",
+        type=str,
+        default=None,
+        help="Audio-to-video (a2v): lock this full audio and generate video from it. Requires --ltx2_mode av "
+        "(optionally --av_cross_attention_mode a2v_only).",
+    )
+    parser.add_argument(
+        "--audio_prefix",
+        type=str,
+        default=None,
+        help="Audio extend: lock the start of this audio and generate the continuation. Requires --ltx2_mode av. "
+        "Use --audio_prefix_seconds to set how much is locked.",
+    )
+    parser.add_argument(
+        "--audio_prefix_seconds",
+        type=float,
+        default=None,
+        help="Seconds of --audio_prefix to lock (default: ~half the clip).",
+    )
+    parser.add_argument(
+        "--audio_inpaint_audio",
+        type=str,
+        default=None,
+        help="Audio inpaint: keep this audio everywhere except --audio_inpaint_interval, which is regenerated. "
+        "Requires --ltx2_mode av.",
+    )
+    parser.add_argument(
+        "--audio_inpaint_interval",
+        type=str,
+        default=None,
+        help="'start,end' seconds: the audio span to regenerate during --audio_inpaint_audio (the rest is kept).",
     )
 
     # -- Audio (AV mode) --
@@ -712,6 +953,22 @@ def main() -> None:
             logger.error(str(exc))
             return
         logger.info("Reference conditioning: %s via %s slot", ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)")
+
+    if (
+        args.reference_audio
+        or args.inpaint_mask
+        or args.extend_prefix
+        or args.outpaint_region
+        or args.drive_video
+        or args.drive_audio
+        or args.audio_prefix
+        or args.audio_inpaint_audio
+    ):
+        try:
+            _apply_composable_conditioning_overrides(prompts, args)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.error(str(exc))
+            return
 
     logger.info("Generating %d sample(s)...", len(prompts))
 
