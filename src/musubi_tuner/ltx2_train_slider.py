@@ -16,7 +16,7 @@ import re
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import toml
@@ -46,6 +46,49 @@ from musubi_tuner.utils import model_utils, train_utils
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+_SENSITIVE_COMMAND_ARGS = {
+    "--wandb_api_key",
+    "--huggingface_token",
+}
+
+
+def _argv_to_command_list() -> list:
+    """Group ``sys.argv`` into ``[flag, value]`` pairs for JSON metadata.
+
+    Boolean flags (``--gradient_checkpointing``) become single-element lists.
+    Flags with values (``--learning_rate 0.0002``) become two-element lists.
+    Positional tokens (script path) become single-element lists.
+    Sensitive values are redacted so checkpoint/state sidecars are safe to share.
+    """
+    result: list[list[str]] = []
+    argv = sys.argv
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--"):
+            if "=" in token:
+                flag, value = token.split("=", 1)
+                result.append([flag, "<redacted>" if flag in _SENSITIVE_COMMAND_ARGS else value])
+                i += 1
+                continue
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                value = "<redacted>" if token in _SENSITIVE_COMMAND_ARGS else argv[i + 1]
+                result.append([token, value])
+                i += 2
+            else:
+                result.append([token])
+                i += 1
+        else:
+            result.append([token])
+            i += 1
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Data classes for slider config
 # ---------------------------------------------------------------------------
 
@@ -59,10 +102,26 @@ class SliderTargetConfig:
 
 
 @dataclass
+class SliderAnchorConfig:
+    """A concept to preserve (text-mode only).
+
+    At both slider multipliers (+1 and -1) the LoRA's prediction for the anchor
+    prompt is constrained (MSE) to match the frozen base model's prediction,
+    preventing the slider from drifting on unrelated concepts.
+    """
+
+    prompt: str
+
+
+@dataclass
 class SliderConfig:
     mode: str  # "text", "reference", or "ic_reference"
     reference_modality: str = "video"  # "video" or "audio" for reference mode
     targets: List[SliderTargetConfig] = field(default_factory=list)
+    anchors: List[SliderAnchorConfig] = field(default_factory=list)  # text-mode preservation
+    anchor_strength: float = 1.0  # weight on the anchor preservation loss (text-mode only)
+    anchor_cap_mult: float = 5.0  # cap per-step anchor loss at this x running median (0=off)
+    batch_all_targets: bool = False  # text-mode: process ALL targets per step (avg) vs one random
     guidance_strength: float = 1.0
     frame_rate: int = 25
     sample_slider_range: List[float] = field(default_factory=lambda: [-2.0, -1.0, 0.0, 1.0, 2.0])
@@ -80,6 +139,9 @@ def load_slider_config(path: str) -> SliderConfig:
     mode = raw.get("mode", "text")
     reference_modality = str(raw.get("reference_modality", "video")).lower()
     guidance_strength = float(raw.get("guidance_strength", 1.0))
+    anchor_strength = float(raw.get("anchor_strength", 1.0))
+    anchor_cap_mult = float(raw.get("anchor_cap_mult", 5.0))
+    batch_all_targets = bool(raw.get("batch_all_targets", False))
     frame_rate = int(raw.get("frame_rate", 25))
     default_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
     sample_slider_range = raw.get("sample_slider_range", default_slider_range)
@@ -103,6 +165,10 @@ def load_slider_config(path: str) -> SliderConfig:
             )
         )
 
+    anchors = []
+    for a in raw.get("anchors", []):
+        anchors.append(SliderAnchorConfig(prompt=a["prompt"]))
+
     pos_cache_dir = raw.get("pos_cache_dir", None)
     neg_cache_dir = raw.get("neg_cache_dir", None)
     text_cache_dir = raw.get("text_cache_dir", None) or pos_cache_dir
@@ -112,6 +178,10 @@ def load_slider_config(path: str) -> SliderConfig:
         mode=mode,
         reference_modality=reference_modality,
         targets=targets,
+        anchors=anchors,
+        anchor_strength=anchor_strength,
+        anchor_cap_mult=anchor_cap_mult,
+        batch_all_targets=batch_all_targets,
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
         sample_slider_range=[float(v) for v in sample_slider_range],
@@ -135,6 +205,24 @@ def _norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     (Ported from ai-toolkit ConceptSliderTrainer.)
     """
     return (tensor - tensor.mean()) / (tensor.std() + 1e-8) * target.std() + target.mean()
+
+
+def _anchor_mse(lora_pred: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    """Raw MSE between LoRA and frozen-base anchor predictions (velocity space).
+
+    The per-step magnitude of this loss is intrinsically spiky: on ~90% of steps
+    the LoRA barely moves the anchor prediction (loss ~1e-4), but on a small
+    fraction of steps it deviates a lot. An offline probe over real predictions
+    showed this spikiness is NOT a removable per-step scale factor — every
+    per-step normalizer tried (variance-normalize, cosine, relative-MSE) left a
+    1000x-7000x dynamic range, because the variation lives in the genuine
+    deviation (the numerator), not in a divisible scale. The robust fix is to
+    *cap* the per-step contribution (see ``_anchor_loss``), which bounds the
+    rare spikes while leaving the typical steps untouched. This mirrors the
+    spirit of Min-SNR-gamma clamping.
+    """
+    diff = lora_pred.float() - base_pred.float()
+    return (diff * diff).mean()
 
 
 def _pad_and_batch(
@@ -372,6 +460,7 @@ class LTX2SliderTrainer:
         self._net_trainer = LTX2NetworkTrainer()
         self.slider_config: Optional[SliderConfig] = None
         self.cached_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._anchor_running_median: Optional[float] = None  # for spike capping
 
     def _prepare_first_frame_conditioning(
         self,
@@ -468,6 +557,60 @@ class LTX2SliderTrainer:
         t = torch.arange(audio_seq_len, device=device).view(1, -1)
         return t < audio_lengths.view(-1, 1)
 
+    def _sample_slider_sigmas(
+        self,
+        args: argparse.Namespace,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Sample shifted-logit-normal sigmas using the regular LTX-2 timestep controls."""
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shifts = torch.full((batch_size,), float(shifted_logit_shift_override), device=device, dtype=torch.float32)
+        else:
+            shift = self._net_trainer._resolve_shifted_logit_normal_shift(args, int(seq_len))
+            shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+
+        def _sample_raw() -> torch.Tensor:
+            return self._net_trainer._sample_shifted_logit_normal_sigmas(
+                batch_size,
+                shifts,
+                std=float(getattr(args, "logit_std", 1.0)),
+                mode=self._net_trainer._resolve_shifted_logit_mode(args),
+                eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+                uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+            )
+
+        min_timestep = getattr(args, "min_timestep", None)
+        max_timestep = getattr(args, "max_timestep", None)
+        if min_timestep is None and max_timestep is None:
+            return _sample_raw()
+
+        min_sigma = (float(min_timestep) / 1000.0) if min_timestep is not None else 0.0
+        max_sigma = (float(max_timestep) / 1000.0) if max_timestep is not None else 1.0
+        if max_sigma < min_sigma:
+            raise ValueError(f"max_timestep must be >= min_timestep; got min={min_timestep}, max={max_timestep}")
+
+        if bool(getattr(args, "preserve_distribution_shape", False)):
+            valid: list[torch.Tensor] = []
+            for _ in range(1000):
+                sampled = _sample_raw()
+                for sigma in sampled:
+                    sigma_value = float(sigma.item())
+                    if min_sigma <= sigma_value <= max_sigma:
+                        valid.append(sigma)
+                    if len(valid) == batch_size:
+                        return torch.stack(valid, dim=0).to(device=device, dtype=torch.float32)
+            logger.warning(
+                "Could not sample %d valid slider timesteps in 1000 loops; falling back to clamped samples.",
+                batch_size,
+            )
+            return _sample_raw().clamp(min=min_sigma, max=max_sigma)
+
+        return _sample_raw() * (max_sigma - min_sigma) + min_sigma
+
     # -- Prompt pre-caching --------------------------------------------------
 
     def _precache_slider_prompts(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
@@ -479,6 +622,8 @@ class LTX2SliderTrainer:
             prompts.add(target.positive)
             prompts.add(target.negative)
             prompts.add(target.target_class)
+        for anchor in self.slider_config.anchors:
+            prompts.add(anchor.prompt)
         prompts.add("")  # neutral / empty prompt
 
         for prompt_text in prompts:
@@ -499,10 +644,63 @@ class LTX2SliderTrainer:
         args: argparse.Namespace,
         dit_dtype: torch.dtype,
     ) -> float:
-        """One training step for text-only slider mode."""
+        """One training step for text-only slider mode.
+
+        By default a single target is picked at random per step. When
+        ``batch_all_targets`` is enabled, EVERY target is processed in the same
+        step and their gradients are averaged (each target's loss scaled by
+        1/N) into a single optimizer update. This yields a lower-variance,
+        more context-general direction (the shared signal across targets
+        reinforces, context-specific noise partially cancels) at ~N x the
+        per-step cost. The anchor loss, when present, is scaled by the same
+        1/N so anchor magnitude/behaviour is identical to the non-batched path.
+        """
         device = accelerator.device
 
-        target = random.choice(self.slider_config.targets)
+        targets = self.slider_config.targets
+        if self.slider_config.batch_all_targets and len(targets) > 0:
+            n_targets = len(targets)
+            loss_scale = 1.0 / n_targets
+            dir_sum = 0.0
+            anc_sum = 0.0
+            anc_count = 0
+            for tgt in targets:
+                d, a = self._run_one_text_target(
+                    transformer, network, accelerator, args, dit_dtype, tgt, loss_scale
+                )
+                dir_sum += d
+                if a is not None:
+                    anc_sum += a
+                    anc_count += 1
+            direction_avg = dir_sum / n_targets
+            anchor_avg = (anc_sum / anc_count) if anc_count > 0 else None
+            return direction_avg, anchor_avg
+
+        target = random.choice(targets)
+        return self._run_one_text_target(
+            transformer, network, accelerator, args, dit_dtype, target, 1.0
+        )
+
+    def _run_one_text_target(
+        self,
+        transformer,
+        network,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        dit_dtype: torch.dtype,
+        target: "SliderTargetConfig",
+        loss_scale: float,
+    ) -> Tuple[float, Optional[float]]:
+        """Process one slider target: +1/-1 gradient passes for ``target``.
+
+        ``loss_scale`` multiplies the backward loss (1.0 for the single-random
+        path; 1/N when averaging all targets in one step). Returns
+        ``(direction_avg, anchor_avg)`` for this target (anchor_avg is None when
+        no anchors are configured). The reported direction/anchor values are the
+        UNSCALED averages so loss/average keeps its meaning regardless of
+        loss_scale.
+        """
+        device = accelerator.device
 
         # Synthetic noise latents
         latent_frames = getattr(args, "latent_frames", 1)
@@ -512,25 +710,15 @@ class LTX2SliderTrainer:
 
         # Sample sigma from shifted logit-normal
         seq_len = latent_frames * latent_height * latent_width
-        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
-        if shifted_logit_shift_override is not None:
-            shift = float(shifted_logit_shift_override)
-        else:
-            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
-        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
-            1,
-            torch.tensor([float(shift)], device=device, dtype=torch.float32),
-            std=float(getattr(args, "logit_std", 1.0)),
-            mode=shifted_logit_mode,
-            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
-            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
-        )
-        sigma_exp = sigma.view(1, 1, 1, 1, 1)
+        sigma = self._sample_slider_sigmas(args, batch_size=1, seq_len=seq_len, device=device)
+        sigma_exp = sigma.view(-1, 1, 1, 1, 1)
         noisy = sigma_exp * noise  # pure noise scaled by sigma
 
-        # Timestep for model: sigma as [B, 1]
-        model_ts = sigma.unsqueeze(1)
+        # Timestep for model: sigma as [B, 1]. Cast to dit_dtype so attention
+        # backends that require fp16/bf16 inputs (SageAttention, FlashAttention3)
+        # receive matching-precision hidden states. Mirrors call_dit in the
+        # standard trainer, which casts timesteps to network_dtype.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Get cached embeddings
         pos_e, pos_m = self.cached_embeds[target.positive]
@@ -538,27 +726,41 @@ class LTX2SliderTrainer:
         neu_e, neu_m = self.cached_embeds[""]
         tgt_e, tgt_m = self.cached_embeds[target.target_class]
 
-        # Pad and batch for 3-pass: [positive, neutral, negative]
-        text_3x, mask_3x = _pad_and_batch([(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)], device, dit_dtype)
+        # Anchors (text-mode preservation). Each anchor's frozen-base prediction
+        # becomes a target that the LoRA must match at BOTH multipliers (+1 / -1),
+        # so the slider does not drift on these unrelated concepts.
+        anchors = self.slider_config.anchors
+        n_anchors = len(anchors)
+        anchor_strength = self.slider_config.anchor_strength
+        anchor_items = [self.cached_embeds[a.prompt] for a in anchors]
 
-        # No-grad 3-pass forward (LoRA disabled)
+        # Pad and batch the no-grad reference pass:
+        #   [positive, neutral, negative, anchor_0..N]
+        ref_items = [(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)] + anchor_items
+        num_ref = 3 + n_anchors
+        text_ref, mask_ref = _pad_and_batch(ref_items, device, dit_dtype)
+
+        # No-grad forward (LoRA disabled)
         network.set_multiplier(0.0)
-        noisy_3x = noisy.expand(3, -1, -1, -1, -1).to(dtype=dit_dtype)
-        ts_3x = model_ts.expand(3, -1)
+        noisy_ref = noisy.expand(num_ref, -1, -1, -1, -1).to(dtype=dit_dtype)
+        ts_ref = model_ts.expand(num_ref, -1)
 
         with torch.no_grad():
             self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
             with accelerator.autocast():
-                pred_3x = transformer(
-                    noisy_3x,
-                    timestep=ts_3x,
-                    context=text_3x,
-                    attention_mask=mask_3x,
+                pred_ref = transformer(
+                    noisy_ref,
+                    timestep=ts_ref,
+                    context=text_ref,
+                    attention_mask=mask_ref,
                     frame_rate=self.slider_config.frame_rate,
                     transformer_options={},
                 )
 
-        pred_pos, pred_neu, pred_neg = pred_3x.chunk(3, dim=0)
+        ref_chunks = pred_ref.chunk(num_ref, dim=0)
+        pred_pos, pred_neu, pred_neg = ref_chunks[0], ref_chunks[1], ref_chunks[2]
+        # Frozen-base anchor predictions (detached) — the preservation targets.
+        anchor_targets = [c.detach() for c in ref_chunks[3:]]
 
         # Compute directional offset
         direction = pred_pos - pred_neg
@@ -566,26 +768,86 @@ class LTX2SliderTrainer:
         target_enhance = _norm_like_tensor(pred_neu + gs * direction, pred_neu).detach()
         target_erase = _norm_like_tensor(pred_neu - gs * direction, pred_neu).detach()
 
-        del pred_3x, noisy_3x, ts_3x, text_3x, mask_3x, pred_pos, pred_neu, pred_neg, direction
+        del pred_ref, noisy_ref, ts_ref, text_ref, mask_ref, pred_pos, pred_neu, pred_neg, direction
         clean_memory_on_device(device)
 
-        # Prepare target_class embeddings for training passes
-        tgt_text, tgt_mask = _pad_and_batch([(tgt_e, tgt_m)], device, dit_dtype)
+        # Prepare conditioning for the gradient passes:
+        #   [target_class, anchor_0..N]  (anchors share the same noisy latent)
+        grad_items = [(tgt_e, tgt_m)] + anchor_items
+        num_grad = 1 + n_anchors
+        grad_text, grad_mask = _pad_and_batch(grad_items, device, dit_dtype)
         noisy_dit = noisy.to(dtype=dit_dtype)
+        noisy_grad = noisy_dit.expand(num_grad, -1, -1, -1, -1) if n_anchors > 0 else noisy_dit
+        ts_grad = model_ts.expand(num_grad, -1) if n_anchors > 0 else model_ts
+
+        def _anchor_loss(pred_chunks) -> torch.Tensor:
+            """Anchor preservation loss with running-median spike capping.
+
+            Per-step anchor MSE is intrinsically spiky (most steps ~1e-4, a few
+            steps far larger) and no per-step normalizer removes that (verified
+            by offline probe). We instead cap each step's anchor loss at a
+            multiple of its running median, which bounds the rare gradient-norm
+            spikes while leaving typical steps untouched. The cap is applied in
+            a gradient-preserving way (scale the loss tensor by a detached ratio)
+            so the optimizer still moves in the anchor's direction, just not with
+            an explosive magnitude.
+            """
+            if n_anchors == 0:
+                return None
+            losses = [
+                _anchor_mse(pred_chunks[i + 1], anchor_targets[i])
+                for i in range(n_anchors)
+            ]
+            anchor = sum(losses) / n_anchors
+
+            # Running-median cap (self-calibrating, no model-specific constant).
+            cap_mult = self.slider_config.anchor_cap_mult
+            val = float(anchor.detach().item())
+            med = self._anchor_running_median
+            if med is not None and cap_mult > 0:
+                cap = med * cap_mult
+                if val > cap and val > 0:
+                    # Scale the (grad-bearing) loss down to the cap. Ratio is
+                    # detached so only magnitude is clipped, not direction.
+                    anchor = anchor * (cap / val)
+            # Update running median estimate with the UNCAPPED value via a simple
+            # exponential tracker toward the observed value (robust enough for a
+            # cap reference; not a true median but tracks the typical scale).
+            if med is None:
+                self._anchor_running_median = val
+            else:
+                # Move 2% toward current; downweight giant spikes so they don't
+                # inflate the cap reference.
+                step = 0.02 if val <= med * cap_mult else 0.002
+                self._anchor_running_median = med + step * (val - med)
+
+            return anchor * anchor_strength
 
         # Training pass 1: positive direction (multiplier=+1)
         network.set_multiplier(1.0)
         with accelerator.autocast():
             lora_pred_pos = transformer(
-                noisy_dit,
-                timestep=model_ts,
-                context=tgt_text,
-                attention_mask=tgt_mask,
+                noisy_grad,
+                timestep=ts_grad,
+                context=grad_text,
+                attention_mask=grad_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options={},
             )
-        loss_pos = F_torch.mse_loss(lora_pred_pos.float(), target_enhance.float())
-        accelerator.backward(loss_pos * target.weight)
+        # Keep the direction loss and the anchor loss as SEPARATE quantities for
+        # reporting (loss/average stays direction-only, loss/anchor is its own
+        # series). The backward pass still uses their sum, so training behaviour
+        # is unchanged — only what we report is split.
+        if n_anchors > 0:
+            pos_chunks = lora_pred_pos.chunk(num_grad, dim=0)
+            class_pred_pos = pos_chunks[0]
+            dir_pos = F_torch.mse_loss(class_pred_pos.float(), target_enhance.float())
+            anc_pos = _anchor_loss(pos_chunks)
+        else:
+            dir_pos = F_torch.mse_loss(lora_pred_pos.float(), target_enhance.float())
+            anc_pos = None
+        loss_pos = dir_pos if anc_pos is None else (dir_pos + anc_pos)
+        accelerator.backward(loss_pos * target.weight * loss_scale)
 
         del lora_pred_pos
         clean_memory_on_device(device)
@@ -594,22 +856,38 @@ class LTX2SliderTrainer:
         network.set_multiplier(-1.0)
         with accelerator.autocast():
             lora_pred_neg = transformer(
-                noisy_dit,
-                timestep=model_ts,
-                context=tgt_text,
-                attention_mask=tgt_mask,
+                noisy_grad,
+                timestep=ts_grad,
+                context=grad_text,
+                attention_mask=grad_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options={},
             )
-        loss_neg = F_torch.mse_loss(lora_pred_neg.float(), target_erase.float())
-        accelerator.backward(loss_neg * target.weight)
+        if n_anchors > 0:
+            neg_chunks = lora_pred_neg.chunk(num_grad, dim=0)
+            class_pred_neg = neg_chunks[0]
+            dir_neg = F_torch.mse_loss(class_pred_neg.float(), target_erase.float())
+            anc_neg = _anchor_loss(neg_chunks)
+        else:
+            dir_neg = F_torch.mse_loss(lora_pred_neg.float(), target_erase.float())
+            anc_neg = None
+        loss_neg = dir_neg if anc_neg is None else (dir_neg + anc_neg)
+        accelerator.backward(loss_neg * target.weight * loss_scale)
 
-        del lora_pred_neg, noisy_dit, tgt_text, tgt_mask
+        del lora_pred_neg, noisy_dit, noisy_grad, ts_grad, grad_text, grad_mask
         clean_memory_on_device(device)
 
         # Restore multiplier
         network.set_multiplier(1.0)
-        return (loss_pos.item() + loss_neg.item()) / 2.0
+
+        # loss/average == direction only (same meaning as before anchors existed).
+        direction_avg = (dir_pos.item() + dir_neg.item()) / 2.0
+        # loss/anchor == anchor term only; None when no anchors are configured.
+        if n_anchors > 0:
+            anchor_avg = (anc_pos.item() + anc_neg.item()) / 2.0
+        else:
+            anchor_avg = None
+        return direction_avg, anchor_avg
 
     # -- Reference-based slider step -----------------------------------------
 
@@ -640,26 +918,14 @@ class LTX2SliderTrainer:
 
         # Sample sigma
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
-        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
-        if shifted_logit_shift_override is not None:
-            shift = float(shifted_logit_shift_override)
-        else:
-            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
-        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
-            1,
-            torch.tensor([float(shift)], device=device, dtype=torch.float32),
-            std=float(getattr(args, "logit_std", 1.0)),
-            mode=shifted_logit_mode,
-            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
-            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
-        )
-        sigma_exp = sigma.view(1, 1, 1, 1, 1)
+        sigma = self._sample_slider_sigmas(args, batch_size=pos_latents.shape[0], seq_len=seq_len, device=device)
+        sigma_exp = sigma.view(-1, 1, 1, 1, 1)
 
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # Cast timestep to dit_dtype for fp16/bf16-only attention backends (see text step).
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Flow matching velocity targets
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
@@ -751,20 +1017,7 @@ class LTX2SliderTrainer:
         noise = torch.randn_like(pos_audio_latents)
 
         seq_len = pos_virtual_latents.shape[2] * pos_virtual_latents.shape[3] * pos_virtual_latents.shape[4]
-        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
-        if shifted_logit_shift_override is not None:
-            shift = float(shifted_logit_shift_override)
-        else:
-            shift = self._net_trainer._resolve_shifted_logit_normal_shift(args, int(seq_len))
-        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
-        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
-            pos_audio_latents.shape[0],
-            torch.full((pos_audio_latents.shape[0],), float(shift), device=device, dtype=torch.float32),
-            std=float(getattr(args, "logit_std", 1.0)),
-            mode=shifted_logit_mode,
-            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
-            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
-        )
+        sigma = self._sample_slider_sigmas(args, batch_size=pos_audio_latents.shape[0], seq_len=seq_len, device=device)
         model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
         audio_model_ts = model_ts
         if bool(getattr(args, "independent_audio_timestep", False)):
@@ -888,24 +1141,13 @@ class LTX2SliderTrainer:
         noise = torch.randn_like(pos_latents)
 
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
-        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
-        if shifted_logit_shift_override is not None:
-            shift = float(shifted_logit_shift_override)
-        else:
-            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
-        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
-            pos_latents.shape[0],
-            torch.full((pos_latents.shape[0],), float(shift), device=device, dtype=torch.float32),
-            std=float(getattr(args, "logit_std", 1.0)),
-            mode=shifted_logit_mode,
-            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
-            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
-        )
+        sigma = self._sample_slider_sigmas(args, batch_size=pos_latents.shape[0], seq_len=seq_len, device=device)
         sigma_exp = sigma.view(-1, 1, 1, 1, 1)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # call_dit casts timesteps to network_dtype internally, but cast here too
+        # for consistency with the other slider paths.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         ic_batch = {
             "text": text_embeds,
@@ -1107,20 +1349,31 @@ class LTX2SliderTrainer:
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
 
-        # Model-specific init (sets _ltx_mode, _audio_video, etc.)
-        self._net_trainer.handle_model_specific_args(args)
-
-        # Prepare accelerator
+        # Prepare accelerator FIRST so args.mixed_precision is resolved before
+        # handle_model_specific_args runs. handle_model_specific_args casts an
+        # fp32 checkpoint's compute dtype to bf16/fp16, but only when
+        # args.mixed_precision is already set — otherwise dit_dtype stays fp32
+        # and the model loads/computes in full fp32 (slower, more VRAM, and
+        # incompatible with fp16/bf16-only attention backends like SageAttention).
         accelerator = prepare_accelerator(args)
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
+
+        # Model-specific init (sets _ltx_mode, _audio_video, dit_dtype, etc.)
+        self._net_trainer.handle_model_specific_args(args)
+
         is_main_process = accelerator.is_main_process
+        dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
         # Precision
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
         dit_weight_dtype = (
             (None if getattr(args, "fp8_scaled", False) else torch.float8_e4m3fn) if getattr(args, "fp8_base", False) else dit_dtype
         )
+
+        # -- Pre-cache slider prompt embeddings (before DiT to avoid VRAM collision) --
+        if self.slider_config.mode == "text":
+            self._precache_slider_prompts(args, accelerator)
 
         # -- Sample prompt setup (for preview during training) ----------------
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -1132,6 +1385,24 @@ class LTX2SliderTrainer:
             vae.requires_grad_(False)
             vae.eval()
 
+        # -- Pre-cache sample prompt embeddings (before DiT to avoid VRAM collision) --
+        if sample_parameters is not None:
+            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
+            if needs_encoding:
+                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
+                for sp in sample_parameters:
+                    if sp.get("prompt_embeds") is None:
+                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
+                        sp["prompt_embeds"] = embed
+                        sp["prompt_attention_mask"] = mask
+                        neg = sp.get("negative_prompt")
+                        if neg:
+                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
+                            sp["negative_prompt_embeds"] = ne
+                            sp["negative_prompt_attention_mask"] = nm
+                self._net_trainer._cleanup_text_encoder(accelerator)
+                clean_memory_on_device(accelerator.device)
+
         # -- Load transformer -------------------------------------------------
         blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
         self._net_trainer.blocks_to_swap = blocks_to_swap
@@ -1141,8 +1412,21 @@ class LTX2SliderTrainer:
             torch.cuda.reset_peak_memory_stats()
 
         logger.info("Loading DiT model from %s", args.dit)
+        # Determine attention mode from args (mirror LTX2NetworkTrainer.load_transformer)
+        if getattr(args, "sdpa", False):
+            attn_mode = "torch"
+        elif getattr(args, "flash_attn", False):
+            attn_mode = "flash"
+        elif getattr(args, "flash3", False):
+            attn_mode = "flash3"
+        elif getattr(args, "sage_attn", False):
+            attn_mode = "sageattn"
+        elif getattr(args, "xformers", False):
+            attn_mode = "xformers"
+        else:
+            attn_mode = "torch"
         transformer = self._net_trainer.load_transformer(
-            accelerator, args, args.dit, "torch", False, loading_device, dit_weight_dtype
+            accelerator, args, args.dit, attn_mode, False, loading_device, dit_weight_dtype
         )
         transformer.eval()
         transformer.requires_grad_(False)
@@ -1222,29 +1506,6 @@ class LTX2SliderTrainer:
             except TypeError:
                 network.enable_gradient_checkpointing()
 
-        # -- Pre-cache slider prompt embeddings --------------------------------
-        if self.slider_config.mode == "text":
-            self._precache_slider_prompts(args, accelerator)
-
-        # -- Pre-cache sample prompt embeddings --------------------------------
-        if sample_parameters is not None:
-            # Encode sample prompts if they don't already have embeddings
-            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
-            if needs_encoding:
-                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
-                for sp in sample_parameters:
-                    if sp.get("prompt_embeds") is None:
-                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
-                        sp["prompt_embeds"] = embed
-                        sp["prompt_attention_mask"] = mask
-                        neg = sp.get("negative_prompt")
-                        if neg:
-                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
-                            sp["negative_prompt_embeds"] = ne
-                            sp["negative_prompt_attention_mask"] = nm
-                self._net_trainer._cleanup_text_encoder(accelerator)
-                clean_memory_on_device(accelerator.device)
-
         # -- Optimizer & scheduler ---------------------------------------------
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
         optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = NetworkTrainer().get_optimizer(
@@ -1252,6 +1513,14 @@ class LTX2SliderTrainer:
         )
 
         lr_scheduler = NetworkTrainer().get_lr_scheduler(args, optimizer, accelerator.num_processes)
+
+        # Save base param_groups (from CLI) before any resume so we can restore them
+        # if --reset_optimizer_params is set. Mirrors NetworkTrainer.train(); the
+        # slider has its own loop and must replicate this resume-time behavior.
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        saved_param_groups = None
+        if getattr(args, "reset_optimizer_params", False):
+            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
 
         # -- Prepare with accelerator ------------------------------------------
         if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
@@ -1264,6 +1533,21 @@ class LTX2SliderTrainer:
         else:
             transformer = accelerator.prepare(transformer)
 
+        # The frozen base transformer was added to accelerator._models by prepare(),
+        # which means save_state() would serialize it (~13 GB) even though its weights
+        # never change during LoRA/slider training.  Remove it so only the LoRA
+        # network (prepared below) is included in state checkpoints.
+        _unwrapped_transformer = accelerator.unwrap_model(transformer)
+        accelerator._models = [m for m in accelerator._models if accelerator.unwrap_model(m) is not _unwrapped_transformer]
+
+        # torch.compile the DiT blocks (mirrors LTX2NetworkTrainer in ltx2_train_network.py).
+        # Must run after prepare()/_models filtering and before the network is prepared.
+        # blocks_to_swap was set on _net_trainer above, so its disable_linear path is correct.
+        # Compilation is lazy: it triggers on the first forward pass, not here.
+        if args.compile:
+            transformer = self._net_trainer.compile_transformer(args, transformer)
+            transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
+
         network, optimizer, lr_scheduler = accelerator.prepare(network, optimizer, lr_scheduler)
 
         if args.gradient_checkpointing:
@@ -1272,6 +1556,110 @@ class LTX2SliderTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+
+        # -- Resume from saved state (autoresume / --resume) --------------------
+        initial_global_step = 0
+        if getattr(args, "autoresume", False) and not getattr(args, "resume", None):
+            latest = self._net_trainer._find_latest_state_dir(args)
+            if latest:
+                logger.info(f"autoresume: found latest state directory: {latest}")
+                args.resume = latest
+                args._autoresume_selected = True
+            else:
+                logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+                args._autoresume_selected = False
+        else:
+            args._autoresume_selected = getattr(args, "_autoresume_selected", False)
+
+        if getattr(args, "resume", None):
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning("autoresume: selected state directory is missing or incomplete, starting from scratch: %s", args.resume)
+                    args.resume = None
+                else:
+                    raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
+        _resume_state_dir = None
+        if getattr(args, "resume", None):
+            self._net_trainer._register_optimizer_resume_safe_globals(args)
+            logger.info(f"Resuming slider training from state: {args.resume}")
+            accelerator.load_state(args.resume)
+            _resume_state_dir = args.resume
+            resume_step = self._net_trainer._recover_global_step(args.resume)
+            if resume_step > 0:
+                initial_global_step = resume_step
+                logger.info(f"Recovered global_step={initial_global_step} from resume state")
+
+            # Optimizer/scheduler resets after a state-dir resume (mirrors
+            # NetworkTrainer.train()). Only meaningful when optimizer state was
+            # actually loaded (initial_global_step > 0); the weights-only fallback
+            # below re-initializes the optimizer anyway.
+            if initial_global_step > 0:
+                if getattr(args, "reset_optimizer", False):
+                    inner_optimizer.state.clear()
+                    accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+                if getattr(args, "reset_optimizer_params", False) and saved_param_groups is not None:
+                    for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                        for k, v in saved.items():
+                            pg[k] = v
+                    accelerator.print("reset optimizer param groups to CLI values")
+
+                if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+                    # reset lr to base value so the new scheduler starts from the correct base
+                    # (scheduler __init__ uses current group['lr'], not initial_lr)
+                    for pg in inner_optimizer.param_groups:
+                        if "initial_lr" in pg:
+                            pg["lr"] = pg["initial_lr"]
+                            del pg["initial_lr"]
+                    new_inner_scheduler = NetworkTrainer().get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+                    # replace the inner scheduler while keeping the AcceleratedScheduler wrapper
+                    # (the wrapper gates stepping on sync_gradients for gradient accumulation)
+                    if hasattr(lr_scheduler, "scheduler"):
+                        lr_scheduler.scheduler = new_inner_scheduler
+                    else:
+                        lr_scheduler = new_inner_scheduler
+                    accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
+
+        # -- Fallback: resume from latest LoRA checkpoint if no state dir ------
+        # If autoresume is enabled but no state directory was found (e.g. crash
+        # without graceful save), scan output_dir for the highest-step LoRA
+        # checkpoint matching output_name and load its weights.
+        if (
+            initial_global_step == 0
+            and getattr(args, "autoresume", False)
+            and getattr(args, "network_weights", None) is None
+            and args.output_dir
+            and os.path.isdir(args.output_dir)
+        ):
+            import re as _re
+
+            best_step = 0
+            best_path = None
+            step_pattern = _re.compile(
+                _re.escape(args.output_name) + r"-step(\d+)\.safetensors$"
+            )
+            for entry in os.listdir(args.output_dir):
+                m = step_pattern.match(entry)
+                if m:
+                    step = int(m.group(1))
+                    full = os.path.join(args.output_dir, entry)
+                    if step > best_step and os.path.isfile(full):
+                        best_step = step
+                        best_path = full
+            if best_path is not None:
+                logger.info(
+                    "autoresume: no state dir found, but found LoRA checkpoint at step %d: %s",
+                    best_step,
+                    best_path,
+                )
+                info = accelerator.unwrap_model(network).load_weights(best_path)
+                logger.info("Loaded LoRA weights for resume: %s", info)
+                initial_global_step = best_step
+                logger.info(
+                    "Resuming from step %d (optimizer/scheduler re-initialized — weights only)",
+                    initial_global_step,
+                )
 
         # -- Reference dataloader (if reference mode) -------------------------
         ref_dataloader = None
@@ -1300,6 +1688,9 @@ class LTX2SliderTrainer:
             "ss_slider_mode": self.slider_config.mode,
             "ss_slider_guidance_strength": self.slider_config.guidance_strength,
         }
+        if self.slider_config.mode == "text" and len(self.slider_config.anchors) > 0:
+            metadata["ss_slider_anchor_count"] = len(self.slider_config.anchors)
+            metadata["ss_slider_anchor_strength"] = self.slider_config.anchor_strength
         if self.slider_config.mode == "ic_reference":
             metadata["ss_ic_lora_strategy"] = "v2v"
             metadata["ss_slider_ic_reference_training"] = True
@@ -1314,6 +1705,32 @@ class LTX2SliderTrainer:
 
         metadata = {k: str(v) for k, v in metadata.items()}
 
+        # User-facing SAI model-spec metadata (title/author/license/tags/etc.),
+        # embedded in saved safetensors for distribution. Mirrors the standard trainer.
+        from musubi_tuner.utils import sai_model_spec
+
+        sai_title = getattr(args, "metadata_title", None) or args.output_name
+        if getattr(args, "min_timestep", None) is not None or getattr(args, "max_timestep", None) is not None:
+            md_min = args.min_timestep if args.min_timestep is not None else 0
+            md_max = args.max_timestep if args.max_timestep is not None else 1000
+            md_timesteps = (md_min, md_max)
+        else:
+            md_timesteps = None
+        sai_metadata = sai_model_spec.build_metadata(
+            None,
+            self._net_trainer.architecture,
+            time.time(),
+            sai_title,
+            getattr(args, "metadata_reso", None),
+            getattr(args, "metadata_author", None),
+            getattr(args, "metadata_description", None),
+            getattr(args, "metadata_license", None),
+            getattr(args, "metadata_tags", None),
+            timesteps=md_timesteps,
+            custom_arch=getattr(args, "metadata_arch", None),
+        )
+        metadata.update(sai_metadata)
+
         minimum_metadata = {}
         for key in ["ss_base_model_version", "ss_network_module", "ss_network_dim", "ss_network_alpha", "ss_network_args"]:
             if key in metadata:
@@ -1326,15 +1743,63 @@ class LTX2SliderTrainer:
                 init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if getattr(args, "log_tracker_config", None) is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
-            tracker_name = getattr(args, "log_tracker_name", None) or "slider_train"
+            tracker_name = getattr(args, "log_tracker_name", None) or getattr(args, "output_name", "slider_train")
             accelerator.init_trackers(
                 tracker_name,
                 config=train_utils.get_sanitized_config_or_none(args),
                 init_kwargs=init_kwargs,
             )
 
+        # -- Dashboard metrics writer (Parquet for GUI charts) -----------------
+        gui_metrics = None
+        if dashboard_metrics_enabled and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir, reset=initial_global_step == 0)
+            gui_metrics.update_status(
+                step=initial_global_step,
+                max_steps=args.max_train_steps,
+                epoch=0,
+                max_epochs=0,
+                status="starting",
+            )
+
         # -- Save / remove helpers ---------------------------------------------
         save_dtype = dit_dtype
+
+        def _build_checkpoint_metadata() -> dict:
+            """Build the training-settings sidecar dict (shared by checkpoints and state dirs)."""
+            from datetime import datetime
+
+            _training = {
+                "step": global_step,
+                "epoch": 0,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            try:
+                _training["loss"] = float(loss)
+            except Exception:
+                pass
+            if loss_recorder.loss_list:
+                _training["loss_avg"] = loss_recorder.moving_average
+            try:
+                _training["lr"] = float(lr_scheduler.get_last_lr()[0])
+            except Exception:
+                pass
+            # Smoothed seconds-per-step (s/it) from the dashboard metrics writer's
+            # rolling window. Omitted when the writer is disabled (CLI-only runs).
+            if gui_metrics is not None:
+                _sec = gui_metrics.current_sec_per_step()
+                if _sec is not None:
+                    _training["sec_per_step"] = round(_sec, 4)
+                _elapsed = gui_metrics.current_elapsed_sec()
+                if _elapsed is not None:
+                    _training["elapsed_sec"] = round(_elapsed, 1)
+            return {
+                "training": _training,
+                "command": _argv_to_command_list(),
+                "slider_config": asdict(self.slider_config),
+            }
 
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1355,24 +1820,7 @@ class LTX2SliderTrainer:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             if getattr(args, "save_checkpoint_metadata", False):
-                from datetime import datetime
-
-                _md = {
-                    "step": steps,
-                    "epoch": epoch_no,
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-                try:
-                    _md["loss"] = float(loss)
-                except Exception:
-                    pass
-                if loss_recorder.loss_list:
-                    _md["loss_avg"] = loss_recorder.moving_average
-                try:
-                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
-                except Exception:
-                    pass
-                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+                train_utils.save_checkpoint_metadata(ckpt_file, _build_checkpoint_metadata())
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
@@ -1386,6 +1834,17 @@ class LTX2SliderTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def _close_gui_metrics(status: str = "stopped"):
+            if gui_metrics is not None:
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status=status,
+                )
+                gui_metrics.close()
+
         def handle_dashboard_stop_request(global_step: int) -> bool:
             if not train_utils.dashboard_stop_requested():
                 return False
@@ -1393,12 +1852,14 @@ class LTX2SliderTrainer:
             if train_utils.dashboard_stop_mode() == "force":
                 accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
             if global_step <= 0:
                 accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
@@ -1421,26 +1882,39 @@ class LTX2SliderTrainer:
                         "interrupted": True,
                     },
                 )
+                train_utils.save_state_metadata(state_dir, _build_checkpoint_metadata())
+                if gui_metrics is not None:
+                    gui_metrics.log_event("interrupt_state", global_step, path=str(state_dir))
             train_utils.clear_dashboard_stop_request()
+            _close_gui_metrics("stopped")
             accelerator.end_training()
             return True
 
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(
             range(args.max_train_steps),
+            initial=initial_global_step,
             smoothing=0,
             disable=not accelerator.is_local_main_process,
             desc="steps",
         )
 
-        global_step = 0
+        global_step = initial_global_step
         loss_recorder = train_utils.LossRecorder()
+        if initial_global_step > 0 and _resume_state_dir is not None:
+            _meta = train_utils.load_resume_metadata(_resume_state_dir)
+            if _meta and "loss_avg" in _meta:
+                loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+                accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
 
         clean_memory_on_device(accelerator.device)
         optimizer_train_fn()
         optimizer.zero_grad(set_to_none=True)
 
-        logger.info("Starting slider training")
+        if initial_global_step > 0:
+            logger.info("Resuming slider training from step %d", initial_global_step)
+        else:
+            logger.info("Starting slider training")
         logger.info("  mode: %s", self.slider_config.mode)
         logger.info("  max_train_steps: %d", args.max_train_steps)
         logger.info("  learning_rate: %s", args.learning_rate)
@@ -1458,6 +1932,8 @@ class LTX2SliderTrainer:
             self._sample_slider(
                 accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0
             )
+            if gui_metrics is not None:
+                gui_metrics.log_event("sample", 0)
             optimizer_train_fn()
 
         ref_iter = None
@@ -1470,9 +1946,16 @@ class LTX2SliderTrainer:
 
             accelerator.unwrap_model(network).on_step_start()
 
+            grad_norm_value = None
+            _step_start_time = time.perf_counter()
+
+            anchor_loss = None  # populated only in text mode when anchors are configured
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
-                    loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
+                    # Text mode returns (direction_loss, anchor_loss). loss/average
+                    # tracks the direction loss only (unchanged meaning); anchor_loss
+                    # is reported separately as loss/anchor.
+                    loss, anchor_loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
                 else:
                     # Reference mode: get next batch
                     try:
@@ -1490,12 +1973,20 @@ class LTX2SliderTrainer:
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
                     params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    grad_norm_value = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 if accelerator.sync_gradients:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # LoRA max-norm regularization (mirrors hv_train_network.py).
+                    # The slider has its own loop, so this must be applied here;
+                    # the network method self-guards for non-LoRA networks.
+                    if getattr(args, "scale_weight_norms", None):
+                        accelerator.unwrap_model(network).apply_max_norm_regularization(
+                            args.scale_weight_norms, accelerator.device
+                        )
 
             if not accelerator.sync_gradients:
                 continue
@@ -1516,7 +2007,30 @@ class LTX2SliderTrainer:
                     "loss/average": avr_loss,
                     "lr/unet": float(lrs[0]) if lrs else 0.0,
                 }
+                if grad_norm_value is not None:
+                    logs["grad_norm"] = float(grad_norm_value) if not isinstance(grad_norm_value, float) else grad_norm_value
+                if anchor_loss is not None:
+                    logs["loss/anchor"] = anchor_loss
                 accelerator.log(logs, step=global_step)
+
+            if gui_metrics is not None:
+                step_time = time.perf_counter() - _step_start_time
+                gui_metrics.log(
+                    step=global_step,
+                    epoch=0,
+                    loss=loss,
+                    avr_loss=avr_loss,
+                    grad_norm=float(grad_norm_value) if grad_norm_value is not None else None,
+                    lr=float(lr_scheduler.get_last_lr()[0]) if lr_scheduler.get_last_lr() else 0.0,
+                    step_time=step_time,
+                )
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status="training",
+                )
 
             # Sampling
             should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -1536,17 +2050,33 @@ class LTX2SliderTrainer:
                         dit_dtype,
                         global_step,
                     )
+                    if gui_metrics is not None:
+                        gui_metrics.log_event("sample", global_step)
 
                 if should_saving:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                         save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
+                        if gui_metrics is not None:
+                            gui_metrics.log_event("checkpoint", global_step)
 
                         if getattr(args, "save_state", False):
                             train_utils.save_and_remove_state_stepwise(
                                 args, accelerator, global_step, epoch=0, step_in_epoch=global_step
                             )
+                            _state_dir = os.path.join(
+                                args.output_dir,
+                                train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
+                            )
+                            train_utils.update_resume_metadata(
+                                _state_dir,
+                                {
+                                    "loss_avg": loss_recorder.moving_average,
+                                    "loss_count": len(loss_recorder.loss_list),
+                                },
+                            )
+                            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
                         remove_step_no = train_utils.get_remove_step_no(args, global_step)
                         if remove_step_no is not None:
@@ -1564,11 +2094,27 @@ class LTX2SliderTrainer:
 
         if is_main_process and (getattr(args, "save_state", False) or getattr(args, "save_state_on_train_end", False)):
             train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=0, step_in_epoch=global_step)
+            _state_dir = os.path.join(
+                args.output_dir,
+                train_utils.LAST_STATE_NAME.format(args.output_name),
+            )
+            train_utils.update_resume_metadata(
+                _state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                },
+            )
+            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0, force_sync_upload=True)
+            if gui_metrics is not None:
+                gui_metrics.log_event("checkpoint", global_step)
             logger.info("Slider training complete. Model saved.")
+
+        _close_gui_metrics("completed")
 
 
 # ---------------------------------------------------------------------------

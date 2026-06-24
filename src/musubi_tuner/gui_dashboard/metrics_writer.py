@@ -113,17 +113,32 @@ class MetricsWriter:
         entry = {"type": event_type, "step": step, "time": time.time(), **extra}
         self._append_event(entry)
 
-    def update_status(self, **kw):
+    def _compute_speed(self) -> tuple[float, float]:
+        """Return (elapsed_sec, speed_steps_per_sec) from the rolling step-time window."""
         if self._training_started_at is None:
-            elapsed = 0.0
-            speed = 0.0
+            return 0.0, 0.0
+        elapsed = time.monotonic() - self._training_started_at
+        if self._recent_step_times:
+            avg_step_time = sum(self._recent_step_times) / len(self._recent_step_times)
+            speed = 1.0 / avg_step_time if avg_step_time > 0 else 0.0
         else:
-            elapsed = time.monotonic() - self._training_started_at
-            if self._recent_step_times:
-                avg_step_time = sum(self._recent_step_times) / len(self._recent_step_times)
-                speed = 1.0 / avg_step_time if avg_step_time > 0 else 0.0
-            else:
-                speed = self._step_count / elapsed if elapsed > 0 and self._step_count > 0 else 0.0
+            speed = self._step_count / elapsed if elapsed > 0 and self._step_count > 0 else 0.0
+        return elapsed, speed
+
+    def current_sec_per_step(self) -> Optional[float]:
+        """Smoothed seconds-per-step (s/it), or None if no timing samples yet."""
+        _, speed = self._compute_speed()
+        return (1.0 / speed) if speed > 0 else None
+
+    def current_elapsed_sec(self) -> Optional[float]:
+        """Seconds since training timing began this session, or None if not started."""
+        if self._training_started_at is None:
+            return None
+        elapsed, _ = self._compute_speed()
+        return elapsed
+
+    def update_status(self, **kw):
+        elapsed, speed = self._compute_speed()
         status = {
             "elapsed_sec": round(elapsed, 1),
             "speed_steps_per_sec": round(speed, 4),

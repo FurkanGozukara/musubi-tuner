@@ -3544,6 +3544,8 @@ Learns a slider direction from positive/negative prompt pairs. No images or data
 ```toml
 mode = "text"
 guidance_strength = 1.0
+anchor_strength = 1.0
+batch_all_targets = false   # true = train on every target each step (averaged)
 sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
 
 [[targets]]
@@ -3551,6 +3553,12 @@ positive = "extremely detailed, sharp, high resolution, 8k"
 negative = "blurry, out of focus, low quality, soft"
 target_class = ""      # empty = affect all content
 weight = 1.0
+
+[[anchors]]
+prompt = "a portrait of a person"
+
+[[anchors]]
+prompt = "a landscape"
 ```
 
 - `guidance_strength`: Scales the directional offset applied to targets. Higher values = stronger direction signal but may overshoot.
@@ -3559,6 +3567,24 @@ weight = 1.0
 - `sample_slider_range`: Multiplier values used for preview samples during training.
 
 Multiple `[[targets]]` blocks can be defined to train several directions at once (e.g., detail + lighting).
+
+- `batch_all_targets`: Text mode only (default `false`). When `false`, one target is picked at random each step. When `true`, **every** target is processed in the same step and their gradients are averaged (each target's loss scaled by `1/N`) into a single optimizer update. Averaging yields a lower-variance, more context-general direction — the signal shared across targets reinforces while context-specific noise partially cancels — at roughly `N x` the per-step compute. This is **not** equivalent to simply training longer: doubling steps applies sequential, separately-clipped updates that can interfere, whereas batching reconciles all targets in one move. If anchors are configured, the anchor loss is scaled by the same `1/N`, so anchor magnitude/behaviour is unchanged versus the non-batched path.
+
+##### Anchors (concept preservation)
+
+Optional `[[anchors]]` blocks define concepts that should remain unchanged by the slider. For each anchor prompt, the frozen base model's prediction is computed once per step, and the LoRA is constrained to reproduce that same prediction at *both* slider multipliers (`+1` and `-1`). This prevents the slider from drifting on unrelated content — the classic concept-slider preservation technique.
+
+The per-step anchor loss (a plain MSE between the LoRA and frozen-base predictions) is intrinsically spiky in flow-matching velocity space: on ~90% of steps the LoRA barely moves the anchor prediction (loss ~1e-4), but on a small fraction of steps it deviates a lot. An offline probe over real predictions confirmed this spikiness is **not** a removable per-step scale factor — every per-step normalizer tried (variance-normalize, cosine, relative-MSE) still left a 1000-7000x dynamic range, because the variation lives in the genuine deviation, not in a divisible scale. Instead, each step's anchor loss is **capped at a multiple of its running median** (`anchor_cap_mult`), which bounds the rare gradient-norm spikes while leaving the typical steps untouched. This mirrors the spirit of Min-SNR-γ clamping. The cap is applied gradient-preservingly (the loss is scaled by a detached ratio), so the optimizer still moves in the anchor's direction — just not with explosive magnitude.
+
+> **Important — `loss/anchor` magnitude is NOT a measure of anchor impact.** The anchor loss value is typically tiny (~1% of `loss/average`) because it is a *squared* near-zero residual. Its *gradient*, however, is a non-squared, consistently-directed pull on the LoRA weights every step, so even a tiny loss value meaningfully constrains training. In practice, adding an anchor noticeably raises the steady-state direction loss (e.g. ~0.0048 → ~0.0078 on the skin-tone test) because the LoRA spends capacity preserving the anchor instead of maximizing the slide. That higher direction loss is the *cost of preservation*, working as designed — it does **not** mean training is broken. Judge anchor effectiveness from samples (does the anchor concept hold at ±2 while the slider direction still works), never from the `loss/anchor` number.
+
+- `[[anchors]]` / `prompt`: A text prompt describing a concept to preserve. Add as many blocks as needed.
+- `anchor_strength`: Weight on the anchor preservation loss (default `1.0`). Raise it if you observe drift on the anchor concept; lower it if the slider direction is being suppressed. Because the anchor's gradient pull is not proportional to its small loss value, treat this as an empirical knob tuned from samples.
+- `anchor_cap_mult`: Per-step spike cap, as a multiple of the running median anchor loss (default `5.0`, set `0` to disable). Lower values (3-5) clamp spikes harder and keep grad_norm calmer; higher values let more of the raw signal through. The cap only affects rare spike steps, so it stabilizes grad_norm **without** weakening the anchor's steady-state preservation pull (which comes from the ~90% of normal steps). The `loss/anchor` TensorBoard series reflects the post-cap value.
+
+Each anchor adds one extra row to both the no-grad reference forward pass and each gradient pass, so keep the anchor count small (typically 1-3). **Anchors apply to `text` mode only** — `reference` and `ic_reference` modes ignore them, since paired positive/negative examples already largely self-regularize the LoRA against unrelated drift.
+
+> **Choosing anchors:** A good anchor is a concept *adjacent to but not on* the slider's axis. For a slider that changes an attribute of people (e.g. skin tone), avoid anchors where the model will inject a person — "a city street" or "a t-shirt" will spawn a person whose attribute then sits on the slider axis and fights training. People-free nature/landscape prompts (e.g. `"a mountain valley at sunset, forest and rocks, no people"`) are the safest anchors for person-attribute sliders.
 
 #### Example Command (Text-Only)
 <sub>[↑ contents](#table-of-contents)</sub>
