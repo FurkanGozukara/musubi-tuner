@@ -2667,21 +2667,20 @@ class LTX2SamplingMixin:
             generator=generator,
         )
 
-        # Reference-video IC-LoRA helpers call base_model directly and bypass the latent_idx / keyframe
-        # guide-append path used during training, so composing THOSE guides here is unsupported -> fail fast.
-        # first_frame (conditioning_latent) and inpaint masks are supported on the PURE v2v path via
-        # composable target conditioning (_do_v2v_denoising builds them through the ltx_2 ConditioningItem
-        # API + our OR-merge); they are not supported on the audio-bearing av_ic / video_ref_only_av paths.
+        # first_frame (conditioning_latent) + inpaint masks + latent_idx guides are composed on the PURE
+        # v2v path via composable target conditioning (_do_v2v_denoising builds them through the ltx_2
+        # ConditioningItem API + our OR-merge; latent_idx@k generalizes the first_frame@0 anchor to any slot).
+        # NOT supported: keyframe (token-append) guides on any v2v path (the dedicated helpers bypass the
+        # append path), and any guide / first_frame on the audio-bearing av_ic / video_ref_only_av paths.
         _pure_v2v = v2v_ref_latents is not None and not av_ic_sampling and not video_ref_only_av_sampling
         if v2v_ref_latents is not None and (
-            latent_idx_guides or keyframe_guides or (conditioning_latent is not None and not _pure_v2v)
+            keyframe_guides or (latent_idx_guides and not _pure_v2v) or (conditioning_latent is not None and not _pure_v2v)
         ):
             raise ValueError(
-                "Reference-video IC-LoRA sampling does not compose latent_idx or keyframe guides at inference "
-                "(the dedicated denoising helpers bypass the guide-append path used in training), and the "
-                "audio-bearing av_ic / video_ref_only_av paths do not compose first-frame conditioning. "
-                "Drop the latent_idx/keyframe guides (first-frame + inpaint ARE supported on the pure v2v path), "
-                "or use --ic_lora_strategy audio_ref_ic / none."
+                "Reference-video IC-LoRA inference composes first_frame + inpaint + latent_idx guides ONLY on "
+                "the pure v2v path (not the audio-bearing av_ic / video_ref_only_av paths), and keyframe "
+                "(token-append) guides are not composed on any v2v path. Drop keyframe guides / move conditioning "
+                "to the pure v2v path, or use --ic_lora_strategy none / audio_ref_ic."
             )
 
         # Inpaint conditioning is only composed on the pure v2v denoiser; warn + drop it on the
@@ -2772,6 +2771,7 @@ class LTX2SamplingMixin:
                 inpaint_source_latent=sample_parameter.get("inpaint_source_latent"),
                 inpaint_invert=bool(sample_parameter.get("inpaint_invert", False)),
                 inpaint_threshold=float(sample_parameter.get("inpaint_threshold", 0.5)),
+                latent_idx_guides=latent_idx_guides,
             )
             return video, audio_waveform
 
@@ -3984,6 +3984,7 @@ class LTX2SamplingMixin:
         inpaint_source_latent: Optional[torch.Tensor] = None,
         inpaint_invert: bool = False,
         inpaint_threshold: float = 0.5,
+        latent_idx_guides: Optional[list] = None,
     ):
         """V2V / IC-LoRA denoising: concatenate reference + target tokens with per-token timesteps.
 
@@ -4109,7 +4110,8 @@ class LTX2SamplingMixin:
         target_cond_tokens = None  # [B, tgt_seq] bool: pinned-clean tokens -> timestep 0, excluded from denoise
         _has_ff = conditioning_latent is not None
         _has_inpaint = inpaint_mask is not None and inpaint_source_latent is not None
-        if _has_ff or _has_inpaint:
+        _has_latent_idx = bool(latent_idx_guides)
+        if _has_ff or _has_inpaint or _has_latent_idx:
             from musubi_tuner.ltx_2.tools import VideoLatentTools
             from musubi_tuner.ltx_2.conditioning.types.latent_cond import VideoConditionByLatentIndex
             from musubi_tuner.ltx2_inference_conditioning import VideoConditionByMask
@@ -4136,6 +4138,16 @@ class LTX2SamplingMixin:
                     latent=ff_latent,
                     strength=1.0,
                     latent_idx=0,
+                ).apply_to(cond_state, cond_tools)
+            for _g in latent_idx_guides or []:
+                # latent_idx@k: pin a guide latent (edited keyframe) at an ARBITRARY slot, generalizing the
+                # first_frame@0 anchor to any position. Accumulates into the same cond_state -> OR-merge with
+                # first_frame / inpaint. Strength must be 1.0 (the binary timestep bridge below enforces it).
+                _g_lat = _g.latent.to(device=transformer_device, dtype=dit_dtype)
+                cond_state = VideoConditionByLatentIndex(
+                    latent=_g_lat,
+                    strength=float(getattr(_g, "strength", 1.0)),
+                    latent_idx=int(_g.latent_idx),
                 ).apply_to(cond_state, cond_tools)
             if _has_inpaint:
                 from musubi_tuner.ltx2_inpaint_mask import build_inpaint_token_mask
@@ -4169,11 +4181,12 @@ class LTX2SamplingMixin:
             cond_region_5d = cond_state_5d.denoise_mask <= 0
             clean_target_5d = cond_state_5d.clean_latent.to(dtype=latents.dtype)
             logger.info(
-                "V2V composable conditioning: %d/%d target tokens pinned clean (first_frame=%s, inpaint=%s)",
+                "V2V composable conditioning: %d/%d target tokens pinned clean (first_frame=%s, inpaint=%s, latent_idx=%d)",
                 int(target_cond_tokens.sum().item()),
                 int(target_cond_tokens.shape[1]),
                 _has_ff,
                 _has_inpaint,
+                len(latent_idx_guides or []),
             )
 
         # V2V denoising loop
