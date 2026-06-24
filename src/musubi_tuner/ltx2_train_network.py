@@ -3883,10 +3883,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         return transformer
 
     def compile_transformer(self, args: argparse.Namespace, transformer):
-        base_model = transformer.model if hasattr(transformer, "model") else transformer
-        target_blocks = []
-        if hasattr(base_model, "transformer_blocks"):
-            target_blocks.append(base_model.transformer_blocks)
+        target_blocks = model_utils.resolve_compile_block_lists(transformer, ("transformer_blocks",))
         return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
 
     def _load_vae_impl(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):

@@ -768,11 +768,13 @@
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.blocks_to_swap" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="CPU offload blocks" />
 							<FormField type="number" fieldPath="training.max_data_loader_n_workers" value={t.max_data_loader_n_workers ?? ''} oninput={(e) => update('max_data_loader_n_workers', e.target.value === '' ? null : Number(e.target.value))} placeholder="CLI default" min={0} tooltip="Dataloader workers" />
+							<FormField type="number" fieldPath="training.dataloader_prefetch_factor" value={t.dataloader_prefetch_factor ?? ''} oninput={(e) => update('dataloader_prefetch_factor', e.target.value === '' ? null : Number(e.target.value))} placeholder="PyTorch default" min={1} disabled={t.max_data_loader_n_workers === 0} tooltip="Batches prefetched per worker. Requires dataloader workers." />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle fieldPath="training.gradient_checkpointing" checked={t.gradient_checkpointing ?? false} onchange={(e) => update('gradient_checkpointing', e.target.checked)} tooltip="Gradient checkpointing" />
 							<FormToggle fieldPath="training.separate_audio_buckets" checked={t.separate_audio_buckets ?? false} onchange={(e) => update('separate_audio_buckets', e.target.checked)} tooltip="Separate audio/video buckets" />
 							<FormToggle fieldPath="training.persistent_data_loader_workers" checked={t.persistent_data_loader_workers ?? false} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} tooltip="Keep workers between epochs" />
+							<FormToggle fieldPath="training.dataloader_pin_memory" checked={t.dataloader_pin_memory ?? false} onchange={(e) => update('dataloader_pin_memory', e.target.checked)} tooltip="Use pinned DataLoader buffers and non-blocking host-to-device copies." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							{#if t.ltx2_mode === 'audio'}
@@ -938,6 +940,9 @@
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle fieldPath="training.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Enable torch.compile" />
 							<FormToggle fieldPath="training.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage || !t.compile} tooltip="Pass --compile_fullgraph." />
+							<FormToggle fieldPath="training.compile_auto_cache_size_limit" checked={t.compile_auto_cache_size_limit ?? false} onchange={(e) => update('compile_auto_cache_size_limit', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Raise Dynamo cache limit based on compiled block count." />
+							<FormToggle fieldPath="training.compile_fallback_to_eager" checked={t.compile_fallback_to_eager ?? false} onchange={(e) => update('compile_fallback_to_eager', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Continue in eager mode if compile setup fails." />
+							<FormToggle fieldPath="training.compile_cudagraph_mark_step" checked={t.compile_cudagraph_mark_step ?? false} onchange={(e) => update('compile_cudagraph_mark_step', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Call the PyTorch CUDAGraph step marker each training step." />
 							<FormToggle fieldPath="training.cuda_allow_tf32" checked={t.cuda_allow_tf32 ?? false} onchange={(e) => update('cuda_allow_tf32', e.target.checked)} tooltip="Allow TF32 on Ampere+" />
 							<FormToggle fieldPath="training.cuda_cudnn_benchmark" checked={t.cuda_cudnn_benchmark ?? false} onchange={(e) => update('cuda_cudnn_benchmark', e.target.checked)} tooltip="cuDNN benchmark mode" />
 							<FormToggle fieldPath="training.disable_numpy_memmap" checked={t.disable_numpy_memmap ?? false} onchange={(e) => update('disable_numpy_memmap', e.target.checked)} tooltip="Disable numpy memmap model loading." />
@@ -961,6 +966,7 @@
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle fieldPath="training.dynamo_fullgraph" checked={t.dynamo_fullgraph ?? false} onchange={(e) => update('dynamo_fullgraph', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo fullgraph mode." />
 							<FormToggle fieldPath="training.dynamo_dynamic" checked={t.dynamo_dynamic ?? false} onchange={(e) => update('dynamo_dynamic', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo dynamic mode." />
+							<FormToggle fieldPath="training.dynamo_use_regional_compilation" checked={t.dynamo_use_regional_compilation ?? false} onchange={(e) => update('dynamo_use_regional_compilation', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="Request Accelerate regional compilation when supported." />
 							<FormToggle fieldPath="training.ddp_gradient_as_bucket_view" checked={t.ddp_gradient_as_bucket_view ?? false} onchange={(e) => update('ddp_gradient_as_bucket_view', e.target.checked)} tooltip="Enable DDP gradient_as_bucket_view." />
 							<FormToggle fieldPath="training.ddp_static_graph" checked={t.ddp_static_graph ?? false} onchange={(e) => update('ddp_static_graph', e.target.checked)} tooltip="Enable DDP static_graph." />
 							<FormToggle label="DDP Find Unused" fieldPath="training.ddp_find_unused_parameters" checked={t.ddp_find_unused_parameters ?? false} onchange={(e) => update('ddp_find_unused_parameters', e.target.checked)} tooltip="Enable DDP find_unused_parameters for branchy training graphs." />

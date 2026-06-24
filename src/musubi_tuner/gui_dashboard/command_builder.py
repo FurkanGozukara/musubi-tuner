@@ -255,6 +255,59 @@ def _compile_dynamic_value(value) -> str | None:
     return None
 
 
+def _append_compile_args(cmd: list[str], t) -> None:
+    if getattr(t, "compile", False):
+        cmd.append("--compile")
+        if getattr(t, "compile_backend", ""):
+            cmd += ["--compile_backend", t.compile_backend]
+        if getattr(t, "compile_mode", ""):
+            cmd += ["--compile_mode", t.compile_mode]
+        compile_dynamic = _compile_dynamic_value(getattr(t, "compile_dynamic", None))
+        if compile_dynamic:
+            cmd += ["--compile_dynamic", compile_dynamic]
+        if getattr(t, "compile_fullgraph", False):
+            cmd.append("--compile_fullgraph")
+        if getattr(t, "compile_cache_size_limit", None) is not None:
+            cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
+        if getattr(t, "compile_auto_cache_size_limit", False):
+            cmd.append("--compile_auto_cache_size_limit")
+        if getattr(t, "compile_fallback_to_eager", False):
+            cmd.append("--compile_fallback_to_eager")
+        if getattr(t, "compile_cudagraph_mark_step", False):
+            cmd.append("--compile_cudagraph_mark_step")
+
+    if getattr(t, "dynamo_backend", "NO") != "NO":
+        cmd += ["--dynamo_backend", t.dynamo_backend]
+        if getattr(t, "dynamo_mode", None):
+            cmd += ["--dynamo_mode", t.dynamo_mode]
+        if getattr(t, "dynamo_fullgraph", False):
+            cmd.append("--dynamo_fullgraph")
+        if getattr(t, "dynamo_dynamic", False):
+            cmd.append("--dynamo_dynamic")
+        if getattr(t, "dynamo_use_regional_compilation", False):
+            cmd.append("--dynamo_use_regional_compilation")
+
+
+def _append_dataloader_args(cmd: list[str], t) -> None:
+    if getattr(t, "max_data_loader_n_workers", None) is not None:
+        cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
+    if getattr(t, "persistent_data_loader_workers", False):
+        cmd.append("--persistent_data_loader_workers")
+    if getattr(t, "dataloader_pin_memory", False):
+        cmd.append("--dataloader_pin_memory")
+    if getattr(t, "dataloader_prefetch_factor", None) is not None:
+        cmd += ["--dataloader_prefetch_factor", str(t.dataloader_prefetch_factor)]
+
+
+def _append_cuda_args(cmd: list[str], t) -> None:
+    if getattr(t, "cuda_allow_tf32", False):
+        cmd.append("--cuda_allow_tf32")
+    if getattr(t, "cuda_cudnn_benchmark", False):
+        cmd.append("--cuda_cudnn_benchmark")
+    if getattr(t, "cuda_memory_fraction", None) is not None:
+        cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+
+
 def _append_h2d_block_swap_args(cmd: list[str], settings) -> None:
     if not getattr(settings, "block_swap_h2d_only", False):
         return
@@ -1170,35 +1223,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--img_in_txt_in_offloading")
 
     # Compile
-    if t.compile:
-        cmd.append("--compile")
-        if t.compile_backend:
-            cmd += ["--compile_backend", t.compile_backend]
-        if t.compile_mode:
-            cmd += ["--compile_mode", t.compile_mode]
-        compile_dynamic = _compile_dynamic_value(t.compile_dynamic)
-        if compile_dynamic:
-            cmd += ["--compile_dynamic", compile_dynamic]
-        if t.compile_fullgraph:
-            cmd.append("--compile_fullgraph")
-        if t.compile_cache_size_limit is not None:
-            cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
-    if t.dynamo_backend != "NO":
-        cmd += ["--dynamo_backend", t.dynamo_backend]
-        if t.dynamo_mode:
-            cmd += ["--dynamo_mode", t.dynamo_mode]
-        if t.dynamo_fullgraph:
-            cmd.append("--dynamo_fullgraph")
-        if t.dynamo_dynamic:
-            cmd.append("--dynamo_dynamic")
+    _append_compile_args(cmd, t)
 
     # CUDA
-    if t.cuda_allow_tf32:
-        cmd.append("--cuda_allow_tf32")
-    if t.cuda_cudnn_benchmark:
-        cmd.append("--cuda_cudnn_benchmark")
-    if t.cuda_memory_fraction is not None:
-        cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+    _append_cuda_args(cmd, t)
     if t.disable_numpy_memmap:
         cmd.append("--disable_numpy_memmap")
     if t.ddp_timeout is not None:
@@ -1750,10 +1778,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # Misc
     if t.separate_audio_buckets:
         cmd.append("--separate_audio_buckets")
-    if t.max_data_loader_n_workers is not None:
-        cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
-    if t.persistent_data_loader_workers:
-        cmd.append("--persistent_data_loader_workers")
+    _append_dataloader_args(cmd, t)
     _append_ltx2_conditioning(cmd, t, config)
 
     cmd += _split_cli_args(t.extra_args)
@@ -1985,6 +2010,10 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
 
     if getattr(t, "preserve_audio_timing", False):
         cmd.append("--preserve_audio_timing")
+
+    # Compile / CUDA
+    _append_compile_args(cmd, t)
+    _append_cuda_args(cmd, t)
 
     # Q-GaLore
     if t.qgalore_full_ft:
@@ -2236,6 +2265,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
         if args_parts:
             cmd += ["--tread_args"] + args_parts
+
+    _append_dataloader_args(cmd, t)
 
     # Conditioning (recipe / intrinsic / directional). --lora_target_preset / --ic_lora_strategy are
     # LoRA-only and not emitted for full fine-tune; a recipe's reference still derives the strategy.

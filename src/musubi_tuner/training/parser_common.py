@@ -127,6 +127,25 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
     )
     parser.add_argument(
+        "--compile_auto_cache_size_limit",
+        action="store_true",
+        help="Opt-in: raise torch._dynamo.config.cache_size_limit to at least 2x the compiled block count"
+        " / オプトイン: コンパイル対象ブロック数の2倍以上にtorch._dynamo.config.cache_size_limitを引き上げる",
+    )
+    parser.add_argument(
+        "--compile_fallback_to_eager",
+        action="store_true",
+        help="Opt-in: if torch.compile setup fails, restore eager blocks and continue without compilation"
+        " / オプトイン: torch.compileのセットアップに失敗した場合、Eagerブロックに戻してコンパイルなしで続行する",
+    )
+    parser.add_argument(
+        "--compile_cudagraph_mark_step",
+        action="store_true",
+        help="Opt-in: call torch.compiler.cudagraph_mark_step_begin() at each training step for compile modes "
+        "that use CUDAGraphs / オプトイン: CUDAGraphを使うcompileモード向けに各学習ステップで"
+        "torch.compiler.cudagraph_mark_step_begin()を呼び出す",
+    )
+    parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
         help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",
@@ -169,6 +188,12 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         "--dynamo_dynamic",
         action="store_true",
         help="use dynamic mode for dynamo / dynamoのdynamicモードを使う",
+    )
+    parser.add_argument(
+        "--dynamo_use_regional_compilation",
+        action="store_true",
+        help="Opt-in: request Accelerate TorchDynamoPlugin regional compilation when supported"
+        " / オプトイン: 対応するAccelerate環境でTorchDynamoPluginのregional compilationを要求する",
     )
 
 

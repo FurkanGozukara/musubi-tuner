@@ -37,7 +37,12 @@ from musubi_tuner.modality_freezer import ModalityFreezer
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
-from musubi_tuner.training.accelerator_setup import clean_memory_on_device, collator_class, prepare_accelerator
+from musubi_tuner.training.accelerator_setup import (
+    clean_memory_on_device,
+    collator_class,
+    dataloader_extra_kwargs,
+    prepare_accelerator,
+)
 from musubi_tuner.training.losses import per_element_loss as _per_element_loss, reduce_masked_loss
 from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.metadata import (
@@ -541,6 +546,7 @@ def train(self, args):
 
     # num workers for data loader: if 0, persistent_workers is not available
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
+    loader_extra_kwargs = dataloader_extra_kwargs(args, n_workers)
 
     train_audio_sampler, train_audio_sampler_mode, train_audio_sampler_stats = build_audio_sampler(
         dataset_group=train_dataset_group,
@@ -575,6 +581,7 @@ def train(self, args):
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            **loader_extra_kwargs,
         )
     else:
         train_dataloader = torch.utils.data.DataLoader(
@@ -585,6 +592,7 @@ def train(self, args):
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            **loader_extra_kwargs,
         )
     if validation_dataset_group is not None:
         validation_dataloader = torch.utils.data.DataLoader(
@@ -594,6 +602,7 @@ def train(self, args):
             collate_fn=validation_collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            **loader_extra_kwargs,
         )
 
     # calculate max_train_steps
@@ -1754,7 +1763,11 @@ def train(self, args):
             _is_first_step = epoch == epoch_to_start and step == 0
             if _is_first_step:
                 _log_vram("FIRST_ITER: before batch processing", logger)
-            # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
+            if getattr(args, "compile_cudagraph_mark_step", False) and getattr(args, "compile", False):
+                compiler = getattr(torch, "compiler", None)
+                mark_step_begin = getattr(compiler, "cudagraph_mark_step_begin", None)
+                if mark_step_begin is not None:
+                    mark_step_begin()
             if (
                 args.log_cuda_memory_every_n_steps is not None
                 and args.log_cuda_memory_every_n_steps > 0

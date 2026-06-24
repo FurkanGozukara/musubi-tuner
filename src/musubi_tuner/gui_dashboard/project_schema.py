@@ -407,10 +407,14 @@ class TrainingConfig(BaseModel):
     compile_dynamic: bool | str | None = False
     compile_fullgraph: bool = False
     compile_cache_size_limit: Optional[int] = None
+    compile_auto_cache_size_limit: bool = False
+    compile_fallback_to_eager: bool = False
+    compile_cudagraph_mark_step: bool = False
     dynamo_backend: str = "NO"
     dynamo_mode: Optional[Literal["default", "reduce-overhead", "max-autotune"]] = None
     dynamo_fullgraph: bool = False
     dynamo_dynamic: bool = False
+    dynamo_use_regional_compilation: bool = False
 
     # CUDA
     cuda_allow_tf32: bool = False
@@ -704,6 +708,8 @@ class TrainingConfig(BaseModel):
     separate_audio_buckets: bool = False
     max_data_loader_n_workers: Optional[int] = None
     persistent_data_loader_workers: bool = False
+    dataloader_pin_memory: bool = False
+    dataloader_prefetch_factor: Optional[int] = None
     # Composable conditioning recipe (TOML path). When set it is AUTHORITATIVE and mutually exclusive
     # with the individual conditioning controls below: the command builder emits only
     # --ltx2_conditioning_config and omits the flags the recipe owns (--lora_target_preset,

@@ -503,7 +503,41 @@
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField type="number" fieldPath="full_finetune.max_data_loader_n_workers" value={t.max_data_loader_n_workers ?? ''} oninput={(e) => update('max_data_loader_n_workers', numberOrNull(e.target.value))} min={0} />
+					<FormField type="number" fieldPath="full_finetune.dataloader_prefetch_factor" value={t.dataloader_prefetch_factor ?? ''} oninput={(e) => update('dataloader_prefetch_factor', numberOrNull(e.target.value))} min={1} disabled={t.max_data_loader_n_workers === 0} tooltip="Batches prefetched per worker. Requires dataloader workers." />
 					<FormToggle fieldPath="full_finetune.persistent_data_loader_workers" checked={t.persistent_data_loader_workers ?? false} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} />
+					<FormToggle fieldPath="full_finetune.dataloader_pin_memory" checked={t.dataloader_pin_memory ?? false} onchange={(e) => update('dataloader_pin_memory', e.target.checked)} tooltip="Use pinned DataLoader buffers and non-blocking host-to-device copies." />
+				</div>
+			</div>
+		</FormGroup>
+
+		<FormGroup title="Compile & CUDA">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+					<FormToggle fieldPath="full_finetune.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Enable torch.compile" />
+					<FormToggle fieldPath="full_finetune.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Pass --compile_fullgraph." />
+					<FormToggle fieldPath="full_finetune.compile_auto_cache_size_limit" checked={t.compile_auto_cache_size_limit ?? false} onchange={(e) => update('compile_auto_cache_size_limit', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Raise Dynamo cache limit based on compiled block count." />
+					<FormToggle fieldPath="full_finetune.compile_fallback_to_eager" checked={t.compile_fallback_to_eager ?? false} onchange={(e) => update('compile_fallback_to_eager', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Continue in eager mode if compile setup fails." />
+					<FormToggle fieldPath="full_finetune.compile_cudagraph_mark_step" checked={t.compile_cudagraph_mark_step ?? false} onchange={(e) => update('compile_cudagraph_mark_step', e.target.checked)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Call the PyTorch CUDAGraph step marker each training step." />
+					<FormToggle fieldPath="full_finetune.cuda_allow_tf32" checked={t.cuda_allow_tf32 ?? false} onchange={(e) => update('cuda_allow_tf32', e.target.checked)} tooltip="Allow TF32 on Ampere+" />
+					<FormToggle fieldPath="full_finetune.cuda_cudnn_benchmark" checked={t.cuda_cudnn_benchmark ?? false} onchange={(e) => update('cuda_cudnn_benchmark', e.target.checked)} tooltip="cuDNN benchmark mode." />
+				</div>
+				<div class="grid grid-cols-3 gap-2">
+					<FormField fieldPath="full_finetune.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile backend" />
+					<FormField fieldPath="full_finetune.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile mode" />
+					<FormSelect fieldPath="full_finetune.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Value for --compile_dynamic." />
+				</div>
+				<div class="grid grid-cols-2 gap-2">
+					<FormField type="number" fieldPath="full_finetune.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', numberOrNull(e.target.value))} placeholder="Default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="torch.compile cache size limit" />
+					<FormField type="number" fieldPath="full_finetune.cuda_memory_fraction" value={t.cuda_memory_fraction ?? ''} oninput={(e) => update('cuda_memory_fraction', numberOrNull(e.target.value))} placeholder="None" step="0.05" min={0} max={1} tooltip="Limit CUDA memory fraction" />
+				</div>
+				<div class="grid grid-cols-2 gap-2">
+					<FormField fieldPath="full_finetune.dynamo_backend" value={t.dynamo_backend || 'NO'} oninput={(e) => update('dynamo_backend', e.target.value || 'NO')} tooltip="Accelerate TorchDynamo backend. Default NO disables it." />
+					<FormSelect fieldPath="full_finetune.dynamo_mode" value={t.dynamo_mode || ''} options={[{value:'',label:'Default'}, 'default', 'reduce-overhead', 'max-autotune']} onchange={(e) => update('dynamo_mode', e.target.value || null)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo mode." />
+				</div>
+				<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+					<FormToggle fieldPath="full_finetune.dynamo_fullgraph" checked={t.dynamo_fullgraph ?? false} onchange={(e) => update('dynamo_fullgraph', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo fullgraph mode." />
+					<FormToggle fieldPath="full_finetune.dynamo_dynamic" checked={t.dynamo_dynamic ?? false} onchange={(e) => update('dynamo_dynamic', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo dynamic mode." />
+					<FormToggle fieldPath="full_finetune.dynamo_use_regional_compilation" checked={t.dynamo_use_regional_compilation ?? false} onchange={(e) => update('dynamo_use_regional_compilation', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="Request Accelerate regional compilation when supported." />
 				</div>
 			</div>
 		</FormGroup>

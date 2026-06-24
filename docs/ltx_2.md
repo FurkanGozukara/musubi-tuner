@@ -678,6 +678,21 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) are supported — `--fp8_base --fp8_scaled` works the same as with standard checkpoints (weights are dequantized to bf16 first, then re-quantized).
 
+Optional torch.compile and DataLoader flags:
+
+| Flag | Effect |
+|---|---|
+| `--compile` | Enables block-level `torch.compile` for the LTX-2 transformer. |
+| `--compile_dynamic false` | Avoids dynamic-shape compile paths when the training shape is fixed. |
+| `--compile_auto_cache_size_limit` | Raises the Dynamo cache limit based on the number of compiled blocks. |
+| `--compile_fallback_to_eager` | Restores eager blocks and continues if compile setup fails. |
+| `--compile_cudagraph_mark_step` | Calls the PyTorch CUDAGraph step marker each train step; use only after measuring. |
+| `--dynamo_use_regional_compilation` | Requests Accelerate regional compilation when supported by the installed Accelerate version. |
+| `--dataloader_pin_memory` | Enables pinned host buffers and non-blocking host-to-device copies. |
+| `--dataloader_prefetch_factor N` | Sets DataLoader worker prefetching when workers are enabled. |
+
+All flags above are off by default. `torch.compile` speedups are workload-dependent; gradient checkpointing and very small step counts can hide gains behind compile overhead. For generic compile arguments and limitations, see [torch.compile](./torch_compile.md).
+
 For LTX-2 checkpoints, replace:
 - `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
 - `--ltx_version 2.3` -> `--ltx_version 2.0`

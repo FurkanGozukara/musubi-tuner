@@ -3,6 +3,7 @@
 from datetime import timedelta
 import argparse
 import gc
+import inspect
 import logging
 import os
 import time
@@ -50,14 +51,10 @@ class collator_class:
 
 
 def dataloader_extra_kwargs(args: argparse.Namespace, n_workers: int) -> dict:
-    """Opt-in DataLoader kwargs derived from CLI args (default off -> baseline behavior).
-
-    With --dataloader_pin_memory unset this returns {"pin_memory": False}, which equals the
-    torch DataLoader default, so the constructed loader is behaviorally identical to the
-    pre-feature call. --dataloader_prefetch_factor is only forwarded when explicitly set AND
-    n_workers > 0 (torch raises if prefetch_factor is passed with num_workers == 0).
-    """
-    extra = {"pin_memory": bool(getattr(args, "dataloader_pin_memory", False))}
+    """Opt-in DataLoader kwargs derived from CLI args."""
+    extra = {}
+    if getattr(args, "dataloader_pin_memory", False):
+        extra["pin_memory"] = True
     prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
     if prefetch_factor is not None and n_workers > 0:
         extra["prefetch_factor"] = prefetch_factor
@@ -123,12 +120,18 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
 
     dynamo_plugin = None
     if args.dynamo_backend.upper() != "NO":
-        dynamo_plugin = TorchDynamoPlugin(
+        dynamo_kwargs = dict(
             backend=DynamoBackend(args.dynamo_backend.upper()),
             mode=args.dynamo_mode,
             fullgraph=args.dynamo_fullgraph,
             dynamic=args.dynamo_dynamic,
         )
+        if getattr(args, "dynamo_use_regional_compilation", False):
+            if "use_regional_compilation" in inspect.signature(TorchDynamoPlugin).parameters:
+                dynamo_kwargs["use_regional_compilation"] = True
+            else:
+                logger.warning("--dynamo_use_regional_compilation was requested, but this Accelerate version does not support it")
+        dynamo_plugin = TorchDynamoPlugin(**dynamo_kwargs)
 
     accelerator_kwargs = dict(
         gradient_accumulation_steps=args.gradient_accumulation_steps,

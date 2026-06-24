@@ -259,37 +259,166 @@ def disable_linear_from_compile(module: torch.nn.Module):
             sub_module.forward = sub_module._eager_forward  # override forward to disable compile
 
 
+def compile_dynamic_arg(args: argparse.Namespace) -> bool | None:
+    compile_dynamic = getattr(args, "compile_dynamic", None)
+    if compile_dynamic is None:
+        return None
+    if isinstance(compile_dynamic, bool):
+        return compile_dynamic
+    return {"true": True, "false": False, "auto": None}[compile_dynamic.lower()]
+
+
+def unwrap_compile_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap common compile/distributed wrappers without requiring an Accelerator instance."""
+    unwrapped = module
+    seen: set[int] = set()
+    for _ in range(8):
+        if id(unwrapped) in seen:
+            break
+        seen.add(id(unwrapped))
+
+        next_module = getattr(unwrapped, "module", None)
+        if isinstance(next_module, torch.nn.Module) and next_module is not unwrapped:
+            unwrapped = next_module
+            continue
+
+        next_module = getattr(unwrapped, "_orig_mod", None)
+        if isinstance(next_module, torch.nn.Module) and next_module is not unwrapped:
+            unwrapped = next_module
+            continue
+
+        break
+    return unwrapped
+
+
+def resolve_compile_block_lists(
+    module: torch.nn.Module,
+    block_attr_names: tuple[str, ...] = ("transformer_blocks",),
+) -> list[torch.nn.ModuleList | list[torch.nn.Module]]:
+    """Find block lists on a model or a single-GPU wrapper's `.model` child."""
+    roots = [unwrap_compile_module(module)]
+    wrapped_model = getattr(roots[0], "model", None)
+    if isinstance(wrapped_model, torch.nn.Module) and wrapped_model is not roots[0]:
+        roots.append(wrapped_model)
+
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]] = []
+    seen: set[int] = set()
+    for root in roots:
+        for attr_name in block_attr_names:
+            value: Any = root
+            for part in attr_name.split("."):
+                value = getattr(value, part, None)
+                if value is None:
+                    break
+            if value is None or id(value) in seen:
+                continue
+            if isinstance(value, (torch.nn.ModuleList, list)):
+                target_blocks.append(value)
+                seen.add(id(value))
+    return target_blocks
+
+
+def _collect_compile_targets(
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
+) -> list[tuple[torch.nn.ModuleList | list[torch.nn.Module], int, torch.nn.Module]]:
+    targets: list[tuple[torch.nn.ModuleList | list[torch.nn.Module], int, torch.nn.Module]] = []
+    for blocks in target_blocks:
+        for i, block in enumerate(blocks):
+            if not isinstance(block, torch.nn.Module):
+                logger.debug("Skipping non-module torch.compile target at index %s: %r", i, block)
+                continue
+            if hasattr(block, "_hf_hook"):
+                logger.info("Skipping torch.compile target at index %s because an HF offload hook is attached", i)
+                continue
+            targets.append((blocks, i, block))
+    return targets
+
+
+def _configure_compile_cache(args: argparse.Namespace, target_count: int) -> None:
+    cache_size_limit = getattr(args, "compile_cache_size_limit", None)
+    if getattr(args, "compile_auto_cache_size_limit", False) and target_count > 0:
+        auto_limit = target_count * 2
+        if cache_size_limit is None:
+            current_limit = getattr(torch._dynamo.config, "cache_size_limit", 0)
+            cache_size_limit = max(int(current_limit or 0), auto_limit)
+        else:
+            cache_size_limit = max(cache_size_limit, auto_limit)
+
+    if cache_size_limit is not None:
+        torch._dynamo.config.cache_size_limit = cache_size_limit
+        logger.info("Set torch._dynamo.config.cache_size_limit to %s", cache_size_limit)
+
+
+def compile_module(args: argparse.Namespace, module: torch.nn.Module) -> torch.nn.Module:
+    compile_dynamic = compile_dynamic_arg(args)
+    logger.info(
+        "Compiling model with torch.compile: backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
+        args.compile_backend,
+        args.compile_mode,
+        compile_dynamic,
+        args.compile_fullgraph,
+    )
+    _configure_compile_cache(args, 1)
+    try:
+        return torch.compile(
+            module,
+            backend=args.compile_backend,
+            mode=args.compile_mode,
+            dynamic=compile_dynamic,
+            fullgraph=args.compile_fullgraph,
+        )
+    except Exception as e:
+        if getattr(args, "compile_fallback_to_eager", False):
+            logger.warning("torch.compile setup failed; continuing with eager model: %s", e)
+            return module
+        raise
+
+
 def compile_transformer(
     args: argparse.Namespace,
     transformer: torch.nn.Module,
     target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
     disable_linear: bool,
 ) -> torch.nn.Module:
+    targets = _collect_compile_targets(target_blocks)
+    if len(targets) == 0:
+        logger.warning("torch.compile was requested, but no compile target blocks were found; leaving transformer eager")
+        return transformer
+
     if disable_linear:
         logger.info("Disable linear from torch.compile for swap blocks...")
-        for blocks in target_blocks:
-            for block in blocks:
-                disable_linear_from_compile(block)
+        for _, _, block in targets:
+            disable_linear_from_compile(block)
 
-    compile_dynamic = None
-    if args.compile_dynamic is not None:
-        compile_dynamic = {"true": True, "false": False, "auto": None}[args.compile_dynamic.lower()]
-
+    compile_dynamic = compile_dynamic_arg(args)
     logger.info(
-        f"Compiling DiT model with torch.compile: backend={args.compile_backend}, mode={args.compile_mode}, dynamic={compile_dynamic}, fullgraph={args.compile_fullgraph}"
+        "Compiling DiT model blocks with torch.compile: blocks=%d, backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
+        len(targets),
+        args.compile_backend,
+        args.compile_mode,
+        compile_dynamic,
+        args.compile_fullgraph,
     )
+    _configure_compile_cache(args, len(targets))
 
-    if args.compile_cache_size_limit is not None:
-        torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
-
-    for blocks in target_blocks:
-        for i, block in enumerate(blocks):
-            block = torch.compile(
+    compiled_refs: list[tuple[torch.nn.ModuleList | list[torch.nn.Module], int, torch.nn.Module]] = []
+    try:
+        for blocks, i, block in targets:
+            compiled_block = torch.compile(
                 block,
                 backend=args.compile_backend,
                 mode=args.compile_mode,
                 dynamic=compile_dynamic,
                 fullgraph=args.compile_fullgraph,
             )
+            compiled_refs.append((blocks, i, block))
+            blocks[i] = compiled_block
+    except Exception as e:
+        for blocks, i, block in reversed(compiled_refs):
             blocks[i] = block
+        if getattr(args, "compile_fallback_to_eager", False):
+            logger.warning("torch.compile setup failed; restored eager blocks and continuing: %s", e)
+            return transformer
+        raise
+
     return transformer

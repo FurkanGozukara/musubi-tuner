@@ -26,6 +26,7 @@ from musubi_tuner.training.metadata import (
 )
 from musubi_tuner.training.outputs import DiTOutput as DiTOutput
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
+from musubi_tuner.utils import model_utils
 
 
 class NetworkTrainer:
@@ -96,7 +97,7 @@ class NetworkTrainer:
 
     def compile_transformer(self, args, transformer):
         if args.compile:
-            transformer = torch.compile(transformer, backend=args.dynamo_backend, mode=args.dynamo_mode)
+            transformer = model_utils.compile_module(args, transformer)
         return transformer
 
     def scale_shift_latents(self, latents):
