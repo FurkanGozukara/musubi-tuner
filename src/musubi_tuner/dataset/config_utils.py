@@ -26,13 +26,14 @@ import voluptuous
 from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Optional as VOptional, Schema
 
 from musubi_tuner.dataset.image_video_dataset import (
-    ARCHITECTURE_LTX2,
-    ARCHITECTURE_LTX2_FULL,
     AudioDataset,
     DatasetGroup,
     ImageDataset,
     VideoDataset,
 )
+
+# LTX-2 fork addition — separate import so upstream's inserts into the block above don't conflict
+from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL
 
 import logging
 

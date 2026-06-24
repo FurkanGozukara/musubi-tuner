@@ -23,9 +23,11 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_KREA2,
-    ARCHITECTURE_LTX2,
     ARCHITECTURE_Z_IMAGE,
 )
+
+# LTX-2 fork addition — separate import so upstream's inserts into the sorted block above don't conflict
+from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

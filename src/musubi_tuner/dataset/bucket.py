@@ -21,14 +21,15 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_KREA2,
-    ARCHITECTURE_LTX2,
-    ARCHITECTURE_LTX2_FULL,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_WAN,
     ARCHITECTURE_Z_IMAGE,
 )
+
+# LTX-2 fork additions — separate import so upstream's inserts into the sorted block above don't conflict
+from musubi_tuner.dataset.architectures import ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL
 from musubi_tuner.dataset.media_utils import divisible_by
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
 

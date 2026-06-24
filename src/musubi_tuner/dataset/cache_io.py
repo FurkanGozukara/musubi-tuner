@@ -15,11 +15,13 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
-    ARCHITECTURE_LTX2_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
 )
+
+# LTX-2 fork addition — separate import so upstream's inserts into the sorted block above don't conflict
+from musubi_tuner.dataset.architectures import ARCHITECTURE_LTX2_FULL
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
