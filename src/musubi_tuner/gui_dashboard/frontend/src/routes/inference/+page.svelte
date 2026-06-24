@@ -59,7 +59,7 @@
 	let inferenceLogs = $derived($processLogs.inference || []);
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, s.ltx2_checkpoint || ''));
-	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, s.gemma_safetensors || ''));
+	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, s.gemma_safetensors || '', s.gemma_root || ''));
 	let gemmaRootDisabled = $derived(Boolean(s.gemma_safetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, s.gemma_root || '', s.gemma_safetensors || ''));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, s.gemma_root || '', ''));

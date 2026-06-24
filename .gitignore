@@ -15,7 +15,4 @@ AGENTS.md
 .mcp.json
 references/
 projects/
-tests/
-
-dev_tests
-sakuga_pipeline
+dev/

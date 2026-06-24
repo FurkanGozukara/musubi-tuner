@@ -63,7 +63,7 @@
 	let dinoLogs = $derived($processLogs.cache_dino || []);
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, caching.ltx2_checkpoint || ''));
-	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, caching.gemma_safetensors || ''));
+	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, caching.gemma_safetensors || '', caching.gemma_root || ''));
 	let gemmaRootDisabled = $derived(Boolean(caching.gemma_safetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', caching.gemma_safetensors || ''));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', ''));

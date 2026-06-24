@@ -92,6 +92,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [NF4 Quantization](#nf4-quantization)
+    - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
@@ -1305,7 +1306,7 @@ Dashboard workflow: the Project page has a **Cache & Start Training** action. It
 ### DoRA LoRA Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
-DoRA adds a separate learnable magnitude vector to the standard LTX-2 LoRA backend. It is opt-in and uses the same target presets, rank, alpha, optimizer, and dataset settings as regular LoRA.
+DoRA adds a separate learnable magnitude vector to the standard LTX-2 LoRA backend. It is opt-in and uses the same target presets, rank, alpha, optimizer, and dataset settings as regular LoRA. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80))
 
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
@@ -1619,6 +1620,17 @@ accelerate launch ... ltx2_train_network.py ^
 - Compatible with `--blocks_to_swap`, `--gradient_checkpointing`, and other training options. NF4 reduces block swap transfer size (4-bit vs 16-bit per weight).
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
+### NVFP4 (FP4 E2M1) Checkpoints
+<sub>[↑ contents](#table-of-contents)</sub>
+
+NVFP4 (NVIDIA FP4, E2M1) is a 4-bit weight format used by some pre-quantized LTX-2 checkpoints (e.g. Lightricks releases). Transformer block weights are stored as packed uint8 (two FP4 values per byte) with two-level scaling: a per-block `weight_scale` (float8_e4m3) and a per-tensor `weight_scale_2` (float32). Early blocks, VAE, vocoder, connectors, biases, and norms stay in BF16.
+
+NVFP4 checkpoints are detected automatically from the safetensors metadata (or from the presence of `weight_scale_2` keys) — there is no separate flag. Point the DiT checkpoint at the NVFP4 file and it is loaded with on-the-fly dequantization to the compute dtype during each `F.linear`, then a LoRA is trained over the frozen base, the same way as NF4. Auto-detection is skipped when `--nf4_base` or `--fp8_scaled` is set.
+
+Weights are dequantized to the compute dtype and run through a standard `F.linear` (not a native FP4 matmul), so NVFP4 works on any BF16-capable GPU and does not require FP4 tensor cores (Blackwell). The 4-bit format is a memory optimization, not an FP4 compute path.
+
+(Credit: [phazei](https://github.com/phazei) — [PR #87](https://github.com/AkaneTendo25/musubi-tuner/pull/87))
+
 ### int8 Base (Optimum-Quanto)
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -1836,8 +1848,8 @@ LTX-2 training accepts optimizer selection through `--optimizer_type`; optimizer
 | `Adafactor` | You want Adafactor's factored optimizer state and scheduler behavior. | No | Yes | If `relative_step` is omitted, it defaults to `True`; relative-step mode uses the Adafactor scheduler path. |
 | `CAME`, `CAMESimple`, `came_simple` | You want CAME without 8-bit optimizer-state quantization. | No | Yes | Supports `stochastic_rounding`, `use_cautious`, and related CAME args through `--optimizer_args`. |
 | `CAME8bit`, `came_8bit` | You want CAME with block-wise 8-bit optimizer state for eligible tensors. | No | Yes | Supports the same CAME args plus 8-bit state settings such as `min_8bit_size` and `quant_block_size`. |
-| `SinkSGD`, `SinkSGD_adv`, `sinksgd`, `sink_sgd`, `sinksgdadv` | You want Sinkhorn-normalized SGD with momentum for LoRA-style training. | No | Yes | Supports `momentum`, `nesterov`, `nesterov_coef`, `normed_momentum`, `weight_decay`, `sinkhorn_iterations`, `orthogonal_sinkhorn`, `orthogonal_gradient`, `spectral_normalization`, and `state_precision`. State precision modes are `auto`, `fp32`, and `bf16_sr`. Optional LR scaling requires explicit args such as `scale_lr_with_grad_accum=True` or `scale_lr_with_effective_batch=True`. |
-| `ProdigyPlusScheduleFree`, `ProdigyPlus`, `PPlus` | You want the Prodigy Plus schedule-free optimizer. | `prodigy-plus-schedule-free` | Yes | Opt-in only. The trainer fills missing Prodigy Plus constructor args with the recommended defaults below, but does not change `--learning_rate`, `--lr_scheduler`, or clipping unless you pass those values or use the dashboard preset. |
+| `SinkSGD`, `SinkSGD_adv`, `sinksgd`, `sink_sgd`, `sinksgdadv` | You want Sinkhorn-normalized SGD with momentum for LoRA-style training. | No | Yes | Supports `momentum`, `nesterov`, `nesterov_coef`, `normed_momentum`, `weight_decay`, `sinkhorn_iterations`, `orthogonal_sinkhorn`, `orthogonal_gradient`, `spectral_normalization`, and `state_precision`. State precision modes are `auto`, `fp32`, and `bf16_sr`. Optional LR scaling requires explicit args such as `scale_lr_with_grad_accum=True` or `scale_lr_with_effective_batch=True`. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80)) |
+| `ProdigyPlusScheduleFree`, `ProdigyPlus`, `PPlus` | You want the Prodigy Plus schedule-free optimizer. | `prodigy-plus-schedule-free` | Yes | Opt-in only. The trainer fills missing Prodigy Plus constructor args with the recommended defaults below, but does not change `--learning_rate`, `--lr_scheduler`, or clipping unless you pass those values or use the dashboard preset. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80)) |
 
 Recommended Prodigy Plus LoRA starting point:
 
@@ -2022,6 +2034,7 @@ python ltx2_generate_video.py ^
 - If both `--reference_image` and `--reference_video` are supplied, `--reference_video` takes priority.
 - Global `--reference_image` / `--reference_video` overrides replace conflicting per-prompt `image_path` / `v2v_ref_path` entries loaded from prompt files, and also clear any cached reference latents tied to those prompt entries before sampling.
 - If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
+- Attention backend: `--sdpa` (default), `--flash_attn`, `--flash3`, `--xformers`, or `--sage_attn` (equivalently `--attn_mode {sdpa,flash,flash3,xformers,sageattn}`). `--sage_attn` runs the DiT attention through [SageAttention](https://github.com/thu-ml/SageAttention) (requires the `sageattention` package; masked attention falls back to SDPA). It is inference-only — training rejects it. (Credit: [phazei](https://github.com/phazei) — [PR #87](https://github.com/AkaneTendo25/musubi-tuner/pull/87))
 
 #### Rendering Trained Conditioning
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -2260,7 +2273,7 @@ CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignme
 - `--tread_args` accepts `target`, `selection_ratio`, `start_layer_idx`, and `end_layer_idx`; aliases are `modality`, `ratio`, `start`, and `end`.
 - TREAD is training-only. Video targets require a video-enabled path; audio-only training must use `target=audio`.
 
-**Differential Guidance** - Prediction-relative scaling for the video/main training target. This is opt-in:
+**Differential Guidance** - Prediction-relative scaling for the video/main training target. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80)) This is opt-in:
 ```bash
 --differential_guidance
 ```
@@ -3572,7 +3585,7 @@ Multiple `[[targets]]` blocks can be defined to train several directions at once
 
 ##### Anchors (concept preservation)
 
-Optional `[[anchors]]` blocks define concepts that should remain unchanged by the slider. For each anchor prompt, the frozen base model's prediction is computed once per step, and the LoRA is constrained to reproduce that same prediction at *both* slider multipliers (`+1` and `-1`). This prevents the slider from drifting on unrelated content — the classic concept-slider preservation technique.
+Optional `[[anchors]]` blocks define concepts that should remain unchanged by the slider. For each anchor prompt, the frozen base model's prediction is computed once per step, and the LoRA is constrained to reproduce that same prediction at *both* slider multipliers (`+1` and `-1`). This prevents the slider from drifting on unrelated content — the classic concept-slider preservation technique. (Credit: [phazei](https://github.com/phazei) — [PR #87](https://github.com/AkaneTendo25/musubi-tuner/pull/87))
 
 The per-step anchor loss (a plain MSE between the LoRA and frozen-base predictions) is intrinsically spiky in flow-matching velocity space: on ~90% of steps the LoRA barely moves the anchor prediction (loss ~1e-4), but on a small fraction of steps it deviates a lot. An offline probe over real predictions confirmed this spikiness is **not** a removable per-step scale factor — every per-step normalizer tried (variance-normalize, cosine, relative-MSE) still left a 1000-7000x dynamic range, because the variation lives in the genuine deviation, not in a divisible scale. Instead, each step's anchor loss is **capped at a multiple of its running median** (`anchor_cap_mult`), which bounds the rare gradient-norm spikes while leaving the typical steps untouched. This mirrors the spirit of Min-SNR-γ clamping. The cap is applied gradient-preservingly (the loss is scaled by a detached ratio), so the optimizer still moves in the anchor's direction — just not with explosive magnitude.
 
@@ -4165,7 +4178,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 Add `--save_merged_checkpoint` if you need to write a full merged LTX-2 checkpoint instead of only the trained transformer weights. This can add save-time memory pressure, and repeated merged saves may show slow memory growth, so validate saving separately when running close to the VRAM limit.
 
-TREAD can also be enabled as a training-time token-routing option. In measured LTX-2.3 runs, `selection_ratio=0.5` reduced step time by about 15-21% depending on mode. Evaluate output quality and convergence separately before using it for long runs because TREAD changes the effective token route. (Implementation credit: [Ada123-a](https://github.com/Ada123-a))
+TREAD can also be enabled as a training-time token-routing option. In measured LTX-2.3 runs, `selection_ratio=0.5` reduced step time by about 15-21% depending on mode. Evaluate output quality and convergence separately before using it for long runs because TREAD changes the effective token route. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80))
 
 ```bash
 --tread --tread_args target=video selection_ratio=0.5

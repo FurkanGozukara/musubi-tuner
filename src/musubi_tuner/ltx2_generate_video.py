@@ -405,7 +405,7 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa"],
+        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa", "sageattn"],
         help="Attention backend",
     )
     # Training-style boolean attention flags (for config portability)
@@ -413,6 +413,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flash3", action="store_true", help="Use FlashAttention 3 (same as --attn_mode flash3)")
     parser.add_argument("--sdpa", action="store_true", help="Use SDPA (same as --attn_mode sdpa)")
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
+    parser.add_argument(
+        "--sage_attn",
+        action="store_true",
+        help="Use SageAttention (inference only; requires the sageattention package; same as --attn_mode sageattn)",
+    )
     parser.add_argument("--fp8_base", action="store_true", help="Use FP8 cast for DiT weights")
     parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled FP8 (requires fp8_base)")
     parser.add_argument(
@@ -730,12 +735,13 @@ def parse_args() -> argparse.Namespace:
 
 def _configure_attention_flags(args: argparse.Namespace) -> None:
     # If a training-style boolean flag was explicitly set, it takes priority
-    if args.flash_attn or args.flash3 or args.sdpa or args.xformers:
+    if args.flash_attn or args.flash3 or args.sdpa or args.xformers or getattr(args, "sage_attn", False):
         # Flags already set by argparse; ensure the others are False
         args.flash_attn = bool(args.flash_attn)
         args.flash3 = bool(args.flash3)
         args.sdpa = bool(args.sdpa)
         args.xformers = bool(args.xformers)
+        args.sage_attn = bool(getattr(args, "sage_attn", False))
         return
 
     # Otherwise derive from --attn_mode
@@ -744,6 +750,7 @@ def _configure_attention_flags(args: argparse.Namespace) -> None:
     args.flash_attn = attn_mode in {"flash", "flash2"}
     args.flash3 = attn_mode == "flash3"
     args.xformers = attn_mode == "xformers"
+    args.sage_attn = attn_mode in {"sageattn", "sage_attention", "sage"}
 
 
 # ---------------------------------------------------------------------------

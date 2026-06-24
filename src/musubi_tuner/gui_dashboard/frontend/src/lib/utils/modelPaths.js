@@ -26,8 +26,10 @@ export function effectiveGemmaRoot(cwd, config, explicit = '', gemmaSafetensors 
 	return explicit || config?.default_gemma_root || joinPath(defaultModelDir(cwd, config), DEFAULT_GEMMA_ROOT_NAME);
 }
 
-export function effectiveGemmaSafetensors(config, explicit = '') {
-	return explicit || config?.default_gemma_safetensors || '';
+export function effectiveGemmaSafetensors(config, explicit = '', explicitGemmaRoot = '') {
+	if (explicit) return explicit;
+	if (explicitGemmaRoot) return '';
+	return config?.default_gemma_safetensors || '';
 }
 
 export function pathBaseName(path) {

@@ -2711,7 +2711,7 @@ def _rl_common_model_args(config: ProjectConfig) -> list[str]:
     """
     t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     network_module = _effective_training_network_module(t)
     network_args_parts = _training_network_args_parts(t)

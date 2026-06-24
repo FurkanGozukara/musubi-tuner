@@ -92,7 +92,7 @@
 
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, t.ltx2_checkpoint || ''));
-	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, t.gemma_safetensors || ''));
+	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, t.gemma_safetensors || '', t.gemma_root || ''));
 	let gemmaRootDisabled = $derived(Boolean(t.gemma_safetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', t.gemma_safetensors || ''));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', ''));
