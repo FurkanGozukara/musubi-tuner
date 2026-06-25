@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from typing import Callable
 
 import accelerate
@@ -30,10 +31,27 @@ STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
+SAVE_STATE_MODE_FULL = "full"
+SAVE_STATE_MODE_MINIMAL = "minimal"
+SAVE_STATE_MODES = {SAVE_STATE_MODE_FULL, SAVE_STATE_MODE_MINIMAL}
 
-def save_resume_metadata(state_dir: str, global_step: int, step_in_epoch: int, epoch: int):
+
+def get_save_state_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "save_state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower()
+    if mode not in SAVE_STATE_MODES:
+        raise ValueError(f"--save_state_mode must be one of: {', '.join(sorted(SAVE_STATE_MODES))}")
+    return mode
+
+
+def save_resume_metadata(
+    state_dir: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+    state_mode: str = SAVE_STATE_MODE_FULL,
+):
     """Save resume metadata alongside an accelerator state checkpoint."""
-    metadata = {"global_step": global_step, "step_in_epoch": step_in_epoch, "epoch": epoch}
+    metadata = {"global_step": global_step, "step_in_epoch": step_in_epoch, "epoch": epoch, "state_mode": state_mode}
     path = os.path.join(state_dir, RESUME_METADATA_NAME)
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
@@ -60,6 +78,7 @@ def save_state_manifest(
     global_step: int,
     step_in_epoch: int,
     epoch: int,
+    state_mode: str = SAVE_STATE_MODE_FULL,
 ) -> None:
     """Write a completion marker after accelerator.save_state() finishes."""
     path = os.path.join(state_dir, STATE_MANIFEST_NAME)
@@ -70,6 +89,7 @@ def save_state_manifest(
         "format_version": 1,
         "complete": True,
         "state_type": state_type,
+        "state_mode": state_mode,
         "global_step": int(global_step or 0),
         "step_in_epoch": int(step_in_epoch or 0),
         "epoch": int(epoch or 0),
@@ -96,7 +116,18 @@ def load_state_manifest(state_dir: str) -> dict | None:
     return manifest
 
 
-def _has_state_payload_files(state_dir: str) -> bool:
+def state_manifest_mode(state_dir: str) -> str | None:
+    manifest = load_state_manifest(state_dir)
+    if manifest is None:
+        return None
+    return str(manifest.get("state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower()
+
+
+def is_minimal_state_dir(state_dir: str) -> bool:
+    return state_manifest_mode(state_dir) == SAVE_STATE_MODE_MINIMAL
+
+
+def _has_state_payload_files(state_dir: str, *, require_optimizer: bool = True) -> bool:
     try:
         names = os.listdir(state_dir)
     except OSError:
@@ -106,7 +137,7 @@ def _has_state_payload_files(state_dir: str) -> bool:
         name in {"model.safetensors", "pytorch_model.bin"} or re.match(r"model_\d+\.(safetensors|bin)$", name) for name in names
     )
     has_optimizer = any(name == "optimizer.bin" or re.match(r"optimizer_\d+\.bin$", name) for name in names)
-    return has_model and has_optimizer
+    return has_model and (has_optimizer or not require_optimizer)
 
 
 def is_complete_state_dir(state_dir: str) -> bool:
@@ -116,6 +147,8 @@ def is_complete_state_dir(state_dir: str) -> bool:
 
     manifest = load_state_manifest(state_dir)
     if manifest is not None:
+        if str(manifest.get("state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower() == SAVE_STATE_MODE_MINIMAL:
+            return False
         files = manifest.get("files")
         if not isinstance(files, list):
             return False
@@ -133,6 +166,51 @@ def is_complete_state_dir(state_dir: str) -> bool:
         return False
 
     return _has_state_payload_files(state_dir)
+
+
+@contextmanager
+def _without_accelerator_runtime_state(accelerator: accelerate.Accelerator):
+    """Temporarily omit heavy runtime objects from accelerator.save_state()."""
+
+    attrs = ("_optimizers", "_schedulers", "_dataloaders")
+    originals = {}
+    for attr in attrs:
+        if hasattr(accelerator, attr):
+            originals[attr] = getattr(accelerator, attr)
+            setattr(accelerator, attr, [])
+
+    try:
+        yield
+    finally:
+        for attr, value in originals.items():
+            setattr(accelerator, attr, value)
+
+
+def save_accelerator_state(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    state_dir: str,
+) -> str:
+    """Save accelerator state and return the effective state mode."""
+
+    state_mode = get_save_state_mode(args)
+    if state_mode == SAVE_STATE_MODE_FULL:
+        accelerator.save_state(state_dir)
+        return SAVE_STATE_MODE_FULL
+
+    distributed_type = str(getattr(accelerator, "distributed_type", "")).upper()
+    if "DEEPSPEED" in distributed_type or "MEGATRON" in distributed_type:
+        logger.warning(
+            "--save_state_mode minimal is not supported for %s; falling back to full state saving.",
+            distributed_type,
+        )
+        accelerator.save_state(state_dir)
+        return SAVE_STATE_MODE_FULL
+
+    logger.info("saving minimal state without optimizer, scheduler, or dataloader state")
+    with _without_accelerator_runtime_state(accelerator):
+        accelerator.save_state(state_dir)
+    return SAVE_STATE_MODE_MINIMAL
 
 
 def update_resume_metadata(state_dir: str, extra: dict):
@@ -292,14 +370,15 @@ def save_and_remove_state_on_epoch_end(
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
-    accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, state_mode=effective_state_mode)
     save_state_manifest(
         state_dir,
         state_type="epoch",
         global_step=global_step,
         step_in_epoch=step_in_epoch,
         epoch=epoch_no,
+        state_mode=effective_state_mode,
     )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
@@ -328,14 +407,15 @@ def save_and_remove_state_stepwise(
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
-    accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, state_mode=effective_state_mode)
     save_state_manifest(
         state_dir,
         state_type="step",
         global_step=step_no,
         step_in_epoch=step_in_epoch,
         epoch=epoch,
+        state_mode=effective_state_mode,
     )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
@@ -368,14 +448,15 @@ def save_state_on_train_end(
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
-    accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, state_mode=effective_state_mode)
     save_state_manifest(
         state_dir,
         state_type="final",
         global_step=global_step,
         step_in_epoch=step_in_epoch,
         epoch=epoch,
+        state_mode=effective_state_mode,
     )
 
     if args.save_state_to_huggingface:
@@ -404,14 +485,15 @@ def save_state_on_interrupt(
         state_name = INTERRUPT_STATE_UNIQUE_NAME.format(model_name, step_no, int(time.time()))
         state_dir = os.path.join(args.output_dir, state_name)
 
-    accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, state_mode=effective_state_mode)
     save_state_manifest(
         state_dir,
         state_type="interrupt",
         global_step=global_step,
         step_in_epoch=step_in_epoch,
         epoch=epoch,
+        state_mode=effective_state_mode,
     )
 
     if args.save_state_to_huggingface:

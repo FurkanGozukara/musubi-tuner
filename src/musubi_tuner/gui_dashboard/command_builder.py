@@ -1380,6 +1380,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
         cmd.append("--save_state_on_train_end")
+    if (t.save_state or t.save_state_on_train_end) and t.save_state_mode != "full":
+        cmd += ["--save_state_mode", t.save_state_mode]
     if t.save_checkpoint_metadata:
         cmd.append("--save_checkpoint_metadata")
     if t.no_metadata:
@@ -2200,6 +2202,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
         cmd.append("--save_state_on_train_end")
+    if (t.save_state or t.save_state_on_train_end) and t.save_state_mode != "full":
+        cmd += ["--save_state_mode", t.save_state_mode]
     if t.no_final_save:
         cmd.append("--no_final_save")
     if t.save_checkpoint_metadata:
@@ -2634,6 +2638,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
         cmd.append("--save_state_on_train_end")
+    if (t.save_state or t.save_state_on_train_end) and t.save_state_mode != "full":
+        cmd += ["--save_state_mode", t.save_state_mode]
     if t.resume:
         cmd += ["--resume", t.resume]
     if t.reset_optimizer:

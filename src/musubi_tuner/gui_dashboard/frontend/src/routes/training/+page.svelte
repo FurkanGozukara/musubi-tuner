@@ -66,6 +66,10 @@
 		{ value: 'relative', label: 'Relative' },
 		{ value: 'absolute', label: 'Absolute' },
 	];
+	const saveStateModeOptions = [
+		{ value: 'full', label: 'Full' },
+		{ value: 'minimal', label: 'Minimal' },
+	];
 	const boundaryCodecOptions = ['none', 'int8', 'int4'];
 	const remoteActivationCodecOptions = ['none', 'int8', 'int4', 'aq-int8', 'aq-int4'];
 	const lycorisAlgoOptions = [
@@ -894,8 +898,9 @@
 							<FormField type="number" fieldPath="training.save_every_n_epochs" value={t.save_every_n_epochs ?? ''} oninput={(e) => update('save_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N epochs" />
 							<FormField type="number" fieldPath="training.save_every_n_steps" value={t.save_every_n_steps ?? ''} oninput={(e) => update('save_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N steps" />
 						</div>
-						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+						<div class="grid grid-cols-2 gap-2">
 							<FormToggle fieldPath="training.save_state" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} tooltip="Save optimizer state" />
+							<FormSelect fieldPath="training.save_state_mode" value={t.save_state_mode || 'full'} options={saveStateModeOptions} onchange={(e) => update('save_state_mode', e.target.value)} disabled={!(t.save_state || t.save_state_on_train_end)} tooltip="Full can resume optimizer state. Minimal skips optimizer, scheduler, and dataloader state." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.log_with" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
@@ -1131,7 +1136,7 @@
 						<FormField fieldPath="training.huggingface_path_in_repo" value={t.huggingface_path_in_repo || ''} oninput={(e) => update('huggingface_path_in_repo', e.target.value)} placeholder="/" tooltip="Upload path within repo" />
 						<FormField fieldPath="training.huggingface_token" value={t.huggingface_token || ''} oninput={(e) => update('huggingface_token', e.target.value)} placeholder="hf_..." tooltip="HuggingFace API token (or set HF_TOKEN env)" />
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
-							<FormToggle fieldPath="training.save_state_to_huggingface" checked={t.save_state_to_huggingface ?? false} onchange={(e) => update('save_state_to_huggingface', e.target.checked)} tooltip="Also upload optimizer state" />
+							<FormToggle fieldPath="training.save_state_to_huggingface" checked={t.save_state_to_huggingface ?? false} onchange={(e) => update('save_state_to_huggingface', e.target.checked)} tooltip="Also upload saved training state" />
 							<FormToggle fieldPath="training.resume_from_huggingface" checked={t.resume_from_huggingface ?? false} onchange={(e) => update('resume_from_huggingface', e.target.checked)} tooltip="Resume training from HuggingFace" />
 							<FormToggle fieldPath="training.async_upload" checked={t.async_upload ?? false} onchange={(e) => update('async_upload', e.target.checked)} tooltip="Upload checkpoints asynchronously" />
 						</div>

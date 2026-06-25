@@ -826,12 +826,13 @@ Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints a
 ### Resuming Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Requires `--save_state` to be enabled. State directories contain optimizer, scheduler, and RNG states. See the [Advanced Configuration guide](./advanced_config.md) for general `--save_state` / `--resume` behavior shared across all architectures.
+Requires `--save_state` to be enabled. By default, `--save_state_mode full` writes optimizer, scheduler, dataloader, RNG, and model/adapter state so the directory can be loaded with `--resume`. See the [Advanced Configuration guide](./advanced_config.md) for general `--save_state` / `--resume` behavior shared across all architectures.
 
 | Flag | Description |
 |------|-------------|
 | `--resume <path>` | Resume from a specific state directory |
 | `--autoresume` | Automatically resume from the latest state in `output_dir`. Ignored if `--resume` is specified. Starts from scratch if no state is found |
+| `--save_state_mode full|minimal` | `full` saves resumable optimizer state. `minimal` saves a compact state artifact without optimizer/scheduler/dataloader state |
 | `--reset_optimizer` | Clear optimizer momentum/variance on resume, keep model weights only |
 | `--reset_optimizer_params` | Reset optimizer param groups (lr, weight_decay, etc.) to current CLI values on resume, keep momentum/variance |
 | `--reset_dataloader` | Skip mid-epoch batch skip, restart epoch from beginning |
@@ -841,6 +842,8 @@ Requires `--save_state` to be enabled. State directories contain optimizer, sche
 Mid-epoch checkpoints record `step_in_epoch` in `resume_metadata.json`. On resume, already-processed batches are skipped to keep global step consistent. `--reset_dataloader` disables this.
 
 The moving average loss is saved in state checkpoints and restored on resume.
+
+`--save_state_mode minimal` is intended for compact saved artifacts when you do not need optimizer-continuation resume. Minimal state directories still include resume metadata and a manifest, but they are not loadable with `--resume`; `--autoresume` ignores them. To continue from a minimal artifact, load the saved adapter with `--network_weights` and start a fresh optimizer, or save with `--save_state_mode full`.
 
 Newly saved state directories also include `state_manifest.json`, written only after the accelerator state save completes. `--autoresume` and the dashboard resume detector ignore incomplete state directories, so a crashed or force-killed save is not selected accidentally.
 

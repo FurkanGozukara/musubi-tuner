@@ -851,6 +851,13 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="save training state (including optimizer states etc.) on train end even if --save_state is not specified"
         " / --save_stateが未指定時にもoptimizerなど学習状態も含めたstateを学習終了時に保存する",
     )
+    parser.add_argument(
+        "--save_state_mode",
+        type=str,
+        default="full",
+        choices=["full", "minimal"],
+        help="training state contents to save: full is resumable; minimal skips optimizer/scheduler/dataloader state and cannot be loaded with --resume",
+    )
 
 
 def _add_metadata_args(parser: argparse.ArgumentParser) -> None:

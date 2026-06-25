@@ -52,6 +52,10 @@
 		{ value: 'relative', label: 'Relative' },
 		{ value: 'absolute', label: 'Absolute' },
 	];
+	const saveStateModeOptions = [
+		{ value: 'full', label: 'Full' },
+		{ value: 'minimal', label: 'Minimal' },
+	];
 
 	let t = $derived($projectConfig?.full_finetune || {});
 	let status = $derived($processStatuses.full_finetune || { state: 'idle', exit_code: null });
@@ -786,6 +790,7 @@
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 					<FormToggle fieldPath="full_finetune.save_state" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.save_state_on_train_end" checked={t.save_state_on_train_end ?? false} onchange={(e) => update('save_state_on_train_end', e.target.checked)} />
+					<FormSelect fieldPath="full_finetune.save_state_mode" value={t.save_state_mode || 'full'} options={saveStateModeOptions} onchange={(e) => update('save_state_mode', e.target.value)} disabled={!(t.save_state || t.save_state_on_train_end)} tooltip="Full can resume optimizer state. Minimal skips optimizer, scheduler, and dataloader state." />
 					<FormToggle fieldPath="full_finetune.save_merged_checkpoint" checked={t.save_merged_checkpoint ?? false} onchange={(e) => update('save_merged_checkpoint', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.no_final_save" checked={t.no_final_save ?? false} onchange={(e) => update('no_final_save', e.target.checked)} />
 				</div>

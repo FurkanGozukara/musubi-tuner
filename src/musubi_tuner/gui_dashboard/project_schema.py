@@ -497,6 +497,7 @@ class TrainingConfig(BaseModel):
     save_last_n_epochs_state: Optional[int] = None
     save_last_n_steps_state: Optional[int] = None
     save_state: bool = False
+    save_state_mode: Literal["full", "minimal"] = "full"
     save_state_on_train_end: bool = False
     save_checkpoint_metadata: bool = False
     no_metadata: bool = False

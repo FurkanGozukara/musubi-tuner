@@ -25,6 +25,20 @@ def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: a
         return 0
 
     if not args.resume_from_huggingface:
+        if train_utils.is_minimal_state_dir(args.resume):
+            if getattr(args, "_autoresume_selected", False):
+                logger.warning(
+                    "autoresume: selected state directory was saved without optimizer state, starting from scratch: %s",
+                    args.resume,
+                )
+                args.resume = None
+                self._resume_state_dir = None
+                return 0
+            raise ValueError(
+                f"resume state directory was saved with --save_state_mode minimal and cannot be loaded with --resume: {args.resume}. "
+                "Use --save_state_mode full for resumable optimizer state, or load the saved adapter with --network_weights."
+            )
+
         if not train_utils.is_complete_state_dir(args.resume):
             if getattr(args, "_autoresume_selected", False):
                 logger.warning(
@@ -92,6 +106,11 @@ def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: a
     if len(results) == 0:
         raise ValueError("No files found in the specified repo id/path/revision")
     dirname = os.path.dirname(results[0])
+    if train_utils.is_minimal_state_dir(dirname):
+        raise ValueError(
+            f"resume state directory was saved with --save_state_mode minimal and cannot be loaded with --resume: {args.resume}. "
+            "Use --save_state_mode full for resumable optimizer state, or load the saved adapter with --network_weights."
+        )
     self._register_optimizer_resume_safe_globals(args)
     accelerator.load_state(dirname)
     self._resume_state_dir = dirname
