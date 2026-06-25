@@ -8,6 +8,7 @@ import time
 
 import toml
 import torch
+from accelerate.utils import set_seed
 from safetensors.torch import save_file
 from tqdm import tqdm
 
@@ -24,7 +25,6 @@ from musubi_tuner.hv_train_network import (
     compute_loss_weighting_for_sd3,
     prepare_accelerator,
     read_config_from_file,
-    set_seed,
     setup_parser_common,
     should_sample_images,
 )

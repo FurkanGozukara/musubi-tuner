@@ -896,6 +896,8 @@ save_text_encoder_output_cache_ltx2 = _cache_io.save_text_encoder_output_cache_l
 save_text_encoder_output_cache_ltx2_gemma = _cache_io.save_text_encoder_output_cache_ltx2_gemma  # noqa: F811
 save_latent_cache_ideogram4 = _cache_io.save_latent_cache_ideogram4  # noqa: F811
 save_text_encoder_output_cache_ideogram4 = _cache_io.save_text_encoder_output_cache_ideogram4  # noqa: F811
+save_latent_cache_krea2 = _cache_io.save_latent_cache_krea2  # noqa: F811
+save_text_encoder_output_cache_krea2 = _cache_io.save_text_encoder_output_cache_krea2  # noqa: F811
 
 
 from musubi_tuner.dataset import bucket as _bucket  # noqa: E402

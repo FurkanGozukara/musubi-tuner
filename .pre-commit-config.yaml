@@ -5,3 +5,30 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+
+  # Catches cross-module import breaks ruff can't see — e.g. a merge that drops a
+  # constant/function so `from X import Y` resolves a name X no longer exports.
+  # Runs on the whole package (not just changed files) so a provider-side removal is
+  # caught even when the consumer file is untouched. Only `no-name-in-module` is
+  # enabled, so noise stays near zero; transformers is ignored (version-skew symbols).
+  - repo: local
+    hooks:
+      - id: pylint-import-names
+        name: pylint no-name-in-module (cross-module import check)
+        entry: pylint --disable=all --enable=no-name-in-module --ignored-modules=transformers --jobs 0 src/musubi_tuner
+        language: python
+        additional_dependencies: [pylint]
+        types: [python]
+        pass_filenames: false
+        always_run: true
+
+      # Heavier, full-env runtime check: catches dynamic/transitive import breaks pylint
+      # cannot see (e.g. importlib network modules, circular imports, missing deps).
+      # Manual stage so it never blocks a normal commit — run deliberately after merges:
+      #   pre-commit run import-smoke --hook-stage manual
+      - id: import-smoke
+        name: import smoke (full env; run after merges)
+        entry: python -c "import musubi_tuner.ltx2_train_network, musubi_tuner.ltx2_train_slider, musubi_tuner.ltx2_cache_latents, musubi_tuner.ltx2_cache_text_encoder_outputs; print('import-smoke OK')"
+        language: system
+        pass_filenames: false
+        stages: [manual]
