@@ -1016,6 +1016,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
     if t.dim_from_weights:
         cmd.append("--dim_from_weights")
+    if t.frozen_network_weights:
+        cmd += ["--frozen_network_weights"] + _split_cli_args(t.frozen_network_weights)
+    if t.frozen_network_multiplier:
+        cmd += ["--frozen_network_multiplier"] + _split_cli_args(t.frozen_network_multiplier)
     if t.base_weights:
         cmd += ["--base_weights"] + _split_cli_args(t.base_weights)
     if t.base_weights_multiplier:

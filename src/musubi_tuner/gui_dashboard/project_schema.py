@@ -261,6 +261,8 @@ class TrainingConfig(BaseModel):
     network_dropout: Optional[float] = None
     scale_weight_norms: Optional[float] = None
     dim_from_weights: bool = False
+    frozen_network_weights: str = ""
+    frozen_network_multiplier: str = ""
     base_weights: str = ""
     base_weights_multiplier: str = ""
     lycoris_config: str = ""

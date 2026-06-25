@@ -752,6 +752,23 @@ def _add_network_args(parser: argparse.ArgumentParser) -> None:
         nargs="*",
         help="multiplier for network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みの倍率",
     )
+    parser.add_argument(
+        "--frozen_network_weights",
+        type=str,
+        default=None,
+        nargs="*",
+        help=(
+            "network weights to attach as frozen adapters during training; they affect training forwards but are not "
+            "optimized or saved into the output network"
+        ),
+    )
+    parser.add_argument(
+        "--frozen_network_multiplier",
+        type=float,
+        default=None,
+        nargs="*",
+        help="optional multipliers for frozen_network_weights, one value per frozen network (default: 1.0)",
+    )
 
 
 def _add_save_load_args(parser: argparse.ArgumentParser) -> None:

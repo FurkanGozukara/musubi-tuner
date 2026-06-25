@@ -596,6 +596,8 @@
 							<FormField type="number" fieldPath="training.audio_alpha" value={t.audio_alpha ?? ''} oninput={(e) => update('audio_alpha', e.target.value ? Number(e.target.value) : null)} placeholder="Match main alpha" step="0.1" tooltip="Optional separate audio LoRA alpha." />
 						</div>
 						<PathInput fieldPath="training.network_weights" value={t.network_weights || ''} oninput={(e) => update('network_weights', e.target.value)} showFiles tooltip="Warm-start from existing LoRA weights" />
+						<FormField fieldPath="training.frozen_network_weights" value={t.frozen_network_weights || ''} oninput={(e) => update('frozen_network_weights', e.target.value)} placeholder="path1 path2 ..." tooltip="Attach frozen LoRA weights during training without saving them into the new adapter." />
+						<FormField fieldPath="training.frozen_network_multiplier" value={t.frozen_network_multiplier || ''} oninput={(e) => update('frozen_network_multiplier', e.target.value)} placeholder="1.0 0.5 ..." tooltip="Optional multipliers paired with Frozen Network Weights." />
 						<FormField fieldPath="training.base_weights" value={t.base_weights || ''} oninput={(e) => update('base_weights', e.target.value)} placeholder="path1 path2 ..." tooltip="Space-separated base weights passed through to the trainer." />
 						<FormField fieldPath="training.base_weights_multiplier" value={t.base_weights_multiplier || ''} oninput={(e) => update('base_weights_multiplier', e.target.value)} placeholder="1.0 0.5 ..." tooltip="Optional multipliers paired with Base Weights." />
 						<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">

@@ -100,6 +100,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
     - [Modality Freezing (G2D)](#modality-freezing-g2d)
+    - [Frozen Auxiliary LoRA During Training](#frozen-auxiliary-lora-during-training)
     - [Optimizers](#optimizers)
     - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Per-Module LoRA Rank](#per-module-lora-rank)
@@ -1835,6 +1836,26 @@ Example:
 Logged to TensorBoard: `modality_freeze/state` (0=both active, 1=audio frozen, -1=video frozen), `modality_freeze/video_loss_ema`, `modality_freeze/audio_loss_ema`.
 
 For audio-overfitting cases, modality freezing can be combined with `--audio_loss_balance_mode ema_mag`, a lower `--audio_lr`, and lower audio LoRA rank.
+
+### Frozen Auxiliary LoRA During Training
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Use frozen auxiliary adapters when a new LoRA should train while another LoRA remains active in the forward pass. This is useful for training an adapter on top of an existing behavior without permanently merging that behavior into the base model.
+
+- `--frozen_network_weights <path> [path ...]`: Attach one or more LoRA weight files as frozen adapters during training.
+- `--frozen_network_multiplier <float> [float ...]`: Optional multiplier per frozen adapter. Missing values default to `1.0`.
+
+The frozen adapters are set to eval mode, are not added to the optimizer, and are not saved into the output LoRA. They only affect the training forward pass. Use `--network_weights` when you want to warm-start the LoRA that is being trained, and use `--base_weights` when you want to merge weights into the base model before training.
+
+Example:
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --network_module networks.lora_ltx2 ^
+  --frozen_network_weights output/style_anchor.safetensors ^
+  --frozen_network_multiplier 0.5 ^
+  --network_dim 32 ^
+  --output_name new_subject_lora
+```
 
 ### Optimizers
 <sub>[↑ contents](#table-of-contents)</sub>

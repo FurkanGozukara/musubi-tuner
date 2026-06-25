@@ -43,6 +43,7 @@ from musubi_tuner.training.accelerator_setup import (
     dataloader_extra_kwargs,
     prepare_accelerator,
 )
+from musubi_tuner.training.frozen_networks import apply_frozen_networks, prepare_frozen_networks_for_training
 from musubi_tuner.training.losses import per_element_loss as _per_element_loss, reduce_masked_loss
 from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.metadata import (
@@ -410,6 +411,9 @@ def train(self, args):
 
         accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
 
+    frozen_networks = apply_frozen_networks(args, accelerator, network_module, transformer, self.load_network_weights)
+    self._frozen_networks = frozen_networks
+
     # prepare network
     net_kwargs = {}
     if args.network_args is not None:
@@ -643,6 +647,17 @@ def train(self, args):
     if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
         logger.info(f"casting model to {dit_weight_dtype}")
         transformer.to(dit_weight_dtype)
+    if frozen_networks:
+        prepare_frozen_networks_for_training(
+            frozen_networks,
+            device=accelerator.device,
+            dtype=network_dtype,
+            model_parallel=model_parallel,
+            place_network_for_model_parallel=self.place_network_for_model_parallel,
+            args=args,
+            accelerator=accelerator,
+            transformer=transformer,
+        )
     if model_parallel:
         self.place_network_for_model_parallel(args, accelerator, transformer, network)
     _log_vram("BEFORE accelerator.prepare(transformer)", logger)
