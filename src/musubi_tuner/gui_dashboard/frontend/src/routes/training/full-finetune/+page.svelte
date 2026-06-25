@@ -47,6 +47,11 @@
 		'smmf'
 	];
 	const prodigyPlusOptimizerArgs = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
+	const weightNoiseModeOptions = [
+		{ value: 'none', label: 'Off' },
+		{ value: 'relative', label: 'Relative' },
+		{ value: 'absolute', label: 'Absolute' },
+	];
 
 	let t = $derived($projectConfig?.full_finetune || {});
 	let status = $derived($processStatuses.full_finetune || { state: 'idle', exit_code: null });
@@ -562,6 +567,10 @@
 				</div>
 				<FormField fieldPath="full_finetune.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder="key=value ..." />
 				<FormField fieldPath="full_finetune.base_optimizer_args" value={t.base_optimizer_args || ''} oninput={(e) => update('base_optimizer_args', e.target.value)} placeholder="key=value ..." />
+				<div class="grid grid-cols-2 gap-2">
+					<FormSelect fieldPath="full_finetune.weight_noise_mode" value={t.weight_noise_mode || 'none'} options={weightNoiseModeOptions} onchange={(e) => update('weight_noise_mode', e.target.value)} tooltip="Post-step weight perturbation mode." />
+					<FormField type="number" fieldPath="full_finetune.weight_noise_scale" value={t.weight_noise_scale ?? 0.01} oninput={(e) => update('weight_noise_scale', Number(e.target.value))} min={0} step="0.001" disabled={(t.weight_noise_mode || 'none') === 'none'} tooltip="Perturbation scale. Relative mode multiplies each tensor RMS; absolute mode uses this value directly." />
+				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.lr_scheduler" value={t.lr_scheduler || 'constant_with_warmup'} options={['constant', 'constant_with_warmup', 'linear', 'cosine', 'cosine_with_restarts', 'polynomial']} onchange={(e) => update('lr_scheduler', e.target.value)} />
 					<FormField type="number" fieldPath="full_finetune.lr_warmup_steps" value={t.lr_warmup_steps ?? 500} oninput={(e) => update('lr_warmup_steps', Number(e.target.value))} min={0} />

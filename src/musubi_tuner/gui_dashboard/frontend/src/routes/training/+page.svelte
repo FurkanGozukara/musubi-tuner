@@ -61,6 +61,11 @@
 		'optimi_adan',
 	];
 	const prodigyPlusOptimizerArgs = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
+	const weightNoiseModeOptions = [
+		{ value: 'none', label: 'Off' },
+		{ value: 'relative', label: 'Relative' },
+		{ value: 'absolute', label: 'Absolute' },
+	];
 	const boundaryCodecOptions = ['none', 'int8', 'int4'];
 	const remoteActivationCodecOptions = ['none', 'int8', 'int4', 'aq-int8', 'aq-int4'];
 	const lycorisAlgoOptions = [
@@ -689,6 +694,10 @@
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.max_grad_norm" value={t.max_grad_norm ?? 1.0} oninput={(e) => update('max_grad_norm', Number(e.target.value))} step="0.1" tooltip="Gradient clipping" />
 								<FormField fieldPath="training.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder="key=value ..." tooltip="Extra optimizer args" />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect fieldPath="training.weight_noise_mode" value={t.weight_noise_mode || 'none'} options={weightNoiseModeOptions} onchange={(e) => update('weight_noise_mode', e.target.value)} tooltip="Post-step weight perturbation mode." />
+								<FormField type="number" fieldPath="training.weight_noise_scale" value={t.weight_noise_scale ?? 0.01} oninput={(e) => update('weight_noise_scale', Number(e.target.value))} min={0} step="0.001" disabled={(t.weight_noise_mode || 'none') === 'none'} tooltip="Perturbation scale. Relative mode multiplies each tensor RMS; absolute mode uses this value directly." />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.lr_decay_steps" value={t.lr_decay_steps ?? ''} oninput={(e) => update('lr_decay_steps', e.target.value ? Number(e.target.value) : null)} placeholder="None" tooltip="LR decay steps" />

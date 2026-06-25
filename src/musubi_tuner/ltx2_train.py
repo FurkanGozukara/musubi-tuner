@@ -48,6 +48,7 @@ from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.timesteps import (
     compute_loss_weighting_for_sd3,
 )
+from musubi_tuner.training.weight_noise import apply_weight_noise_to_optimizer, validate_weight_noise_args
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients
 from musubi_tuner.audio_loss_balance import (
@@ -3143,6 +3144,7 @@ def main() -> None:
     parser = ltx2_finetune_setup_parser(parser)
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    validate_weight_noise_args(args)
 
     trainer = LTX2NetworkTrainer()
 
@@ -6698,6 +6700,9 @@ def main() -> None:
                     if did_fused_step:
                         lr_scheduler.step()
                     did_optimizer_step = did_fused_step
+
+                if did_optimizer_step:
+                    apply_weight_noise_to_optimizer(optimizer, args, global_step=global_step)
 
                 if did_optimizer_step and getattr(trainer, "_self_flow", None) is not None:
                     try:

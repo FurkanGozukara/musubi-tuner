@@ -316,6 +316,8 @@ class TrainingConfig(BaseModel):
     accumulation_group_by: Literal["none", "frames", "bucket", "dataset"] = "none"
     accumulation_group_remainder: Literal["drop", "pad", "allow_mixed"] = "drop"
     max_grad_norm: float = 1.0
+    weight_noise_mode: Literal["none", "relative", "absolute"] = "none"
+    weight_noise_scale: float = 0.01
     audio_lr: Optional[float] = None
     lr_args: str = ""
     lr_group_warmup_args: str = ""

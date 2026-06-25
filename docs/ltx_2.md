@@ -1861,6 +1861,13 @@ Recommended Prodigy Plus LoRA starting point:
 --optimizer_args betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False use_focus=False
 ```
 
+Optional post-step weight perturbation:
+
+- `--weight_noise_mode none|relative|absolute`: Default is `none`. `relative` scales the perturbation by each trainable tensor's RMS; `absolute` uses the scale directly.
+- `--weight_noise_scale <float>`: Noise scale used when weight perturbation is enabled. The default is `0.01`, but it has no effect while the mode is `none`.
+
+The perturbation is applied only after a synchronized optimizer step, uses the optimizer's trainable floating-point tensors, and leaves the default training path unchanged.
+
 ### Per-Module Learning Rates
 <sub>[↑ contents](#table-of-contents)</sub>
 

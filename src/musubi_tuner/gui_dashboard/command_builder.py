@@ -69,6 +69,14 @@ def _effective_network_module(explicit: str) -> str:
     return explicit or get_ltx2_training_network_module_default()
 
 
+def _append_weight_noise_args(cmd: list[str], config_section) -> None:
+    mode = str(getattr(config_section, "weight_noise_mode", "none") or "none").lower()
+    if mode == "none":
+        return
+    cmd += ["--weight_noise_mode", str(mode)]
+    cmd += ["--weight_noise_scale", str(getattr(config_section, "weight_noise_scale", 0.01))]
+
+
 def _training_requests_lycoris(t, network_module: str) -> bool:
     return (
         "lycoris" in (network_module or "").lower()
@@ -1074,6 +1082,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--accumulation_group_by", t.accumulation_group_by]
         cmd += ["--accumulation_group_remainder", t.accumulation_group_remainder]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+    _append_weight_noise_args(cmd, t)
     if t.audio_lr is not None:
         cmd += ["--audio_lr", str(t.audio_lr)]
     if t.lr_args:
@@ -1894,6 +1903,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--accumulation_group_by", t.accumulation_group_by]
         cmd += ["--accumulation_group_remainder", t.accumulation_group_remainder]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+    _append_weight_noise_args(cmd, t)
     if t.lr_args:
         cmd += ["--lr_args"] + _split_cli_args(t.lr_args)
     if t.lr_group_warmup_args:

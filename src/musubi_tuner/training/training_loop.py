@@ -62,12 +62,15 @@ from musubi_tuner.training.runtime_utils import (
 )
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
+from musubi_tuner.training.weight_noise import apply_weight_noise_to_optimizer, validate_weight_noise_args
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 
 logger = logging.getLogger("musubi_tuner.hv_train_network")
 
 
 def train(self, args):
+    validate_weight_noise_args(args)
+
     if torch.cuda.is_available():
         if args.cuda_memory_fraction is not None:
             if not (0.0 < args.cuda_memory_fraction <= 1.0):
@@ -2330,6 +2333,8 @@ def train(self, args):
                         raise
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
+                if accelerator.sync_gradients:
+                    apply_weight_noise_to_optimizer(optimizer, args, global_step=global_step)
                 if accelerator.sync_gradients and hasattr(self, "_self_flow") and self._self_flow is not None:
                     try:
                         # Use stored network ref: may be LoRA network or transformer (full fine-tuning).

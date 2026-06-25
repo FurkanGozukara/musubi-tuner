@@ -13,6 +13,8 @@ import pathlib
 import toml
 from accelerate.utils import DynamoBackend
 
+from musubi_tuner.training.weight_noise import add_weight_noise_args
+
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +401,7 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         help="Max gradient norm, 0 for no clipping / 勾配正規化の最大norm、0でclippingを行わない",
     )
+    add_weight_noise_args(parser)
 
 
 def _add_lr_scheduler_args(parser: argparse.ArgumentParser) -> None:
