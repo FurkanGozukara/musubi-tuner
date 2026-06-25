@@ -1437,8 +1437,14 @@ class LTX2SamplingMixin:
         device: torch.device,
         dtype: torch.dtype,
         max_frames: int = 1,
+        replicate_image_to: int = 0,
     ) -> torch.Tensor:
         """Load image or video from disk and encode through VAE for V2V reference conditioning.
+
+        ``replicate_image_to``: when the input is a still image and this is > 1, repeat that single
+        frame into a static clip of this many frames before encoding. The temporal VAE then produces
+        a full set of latent slots, so a single keyframe can be lifted into an in-distribution
+        interior latent slot (a latent slot encodes ~8 pixel frames; a one-frame encode is OOD).
 
         Returns:
             Encoded latent tensor [1, C, F, H_latent, W_latent]
@@ -1487,6 +1493,8 @@ class LTX2SamplingMixin:
         else:
             image = _cover_center_crop(Image.open(ref_path).convert("RGB"), target_width, target_height)
             frames.append(TF.to_tensor(image))
+            if replicate_image_to and int(replicate_image_to) > 1:
+                frames = frames * int(replicate_image_to)  # still image -> static clip (in-distribution slots)
 
         # [F, 3, H, W] → [1, 3, F, H, W], normalize to [-1, 1]
         video_tensor = torch.stack(frames, dim=0).unsqueeze(0)  # [1, F, 3, H, W]
@@ -1861,13 +1869,33 @@ class LTX2SamplingMixin:
 
                 if latent_idx_specs:
                     latent_idx_guides_resolved = []
+                    _fc = int(sample_parameter.get("frame_count") or 33)
                     for spec in latent_idx_specs:
                         try:
-                            lat = _enc(spec["path"])
+                            k = int(spec["frame_idx"])
+                            if spec.get("temporal_fill") == "replicate":
+                                # Lift one keyframe into an in-distribution interior slot: replicate the
+                                # still into a static clip, encode through the temporal VAE, take slot k.
+                                # A single-frame encode is OOD for an interior slot (a latent slot spans
+                                # ~8 pixel frames), so a naive one-slot pin fails to propagate the edit.
+                                clip_lat = self._load_and_encode_v2v_reference(
+                                    ref_path=spec["path"],
+                                    target_height=height,
+                                    target_width=width,
+                                    vae_checkpoint_path=vae_checkpoint,
+                                    device=device,
+                                    dtype=dit_dtype,
+                                    max_frames=_fc,
+                                    replicate_image_to=_fc,
+                                )
+                                k = max(0, min(k, int(clip_lat.shape[2]) - 1))
+                                lat = clip_lat[:, :, k : k + 1]
+                            else:
+                                lat = _enc(spec["path"])
                             latent_idx_guides_resolved.append(
                                 LatentIndexGuide(
                                     latent=lat,
-                                    latent_idx=int(spec["frame_idx"]),
+                                    latent_idx=k,
                                     strength=float(spec.get("strength", 1.0)),
                                 )
                             )
