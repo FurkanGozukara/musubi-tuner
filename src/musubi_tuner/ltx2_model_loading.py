@@ -165,6 +165,7 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
     # quantization-internal keys so we return the true model dtype (bf16),
     # mirroring the behaviour of NF4 checkpoints.
     from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+
     _is_nvfp4 = detect_nvfp4_checkpoint(model_path)
 
     with MemoryEfficientSafeOpen(model_path) as handle:
@@ -577,6 +578,7 @@ def load_ltx2_model(
     fp8_scaled: bool = False,
     fp8_w8a8: bool = False,
     w8a8_mode: str = "int8",
+    w8a8_backend: str | None = None,
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
@@ -760,11 +762,13 @@ def load_ltx2_model(
     _is_nvfp4 = False
     if not nf4_base and not fp8_scaled:
         from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+
         _check_path = model_path if isinstance(model_path, str) else model_path[0]
         _is_nvfp4 = detect_nvfp4_checkpoint(_check_path)
 
     if _is_nvfp4:
         from musubi_tuner.modules.nvfp4_utils import load_nvfp4_state_dict, apply_nvfp4_monkey_patch
+
         logger.info("Detected NVFP4 (Lightricks FP4 E2M1) checkpoint — loading with on-the-fly dequantization")
         sd = load_nvfp4_state_dict(
             model_files=model_path if isinstance(model_path, list) else [model_path],
@@ -1000,6 +1004,7 @@ def load_ltx2_model(
     _trace_vram_ltx2(f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})")
     if _is_nvfp4:
         from musubi_tuner.modules.nvfp4_utils import apply_nvfp4_monkey_patch
+
         apply_nvfp4_monkey_patch(base_model, sd)
     elif nf4_base:
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
@@ -1016,10 +1021,10 @@ def load_ltx2_model(
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     if fp8_w8a8:
-        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd)
+        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd, w8a8_backend=w8a8_backend)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
     if int8_base or int8_dynamic:
-        apply_quanto_int8_monkey_patch(base_model)
+        apply_quanto_int8_monkey_patch(base_model, w8a8_backend=w8a8_backend)
         _trace_vram_ltx2("AFTER quanto int8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)

@@ -855,6 +855,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="W8A8 quantization format: int8 (Turing+, default) or fp8 (Ada Lovelace+).",
     )
     parser.add_argument(
+        "--w8a8_backend",
+        type=str,
+        default=None,
+        choices=["torch", "triton", "cutlass"],
+        help=(
+            "Opt-in backend for int8 W8A8 matmuls. Omit to keep the existing W8A8 behavior. "
+            "'torch' uses torch._int_mm only; 'triton' requires the Triton row-major backward matmul; "
+            "'cutlass' requires the optional native CUTLASS extension."
+        ),
+    )
+    parser.add_argument(
         "--int8_base",
         action="store_true",
         help=(

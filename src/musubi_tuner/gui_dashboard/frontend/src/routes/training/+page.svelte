@@ -663,8 +663,11 @@
 								<FormSelect fieldPath="training.w8a8_mode" value={t.w8a8_mode || 'int8'} options={['int8', 'fp8']} onchange={(e) => update('w8a8_mode', e.target.value)} disabled={!t.fp8_w8a8} tooltip="int8 (Turing+) or fp8 (Ada+)" />
 							</div>
 							<div class="grid grid-cols-3 gap-2">
+								<FormSelect fieldPath="training.w8a8_backend" value={t.w8a8_backend || ''} options={[{value:'',label:'Default'},{value:'torch',label:'torch'},{value:'triton',label:'triton'},{value:'cutlass',label:'cutlass'}]} onchange={(e) => update('w8a8_backend', e.target.value || null)} disabled={(!t.fp8_w8a8 || (t.w8a8_mode || 'int8') !== 'int8') && !t.int8_base && !t.int8_base_dynamic} tooltip="Manual int8 matmul backend selector; leave blank to preserve existing behavior." />
 								<FormField type="number" fieldPath="training.awq_alpha" value={t.awq_alpha ?? 0.25} oninput={(e) => update('awq_alpha', Number(e.target.value))} step="0.05" min={0} max={1} disabled={!t.awq_calibration} tooltip="AWQ scaling strength" />
 								<FormField type="number" fieldPath="training.awq_num_batches" value={t.awq_num_batches ?? 8} oninput={(e) => update('awq_num_batches', Number(e.target.value))} min={1} disabled={!t.awq_calibration} tooltip="Calibration batches" />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
 								<FormSelect fieldPath="training.quantize_device" value={t.quantize_device || ''} options={[{value:'',label:'Auto'},{value:'cuda',label:'CUDA'},{value:'cpu',label:'CPU'}]} onchange={(e) => update('quantize_device', e.target.value || null)} tooltip="Device for quantization math" />
 							</div>
 						</div>

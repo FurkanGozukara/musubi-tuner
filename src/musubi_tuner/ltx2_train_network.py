@@ -3838,6 +3838,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             fp8_w8a8=bool(getattr(args, "fp8_w8a8", False)),
             w8a8_mode=str(getattr(args, "w8a8_mode", "int8")),
+            w8a8_backend=getattr(args, "w8a8_backend", None),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
             fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),

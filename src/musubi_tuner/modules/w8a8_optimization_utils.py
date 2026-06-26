@@ -198,6 +198,8 @@ def _supports_triton_mm(device):
 
 
 _INT8_EPILOGUE = "unset"
+_CUTLASS_MM_8BIT = "unset"
+_INT8_BACKENDS = {"torch", "triton", "cutlass"}
 
 
 def _get_int8_epilogue():
@@ -213,8 +215,63 @@ def _get_int8_epilogue():
     return _INT8_EPILOGUE
 
 
+def _get_cutlass_mm_8bit():
+    """Import and build the optional CUTLASS int8 matmul lazily."""
+    global _CUTLASS_MM_8BIT
+    if _CUTLASS_MM_8BIT == "unset":
+        try:
+            from musubi_tuner.modules.cutlass_int8 import int8_mm, is_available
+
+            _CUTLASS_MM_8BIT = int8_mm if is_available() else None
+        except Exception as exc:
+            logger.info("W8A8 CUTLASS int8 backend unavailable: %s", exc)
+            _CUTLASS_MM_8BIT = None
+    return _CUTLASS_MM_8BIT
+
+
+def _torch_dtype_code_supported(dtype: torch.dtype) -> bool:
+    return dtype in {torch.float16, torch.bfloat16, torch.float32}
+
+
+def _resolve_int8_backend(w8a8_backend: str, *, use_int_mm: bool):
+    """Resolve an explicitly selected int8 matmul backend.
+
+    Acceleration backends are opt-in. If the selected backend is not usable,
+    fail early instead of silently picking a different implementation.
+    """
+    if w8a8_backend not in _INT8_BACKENDS:
+        expected = "', '".join(sorted(_INT8_BACKENDS))
+        raise ValueError(f"Unsupported W8A8 backend: {w8a8_backend!r}. Expected '{expected}'.")
+    if not use_int_mm:
+        if w8a8_backend != "torch":
+            raise RuntimeError(f"W8A8 backend {w8a8_backend!r} requires torch._int_mm support.")
+        return None, None
+    if w8a8_backend == "torch":
+        return None, None
+    if w8a8_backend == "triton":
+        triton_mm = _get_triton_mm_8bit()
+        if triton_mm is None:
+            raise RuntimeError("W8A8 backend 'triton' was selected, but the Triton int8 matmul is unavailable.")
+        return triton_mm, None
+    cutlass_mm = _get_cutlass_mm_8bit()
+    if cutlass_mm is None:
+        raise RuntimeError(
+            "W8A8 backend 'cutlass' was selected, but the CUTLASS extension could not be built or loaded. "
+            "Set LTX2_CUTLASS_INCLUDE_DIR to a CUTLASS include tree."
+        )
+    return None, cutlass_mm
+
+
+def _resolve_legacy_int8_backend(*, use_int_mm: bool):
+    """Preserve the historical W8A8 backend behavior when no selector is set."""
+    if not use_int_mm:
+        return None, None
+    return _get_triton_mm_8bit(), None
+
+
 _INT8_QUANTIZE = "unset"
 _USE_FUSED_QUANT = None
+_USE_CUTLASS_SCALED_EPILOGUE = None
 
 
 def _get_int8_quantize():
@@ -239,6 +296,24 @@ def _use_fused_quant():
     return _USE_FUSED_QUANT
 
 
+def _use_cutlass_scaled_epilogue():
+    """Experimental opt-in for the extension-level CUTLASS scale/bias epilogue.
+
+    The default CUTLASS path returns an int32 accumulator and reuses the shared
+    Python-side epilogue. This flag routes the scale/bias/cast step through the
+    extension's CUDA epilogue kernel instead.
+    """
+    global _USE_CUTLASS_SCALED_EPILOGUE
+    if _USE_CUTLASS_SCALED_EPILOGUE is None:
+        _USE_CUTLASS_SCALED_EPILOGUE = os.getenv("LTX2_CUTLASS_SCALED_EPILOGUE", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    return _USE_CUTLASS_SCALED_EPILOGUE
+
+
 # ---------------------------------------------------------------------------
 # Custom autograd Functions
 # ---------------------------------------------------------------------------
@@ -252,7 +327,7 @@ class _W8A8Int8Function(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight_int8, weight_int8_t, weight_scale, bias, triton_mm):
+    def forward(ctx, x, weight_int8, weight_int8_t, weight_scale, bias, triton_mm, cutlass_mm, use_triton_scaled_forward):
         # weight_int8: [out, in] int8
         # weight_int8_t: optional [in, out] contiguous int8 fallback for fast backward RHS layout
         # weight_scale: [out, 1] float32
@@ -268,28 +343,66 @@ class _W8A8Int8Function(torch.autograd.Function):
         # [M, K] @ [K, N] -> [M, N] int32   (N = out_features)
         # _int_mm handles transposed second operand (column-major) natively via cuBLAS;
         # no .contiguous() needed on weight_int8.t(), which avoids a 16MB transient copy.
-        out_int32 = _int_mm_allow_small_m(x_int8.contiguous(), weight_int8.t())
-
-        # Rescale int32 -> compute dtype. Fused Triton epilogue (one pass over [M,N])
-        # when available and weight scale is per-row; else eager multi-pass rescale.
-        out_features = weight_int8.shape[0]
-        epilogue = _get_int8_epilogue()
-        if epilogue is not None and weight_scale.numel() == out_features:
-            output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, x.dtype)
-            output = output.reshape(*original_shape[:-1], out_features)
+        cutlass_scaled = getattr(cutlass_mm, "scaled", None) if cutlass_mm is not None else None
+        out_int32 = None
+        if (
+            cutlass_scaled is not None
+            and _use_cutlass_scaled_epilogue()
+            and weight_int8_t is not None
+            and _torch_dtype_code_supported(x.dtype)
+        ):
+            output = cutlass_scaled(
+                x_int8.contiguous(),
+                weight_int8,
+                x_scale.contiguous(),
+                weight_scale.reshape(-1).contiguous(),
+                bias.float().contiguous() if bias is not None else None,
+                output_dtype=x.dtype,
+            )
+            output = output.reshape(*original_shape[:-1], weight_int8.shape[0])
         else:
-            output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
-            if bias is not None:
-                output = output + bias.float()
-            output = output.to(x.dtype).reshape(*original_shape[:-1], -1)
+            triton_scaled = getattr(triton_mm, "scaled", None) if use_triton_scaled_forward and triton_mm is not None else None
+            if triton_scaled is not None and _torch_dtype_code_supported(x.dtype):
+                output = triton_scaled(
+                    x_int8.contiguous(),
+                    weight_int8.t(),
+                    x_scale.contiguous(),
+                    weight_scale.reshape(-1).contiguous(),
+                    bias.float().contiguous() if bias is not None else None,
+                    output_dtype=x.dtype,
+                )
+                output = output.reshape(*original_shape[:-1], weight_int8.shape[0])
+            elif cutlass_mm is not None and weight_int8_t is not None:
+                out_int32 = cutlass_mm(x_int8.contiguous(), weight_int8)
+            elif triton_mm is not None:
+                out_int32 = triton_mm(x_int8.contiguous(), weight_int8.t())
+            else:
+                out_int32 = _int_mm_allow_small_m(x_int8.contiguous(), weight_int8.t())
+
+            if out_int32 is not None:
+                # Rescale int32 -> compute dtype. Fused Triton epilogue (one pass over [M,N])
+                # when available and weight scale is per-row; else eager multi-pass rescale.
+                out_features = weight_int8.shape[0]
+                epilogue = _get_int8_epilogue()
+                if epilogue is not None and weight_scale.numel() == out_features:
+                    output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, x.dtype)
+                    output = output.reshape(*original_shape[:-1], out_features)
+                else:
+                    output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
+                    if bias is not None:
+                        output = output + bias.float()
+                    output = output.to(x.dtype).reshape(*original_shape[:-1], -1)
 
         # Save ONLY references to existing module buffers.
-        if triton_mm is None:
+        if cutlass_mm is not None:
             ctx.save_for_backward(weight_int8_t, weight_scale)
-        else:
+        elif triton_mm is not None:
             ctx.save_for_backward(weight_int8, weight_scale)
+        else:
+            ctx.save_for_backward(weight_int8_t, weight_scale)
         ctx.input_dtype = x.dtype
         ctx.triton_mm = triton_mm
+        ctx.cutlass_mm = cutlass_mm
         return output
 
     @staticmethod
@@ -313,23 +426,43 @@ class _W8A8Int8Function(torch.autograd.Function):
         else:
             go_2d = go.float() * _output_scale_view(weight_scale)
             grad_int8, grad_scale = _quantize_int8_per_token(go_2d)
-        if ctx.triton_mm is None:
+        cutlass_scaled = getattr(ctx.cutlass_mm, "scaled", None) if ctx.cutlass_mm is not None else None
+        if cutlass_scaled is not None and _use_cutlass_scaled_epilogue() and _torch_dtype_code_supported(ctx.input_dtype):
+            grad_input = cutlass_scaled(
+                grad_int8.contiguous(),
+                weight_saved,
+                grad_scale.contiguous(),
+                None,
+                None,
+                output_dtype=ctx.input_dtype,
+            )
+            in_features = weight_saved.shape[0]
+        elif ctx.cutlass_mm is not None:
+            grad_int32 = ctx.cutlass_mm(grad_int8.contiguous(), weight_saved)
+            in_features = weight_saved.shape[0]
+            epilogue = _get_int8_epilogue()
+            if epilogue is not None:
+                grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
+            else:
+                grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
+        elif ctx.triton_mm is None:
             grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved.t())
             in_features = weight_saved.shape[0]
+            epilogue = _get_int8_epilogue()
+            if epilogue is not None:
+                grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
+            else:
+                grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
         else:
-            try:
-                grad_int32 = ctx.triton_mm(grad_int8.contiguous(), weight_saved)
-            except Exception:
-                logger.exception("W8A8 Triton backward failed; falling back to torch._int_mm.")
-                grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved)
+            grad_int32 = ctx.triton_mm(grad_int8.contiguous(), weight_saved)
             in_features = weight_saved.shape[1]
-        epilogue = _get_int8_epilogue()
-        if epilogue is not None:
-            grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
-        else:
-            grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
+            epilogue = _get_int8_epilogue()
+            if epilogue is not None:
+                grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
+            else:
+                grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
         grad_input = grad_input.reshape(*grad_output.shape[:-1], in_features)
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 class _W8A8TransientDequantFunction(torch.autograd.Function):
@@ -401,22 +534,37 @@ def _convert_fp8_to_int8_weights(module, *, keep_transpose_buffer: bool):
 # ---------------------------------------------------------------------------
 
 
-def _make_w8a8_int8_forward(use_int_mm, triton_mm):
+def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_scaled_forward=False):
     """Create W8A8 int8 forward with small-batch fallback."""
     if use_int_mm:
 
         def forward(self, x):
             if not _supports_int_mm(x.device):
                 return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
-            if triton_mm is not None and _supports_triton_mm(x.device):
+            if cutlass_mm is not None and hasattr(self, "weight_int8_t"):
+                weight_int8_t = self.weight_int8_t
+                triton_mm_for_device = None
+                cutlass_mm_for_device = cutlass_mm
+            elif triton_mm is not None and _supports_triton_mm(x.device):
                 weight_int8_t = None
                 triton_mm_for_device = triton_mm
+                cutlass_mm_for_device = None
             elif hasattr(self, "weight_int8_t"):
                 weight_int8_t = self.weight_int8_t
                 triton_mm_for_device = None
+                cutlass_mm_for_device = None
             else:
                 return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
-            return _W8A8Int8Function.apply(x, self.weight, weight_int8_t, self.scale_weight, self.bias, triton_mm_for_device)
+            return _W8A8Int8Function.apply(
+                x,
+                self.weight,
+                weight_int8_t,
+                self.scale_weight,
+                self.bias,
+                triton_mm_for_device,
+                cutlass_mm_for_device,
+                use_triton_scaled_forward,
+            )
     else:
         # _int_mm unavailable: still save VRAM via custom autograd
         def forward(self, x):
@@ -447,7 +595,9 @@ def _make_w8a8_fp8_forward():
 # ---------------------------------------------------------------------------
 
 
-def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch.Tensor] | None = None):
+def apply_w8a8_monkey_patch(
+    model, w8a8_mode="int8", state_dict: dict[str, torch.Tensor] | None = None, w8a8_backend: str | None = None
+):
     """Replace forward methods on FP8-patched linears with W8A8 versions.
 
     Must be called AFTER apply_fp8_monkey_patch + load_state_dict
@@ -461,22 +611,38 @@ def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch
         state_dict: Optional loaded state dict to update in-place after int8
             conversion. With load_state_dict(assign=True), this releases the
             old FP8 weight entries instead of keeping both FP8 and int8 copies.
+        w8a8_backend: optional opt-in int8 matmul backend: "torch",
+            "triton", or "cutlass". None preserves the historical behavior.
+            Non-None selections fail early when unavailable.
     """
     if w8a8_mode not in {"int8", "fp8"}:
         raise ValueError(f"Unsupported W8A8 mode: {w8a8_mode!r}. Expected 'int8' or 'fp8'.")
 
     use_int_mm = hasattr(torch, "_int_mm")
-    triton_mm = _get_triton_mm_8bit() if w8a8_mode == "int8" and use_int_mm else None
+    triton_mm = None
+    cutlass_mm = None
+    use_triton_scaled_forward = False
+    if w8a8_mode == "int8":
+        if w8a8_backend is None:
+            triton_mm, cutlass_mm = _resolve_legacy_int8_backend(use_int_mm=use_int_mm)
+        else:
+            triton_mm, cutlass_mm = _resolve_int8_backend(w8a8_backend, use_int_mm=use_int_mm)
+            use_triton_scaled_forward = w8a8_backend == "triton"
+    elif w8a8_backend is not None and w8a8_backend not in _INT8_BACKENDS:
+        expected = "', '".join(sorted(_INT8_BACKENDS))
+        raise ValueError(f"Unsupported W8A8 backend: {w8a8_backend!r}. Expected '{expected}'.")
     if w8a8_mode == "int8" and not use_int_mm:
         logger.warning(
             "torch._int_mm not available (requires PyTorch 2.1+); W8A8 int8 will use dequantize+matmul fallback (still saves VRAM)."
         )
-    if w8a8_mode == "int8" and use_int_mm and triton_mm is None:
+    if w8a8_mode == "int8" and use_int_mm and triton_mm is None and cutlass_mm is None:
         logger.info("W8A8 int8: Triton row-major matmul unavailable; keeping transpose buffers for fast backward.")
 
     # Build the forward function once (shared by all patched layers)
     if w8a8_mode == "int8":
-        new_forward = _make_w8a8_int8_forward(use_int_mm, triton_mm)
+        new_forward = _make_w8a8_int8_forward(
+            use_int_mm, triton_mm, cutlass_mm, use_triton_scaled_forward=use_triton_scaled_forward
+        )
     else:
         new_forward = _make_w8a8_fp8_forward()
 
@@ -488,7 +654,7 @@ def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch
             continue
 
         if w8a8_mode == "int8":
-            _convert_fp8_to_int8_weights(module, keep_transpose_buffer=triton_mm is None)
+            _convert_fp8_to_int8_weights(module, keep_transpose_buffer=triton_mm is None or cutlass_mm is not None)
             if state_dict is not None:
                 weight_key = f"{name}.weight"
                 scale_key = f"{name}.scale_weight"
@@ -500,7 +666,7 @@ def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch
         module.forward = new_forward.__get__(module, type(module))
         patched_count += 1
 
-    backend = "triton" if triton_mm is not None else "torch"
+    backend = "cutlass" if cutlass_mm is not None else "triton" if triton_mm is not None else "torch"
     logger.info("W8A8 %s (%s): patched %d linear layers", w8a8_mode, backend, patched_count)
     return model
 
@@ -530,7 +696,7 @@ def register_quanto_int8_scale_buffers(model, state_dict):
     return registered
 
 
-def apply_quanto_int8_monkey_patch(model):
+def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
     """Bind the int8 W8A8 forward to Linear layers that already hold an int8
     weight + scale_weight buffer (Optimum-Quanto qint8 checkpoints).
 
@@ -539,12 +705,19 @@ def apply_quanto_int8_monkey_patch(model):
     int8 buffer is built for the fast backward. Call AFTER load_state_dict.
     """
     use_int_mm = hasattr(torch, "_int_mm")
-    triton_mm = _get_triton_mm_8bit() if use_int_mm else None
+    triton_mm = None
+    cutlass_mm = None
+    use_triton_scaled_forward = False
+    if w8a8_backend is None:
+        triton_mm, cutlass_mm = _resolve_legacy_int8_backend(use_int_mm=use_int_mm)
+    else:
+        triton_mm, cutlass_mm = _resolve_int8_backend(w8a8_backend, use_int_mm=use_int_mm)
+        use_triton_scaled_forward = w8a8_backend == "triton"
     if not use_int_mm:
         logger.warning(
             "torch._int_mm unavailable (PyTorch < 2.1); quanto int8 will dequantize+matmul (VRAM saved, no int8 speedup)."
         )
-    new_forward = _make_w8a8_int8_forward(use_int_mm, triton_mm)
+    new_forward = _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm, use_triton_scaled_forward=use_triton_scaled_forward)
 
     patched = 0
     for module in model.modules():
@@ -558,7 +731,7 @@ def apply_quanto_int8_monkey_patch(model):
         module.scale_weight = module.scale_weight.reshape(module.weight.shape[0], 1).to(
             device=module.weight.device, dtype=torch.float32
         )
-        if triton_mm is None and use_int_mm:
+        if (triton_mm is None or cutlass_mm is not None) and use_int_mm:
             weight_int8_t = module.weight.t().contiguous()
             if "weight_int8_t" in module._buffers:
                 module.weight_int8_t = weight_int8_t
@@ -567,6 +740,12 @@ def apply_quanto_int8_monkey_patch(model):
         module.forward = new_forward.__get__(module, type(module))
         patched += 1
 
-    backend = "triton" if triton_mm is not None else ("torch._int_mm" if use_int_mm else "dequant-fallback")
+    backend = (
+        "cutlass"
+        if cutlass_mm is not None
+        else "triton"
+        if triton_mm is not None
+        else ("torch._int_mm" if use_int_mm else "dequant-fallback")
+    )
     logger.info("Quanto int8 (%s): patched %d linear layers", backend, patched)
     return model

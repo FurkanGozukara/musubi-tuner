@@ -618,6 +618,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_w8a8")
     if s.w8a8_mode != "int8":
         cmd += ["--w8a8_mode", s.w8a8_mode]
+    if s.fp8_w8a8 and s.w8a8_mode == "int8" and getattr(s, "w8a8_backend", None):
+        cmd += ["--w8a8_backend", s.w8a8_backend]
     if s.fp8_upcast:
         cmd.append("--fp8_upcast")
     if s.fp8_upcast_stochastic:
@@ -975,6 +977,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_w8a8")
         if t.w8a8_mode != "int8":
             cmd += ["--w8a8_mode", t.w8a8_mode]
+    if getattr(t, "w8a8_backend", None) and (
+        (t.fp8_w8a8 and t.w8a8_mode == "int8") or getattr(t, "int8_base", False) or getattr(t, "int8_base_dynamic", False)
+    ):
+        cmd += ["--w8a8_backend", t.w8a8_backend]
     if getattr(t, "int8_base", False):
         cmd.append("--int8_base")
     if getattr(t, "int8_base_dynamic", False):
@@ -2372,6 +2378,8 @@ def _remote_stage_server_arglist(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_w8a8")
         if r.w8a8_mode != "int8":
             cmd += ["--w8a8_mode", r.w8a8_mode]
+    if r.fp8_w8a8 and r.w8a8_mode == "int8" and getattr(r, "w8a8_backend", None):
+        cmd += ["--w8a8_backend", r.w8a8_backend]
     if r.fp8_upcast:
         cmd.append("--fp8_upcast")
     if r.fp8_upcast_stochastic:

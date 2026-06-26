@@ -226,6 +226,7 @@ class TrainingConfig(BaseModel):
     loftq_iters: int = 2
     fp8_w8a8: bool = False
     w8a8_mode: Literal["int8", "fp8"] = "int8"
+    w8a8_backend: Optional[Literal["torch", "triton", "cutlass"]] = None
     int8_base: bool = False
     int8_base_dynamic: bool = False
     int8_fused_quant: bool = False
@@ -944,6 +945,7 @@ class InferenceConfig(BaseModel):
     fp8_keep_blocks: str = ""
     fp8_w8a8: bool = False
     w8a8_mode: Literal["int8", "fp8"] = "int8"
+    w8a8_backend: Optional[Literal["torch", "triton", "cutlass"]] = None
     fp8_upcast: bool = False
     fp8_upcast_stochastic: bool = False
     fp8_upcast_seed: int = 0
@@ -1046,6 +1048,7 @@ class RemoteStageServerConfig(BaseModel):
     fp8_scaled: bool = False
     fp8_w8a8: bool = False
     w8a8_mode: Literal["int8", "fp8"] = "int8"
+    w8a8_backend: Optional[Literal["torch", "triton", "cutlass"]] = None
     fp8_upcast: bool = False
     fp8_upcast_stochastic: bool = False
     fp8_upcast_seed: int = 0
