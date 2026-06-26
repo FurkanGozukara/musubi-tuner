@@ -57,6 +57,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling](#two-stage-sampling)
     - [Checkpoint Output Format](#checkpoint-output-format)
+    - [Extract LoRA from Full Fine-Tune](#extract-lora-from-full-fine-tune)
     - [Resuming Training](#resuming-training)
   - [Merge LoRA into Base Model](#merge-lora-into-base-model)
     - [Merge-to-Base Arguments](#merge-to-base-arguments)
@@ -820,6 +821,56 @@ python -m musubi_tuner.ltx2_convert_comfy_to_musubi ^
 ```
 
 The dashboard **Tools** tab includes a **ComfyUI Conversion** panel for one-shot conversion of an existing Musubi adapter. It uses the loaded project's LTX-2 mode, audio-only, FP8/W8A8, NF4, and quantization settings when a base transformer is needed for DoRA/DoKr conversion.
+
+### Extract LoRA from Full Fine-Tune
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`ltx2_extract_lora.py` extracts a native Musubi LoRA or DoRA adapter from a pair of full transformer checkpoints by factorizing the weight delta between the base model and the fine-tuned model. This is an offline utility; it does not change training or inference defaults.
+
+```bash
+python -m musubi_tuner.ltx2_extract_lora ^
+  --base_model /models/ltx-2.3-22b-dev.safetensors ^
+  --finetuned_model /models/my_full_finetune.safetensors ^
+  --save_to output/extracted_lora.safetensors ^
+  --target_preset full ^
+  --rank_mode fro ^
+  --fro_target 0.98 ^
+  --max_rank 128 ^
+  --save_precision bf16 ^
+  --report_json output/extracted_lora.report.json
+```
+
+The default extraction path uses per-layer SVD with adaptive Frobenius-energy rank selection. Each selected 2D weight gets its own rank up to `--max_rank`, and the saved checkpoint uses normal native keys (`lora_down`, `lora_up`, `alpha`) so existing LTX-2 LoRA loading can infer per-module ranks from the file.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--extract_mode lora|dora` | `lora` | Plain LoRA delta extraction, or DoRA direction/magnitude extraction |
+| `--rank_mode fixed|fro|quantile|knee|relative_drop` | `fro` | Per-layer rank selection method |
+| `--dim` | `64` | Rank for `fixed`, or low-rank SVD hint |
+| `--min_rank` / `--max_rank` | `1` / `128` | Per-layer rank bounds |
+| `--fro_target` | `0.98` | Squared singular-value energy target for `fro` mode |
+| `--target_preset` | `full` | Same LTX-2 target preset names used by LoRA training, or `custom` with regex includes |
+| `--connector_lora` | off | Include video/audio embedding connector linear layers |
+| `--unsupported_tensors report|skip|error|sidecar` | `report` | Handling for changed tensors that regular LoRA cannot represent |
+| `--dry_run` | off | Inspect key coverage and write the report without saving a LoRA |
+| `--max_modules` | `0` | Optional extraction limit; `0` means no limit |
+
+Pure LoRA cannot encode changed 1D tensors such as attention norm vectors, biases, or scale vectors. If a full fine-tune changed tensors like `q_norm.weight` or `k_norm.weight`, the extractor reports them instead of silently dropping them. Use `--unsupported_tensors error` when you want extraction to fail on those changes. `sidecar` writes exact delta tensors into the file for inspection, but standard LoRA loading ignores those sidecar tensors.
+
+For connector-heavy LTX-2.3 full fine-tunes, run a dry pass first:
+
+```bash
+python -m musubi_tuner.ltx2_extract_lora ^
+  --base_model /models/ltx-2.3-22b-dev.safetensors ^
+  --finetuned_model /models/my_full_finetune.safetensors ^
+  --save_to output/extracted_lora.safetensors ^
+  --target_preset full ^
+  --connector_lora ^
+  --dry_run ^
+  --report_json output/extract_coverage.json
+```
+
+If the report shows large unsupported norm or bias deltas, a higher-rank LoRA alone may still fail to match the full fine-tuned model. Try `--extract_mode dora`, a higher `--max_rank`, and `--connector_lora`, then compare samples against the full checkpoint.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 

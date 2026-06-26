@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from musubi_tuner.gui_dashboard.command_builder import _effective_ltx2_checkpoint
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.ltx2_model_loading import detect_ltx2_dtype
+from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils import model_utils
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,21 @@ class ConvertLoRARequest(BaseModel):
     output_path: str = ""
     target_format: str = "other"
     diffusers_prefix: str = ""
+
+
+class ExtractLoRARequest(BaseModel):
+    base_model_path: str = ""
+    finetuned_model_path: str
+    output_path: str = ""
+    target_preset: str = "full"
+    connector_lora: bool = False
+    extract_mode: str = "lora"
+    rank_mode: str = "fro"
+    dim: int = 64
+    max_rank: int = 128
+    fro_target: float = 0.98
+    unsupported_tensors: str = "report"
+    device: str = "cpu"
 
 
 @dataclasses.dataclass
@@ -73,6 +89,31 @@ class ConvertLoRAJob:
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
 
+@dataclasses.dataclass
+class ExtractLoRAJob:
+    job_id: str
+    base_model_path: str
+    finetuned_model_path: str
+    output_path: str = ""
+    target_preset: str = "full"
+    connector_lora: bool = False
+    extract_mode: str = "lora"
+    rank_mode: str = "fro"
+    dim: int = 64
+    max_rank: int = 128
+    fro_target: float = 0.98
+    unsupported_tensors: str = "report"
+    device: str = "cpu"
+    report_json: str = ""
+    state: str = "queued"
+    message: str = "Queued"
+    error: str = ""
+    created_at: float = dataclasses.field(default_factory=time.time)
+    updated_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
 def _get_config(request: Request) -> ProjectConfig:
     config = request.app.state.project_config
     if config is None:
@@ -96,6 +137,14 @@ def _get_lora_jobs(request: Request) -> dict[str, ConvertLoRAJob]:
     return jobs
 
 
+def _get_extract_lora_jobs(request: Request) -> dict[str, ExtractLoRAJob]:
+    jobs = getattr(request.app.state, "extract_lora_jobs", None)
+    if jobs is None:
+        jobs = {}
+        request.app.state.extract_lora_jobs = jobs
+    return jobs
+
+
 def _snapshot_job(job: ConvertComfyJob) -> dict:
     with job.lock:
         snapshot = {
@@ -115,6 +164,18 @@ def _snapshot_job(job: ConvertComfyJob) -> dict:
             snapshot["target_format"] = job.target_format
         if hasattr(job, "diffusers_prefix"):
             snapshot["diffusers_prefix"] = job.diffusers_prefix
+        if hasattr(job, "finetuned_model_path"):
+            snapshot["finetuned_model_path"] = job.finetuned_model_path
+        if hasattr(job, "target_preset"):
+            snapshot["target_preset"] = job.target_preset
+        if hasattr(job, "connector_lora"):
+            snapshot["connector_lora"] = job.connector_lora
+        if hasattr(job, "extract_mode"):
+            snapshot["extract_mode"] = job.extract_mode
+        if hasattr(job, "rank_mode"):
+            snapshot["rank_mode"] = job.rank_mode
+        if hasattr(job, "report_json"):
+            snapshot["report_json"] = job.report_json
         return snapshot
 
 
@@ -168,6 +229,11 @@ def _default_lora_output_path(input_path: str, target_format: str) -> str:
     path = Path(input_path)
     suffix = "musubi" if target_format == "default" else "diffusers"
     return str(path.parent / f"{path.stem}.{suffix}{path.suffix}")
+
+
+def _default_extract_lora_output_path(input_path: str) -> str:
+    path = Path(input_path)
+    return str(path.parent / f"{path.stem}.extracted_lora{path.suffix}")
 
 
 def _checkpoint_needs_base_model(path: Path) -> bool:
@@ -310,6 +376,70 @@ def _run_convert_lora_job(job: ConvertLoRAJob, config: ProjectConfig) -> None:
         _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
 
 
+def _build_extract_lora_cmd(job: ExtractLoRAJob) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "musubi_tuner.ltx2_extract_lora",
+        "--base_model",
+        job.base_model_path,
+        "--finetuned_model",
+        job.finetuned_model_path,
+        "--save_to",
+        job.output_path,
+        "--target_preset",
+        job.target_preset,
+        "--extract_mode",
+        job.extract_mode,
+        "--rank_mode",
+        job.rank_mode,
+        "--dim",
+        str(job.dim),
+        "--max_rank",
+        str(job.max_rank),
+        "--fro_target",
+        str(job.fro_target),
+        "--unsupported_tensors",
+        job.unsupported_tensors,
+        "--report_json",
+        job.report_json,
+        "--device",
+        job.device or "cpu",
+    ]
+    if job.connector_lora:
+        cmd.append("--connector_lora")
+    return cmd
+
+
+def _run_extract_lora_job(job: ExtractLoRAJob, config: ProjectConfig) -> None:
+    try:
+        _set_job_state(job, state="running", message="Extracting LoRA from fine-tuned checkpoint")
+        cmd = _build_extract_lora_cmd(job)
+        result = subprocess.run(
+            cmd,
+            cwd=config.project_dir or None,
+            env=_converter_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            output_tail = "\n".join((result.stdout or "").splitlines()[-40:])
+            raise RuntimeError(output_tail or f"Extractor exited with code {result.returncode}")
+
+        _set_job_state(
+            job,
+            state="completed",
+            message=f"Saved to {job.output_path}",
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        logger.exception("LoRA extraction failed")
+        _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
+
+
 @router.post("/convert-comfy")
 async def start_convert_comfy(req: ConvertComfyRequest, request: Request):
     config = _get_config(request)
@@ -418,4 +548,80 @@ async def get_convert_lora_status(job_id: str, request: Request):
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Conversion job not found")
+    return _snapshot_job(job)
+
+
+@router.post("/extract-lora")
+async def start_extract_lora(req: ExtractLoRARequest, request: Request):
+    config = _get_config(request)
+    base_model_raw = req.base_model_path.strip() or _effective_ltx2_checkpoint(config, config.training.ltx2_checkpoint)
+    try:
+        base_model_path = _resolve_project_path(config, base_model_raw)
+        finetuned_model_path = _resolve_project_path(config, req.finetuned_model_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not base_model_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Base LTX-2 checkpoint not found: {base_model_path}")
+    if not finetuned_model_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Fine-tuned checkpoint not found: {finetuned_model_path}")
+    if base_model_path.suffix.casefold() != ".safetensors" or finetuned_model_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Input checkpoints must be .safetensors files")
+
+    try:
+        output_path = (
+            _resolve_project_path(config, req.output_path)
+            if req.output_path.strip()
+            else Path(_default_extract_lora_output_path(str(finetuned_model_path)))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if output_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Output path must be a .safetensors file")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    target_preset = (req.target_preset or "full").strip()
+    valid_presets = set(lora_ltx2.LTX2_LORA_TARGET_PRESETS.keys()) | {"custom"}
+    if target_preset not in valid_presets:
+        raise HTTPException(status_code=400, detail=f"Unknown target preset: {target_preset}")
+    extract_mode = (req.extract_mode or "lora").strip()
+    if extract_mode not in {"lora", "dora"}:
+        raise HTTPException(status_code=400, detail="extract_mode must be 'lora' or 'dora'")
+    rank_mode = (req.rank_mode or "fro").strip()
+    if rank_mode not in {"fixed", "fro", "quantile", "knee", "relative_drop"}:
+        raise HTTPException(status_code=400, detail="Invalid rank mode")
+    unsupported_tensors = (req.unsupported_tensors or "report").strip()
+    if unsupported_tensors not in {"report", "skip", "error", "sidecar"}:
+        raise HTTPException(status_code=400, detail="Invalid unsupported tensor mode")
+
+    report_json = str(output_path.with_suffix(".report.json"))
+    jobs = _get_extract_lora_jobs(request)
+    _prune_finished_jobs(jobs)
+    job = ExtractLoRAJob(
+        job_id=uuid.uuid4().hex,
+        base_model_path=str(base_model_path),
+        finetuned_model_path=str(finetuned_model_path),
+        output_path=str(output_path),
+        target_preset=target_preset,
+        connector_lora=bool(req.connector_lora),
+        extract_mode=extract_mode,
+        rank_mode=rank_mode,
+        dim=max(1, int(req.dim)),
+        max_rank=max(1, int(req.max_rank)),
+        fro_target=float(req.fro_target),
+        unsupported_tensors=unsupported_tensors,
+        device=(req.device or "cpu").strip(),
+        report_json=report_json,
+    )
+    jobs[job.job_id] = job
+    thread = threading.Thread(target=_run_extract_lora_job, args=(job, config), daemon=True)
+    thread.start()
+    return _snapshot_job(job)
+
+
+@router.get("/extract-lora/{job_id}")
+async def get_extract_lora_status(job_id: str, request: Request):
+    jobs = _get_extract_lora_jobs(request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Extraction job not found")
     return _snapshot_job(job)
