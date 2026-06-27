@@ -43,7 +43,12 @@ from musubi_tuner.training.accelerator_setup import (
     dataloader_extra_kwargs,
     prepare_accelerator,
 )
-from musubi_tuner.training.frozen_networks import apply_frozen_networks, prepare_frozen_networks_for_training
+from musubi_tuner.training.frozen_networks import (
+    apply_frozen_networks,
+    apply_warm_start_surplus_network,
+    prepare_frozen_networks_for_training,
+    split_warm_start_state_dict,
+)
 from musubi_tuner.training.losses import per_element_loss as _per_element_loss, reduce_masked_loss
 from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.metadata import (
@@ -474,10 +479,20 @@ def train(self, args):
     _log_vram("AFTER network.apply_to (LoRA applied to transformer)", logger)
 
     if args.network_weights is not None:
-        # FIXME consider alpha of weights: this assumes that the alpha is not changed
         weights_sd = self.load_network_weights(args.network_weights, network_module)
-        info = load_network_state_dict(network, weights_sd, False)
+        load_sd = split_warm_start_state_dict(network, weights_sd)[0] if args.network_freeze_surplus_modules else weights_sd
+        info = load_network_state_dict(network, load_sd, False)
         accelerator.print(f"load network weights from {args.network_weights}: {info}")
+        surplus_network = apply_warm_start_surplus_network(
+            args,
+            accelerator,
+            network_module,
+            transformer,
+            network,
+            weights_sd,
+        )
+        if surplus_network is not None:
+            frozen_networks.append(surplus_network)
 
     # LyCORIS + FP8 backend compatibility:
     # keep most base model in FP8, but upcast adapted base layers that LyCORIS touches.

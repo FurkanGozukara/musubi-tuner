@@ -1917,6 +1917,8 @@ Use frozen auxiliary adapters when a new LoRA should train while another LoRA re
 
 The frozen adapters are set to eval mode, are not added to the optimizer, and are not saved into the output LoRA. They only affect the training forward pass. Use `--network_weights` when you want to warm-start the LoRA that is being trained, and use `--base_weights` when you want to merge weights into the base model before training.
 
+When narrowing a warm-start LoRA to a smaller target preset, add `--network_freeze_surplus_modules` to keep compatible extra modules from `--network_weights` active as frozen adapters. Only modules outside the active trainable network are frozen; trainable modules still load and save normally.
+
 Example:
 ```bash
 accelerate launch ... ltx2_train_network.py ^

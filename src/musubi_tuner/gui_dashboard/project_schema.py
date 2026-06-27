@@ -269,6 +269,7 @@ class TrainingConfig(BaseModel):
     lora_target_preset_manual: bool = False
     network_args: str = ""
     network_weights: str = ""
+    network_freeze_surplus_modules: bool = False
     network_dropout: Optional[float] = None
     scale_weight_norms: Optional[float] = None
     dim_from_weights: bool = False

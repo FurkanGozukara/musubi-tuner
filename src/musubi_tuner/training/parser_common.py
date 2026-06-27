@@ -694,6 +694,14 @@ def _add_network_args(parser: argparse.ArgumentParser) -> None:
         "--network_weights", type=str, default=None, help="pretrained weights for network / 学習するネットワークの初期重み"
     )
     parser.add_argument(
+        "--network_freeze_surplus_modules",
+        action="store_true",
+        help=(
+            "when warm-starting from network_weights, attach compatible modules outside the active target set "
+            "as frozen adapters instead of only reporting them as unexpected keys"
+        ),
+    )
+    parser.add_argument(
         "--network_module", type=str, default=None, help="network module to train / 学習対象のネットワークのモジュール"
     )
     parser.add_argument(

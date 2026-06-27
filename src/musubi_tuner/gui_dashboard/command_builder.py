@@ -1073,6 +1073,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_args"] + network_args_parts
     if t.network_weights:
         cmd += ["--network_weights", t.network_weights]
+    if t.network_freeze_surplus_modules:
+        cmd.append("--network_freeze_surplus_modules")
     if t.network_dropout is not None:
         cmd += ["--network_dropout", str(t.network_dropout)]
     if t.scale_weight_norms is not None:

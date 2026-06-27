@@ -57,6 +57,36 @@ def _normalize_created_network(created: Any) -> torch.nn.Module:
     return created
 
 
+def _module_prefix(key: str) -> str | None:
+    if "." not in key:
+        return None
+    return key.split(".", 1)[0]
+
+
+def _state_dict_module_names(state_dict: dict[str, torch.Tensor]) -> set[str]:
+    return {prefix for key in state_dict.keys() if (prefix := _module_prefix(key)) is not None}
+
+
+def split_warm_start_state_dict(
+    trainable_network: torch.nn.Module,
+    weights_sd: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Split warm-start weights into trainable-network keys and surplus module keys."""
+
+    active_modules = _state_dict_module_names(trainable_network.state_dict())
+    active_sd: dict[str, torch.Tensor] = {}
+    surplus_sd: dict[str, torch.Tensor] = {}
+
+    for key, value in weights_sd.items():
+        prefix = _module_prefix(key)
+        if prefix is None or prefix in active_modules:
+            active_sd[key] = value
+        else:
+            surplus_sd[key] = value
+
+    return active_sd, surplus_sd
+
+
 def apply_frozen_networks(
     args: Any,
     accelerator: Any,
@@ -93,6 +123,65 @@ def apply_frozen_networks(
         _accelerator_print(accelerator, f"attached frozen network weights from {weight_path}: {info}")
 
     return frozen_networks
+
+
+def apply_warm_start_surplus_network(
+    args: Any,
+    accelerator: Any,
+    network_module: Any,
+    transformer: torch.nn.Module,
+    trainable_network: torch.nn.Module,
+    weights_sd: dict[str, torch.Tensor],
+) -> torch.nn.Module | None:
+    """Attach warm-start modules that are outside the active trainable network."""
+
+    if not getattr(args, "network_freeze_surplus_modules", False):
+        return None
+    if not weights_sd:
+        return None
+
+    create_from_weights = getattr(network_module, "create_arch_network_from_weights", None)
+    if not callable(create_from_weights):
+        raise ValueError("--network_freeze_surplus_modules requires create_arch_network_from_weights support")
+
+    _, surplus_sd = split_warm_start_state_dict(trainable_network, weights_sd)
+    surplus_modules = sorted(_state_dict_module_names(surplus_sd))
+    if not surplus_modules:
+        _accelerator_print(accelerator, "warm-start surplus freeze: no surplus modules found")
+        return None
+
+    surplus_module_set = set(surplus_modules)
+    if not surplus_sd:
+        _accelerator_print(accelerator, "warm-start surplus freeze: no loadable surplus weights found")
+        return None
+
+    network = _normalize_created_network(create_from_weights(1.0, surplus_sd, unet=transformer))
+    created_modules = _state_dict_module_names(network.state_dict())
+    if not created_modules:
+        _accelerator_print(
+            accelerator,
+            f"warm-start surplus freeze: skipped {len(surplus_modules)} surplus modules because none matched this model",
+        )
+        return None
+
+    loadable_sd = {
+        key: value for key, value in surplus_sd.items() if (prefix := _module_prefix(key)) is not None and prefix in created_modules
+    }
+    skipped_modules = sorted(surplus_module_set - created_modules)
+
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    info = load_network_state_dict(network, loadable_sd, strict=False)
+    network.requires_grad_(False)
+    network.eval()
+
+    _accelerator_print(
+        accelerator,
+        "warm-start surplus freeze: "
+        f"attached {len(created_modules)} frozen modules; "
+        f"skipped {len(skipped_modules)} incompatible modules; "
+        f"load info: {info}",
+    )
+    return network
 
 
 def prepare_frozen_networks_for_training(
