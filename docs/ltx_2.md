@@ -41,6 +41,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Latent Caching Command](#latent-caching-command)
     - [Latent Caching Arguments](#latent-caching-arguments)
     - [Latent Cache Output Files](#latent-cache-output-files)
+    - [Latent Cache Preview and Verification](#latent-cache-preview-and-verification)
     - [Memory Optimization for Caching](#memory-optimization-for-caching)
   - [Caching Text Encoder Outputs](#caching-text-encoder-outputs)
     - [Text Encoder Caching Command](#text-encoder-caching-command)
@@ -493,6 +494,20 @@ python ltx2_cache_latents.py ^
 |--------------|----------|
 | `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. If masked loss is configured, also stores `video_loss_mask`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32`, `ltx2_virtual_height_int32`, and `ltx2_virtual_width_int32` — the virtual spatial geometry used for timestep sampling, derived from `--audio_only_sequence_resolution` when `> 0`, or from the dataset/target resolution when `0`. |
 | `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32`. If audio masked loss is configured, also stores `audio_loss_mask`. |
+
+### Latent Cache Preview and Verification
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`ltx2_cache_preview.py` checks cached LTX-2 latent files and writes `summary.json` with tensor keys, shapes, dtypes, metadata, and NaN/Inf results. Add `--checkpoint` only when decoded MP4/PNG/WAV previews are needed.
+
+```bash
+python ltx2_cache_preview.py ^
+  --input /path/to/cache_dir ^
+  --output /path/to/cache_preview ^
+  --stats
+```
+
+Useful flags: `--checkpoint`, `--limit N`, `--fail_on_error`, `--no_decode`, `--fps 25`.
 
 ### Memory Optimization for Caching
 <sub>[↑ contents](#table-of-contents)</sub>

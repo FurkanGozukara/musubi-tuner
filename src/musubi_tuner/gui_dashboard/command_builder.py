@@ -65,6 +65,30 @@ def _effective_output_dir(explicit: str) -> str:
     return explicit or get_ltx2_training_output_dir_default()
 
 
+def _default_dataset_cache_directory(config: ProjectConfig) -> str:
+    datasets = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
+    for entry in datasets:
+        if getattr(entry, "cache_directory", ""):
+            return str(entry.cache_directory)
+        if getattr(entry, "directory", ""):
+            return str(Path(entry.directory) / "cache")
+        if getattr(entry, "jsonl_file", ""):
+            return str(Path(entry.jsonl_file).parent / "cache")
+    return ""
+
+
+def _effective_cache_preview_input(config: ProjectConfig) -> str:
+    return config.caching.cache_preview_input or _default_dataset_cache_directory(config)
+
+
+def _effective_cache_preview_output(config: ProjectConfig) -> str:
+    if config.caching.cache_preview_output:
+        return config.caching.cache_preview_output
+    if config.project_dir:
+        return str(Path(config.project_dir) / "cache_preview")
+    return "cache_preview"
+
+
 def _effective_network_module(explicit: str) -> str:
     return explicit or get_ltx2_training_network_module_default()
 
@@ -508,6 +532,39 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--cache_before_connector")
 
     cmd += _split_cli_args(c.cache_text_extra_args)
+    return cmd
+
+
+def build_cache_preview_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_preview.py."""
+    c = config.caching
+    cmd = [
+        sys.executable,
+        "-u",
+        _find_script("ltx2_cache_preview.py"),
+        "--input",
+        _effective_cache_preview_input(config),
+        "--output",
+        _effective_cache_preview_output(config),
+        "--fps",
+        str(c.cache_preview_fps),
+    ]
+
+    if c.cache_preview_decode:
+        cmd += ["--checkpoint", _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)]
+        if c.cache_preview_device:
+            cmd += ["--device", c.cache_preview_device]
+        if c.cache_preview_dtype:
+            cmd += ["--dtype", c.cache_preview_dtype]
+    else:
+        cmd.append("--no_decode")
+
+    if c.cache_preview_stats:
+        cmd.append("--stats")
+    if c.cache_preview_fail_on_error:
+        cmd.append("--fail_on_error")
+    if c.cache_preview_limit is not None:
+        cmd += ["--limit", str(c.cache_preview_limit)]
     return cmd
 
 

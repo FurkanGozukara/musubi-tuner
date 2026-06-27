@@ -8,9 +8,9 @@
 	let showThemePicker = $state(false);
 
 	const navItems = [
-		{ href: '/', label: 'Overview', group: 'Workflow', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4', always: true, statusTypes: ['cache_latents', 'cache_text', 'training', 'full_finetune'] },
+		{ href: '/', label: 'Overview', group: 'Workflow', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4', always: true, statusTypes: ['cache_latents', 'cache_text', 'cache_preview', 'training', 'full_finetune'] },
 		{ href: '/dataset', label: 'Dataset', group: 'Workflow', icon: 'M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M4 7c0-2 1-3 3-3h10c2 0 3 1 3 3M4 7h16M9 11h6' },
-		{ href: '/caching', label: 'Caching', group: 'Workflow', icon: 'M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M9 3v4M15 3v4M4 11h16', processTypes: ['cache_latents', 'cache_text'] },
+		{ href: '/caching', label: 'Caching', group: 'Workflow', icon: 'M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M9 3v4M15 3v4M4 11h16', processTypes: ['cache_latents', 'cache_text', 'cache_preview'] },
 		{ href: '/samples', label: 'Samples', group: 'Tools', icon: 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
 		{ href: '/training/conditioning', label: 'Conditioning', group: 'Workflow', icon: 'M12 2l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5' },
 		{ href: '/training', label: 'Training', group: 'Workflow', icon: 'M13 10V3L4 14h7v7l9-11h-7z', processTypes: ['training', 'remote_stage_launcher', 'remote_stage_server'] },

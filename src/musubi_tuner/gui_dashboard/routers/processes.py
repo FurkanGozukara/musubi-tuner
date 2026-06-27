@@ -15,6 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_dino_cmd,
     build_cache_latents_cmd,
+    build_cache_preview_cmd,
     build_cache_text_cmd,
     build_full_finetune_cmd,
     build_inference_cmd,
@@ -40,6 +41,7 @@ VALID_TYPES = (
     "cache_latents",
     "cache_text",
     "cache_dino",
+    "cache_preview",
     "training",
     "full_finetune",
     "remote_stage_launcher",
@@ -75,6 +77,8 @@ def _build_cmd(proc_type: str, config):
         return build_cache_text_cmd(config)
     elif proc_type == "cache_dino":
         return build_cache_dino_cmd(config)
+    elif proc_type == "cache_preview":
+        return build_cache_preview_cmd(config)
     elif proc_type == "training":
         return build_training_cmd(config)
     elif proc_type == "full_finetune":

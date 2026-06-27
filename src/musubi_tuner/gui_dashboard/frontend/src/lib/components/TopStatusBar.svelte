@@ -68,6 +68,7 @@
 			['cache_latents', 'Cache latents'],
 			['cache_text', 'Cache text'],
 			['cache_dino', 'Cache DINO'],
+			['cache_preview', 'Cache preview'],
 			['inference', 'Inference'],
 			['remote_stage_launcher', 'Remote stage'],
 			['remote_stage_server', 'Remote server'],

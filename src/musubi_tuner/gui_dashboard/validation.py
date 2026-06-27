@@ -331,6 +331,22 @@ def _resolve_project_path(config: ProjectConfig, raw_path: str | None) -> Path |
     return Path(config.project_dir) / path
 
 
+def _default_dataset_cache_directory(config: ProjectConfig) -> str:
+    datasets = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
+    for entry in datasets:
+        if _has_text(getattr(entry, "cache_directory", "")):
+            return str(entry.cache_directory).strip()
+        if _has_text(getattr(entry, "directory", "")):
+            return str(Path(str(entry.directory).strip()) / "cache")
+        if _has_text(getattr(entry, "jsonl_file", "")):
+            return str(Path(str(entry.jsonl_file).strip()).parent / "cache")
+    return ""
+
+
+def _effective_cache_preview_input(config: ProjectConfig) -> str:
+    return config.caching.cache_preview_input or _default_dataset_cache_directory(config)
+
+
 def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     """Validate GUI training config before launch."""
     t = config.training
@@ -1877,6 +1893,71 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     return _build_report(errors, warnings)
 
 
+def validate_cache_preview_config(config: ProjectConfig) -> dict[str, Any]:
+    c = config.caching
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    preview_input = _effective_cache_preview_input(config)
+    if not _has_text(preview_input):
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.cache_preview_input",
+                "Cache Preview Input is required, or at least one dataset must define a cache directory.",
+                label="Cache Preview Input",
+                page="caching",
+            )
+        )
+    else:
+        path = _resolve_project_path(config, preview_input)
+        if path is not None and not path.exists():
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.cache_preview_input",
+                    f"Cache Preview Input not found: {path}",
+                    label="Cache Preview Input",
+                    page="caching",
+                )
+            )
+
+    if c.cache_preview_decode and not _has_cache_text_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required when Decode Previews is enabled.",
+                label="LTX-2 Checkpoint",
+                page="caching",
+            )
+        )
+
+    if c.cache_preview_limit is not None and c.cache_preview_limit < 1:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.cache_preview_limit",
+                "Cache Preview Limit must be at least 1.",
+                label="Preview Limit",
+                page="caching",
+            )
+        )
+
+    if c.cache_preview_fps <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.cache_preview_fps",
+                "Cache Preview FPS must be greater than 0.",
+                label="Preview FPS",
+                page="caching",
+            )
+        )
+
+    return _build_report(errors, warnings)
+
+
 def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
     i = config.inference
     errors: list[dict[str, Any]] = []
@@ -2230,6 +2311,8 @@ def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, 
         return validate_cache_latents_config(config)
     if proc_type == "cache_text":
         return validate_cache_text_config(config)
+    if proc_type == "cache_preview":
+        return validate_cache_preview_config(config)
     if proc_type == "inference":
         return validate_inference_config(config)
     if proc_type in ("rl", "rl_cache_rollouts", "rl_train"):

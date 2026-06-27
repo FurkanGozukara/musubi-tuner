@@ -42,8 +42,8 @@
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
 		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
 		resumeModelDownloadPolling();
-		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino']);
-		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino'], 1000);
+		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview']);
+		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview'], 1000);
 		return () => {
 			clearInterval(logInterval);
 			if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
@@ -58,9 +58,11 @@
 	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null });
 	let textStatus = $derived($processStatuses.cache_text || { state: 'idle', exit_code: null });
 	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
+	let previewStatus = $derived($processStatuses.cache_preview || { state: 'idle', exit_code: null });
 	let latentLogs = $derived($processLogs.cache_latents || []);
 	let textLogs = $derived($processLogs.cache_text || []);
 	let dinoLogs = $derived($processLogs.cache_dino || []);
+	let previewLogs = $derived($processLogs.cache_preview || []);
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, caching.ltx2_checkpoint || ''));
 	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, caching.gemma_safetensors || '', caching.gemma_root || ''));
@@ -462,6 +464,39 @@
 					<CommandPanel processType="cache_text" defaultFilename="cache_text.bat" />
 				{/if}
 			</div>
+		</div>
+
+		<!-- Cache Preview -->
+		<div class="space-y-3">
+			<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Preview</span>
+
+			<FormGroup title="Latent Cache Verification" collapsed={false}>
+				<div class="space-y-2 pt-2">
+					<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
+						<PathInput fieldPath="caching.cache_preview_input" value={caching.cache_preview_input || ''} oninput={(e) => updateCaching('cache_preview_input', e.target.value)} showFiles tooltip="Cache file or directory. Blank uses the first dataset cache directory." />
+						<PathInput fieldPath="caching.cache_preview_output" value={caching.cache_preview_output || ''} oninput={(e) => updateCaching('cache_preview_output', e.target.value)} tooltip="Output directory for summary.json and decoded previews. Blank uses project_dir/cache_preview." />
+					</div>
+					<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+						<FormToggle fieldPath="caching.cache_preview_stats" checked={caching.cache_preview_stats ?? true} onchange={(e) => updateCaching('cache_preview_stats', e.target.checked)} tooltip="Include finite min/max stats in summary.json." />
+						<FormToggle fieldPath="caching.cache_preview_fail_on_error" checked={caching.cache_preview_fail_on_error ?? true} onchange={(e) => updateCaching('cache_preview_fail_on_error', e.target.checked)} tooltip="Return a failed exit code when any cache file has validation or decode errors." />
+						<FormToggle fieldPath="caching.cache_preview_decode" checked={caching.cache_preview_decode ?? false} onchange={(e) => updateCaching('cache_preview_decode', e.target.checked)} tooltip="Decode MP4/PNG/WAV previews with the configured LTX-2 checkpoint." />
+						<FormField type="number" fieldPath="caching.cache_preview_limit" value={caching.cache_preview_limit ?? ''} oninput={(e) => updateCaching('cache_preview_limit', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="All" tooltip="Maximum number of cache files to inspect." />
+					</div>
+					{#if caching.cache_preview_decode}
+						<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+							<FormSelect fieldPath="caching.cache_preview_device" value={caching.cache_preview_device || 'auto'} options={['auto', 'cpu', 'cuda']} onchange={(e) => updateCaching('cache_preview_device', e.target.value)} tooltip="Decode device." />
+							<FormSelect fieldPath="caching.cache_preview_dtype" value={caching.cache_preview_dtype || ''} options={[{ value: '', label: 'auto' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('cache_preview_dtype', e.target.value || null)} tooltip="Decode dtype." />
+							<FormField type="number" fieldPath="caching.cache_preview_fps" value={caching.cache_preview_fps ?? 25} oninput={(e) => updateCaching('cache_preview_fps', Number(e.target.value))} min={0.1} step="0.1" tooltip="FPS for decoded video previews." />
+						</div>
+					{/if}
+				</div>
+			</FormGroup>
+
+			<ProcessControls processType="cache_preview" status={previewStatus} onStart={() => startProcess('cache_preview')} onStop={() => stopProcess('cache_preview')} />
+			<ProcessConsole lines={previewLogs} processType="cache_preview" initiallyCollapsed={false} />
+			{#if $advancedMode}
+				<CommandPanel processType="cache_preview" defaultFilename="cache_preview.bat" />
+			{/if}
 		</div>
 	</div>
 {/if}

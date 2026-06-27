@@ -186,6 +186,16 @@ class CachingConfig(BaseModel):
     cache_before_connector: bool = False
     # Dataset manifest
     save_dataset_manifest: str = ""
+    # Cache preview / verification
+    cache_preview_input: str = ""
+    cache_preview_output: str = ""
+    cache_preview_decode: bool = False
+    cache_preview_stats: bool = True
+    cache_preview_fail_on_error: bool = True
+    cache_preview_limit: Optional[int] = None
+    cache_preview_device: Literal["auto", "cpu", "cuda"] = "auto"
+    cache_preview_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
+    cache_preview_fps: float = 25.0
     # Raw CLI passthroughs, scoped to the individual cache commands.
     cache_latents_extra_args: str = ""
     cache_text_extra_args: str = ""
