@@ -37,11 +37,15 @@
 	let ltxScanJobId = $state('');
 	let gemmaScanJobId = $state('');
 	let gemmaSafetensorsScanJobId = $state('');
+	let cacheStatus = $state(null);
+	let cacheStatusLoading = $state(false);
+	let cacheStatusError = $state('');
 
 	onMount(() => {
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
 		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
 		resumeModelDownloadPolling();
+		refreshCacheStatus().catch(() => {});
 		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview']);
 		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview'], 1000);
 		return () => {
@@ -254,6 +258,43 @@
 	async function stopDownload() {
 		await cancelSharedModelDownload();
 	}
+
+	async function refreshCacheStatus() {
+		if (cacheStatusLoading) return;
+		cacheStatusLoading = true;
+		cacheStatusError = '';
+		try {
+			const res = await fetch('/api/cache/status', { cache: 'no-store' });
+			const data = await res.json();
+			if (!res.ok) throw new Error(data?.detail || 'Cache scan failed');
+			cacheStatus = data;
+		} catch (e) {
+			cacheStatusError = e?.message || 'Cache scan failed';
+			cacheStatus = null;
+		} finally {
+			cacheStatusLoading = false;
+		}
+	}
+
+	function cacheReady(row) {
+		return row.source_count > 0 && row.missing_latent === 0 && row.missing_text === 0 && row.missing_audio === 0;
+	}
+
+	function cacheIssueCount(row) {
+		return (row.missing_latent || 0) + (row.missing_text || 0) + (row.missing_audio || 0) + (row.stale_latent || 0) + (row.stale_text || 0) + (row.stale_audio || 0);
+	}
+
+	function cacheTone(row) {
+		if (row.warnings?.length) return 'warn';
+		if (cacheIssueCount(row) > 0) return 'warn';
+		if (cacheReady(row)) return 'ready';
+		return 'muted';
+	}
+
+	function bucketSummary(row) {
+		if (!row.buckets?.length) return '—';
+		return row.buckets.slice(0, 3).map((b) => `${b.bucket}:${b.count}`).join('  ');
+	}
 </script>
 
 {#if !$projectLoaded}
@@ -262,6 +303,102 @@
 	</div>
 {:else}
 	<div class="space-y-5">
+		<!-- Cache Status -->
+		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
+			<div class="flex items-center justify-between gap-3">
+				<div>
+					<div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Status</div>
+					{#if cacheStatus?.generated_at}
+						<div class="text-[11px]" style="color: var(--text-muted);">Updated {cacheStatus.generated_at}</div>
+					{/if}
+				</div>
+				<button
+					type="button"
+					onclick={refreshCacheStatus}
+					disabled={cacheStatusLoading}
+					class="px-2.5 py-1 text-[11px] font-medium disabled:opacity-50"
+					style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+				>{cacheStatusLoading ? 'Scanning...' : 'Refresh'}</button>
+			</div>
+
+			{#if cacheStatusError}
+				<div class="text-[12px] px-3 py-2" style="color: var(--danger); background: var(--danger-muted); border-radius: var(--radius-sm);">{cacheStatusError}</div>
+			{:else if cacheStatus?.rows?.length}
+				<div class="grid grid-cols-3 xl:grid-cols-6 gap-2">
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Sources</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.source_count}</div>
+					</div>
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Latents</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.latent_count}</div>
+					</div>
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Text</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.text_count}</div>
+					</div>
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Audio</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.audio_count}</div>
+					</div>
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Missing</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.missing_latent + cacheStatus.totals.missing_text + cacheStatus.totals.missing_audio}</div>
+					</div>
+					<div class="px-2 py-1.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
+						<div class="text-[10px] uppercase tracking-wider" style="color: var(--text-muted);">Stale</div>
+						<div class="text-sm font-semibold" style="color: var(--text-primary);">{cacheStatus.totals.stale_latent + cacheStatus.totals.stale_text + cacheStatus.totals.stale_audio}</div>
+					</div>
+				</div>
+
+				<div class="overflow-x-auto">
+					<table class="w-full text-[11px]">
+						<thead>
+							<tr style="color: var(--text-muted); border-bottom: 1px solid var(--border-subtle);">
+								<th class="text-left font-medium py-2 pr-3">Dataset</th>
+								<th class="text-right font-medium py-2 px-2">Sources</th>
+								<th class="text-right font-medium py-2 px-2">Latents</th>
+								<th class="text-right font-medium py-2 px-2">Text</th>
+								<th class="text-right font-medium py-2 px-2">Audio</th>
+								<th class="text-right font-medium py-2 px-2">Missing</th>
+								<th class="text-right font-medium py-2 px-2">Stale</th>
+								<th class="text-left font-medium py-2 pl-3">Buckets</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each cacheStatus.rows as row}
+								<tr style="border-bottom: 1px solid var(--border-subtle);">
+									<td class="py-2 pr-3 min-w-[220px]">
+										<div class="flex items-center gap-2">
+											<span class="w-1.5 h-1.5 rounded-full flex-shrink-0" style="background: {cacheTone(row) === 'ready' ? 'var(--success)' : cacheTone(row) === 'warn' ? 'var(--warning)' : 'var(--text-muted)'};"></span>
+											<div class="min-w-0">
+												<div class="font-medium truncate" style="color: var(--text-primary);">{row.group} {row.index + 1} · {row.type}</div>
+												<div class="truncate" style="color: var(--text-muted);" title={row.cache_directory}>{row.cache_directory || 'No cache directory'}</div>
+												{#if row.warnings?.length}
+													<div style="color: var(--warning);">{row.warnings[0]}</div>
+												{/if}
+											</div>
+										</div>
+									</td>
+									<td class="text-right py-2 px-2 tabular-nums">{row.source_count}</td>
+									<td class="text-right py-2 px-2 tabular-nums">{row.latent_count}</td>
+									<td class="text-right py-2 px-2 tabular-nums">{row.text_count}</td>
+									<td class="text-right py-2 px-2 tabular-nums">{row.audio_count}</td>
+									<td class="text-right py-2 px-2 tabular-nums" style="color: {(row.missing_latent + row.missing_text + row.missing_audio) > 0 ? 'var(--warning)' : 'var(--text-secondary)'};">{row.missing_latent + row.missing_text + row.missing_audio}</td>
+									<td class="text-right py-2 px-2 tabular-nums" style="color: {(row.stale_latent + row.stale_text + row.stale_audio) > 0 ? 'var(--warning)' : 'var(--text-secondary)'};">{row.stale_latent + row.stale_text + row.stale_audio}</td>
+									<td class="py-2 pl-3 min-w-[120px]" style="color: var(--text-muted);">{bucketSummary(row)}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{:else}
+				<div class="text-[12px] px-3 py-2" style="color: var(--text-muted); background: var(--bg-elevated); border-radius: var(--radius-sm);">
+					{cacheStatusLoading ? 'Scanning cache status...' : 'No datasets configured.'}
+				</div>
+			{/if}
+		</div>
+
 		<!-- Shared Settings -->
 		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 			<div class="grid grid-cols-2 xl:grid-cols-3 gap-3">

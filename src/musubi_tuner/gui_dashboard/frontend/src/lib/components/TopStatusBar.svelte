@@ -12,6 +12,11 @@
 	let gpuName = $derived(gpu ? gpu.name.replace('NVIDIA ', '').replace('GeForce ', '') : '');
 	let vramTotal = $derived(gpu ? gpu.vram_total_mb / 1024 : 24);
 	let vramUsed = $derived(gpu ? gpu.vram_used_mb / 1024 : null);
+	let vramPercent = $derived(percentOf(vramUsed, vramTotal));
+	let gpuLoadPercent = $derived(clampPercent(gpu?.utilization ?? vramPercent));
+	let ramPercent = $derived(clampPercent(systemInfo?.ram?.percent));
+	let diskUsedPercent = $derived(clampPercent(systemInfo?.disk?.percent));
+	let cpuPercent = $derived(clampPercent(systemInfo?.cpu?.utilization));
 	const pageTitles = {
 		'/': 'Overview',
 		'/dataset': 'Dataset',
@@ -92,6 +97,37 @@
 		return 'var(--text-muted)';
 	}
 
+	function clampPercent(value) {
+		const numeric = Number(value);
+		if (!Number.isFinite(numeric)) return null;
+		return Math.max(0, Math.min(100, numeric));
+	}
+
+	function percentOf(used, total) {
+		const usedValue = Number(used);
+		const totalValue = Number(total);
+		if (!Number.isFinite(usedValue) || !Number.isFinite(totalValue) || totalValue <= 0) return null;
+		return clampPercent((usedValue / totalValue) * 100);
+	}
+
+	function meterColor(percent) {
+		if (percent == null) return 'var(--text-muted)';
+		if (percent >= 90) return 'var(--danger)';
+		if (percent >= 70) return 'var(--warning)';
+		if (percent >= 35) return 'var(--accent)';
+		return 'var(--success)';
+	}
+
+	function meterStyle(percent) {
+		const value = clampPercent(percent) ?? 0;
+		const color = meterColor(value);
+		return `background: conic-gradient(${color} ${value}%, var(--border) 0);`;
+	}
+
+	function meterText(percent) {
+		return percent == null ? '--%' : `${Math.round(percent)}%`;
+	}
+
 	async function refreshSystemInfo() {
 		try {
 			const res = await fetch('/api/system/info');
@@ -101,7 +137,7 @@
 
 	onMount(async () => {
 		await refreshSystemInfo();
-		_sysInfoTimer = setInterval(refreshSystemInfo, 30000);
+		_sysInfoTimer = setInterval(refreshSystemInfo, 3000);
 	});
 
 	onDestroy(() => {
@@ -151,19 +187,31 @@
 		{#if systemInfo}
 			<div class="min-w-0 flex-1 px-2.5 py-1.5 text-[11px] font-medium tabular-nums flex items-center gap-2 overflow-hidden whitespace-nowrap" style="color: var(--text-secondary); background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
 				{#if gpu}
-					<span class="min-w-0 truncate"><span style="color: var(--text-muted);">GPU</span> {gpuName} {vramUsed.toFixed(1)}/{vramTotal.toFixed(0)}G</span>
+					<span class="min-w-0 truncate inline-flex items-center gap-1" title={`GPU load ${meterText(gpuLoadPercent)} · VRAM ${meterText(vramPercent)}`}>
+						<span class="status-meter" style={meterStyle(vramPercent)} aria-hidden="true"><span></span></span>
+						<span><span style="color: var(--text-muted);">GPU</span> {gpuName} {vramUsed.toFixed(1)}/{vramTotal.toFixed(0)}G</span>
+					</span>
 				{/if}
 				{#if systemInfo.ram}
 					<span class="flex-shrink-0" style="color: var(--border);">|</span>
-					<span class="flex-shrink-0"><span style="color: var(--text-muted);">RAM</span> {systemInfo.ram.used_gb}/{systemInfo.ram.total_gb}G</span>
+					<span class="flex-shrink-0 inline-flex items-center gap-1" title={`RAM used ${meterText(ramPercent)}`}>
+						<span class="status-meter" style={meterStyle(ramPercent)} aria-hidden="true"><span></span></span>
+						<span><span style="color: var(--text-muted);">RAM</span> {systemInfo.ram.used_gb}/{systemInfo.ram.total_gb}G</span>
+					</span>
 				{/if}
 				{#if systemInfo.disk}
 					<span class="flex-shrink-0" style="color: var(--border);">|</span>
-					<span class="flex-shrink-0"><span style="color: var(--text-muted);">Disk</span> {systemInfo.disk.free_gb}G free</span>
+					<span class="flex-shrink-0 inline-flex items-center gap-1" title={`Disk used ${meterText(diskUsedPercent)}`}>
+						<span class="status-meter" style={meterStyle(diskUsedPercent)} aria-hidden="true"><span></span></span>
+						<span><span style="color: var(--text-muted);">Disk</span> {systemInfo.disk.free_gb}G free</span>
+					</span>
 				{/if}
 				{#if systemInfo.cpu}
 					<span class="flex-shrink-0" style="color: var(--border);">|</span>
-					<span class="flex-shrink-0"><span style="color: var(--text-muted);">CPU</span> {systemInfo.cpu.cores}c</span>
+					<span class="flex-shrink-0 inline-flex items-center gap-1" title={`CPU load ${meterText(cpuPercent)}`}>
+						<span class="status-meter" style={meterStyle(cpuPercent)} aria-hidden="true"><span></span></span>
+						<span><span style="color: var(--text-muted);">CPU</span> {systemInfo.cpu.cores}c</span>
+					</span>
 				{/if}
 				{#if systemInfo.python}
 					<span class="flex-shrink-0" style="color: var(--border);">|</span>
@@ -173,3 +221,22 @@
 		{/if}
 	</div>
 </header>
+
+<style>
+	.status-meter {
+		width: 10px;
+		height: 10px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: 0 0 auto;
+		border-radius: 999px;
+	}
+
+	.status-meter > span {
+		width: 5px;
+		height: 5px;
+		border-radius: 999px;
+		background: var(--bg-surface);
+	}
+</style>

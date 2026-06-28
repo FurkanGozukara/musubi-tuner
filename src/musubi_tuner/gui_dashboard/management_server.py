@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system, tools
+from musubi_tuner.gui_dashboard.routers import cache_status, datasets, filesystem, processes, projects, stats, system, tools
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
     app.include_router(datasets.router)
     app.include_router(processes.router)
     app.include_router(filesystem.router)
+    app.include_router(cache_status.router)
     app.include_router(system.router)
     app.include_router(stats.router)
     app.include_router(tools.router)
