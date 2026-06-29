@@ -295,6 +295,36 @@ def validate_connector_lora_cache_features(conditions: Optional[Dict[str, Any]],
         )
 
 
+def should_pass_connector_audio_features(ltx_mode: str) -> bool:
+    """Return whether connector LoRA should forward cached audio pre-connector features."""
+    return str(ltx_mode or "video").lower() in {"av", "audio"}
+
+
+def prepare_connector_lora_transformer_options(
+    transformer_options: Optional[Dict[str, Any]],
+    conditions: Optional[Dict[str, Any]],
+    *,
+    ltx_mode: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    text_mask: torch.Tensor,
+) -> Dict[str, Any]:
+    """Build transformer options for connector LoRA from cached pre-connector features."""
+    validate_connector_lora_cache_features(conditions, ltx_mode=ltx_mode)
+    assert conditions is not None
+
+    resolved_transformer_options = dict(transformer_options or {})
+    video_features = conditions["video_features"]
+    resolved_transformer_options["video_features"] = video_features.to(device=device, dtype=dtype)
+
+    audio_features = conditions.get("audio_features")
+    if should_pass_connector_audio_features(ltx_mode) and isinstance(audio_features, torch.Tensor):
+        resolved_transformer_options["audio_features"] = audio_features.to(device=device, dtype=dtype)
+
+    resolved_transformer_options["features_attention_mask"] = text_mask
+    return resolved_transformer_options
+
+
 _SHORT_VIDEO_WARN_KEYS: set = set()
 _SHORT_VIDEO_WARN_SUPPRESSED: dict = {}
 _VSF_VALIDATION_DONE: dict = {}
@@ -6462,6 +6492,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         video_loss_mask = None
         transformer_options = {"patches_replace": {}}
         if video_conditioning_enabled is not None:
+            # First-frame conditioning is not dataset masked-loss. It keeps latent frame 0 clean
+            # and excludes that clean conditioning frame from denoising loss; the shared loss
+            # reducer still reports this via video_mask_active / mv_act.
             bsz, _c, frames, height, width = latents.shape
             seq_len = frames * height * width
             first_frame_tokens = height * width
@@ -6751,15 +6784,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         # Connector LoRA: pass pre-connector features for on-the-fly connector processing.
         if self._train_connectors:
-            validate_connector_lora_cache_features(conditions, ltx_mode=self._ltx_mode)
-            assert conditions is not None
-            video_features = conditions["video_features"]
-            resolved_transformer_options = dict(resolved_transformer_options)
-            resolved_transformer_options["video_features"] = video_features.to(device=accelerator.device, dtype=network_dtype)
-            audio_features = conditions.get("audio_features")
-            if isinstance(audio_features, torch.Tensor):
-                resolved_transformer_options["audio_features"] = audio_features.to(device=accelerator.device, dtype=network_dtype)
-            resolved_transformer_options["features_attention_mask"] = text_mask
+            resolved_transformer_options = prepare_connector_lora_transformer_options(
+                resolved_transformer_options,
+                conditions,
+                ltx_mode=self._ltx_mode,
+                device=accelerator.device,
+                dtype=network_dtype,
+                text_mask=text_mask,
+            )
 
         forward_args, forward_kwargs = self.prepare_forward_inputs(
             transformer,
