@@ -3149,11 +3149,11 @@ def main() -> None:
     trainer = LTX2NetworkTrainer()
 
     if args.dataset_config is None and getattr(args, "dataset_manifest", None) is None:
-        raise ValueError("dataset_config or dataset_manifest is required / dataset_configまたはdataset_manifestが必要です")
+        raise ValueError("dataset_config or dataset_manifest is required")
     if args.dataset_config is not None and getattr(args, "dataset_manifest", None) is not None:
         logger.info("Both --dataset_config and --dataset_manifest were provided; full fine-tune will use --dataset_manifest.")
     if args.ltx2_checkpoint is None:
-        raise ValueError("path to LTX-2 checkpoint is required / LTX-2チェックポイントのパスが必要です")
+        raise ValueError("path to LTX-2 checkpoint is required")
 
     if getattr(args, "dit", None) is not None and args.dit != args.ltx2_checkpoint:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
@@ -3460,8 +3460,13 @@ def main() -> None:
     if train_dataset_group.num_train_items == 0:
         raise ValueError(
             "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
-            " / データセットに学習データがありません。latent/Text Encoderキャッシュを事前に作成したか確認してください"
         )
+    if getattr(args, "debug_dataset", False):
+        logger.info(
+            "--debug_dataset set: dataset/bucket validation completed for %d training items; exiting before model setup.",
+            int(train_dataset_group.num_train_items),
+        )
+        return
     if bool(getattr(args, "motion_preservation", False)):
         requested_anchor_size = int(getattr(args, "motion_preservation_anchor_cache_size", 0) or 0)
         resolved_anchor_size = _resolve_motion_anchor_cache_size(
@@ -5932,18 +5937,18 @@ def main() -> None:
     if should_sample_images(args, global_step, epoch=0):
         run_sampling_safely(0, global_step)
 
-    accelerator.print("running training / 学習開始")
-    accelerator.print(f"  num examples / サンプル数: {num_train_items}")
-    accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
-    accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+    accelerator.print("running training")
+    accelerator.print(f"  num examples: {num_train_items}")
+    accelerator.print(f"  num batches per epoch: {len(train_dataloader)}")
+    accelerator.print(f"  num epochs: {num_train_epochs}")
     # Note: batch_size is hardcoded to 1 in DataLoader (line 337)
     args.train_batch_size = 1
-    accelerator.print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
+    accelerator.print(f"  batch size per device: {args.train_batch_size}")
     accelerator.print(
-        f"  total train batch size (with parallel & accumulation) / 総バッチサイズ: {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
+        f"  total train batch size (with parallel & accumulation): {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
     )
-    accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
-    accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+    accelerator.print(f"  gradient accumulation steps: {args.gradient_accumulation_steps}")
+    accelerator.print(f"  total optimization steps: {args.max_train_steps}")
     if initial_global_step > 0:
         msg = f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}"
         if steps_to_skip_in_epoch > 0:

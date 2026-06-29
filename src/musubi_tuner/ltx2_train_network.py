@@ -1184,6 +1184,62 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_temporal_weighting_config = None
         self._latent_delta_loss_config = None
 
+    def train(self, args: argparse.Namespace):
+        if getattr(args, "debug_dataset", False):
+            self._debug_dataset_and_exit(args)
+            return
+        return super().train(args)
+
+    def _debug_dataset_and_exit(self, args: argparse.Namespace) -> None:
+        from multiprocessing import Value
+
+        from musubi_tuner.dataset import config_utils
+        from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+
+        self.handle_model_specific_args(args)
+        current_epoch = Value("i", 0)
+        if getattr(args, "dataset_manifest", None) is not None:
+            logger.info("Load dataset manifest from %s", args.dataset_manifest)
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != self.architecture:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{self.architecture}', got '{manifest_architecture}'"
+                )
+            train_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="train",
+                training=True,
+                num_timestep_buckets=getattr(args, "num_timestep_buckets", None),
+                shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
+                spatial_crop_enabled=is_spatial_crop_enabled(args),
+            )
+            if train_dataset_group is None:
+                raise ValueError("dataset manifest contains no training datasets")
+        else:
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+            logger.info("Load dataset config from %s", args.dataset_config)
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
+            train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                blueprint.dataset_group,
+                training=True,
+                num_timestep_buckets=getattr(args, "num_timestep_buckets", None),
+                shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
+                spatial_crop_enabled=is_spatial_crop_enabled(args),
+            )
+
+        if train_dataset_group.num_train_items == 0:
+            raise ValueError(
+                "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
+            )
+        logger.info(
+            "--debug_dataset set: dataset/bucket validation completed for %d training items; exiting before model setup.",
+            int(train_dataset_group.num_train_items),
+        )
+
     def is_model_parallel_enabled(self, args) -> bool:
         return is_ltx2_model_parallel_enabled(args) or is_ltx2_remote_stage_enabled(args)
 
@@ -3349,12 +3405,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError("--awq_calibration requires --nf4_base")
 
         if getattr(args, "fp8_scaled", False):
-            assert getattr(args, "fp8_base", False), "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
+            assert getattr(args, "fp8_base", False), "fp8_scaled requires fp8_base"
 
         if getattr(args, "fp8_scaled", False) and self.dit_dtype is not None and self.dit_dtype.itemsize == 1:
-            raise ValueError(
-                "DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights / DiTの重みはすでにfp8形式です。fp8にスケーリングできません。fp16/bf16の重みを使用してください"
-            )
+            raise ValueError("DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights")
 
         if getattr(args, "fp8_w8a8", False):
             if not getattr(args, "fp8_scaled", False):

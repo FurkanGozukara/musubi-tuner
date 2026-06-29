@@ -125,6 +125,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action="store_true",
         help="Load physically audio-only LTX-2 transformer (omit video modules). Requires --ltx2_mode audio.",
     )
+    parser.add_argument(
+        "--debug_dataset",
+        action="store_true",
+        help=(
+            "Build and validate the dataset/buckets, print dataset summary, then exit before model/training setup. "
+            "This is a CLI-only debug flag, not a dataset TOML key."
+        ),
+    )
     add_ltx2_model_parallel_args(parser)
     add_ltx2_remote_stage_args(parser)
     add_ltx2_intrinsic_cond_args(parser)
@@ -833,7 +841,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--fp8_scaled",
         action="store_true",
-        help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+        help="use scaled fp8 for DiT",
     )
     parser.add_argument(
         "--fp8_keep_blocks",
