@@ -109,6 +109,11 @@
 	let modelStatus = $derived($modelDownloadState.message || '');
 	let modelStatusTone = $derived($modelDownloadState.tone || 'muted');
 	let hasActiveDownload = $derived(Boolean($modelDownloadState.jobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+	let selectedOptimizerAlias = $derived(optimizerAlias(t.optimizer_type));
+	let isQgaloreSelected = $derived(selectedOptimizerAlias.includes('qgalore'));
+	let isApolloSelected = $derived(selectedOptimizerAlias.includes('apollo'));
+	let isQapolloSelected = $derived(selectedOptimizerAlias.includes('qapollo'));
+	let showQgalorePanel = $derived(isQgaloreSelected || isQapolloSelected);
 
 	function update(key, value) {
 		updateSection(section, key, value);
@@ -463,8 +468,7 @@
 		</div>
 	{/if}
 
-	<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-		<div class="space-y-3">
+	<div class="fine-tune-panels">
 		<FormGroup title="Model">
 			<div class="space-y-2 pt-2">
 				<CheckpointInput fieldPath="full_finetune.ltx2_checkpoint" label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(value) => update('ltx2_checkpoint', value)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('full_finetune.ltx2_checkpoint')} error={fieldError('full_finetune.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
@@ -647,6 +651,7 @@
 			</div>
 		</FormGroup>
 
+		{#if showQgalorePanel}
 		<FormGroup title="Q-GaLore">
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
@@ -683,6 +688,7 @@
 				</div>
 			</div>
 		</FormGroup>
+		{/if}
 
 		<FormGroup title="FP8 GEMM (full-FT, sm_89+)">
 			<div class="space-y-2 pt-2">
@@ -713,6 +719,7 @@
 			</div>
 		</FormGroup>
 
+		{#if isApolloSelected}
 		<FormGroup title="APOLLO">
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-2">
@@ -724,14 +731,14 @@
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.apollo_proj" value={t.apollo_proj || 'random'} options={['random', 'svd']} onchange={(e) => update('apollo_proj', e.target.value)} />
 					<FormSelect fieldPath="full_finetune.apollo_proj_type" value={t.apollo_proj_type || 'std'} options={['std', 'reverse_std', 'left', 'right']} onchange={(e) => update('apollo_proj_type', e.target.value)} />
-					<FormSelect label="QAPOLLO State Bits" fieldPath="full_finetune.qapollo_optim_bits" value={String(t.qapollo_optim_bits ?? 8)} options={['8', '32']} onchange={(e) => update('qapollo_optim_bits', Number(e.target.value))} tooltip="bitsandbytes optimizer-state width for QAPOLLOAdamW. 8 is the low-VRAM default; 32 is a diagnostic/stability fallback." />
+					{#if isQapolloSelected}
+						<FormSelect label="QAPOLLO State Bits" fieldPath="full_finetune.qapollo_optim_bits" value={String(t.qapollo_optim_bits ?? 8)} options={['8', '32']} onchange={(e) => update('qapollo_optim_bits', Number(e.target.value))} tooltip="bitsandbytes optimizer-state width for QAPOLLOAdamW. 8 is the low-VRAM default; 32 is a diagnostic/stability fallback." />
+					{/if}
 				</div>
 			</div>
 		</FormGroup>
+		{/if}
 
-		</div>
-
-		<div class="space-y-3">
 		<FormGroup title="Scope">
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-2">
@@ -854,10 +861,30 @@
 				<FormField fieldPath="full_finetune.extra_args" value={t.extra_args || ''} oninput={(e) => update('extra_args', e.target.value)} placeholder="--flag value --other_flag" />
 			</div>
 		</FormGroup>
-		</div>
 	</div>
 
 	<ProcessControls processType={processType} {status} onStart={startFullFinetune} onStop={() => stopProcess(processType)} />
 	<CommandPanel processType={processType} defaultFilename="fine_tuning.bat" />
 </div>
 {/if}
+
+<style>
+	.fine-tune-panels {
+		column-count: 1;
+		column-gap: 1rem;
+	}
+
+	@media (min-width: 1280px) {
+		.fine-tune-panels {
+			column-count: 2;
+		}
+	}
+
+	.fine-tune-panels > :global(*) {
+		break-inside: avoid;
+		display: inline-block;
+		width: 100%;
+		margin-bottom: 0.75rem;
+		vertical-align: top;
+	}
+</style>

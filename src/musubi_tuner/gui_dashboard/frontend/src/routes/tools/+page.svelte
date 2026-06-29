@@ -11,11 +11,7 @@
 		<p>No project loaded. Go to <a href="/" style="color: var(--accent);">Project</a> to create or load one.</p>
 	</div>
 {:else}
-	<div class="space-y-4 max-w-4xl">
-		<div>
-			<h1 class="text-[18px] font-semibold" style="color: var(--text-primary);">Tools</h1>
-		</div>
-
+	<div class="space-y-4">
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
 			<ProjectConfigPanel />
 			<LoRAExtractionPanel />
