@@ -356,6 +356,8 @@ loss_mask_directory = "video_masks"
 
 When a loss mask is configured, the training loop logs the mask-active fraction in the progress bar (`mv_act` / `ma_act`) and emits `loss/video_mask_active`, `loss/video_loss_unmasked`, `loss/video_loss_masked` (and audio equivalents) to TensorBoard / WandB. The pre- vs post-mask loss values show whether the mask is shifting the gradient.
 
+The same video mask metrics can also appear without dataset mask files when an intrinsic conditioner excludes clean conditioning tokens from denoising loss. The common default case is first-frame conditioning: `--ltx2_first_frame_conditioning_p` defaults to `0.1`, and when it fires on a multi-frame video, latent frame 0 is kept clean and excluded from loss. This is expected and does not mean dataset masked-loss training is enabled. Set `--ltx2_first_frame_conditioning_p 0.0` only if you want pure T2V with no first-frame conditioning.
+
 ### Example TOML
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -1131,6 +1133,7 @@ reference_cache_directory/                  # IC-LoRA only
 
 | Error | Cause | Solution |
 |-------|-------|----------|
+| `mv_act` / `loss/video_mask_active` appears even though no `loss_mask_directory` is configured | Usually first-frame conditioning, not dataset masked loss. `--ltx2_first_frame_conditioning_p` defaults to `0.1`; when it fires, frame 0 is clean conditioning and is excluded from loss. | No fix needed if you want the default occasional I2V conditioning. For pure T2V and no first-frame-related mask metrics, pass `--ltx2_first_frame_conditioning_p 0.0`. |
 | Missing cache keys during training | Caching incomplete | Run both `ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py` |
 | FlashAttention varlen mask-length mismatch (for example `expects mask length 1920, got 1024`) after checkpoint switch | Stale text cache from a different checkpoint/version/mode | Re-run `ltx2_cache_text_encoder_outputs.py` with the same `--ltx2_checkpoint` and `--ltx2_mode` as training. Remove old `*_ltx2_te.safetensors` if needed. |
 | Samples become progressively noisier/degraded when training with `--flash_attn` | FlashAttention install/runtime mismatch (CUDA/PyTorch/flash-attn build) | Switch to `--sdpa` to confirm baseline stability. If SDPA is stable, reinstall FlashAttention for your exact CUDA + PyTorch versions and retry. |

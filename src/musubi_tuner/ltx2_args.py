@@ -743,7 +743,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_first_frame_conditioning_p",
         type=float,
         default=0.1,
-        help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
+        help=(
+            "Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0). "
+            "When active, frame 0 is excluded from video loss and may show up in mv_act/video_mask_active logs."
+        ),
     )
     # ---- Endpoint-keyframe training (orthogonal to --ic_lora_strategy) -----
     parser.add_argument(
