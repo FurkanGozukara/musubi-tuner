@@ -4,6 +4,7 @@
 	import { processStatuses, processValidation } from '$lib/stores/processes.js';
 	import { theme, setTheme, THEMES } from '$lib/stores/theme.js';
 	import { uiMode, setUiMode } from '$lib/stores/uiMode.js';
+	import { getConditioningIssues } from '$lib/utils/conditioningStatus.js';
 
 	let showThemePicker = $state(false);
 
@@ -26,6 +27,7 @@
 
 	let currentTheme = $derived(THEMES.find((t) => t.id === $theme) || THEMES[0]);
 	let remoteStageEnabled = $derived(Boolean($projectConfig?.training?.ltx2_remote_stage));
+	let conditioningIssues = $derived(getConditioningIssues($projectConfig));
 
 	// Dashboard dimming: dim when training is not active
 	let trainingActive = $derived.by(() => {
@@ -146,10 +148,12 @@
 						{@const statusTypes = visibleProcessTypes(item.statusTypes || item.processTypes)}
 						{@const dot = statusDot(statusTypes)}
 						{@const validation = validationInfo(processTypes)}
+						{@const condIssues = item.href === '/training/conditioning' ? conditioningIssues : { errors: [], warnings: [], all: [] }}
+						{@const condIssueCount = condIssues.errors.length || condIssues.warnings.length}
 						{@const isDimmed = item.dimWhenIdle && !trainingActive && !isActive}
 						<a
 							href={item.href}
-							title={validation.count > 0 ? validation.title : undefined}
+							title={condIssueCount > 0 ? condIssues.all.map((issue) => issue.msg).join('\n') : validation.count > 0 ? validation.title : undefined}
 							class="flex items-center gap-2 px-3 py-[7px] text-[12px] font-medium"
 							style="
 								border-radius: var(--radius-sm);
@@ -171,6 +175,14 @@
 									class="text-[10px] font-bold tabular-nums flex-shrink-0 inline-flex items-center justify-center"
 									style="background: var(--danger); color: var(--bg-base); border-radius: 4px; height: 16px; min-width: 16px; padding: 0 4px;"
 								>{validation.count}</span>
+							{/if}
+							{#if condIssueCount > 0}
+								<span
+									class="app-status-badge flex-shrink-0"
+									class:app-status-badge-danger={condIssues.errors.length > 0}
+									class:app-status-badge-warning={condIssues.errors.length === 0}
+									style="width: 16px; height: 16px; font-size: 10px; border-radius: 4px;"
+								></span>
 							{/if}
 							{#if dot}
 								<span class="w-[6px] h-[6px] rounded-full flex-shrink-0" style="{dotStyle(dot)}"></span>

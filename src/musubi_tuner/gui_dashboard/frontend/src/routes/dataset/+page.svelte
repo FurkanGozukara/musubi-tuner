@@ -9,6 +9,7 @@
 	let showToml = $state(false);
 	let saving = $state(false);
 	let validationTimer = null;
+	let lastRemovedDataset = $state(null);
 
 	function addDataset(isValidation = false) {
 		projectConfig.update((c) => {
@@ -70,6 +71,15 @@
 	}
 
 	function removeDataset(index, isValidation = false) {
+		const source = isValidation ? validationDatasets : datasets;
+		const removed = source[index];
+		if (!removed) return;
+		lastRemovedDataset = {
+			entry: JSON.parse(JSON.stringify(removed)),
+			index,
+			isValidation,
+			label: isValidation ? `Validation dataset #${index + 1}` : `Dataset #${index + 1}`
+		};
 		projectConfig.update((c) => {
 			if (!c) return c;
 			const ds = { ...(c.dataset || {}) };
@@ -80,6 +90,22 @@
 			}
 			return { ...c, dataset: ds };
 		});
+		saveProjectDebounced();
+	}
+
+	function undoRemoveDataset() {
+		const removed = lastRemovedDataset;
+		if (!removed) return;
+		projectConfig.update((c) => {
+			if (!c) return c;
+			const ds = { ...(c.dataset || {}) };
+			const key = removed.isValidation ? 'validation_datasets' : 'datasets';
+			const items = [...(ds[key] || [])];
+			items.splice(Math.min(removed.index, items.length), 0, removed.entry);
+			ds[key] = items;
+			return { ...c, dataset: ds };
+		});
+		lastRemovedDataset = null;
 		saveProjectDebounced();
 	}
 
@@ -170,12 +196,21 @@
 {:else}
 	<div class="space-y-5">
 		{#if datasetValidationIssues.length}
-			<div class="p-3 space-y-1" style="background: {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+			<div class="space-y-1.5">
 				{#each datasetValidationIssues as issue}
-					<div class="text-[12px]" style="color: {issue.severity === 'error' ? 'var(--danger)' : 'var(--text-secondary)'};">
-						{issue.message}
+					<div class="app-alert" class:app-alert-danger={issue.severity === 'error'} class:app-alert-warning={issue.severity !== 'error'}>
+						<span class="app-alert-icon"></span>
+						<div class="app-alert-body">
+							{issue.message}
+						</div>
 					</div>
 				{/each}
+			</div>
+		{/if}
+		{#if lastRemovedDataset}
+			<div class="removed-dataset-notice">
+				<span>{lastRemovedDataset.label} removed.</span>
+				<button type="button" onclick={undoRemoveDataset}>Undo</button>
 			</div>
 		{/if}
 
@@ -194,7 +229,7 @@
 					{/if}
 				</div>
 			</div>
-			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
+			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
 				{#each datasets as entry, i}
 					<DatasetEntry
 						{entry}
@@ -208,7 +243,7 @@
 				<button
 					type="button"
 					onclick={() => addDataset(false)}
-					class="flex flex-col items-center justify-center gap-2 py-8 text-[13px] font-semibold"
+					class="flex flex-col items-center justify-center self-start gap-2 py-8 text-[13px] font-semibold"
 					style="min-height: 116px; color: var(--accent); background: var(--accent-subtle-bg); border: 2px dashed var(--accent-muted); border-radius: var(--radius-md);"
 					onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.filter = 'brightness(1.05)'; }}
 					onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--accent-muted)'; e.currentTarget.style.filter = 'none'; }}
@@ -224,11 +259,12 @@
 			<div class="flex items-center justify-between mb-2">
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Validation</span>
 			</div>
-			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
+			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
 				{#each validationDatasets as entry, i}
 					<DatasetEntry
 						{entry}
 						index={i}
+						title={`Validation dataset #${i + 1}`}
 						advanced={$advancedMode}
 						onRemove={() => removeDataset(i, true)}
 						onchange={(nextEntry) => updateDataset(i, nextEntry, true)}
@@ -237,7 +273,7 @@
 				<button
 					type="button"
 					onclick={() => addDataset(true)}
-					class="flex flex-col items-center justify-center gap-2 py-6 text-[12px] font-semibold"
+					class="flex flex-col items-center justify-center self-start gap-2 py-6 text-[12px] font-semibold"
 					style="min-height: 96px; color: var(--accent); background: var(--accent-subtle-bg); border: 2px dashed var(--accent-muted); border-radius: var(--radius-md);"
 					onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.filter = 'brightness(1.05)'; }}
 					onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--accent-muted)'; e.currentTarget.style.filter = 'none'; }}
@@ -270,3 +306,28 @@
 		{/if}
 	</div>
 {/if}
+
+<style>
+	.removed-dataset-notice {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		padding: 0.6rem 0.75rem;
+		background: var(--bg-elevated);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		color: var(--text-secondary);
+		font-size: 12px;
+	}
+	.removed-dataset-notice button {
+		flex-shrink: 0;
+		padding: 0.25rem 0.65rem;
+		background: var(--accent-muted);
+		border: 1px solid var(--accent);
+		border-radius: var(--radius-sm);
+		color: var(--accent);
+		font-size: 11px;
+		font-weight: 700;
+	}
+</style>

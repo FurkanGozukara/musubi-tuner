@@ -135,7 +135,7 @@
 		>...</button>
 	</div>
 	{#if error}
-		<div class="mt-1 text-[11px]" style="color: var(--danger);">{error}</div>
+		<div class="app-field-error">{error}</div>
 	{/if}
 </label>
 

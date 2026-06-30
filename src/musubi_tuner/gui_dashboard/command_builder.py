@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import shlex
 import sys
 import tempfile
@@ -25,6 +26,24 @@ from musubi_tuner.gui_dashboard.toml_export import (
     export_conditioning_toml,
     export_dataset_toml,
 )
+
+
+def _conditioning_recipe_for_mode(recipe, mode: str):
+    """Return a launch-effective recipe without mutating the stored GUI recipe.
+
+    The GUI keeps hidden modality settings so switching modes is reversible. The launcher must still
+    ignore blocks that the current mode cannot apply.
+    """
+    if recipe is None:
+        return None
+    effective = copy.deepcopy(recipe)
+    if mode == "video":
+        effective.audio.is_generated = True
+        effective.audio.conditions = []
+    elif mode == "audio":
+        effective.video.is_generated = True
+        effective.video.conditions = []
+    return effective
 
 
 def _find_script(name: str) -> str:
@@ -857,7 +876,9 @@ def _append_ltx2_conditioning(cmd: list[str], t, config, recipe_filename: str = 
     # The structured recipe is built once on the (training-scoped) Conditioning tab and applies to both
     # LoRA and full fine-tune, so always source it from config.training rather than the section `t`
     # (full_finetune inherits the field but the GUI never writes it there).
-    builder_recipe = getattr(config.training, "conditioning_recipe", None)
+    builder_recipe = _conditioning_recipe_for_mode(
+        getattr(config.training, "conditioning_recipe", None), str(getattr(t, "ltx2_mode", "video") or "video")
+    )
     if conditioning_recipe_is_active(builder_recipe):
         recipe_path = export_conditioning_toml(config, builder_recipe, recipe_filename)
         cmd += ["--ltx2_conditioning_config", str(recipe_path)]
@@ -941,11 +962,19 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # Active when an explicit recipe path is set OR the structured GUI builder is active (both lower to
     # --ltx2_conditioning_config in _append_ltx2_conditioning); truthy string for the `if not` gates.
     _cond_recipe = str(getattr(t, "ltx2_conditioning_config", "") or "").strip() or (
-        "builder" if conditioning_recipe_is_active(getattr(config.training, "conditioning_recipe", None)) else ""
+        "builder"
+        if conditioning_recipe_is_active(
+            _conditioning_recipe_for_mode(
+                getattr(config.training, "conditioning_recipe", None), str(getattr(t, "ltx2_mode", "video") or "video")
+            )
+        )
+        else ""
     )
     # Only a REFERENCE recipe derives the LoRA target preset (from its IC-LoRA strategy); an intrinsic-only
     # or directional recipe does not, so the user's --lora_target_preset must still apply for those.
-    _builder_recipe = getattr(config.training, "conditioning_recipe", None)
+    _builder_recipe = _conditioning_recipe_for_mode(
+        getattr(config.training, "conditioning_recipe", None), str(getattr(t, "ltx2_mode", "video") or "video")
+    )
     if conditioning_recipe_is_active(_builder_recipe):
         _recipe_derives_preset = any(c.type == "reference" for c in _builder_recipe.video.conditions) or any(
             c.type == "reference" for c in _builder_recipe.audio.conditions
@@ -1035,13 +1064,27 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if t.w8a8_mode != "int8":
             cmd += ["--w8a8_mode", t.w8a8_mode]
     if getattr(t, "w8a8_backend", None) and (
-        (t.fp8_w8a8 and t.w8a8_mode == "int8") or getattr(t, "int8_base", False) or getattr(t, "int8_base_dynamic", False)
+        (t.fp8_w8a8 and t.w8a8_mode == "int8")
+        or getattr(t, "int8_base", False)
+        or getattr(t, "int8_base_dynamic", False)
+        or getattr(t, "int8_convrot_base", False)
+        or getattr(t, "int8_convrot_dynamic", False)
     ):
         cmd += ["--w8a8_backend", t.w8a8_backend]
     if getattr(t, "int8_base", False):
         cmd.append("--int8_base")
     if getattr(t, "int8_base_dynamic", False):
         cmd.append("--int8_base_dynamic")
+    if getattr(t, "int8_convrot_base", False):
+        cmd.append("--int8_convrot_base")
+    if getattr(t, "int8_convrot_dynamic", False):
+        cmd.append("--int8_convrot_dynamic")
+    if getattr(t, "int8_convrot_groupsize", "auto") not in (None, "", "auto"):
+        cmd += ["--int8_convrot_groupsize", str(t.int8_convrot_groupsize)]
+    if getattr(t, "int8_convrot_no_mse_clip", False):
+        cmd.append("--int8_convrot_no_mse_clip")
+    if getattr(t, "int8_convrot_quality_report", ""):
+        cmd += ["--int8_convrot_quality_report", str(t.int8_convrot_quality_report)]
     if getattr(t, "int8_fused_quant", False):
         cmd.append("--int8_fused_quant")
     if t.awq_calibration:

@@ -590,6 +590,109 @@ input:focus, select:focus, textarea:focus {
 	box-shadow: 0 0 0 2px var(--accent-muted), var(--glow-accent);
 }
 
+/* Compact app alerts */
+.app-alert {
+	display: flex;
+	align-items: flex-start;
+	gap: 0.5rem;
+	padding: 0.45rem 0.6rem;
+	background: color-mix(in srgb, var(--bg-elevated) 58%, transparent);
+	border: 1px solid color-mix(in srgb, var(--border-subtle) 82%, transparent);
+	border-left: 2px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--text-secondary);
+	font-size: 11.5px;
+	line-height: 1.35;
+}
+
+.app-alert-icon {
+	width: 7px;
+	min-width: 7px;
+	height: 7px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	margin-top: 0.28rem;
+	background: var(--text-muted);
+	border-radius: var(--radius-full);
+}
+
+.app-alert-danger {
+	border-color: color-mix(in srgb, var(--danger) 18%, var(--border-subtle));
+	border-left-color: var(--danger);
+	background: color-mix(in srgb, var(--danger-muted) 28%, var(--bg-elevated));
+}
+
+.app-alert-warning {
+	border-color: color-mix(in srgb, var(--warning) 17%, var(--border-subtle));
+	border-left-color: var(--warning);
+	background: color-mix(in srgb, var(--warning-muted) 24%, var(--bg-elevated));
+}
+
+.app-alert-danger .app-alert-icon {
+	background: var(--danger);
+}
+
+.app-alert-warning .app-alert-icon {
+	background: var(--warning);
+}
+
+.app-alert-title {
+	color: var(--text-primary);
+	font-weight: 700;
+}
+
+.app-alert-body {
+	color: var(--text-secondary);
+}
+
+.app-field-error {
+	margin-top: 0.35rem;
+	padding: 0.25rem 0.45rem;
+	background: color-mix(in srgb, var(--danger-muted) 28%, transparent);
+	border-left: 2px solid var(--danger);
+	border-radius: var(--radius-sm);
+	color: color-mix(in srgb, var(--danger) 72%, var(--text-secondary));
+	font-size: 11px;
+	line-height: 1.3;
+}
+
+.app-status-badge {
+	width: 0.9rem;
+	height: 0.9rem;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--radius-full);
+	background: transparent;
+	border: 0;
+	line-height: 0;
+}
+
+.app-status-badge::before {
+	content: "";
+	width: 7px;
+	height: 7px;
+	border-radius: var(--radius-full);
+	background: var(--text-muted);
+}
+
+.app-status-badge-danger {
+	background: transparent;
+}
+
+.app-status-badge-danger::before {
+	background: var(--danger);
+}
+
+.app-status-badge-warning {
+	background: transparent;
+}
+
+.app-status-badge-warning::before {
+	background: var(--warning);
+}
+
 /* Transitions */
 button, a { transition: all 0.12s ease; }
 

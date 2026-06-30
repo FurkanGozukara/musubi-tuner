@@ -239,6 +239,11 @@ class TrainingConfig(BaseModel):
     w8a8_backend: Optional[Literal["torch", "triton", "cutlass"]] = None
     int8_base: bool = False
     int8_base_dynamic: bool = False
+    int8_convrot_base: bool = False
+    int8_convrot_dynamic: bool = False
+    int8_convrot_groupsize: str = "auto"
+    int8_convrot_no_mse_clip: bool = False
+    int8_convrot_quality_report: str = ""
     int8_fused_quant: bool = False
     awq_calibration: bool = False
     awq_alpha: float = 0.25

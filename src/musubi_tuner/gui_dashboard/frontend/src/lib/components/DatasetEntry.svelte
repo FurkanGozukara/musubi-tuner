@@ -4,7 +4,7 @@
 	import FormToggle from './FormToggle.svelte';
 	import PathInput from './PathInput.svelte';
 
-	let { entry = {}, index = 0, onRemove, onchange, advanced = false, sourceError = '' } = $props();
+	let { entry = {}, index = 0, title = '', onRemove, onchange, advanced = false, sourceError = '' } = $props();
 
 	function emit(nextEntry) {
 		if (onchange) {
@@ -67,7 +67,7 @@
 
 <div class="overflow-hidden" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);">
 	<div class="flex items-center justify-between px-4 py-2.5" style="border-bottom: 1px solid var(--border-subtle);">
-		<span class="text-[13px] font-semibold" style="color: var(--text-primary);">Dataset #{index + 1}</span>
+		<span class="text-[13px] font-semibold" style="color: var(--text-primary);">{title || `Dataset #${index + 1}`}</span>
 		<button
 			onclick={onRemove}
 			class="px-2.5 py-1 text-[11px] font-medium"

@@ -404,13 +404,19 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
-    if getattr(t, "int8_base", False) and getattr(t, "int8_base_dynamic", False):
-        message = "int8 Base and int8 Base (dynamic) are mutually exclusive."
-        errors.append(_make_issue("error", "training.int8_base", message, label="int8 Base", page="training"))
-        errors.append(_make_issue("error", "training.int8_base_dynamic", message, label="int8 Base (dynamic)", page="training"))
-    if getattr(t, "int8_base", False) or getattr(t, "int8_base_dynamic", False):
-        _int8_field = "training.int8_base" if t.int8_base else "training.int8_base_dynamic"
-        _int8_label = "int8 Base" if t.int8_base else "int8 Base (dynamic)"
+    _int8_modes = [
+        ("training.int8_base", getattr(t, "int8_base", False), "int8 Base"),
+        ("training.int8_base_dynamic", getattr(t, "int8_base_dynamic", False), "int8 Base (dynamic)"),
+        ("training.int8_convrot_base", getattr(t, "int8_convrot_base", False), "INT8 ConvRot Base"),
+        ("training.int8_convrot_dynamic", getattr(t, "int8_convrot_dynamic", False), "INT8 ConvRot (dynamic)"),
+    ]
+    _enabled_int8_modes = [mode for mode in _int8_modes if mode[1]]
+    if len(_enabled_int8_modes) > 1:
+        message = "Only one int8 base mode can be enabled."
+        for field, _enabled, label in _enabled_int8_modes:
+            errors.append(_make_issue("error", field, message, label=label, page="training"))
+    if len(_enabled_int8_modes) == 1:
+        _int8_field, _enabled, _int8_label = _enabled_int8_modes[0]
         for _conf_field, _conf_val, _conf_label in (
             ("training.fp8_base", t.fp8_base, "FP8 Base"),
             ("training.fp8_scaled", t.fp8_scaled, "FP8 Scaled"),
@@ -1152,6 +1158,54 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "Differential Guidance requires a video/main prediction loss and cannot be used with audio-only training.",
                     label="Differential Guidance",
                     page="techniques",
+                )
+            )
+
+    if t.keyframe_endpoint_training:
+        keyframe_probs = [
+            ("training.keyframe_first_frame_p", "Keyframe First Frame Probability", t.keyframe_first_frame_p),
+            ("training.keyframe_last_frame_p", "Keyframe Last Frame Probability", t.keyframe_last_frame_p),
+            ("training.keyframe_random_interior_p", "Keyframe Random Interior Probability", t.keyframe_random_interior_p),
+        ]
+        parsed_keyframe_probs: list[float] = []
+        for field, label, raw_value in keyframe_probs:
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = float("nan")
+            parsed_keyframe_probs.append(value)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        field,
+                        f"{label} must be a finite number in the inclusive range 0.0 to 1.0.",
+                        label=label,
+                        page="conditioning",
+                    )
+                )
+        try:
+            keyframe_max_random_interior = int(t.keyframe_max_random_interior)
+        except (TypeError, ValueError):
+            keyframe_max_random_interior = -1
+        if keyframe_max_random_interior < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.keyframe_max_random_interior",
+                    "Keyframe Max Random Interior must be at least 0.",
+                    label="Keyframe Max Random Interior",
+                    page="conditioning",
+                )
+            )
+        if parsed_keyframe_probs == [0.0, 0.0, 0.0]:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.keyframe_endpoint_training",
+                    "Endpoint Keyframe Training is enabled, but all keyframe probabilities are 0.",
+                    label="Endpoint Keyframe Training",
+                    page="conditioning",
                 )
             )
 

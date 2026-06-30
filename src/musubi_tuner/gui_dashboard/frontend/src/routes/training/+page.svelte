@@ -15,6 +15,7 @@
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
+	import { getModeEffectiveConditioningRecipe, recipeHasActive } from '$lib/utils/conditioningStatus.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -83,30 +84,26 @@
 	];
 
 	let t = $derived($projectConfig?.training || {});
+	let effectiveConditioningRecipe = $derived(getModeEffectiveConditioningRecipe(t));
 	// A conditioning recipe is authoritative + mutually exclusive: when set, the individual
 	// conditioning controls are disabled (and the command builder omits the flags it owns).
 	let recipeActive = $derived(
 		(t.ltx2_conditioning_config || '').trim().length > 0 ||
-		(t.conditioning_recipe?.enabled && (
-			(t.conditioning_recipe.video?.conditions?.length > 0) ||
-			(t.conditioning_recipe.audio?.conditions?.length > 0) ||
-			t.conditioning_recipe.video?.is_generated === false ||
-			t.conditioning_recipe.audio?.is_generated === false
-		))
+		recipeHasActive(effectiveConditioningRecipe)
 	);
 	// Only a REFERENCE recipe derives the LoRA target preset; an intrinsic-only / directional recipe
 	// leaves the user's preset in effect, so the control must stay enabled for those.
 	let recipeDerivesPreset = $derived(
 		(t.ltx2_conditioning_config || '').trim().length > 0 ||
-		(t.conditioning_recipe?.enabled && (
-			(t.conditioning_recipe.video?.conditions || []).some((c) => c.type === 'reference') ||
-			(t.conditioning_recipe.audio?.conditions || []).some((c) => c.type === 'reference')
+		(recipeHasActive(effectiveConditioningRecipe) && (
+			(effectiveConditioningRecipe.video?.conditions || []).some((c) => c.type === 'reference') ||
+			(effectiveConditioningRecipe.audio?.conditions || []).some((c) => c.type === 'reference')
 		))
 	);
 	// Mirror derive_ic_lora_strategy() so a manual override can pre-seed the preset the recipe would
 	// derive. '' = no introspectable inline reference recipe (an external recipe file cannot be read here).
 	let recipeReferencePreset = $derived.by(() => {
-		const r = t.conditioning_recipe;
+		const r = effectiveConditioningRecipe;
 		if (!r?.enabled) return '';
 		const v = r.video || {}, a = r.audio || {};
 		const vConds = v.conditions || [], aConds = a.conditions || [];
@@ -1167,23 +1164,16 @@
 								Launch SSH sessions for the remote stage servers described by the training spec. The launcher stays attached so stop cleanly tears down the remote processes.
 							</p>
 							{#if hasRemoteStageLauncherValidationIssues}
-								<div class="p-3 space-y-2" style="background: {remoteStageLauncherValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {remoteStageLauncherValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
-									<div class="text-[12px] font-medium" style="color: {remoteStageLauncherValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
-										{remoteStageLauncherValidation.summary}
-									</div>
+								<div class="space-y-1.5">
 									{#if remoteStageLauncherValidation.errors?.length}
-										<div class="space-y-1">
-											{#each remoteStageLauncherValidation.errors as issue}
-												<div class="text-[12px]" style="color: var(--text-primary);">{issue.message}</div>
-											{/each}
-										</div>
+										{#each remoteStageLauncherValidation.errors as issue}
+											<div class="app-alert app-alert-danger"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+										{/each}
 									{/if}
 									{#if remoteStageLauncherValidation.warnings?.length}
-										<div class="space-y-1">
-											{#each remoteStageLauncherValidation.warnings as issue}
-												<div class="text-[12px]" style="color: var(--text-secondary);">{issue.message}</div>
-											{/each}
-										</div>
+										{#each remoteStageLauncherValidation.warnings as issue}
+											<div class="app-alert app-alert-warning"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+										{/each}
 									{/if}
 								</div>
 							{/if}
@@ -1215,23 +1205,16 @@
 						Launch this machine as a stage server. The coordinator connects to this process over TCP and owns the training loop.
 					</p>
 					{#if hasRemoteStageServerValidationIssues}
-						<div class="p-3 space-y-2" style="background: {remoteStageServerValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {remoteStageServerValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
-							<div class="text-[12px] font-medium" style="color: {remoteStageServerValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
-								{remoteStageServerValidation.summary}
-							</div>
+						<div class="space-y-1.5">
 							{#if remoteStageServerValidation.errors?.length}
-								<div class="space-y-1">
-									{#each remoteStageServerValidation.errors as issue}
-										<div class="text-[12px]" style="color: var(--text-primary);">{issue.message}</div>
-									{/each}
-								</div>
+								{#each remoteStageServerValidation.errors as issue}
+									<div class="app-alert app-alert-danger"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+								{/each}
 							{/if}
 							{#if remoteStageServerValidation.warnings?.length}
-								<div class="space-y-1">
-									{#each remoteStageServerValidation.warnings as issue}
-										<div class="text-[12px]" style="color: var(--text-secondary);">{issue.message}</div>
-									{/each}
-								</div>
+								{#each remoteStageServerValidation.warnings as issue}
+									<div class="app-alert app-alert-warning"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+								{/each}
 							{/if}
 						</div>
 					{/if}
@@ -1303,9 +1286,9 @@
 
 		<!-- Controls -->
 		{#if hasValidationIssues}
-			<div class="p-3 space-y-2" style="background: {trainingValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {trainingValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+			<div class="space-y-1.5">
 				<div class="flex items-center justify-between gap-3">
-					<div class="text-[12px] font-medium" style="color: {trainingValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
+					<div class="text-[12px] font-medium" style="color: var(--text-secondary);">
 						{trainingValidation.summary}
 					</div>
 					{#if hasDatasetValidationErrors}
@@ -1313,22 +1296,14 @@
 					{/if}
 				</div>
 				{#if trainingValidation.errors?.length}
-					<div class="space-y-1">
-						{#each trainingValidation.errors as issue}
-							<div class="text-[12px]" style="color: var(--text-primary);">
-								{issue.message}
-							</div>
-						{/each}
-					</div>
+					{#each trainingValidation.errors as issue}
+						<div class="app-alert app-alert-danger"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+					{/each}
 				{/if}
 				{#if trainingValidation.warnings?.length}
-					<div class="space-y-1">
-						{#each trainingValidation.warnings as issue}
-							<div class="text-[12px]" style="color: var(--text-secondary);">
-								{issue.message}
-							</div>
-						{/each}
-					</div>
+					{#each trainingValidation.warnings as issue}
+						<div class="app-alert app-alert-warning"><span class="app-alert-icon"></span><span class="app-alert-body">{issue.message}</span></div>
+					{/each}
 				{/if}
 			</div>
 		{/if}

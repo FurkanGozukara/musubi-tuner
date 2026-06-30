@@ -49,6 +49,6 @@
 		style="background: var(--bg-input); border: 1px solid {invalid ? 'var(--danger)' : 'var(--border)'}; color: var(--text-primary); border-radius: var(--radius-sm);"
 	/>
 	{#if error}
-		<div class="mt-1 text-[11px]" style="color: var(--danger);">{error}</div>
+		<div class="app-field-error">{error}</div>
 	{/if}
 </label>

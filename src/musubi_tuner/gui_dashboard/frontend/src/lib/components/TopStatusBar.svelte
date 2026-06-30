@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import { projectConfig, projectLoaded } from '$lib/stores/project.js';
 	import { processStatuses } from '$lib/stores/processes.js';
+	import { getConditioningIssues } from '$lib/utils/conditioningStatus.js';
 	import { estimateLatentCaching, estimateTextCaching, estimateTraining } from '$lib/utils/vramEstimate.js';
 	import { onMount, onDestroy } from 'svelte';
 
@@ -32,6 +33,9 @@
 		'/settings': 'Setup',
 	};
 	let currentPageTitle = $derived(pageTitles[page.url.pathname] || 'Dashboard');
+	let conditioningIssues = $derived(getConditioningIssues($projectConfig));
+	let hasConditioningIssue = $derived(conditioningIssues.errors.length > 0 || conditioningIssues.warnings.length > 0);
+	let conditioningIssueTitle = $derived(conditioningIssues.all.map((issue) => issue.msg).join('\n'));
 	let monitorConfigHref = $derived.by(() => {
 		const training = $processStatuses.training || { state: 'idle' };
 		const full = $processStatuses.full_finetune || { state: 'idle' };
@@ -150,6 +154,16 @@
 		<div class="min-w-[120px] max-w-[220px] px-2.5 py-1.5 text-[12px] font-semibold truncate flex-shrink-0" style="color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
 			{currentPageTitle}
 		</div>
+		{#if hasConditioningIssue}
+			<a
+				href="/training/conditioning"
+				class="app-status-badge flex-shrink-0"
+				class:app-status-badge-danger={conditioningIssues.errors.length > 0}
+				class:app-status-badge-warning={conditioningIssues.errors.length === 0}
+				title={conditioningIssueTitle}
+				aria-label="Conditioning recipe needs attention"
+			></a>
+		{/if}
 		{#if page.url.pathname === '/training/dashboard'}
 			<a href={monitorConfigHref} class="px-2.5 py-1.5 text-[11px] font-medium flex-shrink-0" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); color: var(--text-secondary); border-radius: var(--radius-sm);">Config</a>
 		{/if}

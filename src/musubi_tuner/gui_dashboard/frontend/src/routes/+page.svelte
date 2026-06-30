@@ -19,7 +19,7 @@
 	let projectDirCheckPending = $state(false);
 	let systemInfo = $state(null);
 	let cwd = $state('');
-	let selectedLoraFamily = $state('video');
+	let selectedLoraFamily = $state('t2v');
 	let selectedMemoryProfile = $state('regular');
 	let removedRecentProjects = $state([]);
 	let recentProjectSummaries = $state({});
@@ -37,34 +37,79 @@
 	let workflowStatsTimer = null;
 
 	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
-	const TEMPLATE_VARIANTS_DISABLED = true;
+	const TEMPLATE_VARIANTS_DISABLED = false;
 	const CACHE_THEN_TRAIN_SESSION_KEY = 'musubi.cacheThenTrain.engaged';
 
 	const LORA_FAMILIES = [
 		{
-			id: 'video',
-			label: 'Video',
-			blurb: 'Standard visual LoRA setup for image and video datasets.'
+			id: 't2v',
+			label: 'T2V',
+			blurb: 'Flexible T2V: generate video and audio from text with no extra conditions.'
 		},
 		{
-			id: 'av',
-			label: 'Audio-Video',
-			blurb: 'Joint audio and video training defaults for synchronized clips.'
+			id: 'i2v',
+			label: 'I2V',
+			blurb: 'I2V: generate video and audio while using the first video frame as clean conditioning.'
 		},
 		{
-			id: 'audio',
-			label: 'Audio-Only',
-			blurb: 'Audio-only mode with audio-target defaults already selected.'
+			id: 'video_extension',
+			label: 'Video Extension',
+			blurb: 'Generate video and audio while using clean video prefix or suffix frames as temporal context.'
 		},
 		{
-			id: 'ic',
-			label: 'IC-LoRA',
-			blurb: 'Reference-conditioned setup for identity or shared-reference work.'
+			id: 'v2v_ic',
+			label: 'V2V IC-LoRA',
+			blurb: 'Reference video/image conditioning for identity, subject, or style transfer.'
+		},
+		{
+			id: 'video_inpainting',
+			label: 'Video Inpainting',
+			blurb: 'Fill masked video regions; mask > threshold is clean conditioning and excluded from loss.'
+		},
+		{
+			id: 'video_outpainting',
+			label: 'Video Outpainting',
+			blurb: 'Keep a spatial crop clean and train the surrounding video content.'
+		},
+		{
+			id: 'a2v',
+			label: 'A2V',
+			blurb: 'Audio-to-video: freeze audio as clean conditioning and train video.'
+		},
+		{
+			id: 'v2a',
+			label: 'V2A',
+			blurb: 'Video-to-audio: freeze video as clean conditioning and train audio/foley.'
+		},
+		{
+			id: 't2a',
+			label: 'T2A',
+			blurb: 'Text-to-audio baseline with audio-only training defaults.'
+		},
+		{
+			id: 'audio_extension',
+			label: 'Audio Extension',
+			blurb: 'Train audio continuation from clean prefix or suffix context.'
+		},
+		{
+			id: 'audio_inpainting',
+			label: 'Audio Inpainting',
+			blurb: 'Fill masked audio regions; mask > threshold is clean conditioning and excluded from loss.'
+		},
+		{
+			id: 'a2a',
+			label: 'A2A',
+			blurb: 'Reference-audio conditioning for audio identity or timbre transfer.'
+		},
+		{
+			id: 'av2av_ic',
+			label: 'AV2AV IC-LoRA',
+			blurb: 'Joint video and audio reference conditioning.'
 		},
 		{
 			id: 'slider',
 			label: 'Slider',
-			blurb: 'Base project for prompt or reference sliders from the Techniques page.'
+			blurb: 'Create a slider training project while keeping the standard LTX-2 project defaults available.'
 		}
 	];
 
@@ -95,6 +140,28 @@
 	let newProjectDir = $derived(repoRoot && newProjectSlug ? `${repoRoot}/projects/${newProjectSlug}` : '');
 
 	let projectDirCheckSeq = 0;
+
+	function emptyConditioningModality() {
+		return { is_generated: true, conditions: [] };
+	}
+
+	function emptyConditioningRecipe() {
+		return { enabled: false, per_sample_loss: 'auto', video: emptyConditioningModality(), audio: emptyConditioningModality() };
+	}
+
+	function conditioningCondition(type, overrides = {}) {
+		return {
+			type,
+			probability: null,
+			invert: false,
+			threshold: 0.5,
+			prefix: type === 'extend' ? 1 : 0,
+			suffix: 0,
+			prefix_p: null,
+			suffix_p: null,
+			...overrides,
+		};
+	}
 
 	onMount(async () => {
 		try {
@@ -202,6 +269,8 @@
 				sample_sampling_preset: 'defaults',
 				lora_target_preset: 't2v',
 				ic_lora_strategy: 'auto',
+				ltx2_first_frame_conditioning_p: 0,
+				conditioning_recipe: emptyConditioningRecipe(),
 				network_dim: 32,
 				network_alpha: 32,
 				optimizer_type: 'adamw8bit',
@@ -230,21 +299,45 @@
 		};
 
 		let familyConfig = shared;
-		if (loraFamily === 'av') {
+		if (loraFamily === 't2v') {
 			familyConfig = {
 				...shared,
 				caching: { ...shared.caching, ltx2_mode: 'av' },
 				training: { ...shared.training, ltx2_mode: 'av' },
 				inference: { ...shared.inference, ltx2_mode: 'av' },
 			};
-		} else if (loraFamily === 'audio') {
+		} else if (loraFamily === 'i2v') {
 			familyConfig = {
 				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'audio' },
-				training: { ...shared.training, ltx2_mode: 'audio', lora_target_preset: 'audio' },
-				inference: { ...shared.inference, ltx2_mode: 'audio' },
+				caching: { ...shared.caching, ltx2_mode: 'av' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'av',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('first_frame', { probability: 1.0 })] },
+						audio: emptyConditioningModality(),
+					},
+				},
+				inference: { ...shared.inference, sample_include_reference: true },
 			};
-		} else if (loraFamily === 'ic') {
+		} else if (loraFamily === 'video_extension') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'av' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'av',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('extend', { prefix: 8, suffix: 0, probability: 1.0 })] },
+						audio: emptyConditioningModality(),
+					},
+				},
+			};
+		} else if (loraFamily === 'v2v_ic') {
 			familyConfig = {
 				...shared,
 				caching: { ...shared.caching, reference_frames: 1, reference_downscale: 1 },
@@ -252,18 +345,150 @@
 					...shared.training,
 					lora_target_preset: 'v2v',
 					ic_lora_strategy: 'v2v',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('reference', { probability: 1.0 })] },
+						audio: emptyConditioningModality(),
+					},
 				},
 				inference: { ...shared.inference, sample_include_reference: true },
 			};
-		} else if (loraFamily === 'slider') {
+		} else if (loraFamily === 'video_inpainting') {
 			familyConfig = {
 				...shared,
-				slider: {
-					...shared.slider,
-					mode: 'text',
-					output_name: 'ltx2_slider',
-					max_train_steps: 500,
+				training: {
+					...shared.training,
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('inpaint', { probability: 1.0 })] },
+						audio: emptyConditioningModality(),
+					},
 				},
+			};
+		} else if (loraFamily === 'video_outpainting') {
+			familyConfig = {
+				...shared,
+				training: {
+					...shared.training,
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('spatial_crop', { probability: 1.0 })] },
+						audio: emptyConditioningModality(),
+					},
+				},
+			};
+		} else if (loraFamily === 'a2v') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'av' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'av',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: emptyConditioningModality(),
+						audio: { is_generated: false, conditions: [] },
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'av' },
+			};
+		} else if (loraFamily === 'v2a') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'av' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'av',
+					lora_target_preset: 'audio_v2a',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: false, conditions: [] },
+						audio: emptyConditioningModality(),
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'av' },
+			};
+		} else if (loraFamily === 't2a') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'audio' },
+				training: { ...shared.training, ltx2_mode: 'audio', lora_target_preset: 'audio' },
+				inference: { ...shared.inference, ltx2_mode: 'audio' },
+			};
+		} else if (loraFamily === 'audio_extension') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'audio' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'audio',
+					lora_target_preset: 'audio',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: emptyConditioningModality(),
+						audio: { is_generated: true, conditions: [conditioningCondition('extend', { prefix: 8, suffix: 0, probability: 1.0 })] },
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'audio' },
+			};
+		} else if (loraFamily === 'audio_inpainting') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'audio' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'audio',
+					lora_target_preset: 'audio',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: emptyConditioningModality(),
+						audio: { is_generated: true, conditions: [conditioningCondition('inpaint', { probability: 1.0 })] },
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'audio' },
+			};
+		} else if (loraFamily === 'a2a') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'audio' },
+				training: {
+					...shared.training,
+					ltx2_mode: 'audio',
+					lora_target_preset: 'audio',
+					ic_lora_strategy: 'audio_ref_ic',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: emptyConditioningModality(),
+						audio: { is_generated: true, conditions: [conditioningCondition('reference')] },
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'audio' },
+			};
+		} else if (loraFamily === 'av2av_ic') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'av', reference_frames: 1, reference_downscale: 1 },
+				training: {
+					...shared.training,
+					ltx2_mode: 'av',
+					lora_target_preset: 'av_ic',
+					ic_lora_strategy: 'av_ic',
+					conditioning_recipe: {
+						enabled: true,
+						per_sample_loss: 'auto',
+						video: { is_generated: true, conditions: [conditioningCondition('reference', { probability: 1.0 })] },
+						audio: { is_generated: true, conditions: [conditioningCondition('reference')] },
+					},
+				},
+				inference: { ...shared.inference, ltx2_mode: 'av', sample_include_reference: true },
 			};
 		}
 
@@ -1016,10 +1241,10 @@
 
 					<div class="space-y-2">
 						<div class="flex items-center justify-between gap-3">
-							<div class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">LoRA Type</div>
+							<div class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Conditioning Preset</div>
 							<div class="text-[10px]" style="color: var(--text-muted);">{activeLoraFamily.label}</div>
 						</div>
-						<div class="flex flex-wrap gap-2">
+						<div class="title-preset-grid">
 							{#each LORA_FAMILIES as family}
 								<button
 									type="button"
@@ -1027,7 +1252,7 @@
 									onclick={() => {
 										if (!TEMPLATE_VARIANTS_DISABLED) selectedLoraFamily = family.id;
 									}}
-									class="choice-pill"
+									class="title-preset-choice"
 									style="background: {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedLoraFamily === family.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
 								>
 									{family.label}
@@ -1793,6 +2018,38 @@
 		font-weight: 500;
 		border-radius: var(--radius-sm);
 		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.title-preset-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(8.25rem, 1fr));
+		gap: 0.4rem;
+	}
+
+	.title-preset-choice {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 2.25rem;
+		padding: 0.38rem 0.45rem;
+		overflow: hidden;
+		border-radius: var(--radius-sm);
+		font-size: 10.5px;
+		font-weight: 650;
+		line-height: 1.15;
+		text-align: center;
+		text-overflow: ellipsis;
+		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.title-preset-choice:hover {
+		border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+		color: var(--text-primary);
+	}
+
+	.title-preset-choice:disabled {
+		cursor: not-allowed;
+		opacity: 0.55;
 	}
 
 	.choice-pill:hover {
