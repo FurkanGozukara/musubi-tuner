@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from musubi_tuner.modules.int8_convrot_utils import rotate_activation_by_groupsize
+
 logger = logging.getLogger(__name__)
 
 SMALL_BATCH_THRESHOLD = 16
@@ -156,6 +158,38 @@ def _quantize_int8_per_token(x):
     return quantized, scale
 
 
+def _int8_convrot_groupsize_value(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0
+        return int(value.detach().reshape(-1)[0].item())
+    return int(value)
+
+
+def _module_int8_convrot_groupsize(module) -> int:
+    return _int8_convrot_groupsize_value(getattr(module, "int8_convrot_groupsize", None))
+
+
+def _has_prequantized_int8_convrot_linears(model) -> bool:
+    for module in model.modules():
+        if (
+            isinstance(module, nn.Linear)
+            and hasattr(module, "scale_weight")
+            and module.weight.dtype == torch.int8
+            and _module_int8_convrot_groupsize(module) > 0
+        ):
+            return True
+    return False
+
+
+def _linear_dequant_fallback(module, x, convrot_groupsize: int = 0):
+    w = _dequantize_weight(module.weight.detach(), module.scale_weight).to(x.dtype)
+    x_linear = rotate_activation_by_groupsize(x, convrot_groupsize) if convrot_groupsize > 0 else x
+    return F.linear(x_linear, w, module.bias)
+
+
 def _int_mm_allow_small_m(a, b):
     """torch._int_mm requires M > 16 on CUDA; pad tiny batches instead of dequantizing weights."""
     m = a.shape[0]
@@ -198,6 +232,9 @@ def _supports_triton_mm(device):
 
 
 _INT8_EPILOGUE = "unset"
+_INT8_CUDA_QUANTIZE = "unset"
+_INT8_CUDA_EPILOGUE = "unset"
+_INT8_CUDA_CONVROT_EPILOGUE = "unset"
 _CUTLASS_MM_8BIT = "unset"
 _INT8_BACKENDS = {"torch", "triton", "cutlass"}
 
@@ -213,6 +250,45 @@ def _get_int8_epilogue():
         except ImportError:
             _INT8_EPILOGUE = None
     return _INT8_EPILOGUE
+
+
+def _get_int8_cuda_quantize():
+    """Lazily import native CUDA row-wise quantization (None if unavailable)."""
+    global _INT8_CUDA_QUANTIZE
+    if _INT8_CUDA_QUANTIZE == "unset":
+        try:
+            from musubi_tuner.modules.cuda_int8_convrot import is_available, quantize_rowwise
+
+            _INT8_CUDA_QUANTIZE = quantize_rowwise if is_available() else None
+        except Exception:
+            _INT8_CUDA_QUANTIZE = None
+    return _INT8_CUDA_QUANTIZE
+
+
+def _get_int8_cuda_epilogue():
+    """Lazily import native CUDA dequant epilogue (None if unavailable)."""
+    global _INT8_CUDA_EPILOGUE
+    if _INT8_CUDA_EPILOGUE == "unset":
+        try:
+            from musubi_tuner.modules.cuda_int8_convrot import dequant_epilogue, is_available
+
+            _INT8_CUDA_EPILOGUE = dequant_epilogue if is_available() else None
+        except Exception:
+            _INT8_CUDA_EPILOGUE = None
+    return _INT8_CUDA_EPILOGUE
+
+
+def _get_int8_cuda_convrot_epilogue():
+    """Lazily import native CUDA ConvRot dequant epilogue (None if unavailable)."""
+    global _INT8_CUDA_CONVROT_EPILOGUE
+    if _INT8_CUDA_CONVROT_EPILOGUE == "unset":
+        try:
+            from musubi_tuner.modules.cuda_int8_convrot import dequant_epilogue_convrot, is_available
+
+            _INT8_CUDA_CONVROT_EPILOGUE = dequant_epilogue_convrot if is_available() else None
+        except Exception:
+            _INT8_CUDA_CONVROT_EPILOGUE = None
+    return _INT8_CUDA_CONVROT_EPILOGUE
 
 
 def _get_cutlass_mm_8bit():
@@ -270,7 +346,10 @@ def _resolve_legacy_int8_backend(*, use_int_mm: bool):
 
 
 _INT8_QUANTIZE = "unset"
+_INT8_CONVROT_QUANTIZE = "unset"
+_INT8_CONVROT_EPILOGUE = "unset"
 _USE_FUSED_QUANT = None
+_USE_CUDA_CONVROT_QUANT = None
 _USE_CUTLASS_SCALED_EPILOGUE = None
 
 
@@ -287,6 +366,32 @@ def _get_int8_quantize():
     return _INT8_QUANTIZE
 
 
+def _get_int8_convrot_quantize():
+    """Lazily import the CUDA ConvRot quantizer (None if it cannot be built)."""
+    global _INT8_CONVROT_QUANTIZE
+    if _INT8_CONVROT_QUANTIZE == "unset":
+        try:
+            from musubi_tuner.modules.cuda_int8_convrot import is_available, quantize_rowwise_convrot
+
+            _INT8_CONVROT_QUANTIZE = quantize_rowwise_convrot if is_available() else None
+        except Exception:
+            _INT8_CONVROT_QUANTIZE = None
+    return _INT8_CONVROT_QUANTIZE
+
+
+def _get_int8_convrot_epilogue():
+    """Lazily import the fused Triton ConvRot grad-input epilogue."""
+    global _INT8_CONVROT_EPILOGUE
+    if _INT8_CONVROT_EPILOGUE == "unset":
+        try:
+            from musubi_tuner.modules.triton_int8_epilogue import dequant_epilogue_convrot, have_triton
+
+            _INT8_CONVROT_EPILOGUE = dequant_epilogue_convrot if have_triton() else None
+        except ImportError:
+            _INT8_CONVROT_EPILOGUE = None
+    return _INT8_CONVROT_EPILOGUE
+
+
 def _use_fused_quant():
     """Opt-in (LTX2_INT8_FUSED_QUANT=1): also fuse the per-token activation quant
     and the backward weight-scale fold into single Triton kernels. Off by default."""
@@ -294,6 +399,24 @@ def _use_fused_quant():
     if _USE_FUSED_QUANT is None:
         _USE_FUSED_QUANT = os.getenv("LTX2_INT8_FUSED_QUANT", "0").strip().lower() in ("1", "true", "yes", "on")
     return _USE_FUSED_QUANT
+
+
+def _use_cuda_convrot_quant():
+    """Use the native CUDA ConvRot activation quantizer when fused quant is enabled.
+
+    Enabled by default under LTX2_INT8_FUSED_QUANT because the extension falls
+    back cleanly when unavailable. Set LTX2_INT8_CONVROT_CUDA_QUANT=0 to force
+    the Triton/eager path.
+    """
+    global _USE_CUDA_CONVROT_QUANT
+    if _USE_CUDA_CONVROT_QUANT is None:
+        _USE_CUDA_CONVROT_QUANT = os.getenv("LTX2_INT8_CONVROT_CUDA_QUANT", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    return _USE_CUDA_CONVROT_QUANT
 
 
 def _use_cutlass_scaled_epilogue():
@@ -327,17 +450,40 @@ class _W8A8Int8Function(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight_int8, weight_int8_t, weight_scale, bias, triton_mm, cutlass_mm, use_triton_scaled_forward):
+    def forward(
+        ctx,
+        x,
+        weight_int8,
+        weight_int8_t,
+        weight_scale,
+        bias,
+        triton_mm,
+        cutlass_mm,
+        use_triton_scaled_forward,
+        convrot_groupsize,
+    ):
         # weight_int8: [out, in] int8
         # weight_int8_t: optional [in, out] contiguous int8 fallback for fast backward RHS layout
         # weight_scale: [out, 1] float32
         original_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
+        convrot_groupsize = int(convrot_groupsize or 0)
         quantize = _get_int8_quantize()
-        if quantize is not None and _use_fused_quant():
-            x_int8, x_scale = quantize(x_2d, None)
+        convrot_quantize = (
+            _get_int8_convrot_quantize()
+            if _use_fused_quant() and _use_cuda_convrot_quant() and x.is_cuda and convrot_groupsize in (16, 64, 256)
+            else None
+        )
+
+        use_fused_quant = quantize is not None and _use_fused_quant() and x.is_cuda
+        if convrot_quantize is not None and convrot_groupsize > 0:
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            x_int8, x_scale = convrot_quantize(x_2d, convrot_groupsize)
+        elif use_fused_quant and convrot_groupsize <= 256:
+            x_2d = x.reshape(-1, x.shape[-1])
+            x_int8, x_scale = quantize(x_2d, None, convrot_groupsize=convrot_groupsize)
         else:
+            x_for_quant = rotate_activation_by_groupsize(x, convrot_groupsize) if convrot_groupsize > 0 else x
+            x_2d = x_for_quant.reshape(-1, x_for_quant.shape[-1])
             x_int8, x_scale = _quantize_int8_per_token(x_2d)
 
         # [M, K] @ [K, N] -> [M, N] int32   (N = out_features)
@@ -383,7 +529,16 @@ class _W8A8Int8Function(torch.autograd.Function):
                 # Rescale int32 -> compute dtype. Fused Triton epilogue (one pass over [M,N])
                 # when available and weight scale is per-row; else eager multi-pass rescale.
                 out_features = weight_int8.shape[0]
-                epilogue = _get_int8_epilogue()
+                epilogue = (
+                    _get_int8_cuda_epilogue()
+                    if _use_fused_quant()
+                    and _use_cuda_convrot_quant()
+                    and out_int32.is_cuda
+                    and _torch_dtype_code_supported(x.dtype)
+                    else None
+                )
+                if epilogue is None:
+                    epilogue = _get_int8_epilogue() if out_int32.is_cuda else None
                 if epilogue is not None and weight_scale.numel() == out_features:
                     output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, x.dtype)
                     output = output.reshape(*original_shape[:-1], out_features)
@@ -403,6 +558,7 @@ class _W8A8Int8Function(torch.autograd.Function):
         ctx.input_dtype = x.dtype
         ctx.triton_mm = triton_mm
         ctx.cutlass_mm = cutlass_mm
+        ctx.convrot_groupsize = convrot_groupsize
         return output
 
     @staticmethod
@@ -421,12 +577,27 @@ class _W8A8Int8Function(torch.autograd.Function):
         # Row-wise weight scales live on the contraction dimension for grad_input,
         # so fold them into grad_output before the int8 matmul.
         quantize = _get_int8_quantize()
-        if quantize is not None and _use_fused_quant() and weight_scale.numel() == out_features:
+        cuda_quantize = (
+            _get_int8_cuda_quantize()
+            if _use_fused_quant() and _use_cuda_convrot_quant() and go.is_cuda and weight_scale.numel() == out_features
+            else None
+        )
+        use_fused_quant = quantize is not None and _use_fused_quant() and go.is_cuda
+        if cuda_quantize is not None:
+            grad_int8, grad_scale = cuda_quantize(go.contiguous(), weight_scale.reshape(out_features).contiguous())
+        elif use_fused_quant and weight_scale.numel() == out_features:
             grad_int8, grad_scale = quantize(go, weight_scale)  # fused fold + per-token quant
         else:
             go_2d = go.float() * _output_scale_view(weight_scale)
             grad_int8, grad_scale = _quantize_int8_per_token(go_2d)
         cutlass_scaled = getattr(ctx.cutlass_mm, "scaled", None) if ctx.cutlass_mm is not None else None
+        convrot_groupsize = int(ctx.convrot_groupsize or 0)
+        convrot_epilogue = None
+        if _use_fused_quant() and grad_output.is_cuda and convrot_groupsize in (16, 64, 256):
+            convrot_epilogue = _get_int8_cuda_convrot_epilogue() if _use_cuda_convrot_quant() else None
+            if convrot_epilogue is None:
+                convrot_epilogue = _get_int8_convrot_epilogue()
+        convrot_applied = False
         if cutlass_scaled is not None and _use_cutlass_scaled_epilogue() and _torch_dtype_code_supported(ctx.input_dtype):
             grad_input = cutlass_scaled(
                 grad_int8.contiguous(),
@@ -440,29 +611,67 @@ class _W8A8Int8Function(torch.autograd.Function):
         elif ctx.cutlass_mm is not None:
             grad_int32 = ctx.cutlass_mm(grad_int8.contiguous(), weight_saved)
             in_features = weight_saved.shape[0]
-            epilogue = _get_int8_epilogue()
-            if epilogue is not None:
+            epilogue = (
+                _get_int8_cuda_epilogue()
+                if _use_fused_quant()
+                and _use_cuda_convrot_quant()
+                and grad_int32.is_cuda
+                and _torch_dtype_code_supported(ctx.input_dtype)
+                else None
+            )
+            if epilogue is None:
+                epilogue = _get_int8_epilogue() if grad_int32.is_cuda else None
+            if convrot_epilogue is not None:
+                grad_input = convrot_epilogue(grad_int32, grad_scale, convrot_groupsize, ctx.input_dtype)
+                convrot_applied = True
+            elif epilogue is not None:
                 grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
             else:
                 grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
         elif ctx.triton_mm is None:
             grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved.t())
             in_features = weight_saved.shape[0]
-            epilogue = _get_int8_epilogue()
-            if epilogue is not None:
+            epilogue = (
+                _get_int8_cuda_epilogue()
+                if _use_fused_quant()
+                and _use_cuda_convrot_quant()
+                and grad_int32.is_cuda
+                and _torch_dtype_code_supported(ctx.input_dtype)
+                else None
+            )
+            if epilogue is None:
+                epilogue = _get_int8_epilogue() if grad_int32.is_cuda else None
+            if convrot_epilogue is not None:
+                grad_input = convrot_epilogue(grad_int32, grad_scale, convrot_groupsize, ctx.input_dtype)
+                convrot_applied = True
+            elif epilogue is not None:
                 grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
             else:
                 grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
         else:
             grad_int32 = ctx.triton_mm(grad_int8.contiguous(), weight_saved)
             in_features = weight_saved.shape[1]
-            epilogue = _get_int8_epilogue()
-            if epilogue is not None:
+            epilogue = (
+                _get_int8_cuda_epilogue()
+                if _use_fused_quant()
+                and _use_cuda_convrot_quant()
+                and grad_int32.is_cuda
+                and _torch_dtype_code_supported(ctx.input_dtype)
+                else None
+            )
+            if epilogue is None:
+                epilogue = _get_int8_epilogue() if grad_int32.is_cuda else None
+            if convrot_epilogue is not None:
+                grad_input = convrot_epilogue(grad_int32, grad_scale, convrot_groupsize, ctx.input_dtype)
+                convrot_applied = True
+            elif epilogue is not None:
                 grad_input = epilogue(grad_int32, grad_scale, None, None, ctx.input_dtype)
             else:
                 grad_input = (grad_int32.float() * grad_scale).to(ctx.input_dtype)
+        if convrot_groupsize > 0 and not convrot_applied:
+            grad_input = rotate_activation_by_groupsize(grad_input, convrot_groupsize, inverse=True)
         grad_input = grad_input.reshape(*grad_output.shape[:-1], in_features)
-        return grad_input, None, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None, None
 
 
 class _W8A8TransientDequantFunction(torch.autograd.Function):
@@ -473,12 +682,15 @@ class _W8A8TransientDequantFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, scale_weight, bias):
+    def forward(ctx, x, weight, scale_weight, bias, convrot_groupsize=0):
+        convrot_groupsize = int(convrot_groupsize or 0)
         weight_deq = _dequantize_weight(weight, scale_weight).to(x.dtype)
-        output = F.linear(x, weight_deq, bias)
+        x_linear = rotate_activation_by_groupsize(x, convrot_groupsize) if convrot_groupsize > 0 else x
+        output = F.linear(x_linear, weight_deq, bias)
         # weight_deq is NOT saved; it is freed when this scope ends.
         ctx.save_for_backward(weight, scale_weight)
         ctx.input_dtype = x.dtype
+        ctx.convrot_groupsize = convrot_groupsize
         return output
 
     @staticmethod
@@ -491,8 +703,10 @@ class _W8A8TransientDequantFunction(torch.autograd.Function):
 
         go_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
         grad_input = go_2d @ weight_deq  # [M, out] @ [out, in]
+        if ctx.convrot_groupsize > 0:
+            grad_input = rotate_activation_by_groupsize(grad_input, ctx.convrot_groupsize, inverse=True)
         grad_input = grad_input.to(ctx.input_dtype).reshape(*grad_output.shape[:-1], weight_deq.shape[1])
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -539,8 +753,9 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_s
     if use_int_mm:
 
         def forward(self, x):
+            convrot_groupsize = _module_int8_convrot_groupsize(self)
             if not _supports_int_mm(x.device):
-                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
+                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
             if cutlass_mm is not None and hasattr(self, "weight_int8_t"):
                 weight_int8_t = self.weight_int8_t
                 triton_mm_for_device = None
@@ -554,7 +769,7 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_s
                 triton_mm_for_device = None
                 cutlass_mm_for_device = None
             else:
-                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
+                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
             return _W8A8Int8Function.apply(
                 x,
                 self.weight,
@@ -564,15 +779,16 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_s
                 triton_mm_for_device,
                 cutlass_mm_for_device,
                 use_triton_scaled_forward,
+                convrot_groupsize,
             )
     else:
         # _int_mm unavailable: still save VRAM via custom autograd
         def forward(self, x):
+            convrot_groupsize = _module_int8_convrot_groupsize(self)
             num_tokens = x.reshape(-1, x.shape[-1]).shape[0]
             if num_tokens <= SMALL_BATCH_THRESHOLD:
-                w = _dequantize_weight(self.weight.detach(), self.scale_weight).to(x.dtype)
-                return F.linear(x, w, self.bias)
-            return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
+                return _linear_dequant_fallback(self, x, convrot_groupsize)
+            return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
 
     return forward
 
@@ -585,7 +801,7 @@ def _make_w8a8_fp8_forward():
         if num_tokens <= SMALL_BATCH_THRESHOLD:
             w = _dequantize_weight(self.weight.detach(), self.scale_weight).to(x.dtype)
             return F.linear(x, w, self.bias)
-        return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
+        return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, 0)
 
     return forward
 
@@ -684,15 +900,22 @@ def register_quanto_int8_scale_buffers(model, state_dict):
     per-row scale get assigned (mirrors apply_fp8_monkey_patch's registration).
     """
     scale_shapes = {k.rsplit(".scale_weight", 1)[0]: state_dict[k].shape for k in state_dict if k.endswith(".scale_weight")}
+    convrot_groups = {
+        k.rsplit(".int8_convrot_groupsize", 1)[0]: _int8_convrot_groupsize_value(state_dict[k])
+        for k in state_dict
+        if k.endswith(".int8_convrot_groupsize")
+    }
     registered = 0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in scale_shapes:
             module.register_buffer("scale_weight", torch.ones(scale_shapes[name], dtype=torch.float32))
+            if name in convrot_groups:
+                module.register_buffer("int8_convrot_groupsize", torch.tensor(convrot_groups[name], dtype=torch.int32))
             # int8 weights can't be leaf parameters that require grad; clear the flag
             # so load_state_dict(assign=True) can assign the int8 tensor in place.
             module.weight.requires_grad_(False)
             registered += 1
-    logger.info("Quanto int8: registered scale_weight buffers on %d linear layers", registered)
+    logger.info("Quanto/int8: registered scale_weight buffers on %d linear layers", registered)
     return registered
 
 
@@ -708,7 +931,13 @@ def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
     triton_mm = None
     cutlass_mm = None
     use_triton_scaled_forward = False
-    if w8a8_backend is None:
+    has_convrot = _has_prequantized_int8_convrot_linears(model)
+    if w8a8_backend is None and has_convrot and use_int_mm:
+        logger.info(
+            "Quanto int8 ConvRot: defaulting to torch._int_mm backend for the matmul; pass --w8a8_backend triton "
+            "to force the Triton matmul backend."
+        )
+    elif w8a8_backend is None:
         triton_mm, cutlass_mm = _resolve_legacy_int8_backend(use_int_mm=use_int_mm)
     else:
         triton_mm, cutlass_mm = _resolve_int8_backend(w8a8_backend, use_int_mm=use_int_mm)
@@ -731,6 +960,9 @@ def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
         module.scale_weight = module.scale_weight.reshape(module.weight.shape[0], 1).to(
             device=module.weight.device, dtype=torch.float32
         )
+        convrot_groupsize = _module_int8_convrot_groupsize(module)
+        if convrot_groupsize > 0 and module.weight.shape[1] % convrot_groupsize != 0:
+            raise ValueError(f"INT8 ConvRot group size {convrot_groupsize} does not divide in_features={module.weight.shape[1]}")
         if (triton_mm is None or cutlass_mm is not None) and use_int_mm:
             weight_int8_t = module.weight.t().contiguous()
             if "weight_int8_t" in module._buffers:

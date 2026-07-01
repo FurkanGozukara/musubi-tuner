@@ -898,12 +898,47 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--int8_convrot_base",
+        action="store_true",
+        help=(
+            "Load a pre-quantized INT8 ConvRot DiT checkpoint with Comfy-compatible metadata and train a LoRA over it. "
+            "The checkpoint must store int8 .weight tensors, .weight_scale tensors, and .comfy_quant "
+            "metadata with convrot_groupsize. Mutually exclusive with other quantized-base modes."
+        ),
+    )
+    parser.add_argument(
+        "--int8_convrot_dynamic",
+        action="store_true",
+        help=(
+            "Quantize a standard bf16/fp16 DiT checkpoint to INT8 ConvRot at load time. "
+            "Weights are rotated offline and activations are rotated online before dynamic int8 matmul. "
+            "Requires LoRA training and is mutually exclusive with other quantized-base modes."
+        ),
+    )
+    parser.add_argument(
+        "--int8_convrot_groupsize",
+        type=str,
+        default="auto",
+        help="INT8 ConvRot group size or comma list to try, largest divisible wins. Default: auto (256,64,16).",
+    )
+    parser.add_argument(
+        "--int8_convrot_no_mse_clip",
+        action="store_true",
+        help="Disable MSE-optimal per-row clipping during INT8 ConvRot quantization; use plain absmax scales.",
+    )
+    parser.add_argument(
+        "--int8_convrot_quality_report",
+        type=str,
+        default=None,
+        help="Optional JSON path for per-layer INT8 ConvRot reconstruction metrics during dynamic quantization.",
+    )
+    parser.add_argument(
         "--int8_fused_quant",
         action="store_true",
         help=(
             "Opt-in: also fuse the int8 activation/gradient quantization into Triton kernels "
             "(~2x faster int8 Linear layers on Ampere; needs Triton). Equivalent to setting "
-            "LTX2_INT8_FUSED_QUANT=1. Applies to --int8_base/--int8_base_dynamic and "
+            "LTX2_INT8_FUSED_QUANT=1. Applies to --int8_base/--int8_base_dynamic, INT8 ConvRot, and "
             "--fp8_w8a8 --w8a8_mode int8."
         ),
     )

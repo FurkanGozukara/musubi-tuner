@@ -2581,8 +2581,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         try:
             self._ltx2_checkpoint_config = SafetensorsModelStateDictLoader().metadata(str(checkpoint_path))
         except (KeyError, TypeError):
-            # Optimum-Quanto int8 exports carry no "config" metadata; rebuild from weights.
-            if not getattr(args, "int8_base", False):
+            # Quantized exports may carry no "config" metadata; rebuild from weights.
+            if not (getattr(args, "int8_base", False) or getattr(args, "int8_convrot_base", False)):
                 raise
             from musubi_tuner.ltx2_model_loading import infer_ltx2_transformer_config_from_weights
 
@@ -3420,10 +3420,19 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         _int8_base = getattr(args, "int8_base", False)
         _int8_dynamic = getattr(args, "int8_base_dynamic", False)
-        if _int8_base and _int8_dynamic:
-            raise ValueError("--int8_base and --int8_base_dynamic are mutually exclusive")
-        if _int8_base or _int8_dynamic:
-            _flag = "--int8_base" if _int8_base else "--int8_base_dynamic"
+        _int8_convrot_base = getattr(args, "int8_convrot_base", False)
+        _int8_convrot_dynamic = getattr(args, "int8_convrot_dynamic", False)
+        _int8_flags = {
+            "--int8_base": _int8_base,
+            "--int8_base_dynamic": _int8_dynamic,
+            "--int8_convrot_base": _int8_convrot_base,
+            "--int8_convrot_dynamic": _int8_convrot_dynamic,
+        }
+        _enabled_int8_flags = [flag for flag, enabled in _int8_flags.items() if enabled]
+        if len(_enabled_int8_flags) > 1:
+            raise ValueError(f"int8 base modes are mutually exclusive: {', '.join(_enabled_int8_flags)}")
+        if _enabled_int8_flags:
+            _flag = _enabled_int8_flags[0]
             for _conflict in ("fp8_base", "fp8_scaled", "nf4_base"):
                 if getattr(args, _conflict, False):
                     raise ValueError(f"{_flag} and --{_conflict} are mutually exclusive")
@@ -3929,6 +3938,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             fp8_keep_blocks=getattr(args, "fp8_keep_blocks", None),
             int8_base=bool(getattr(args, "int8_base", False)),
             int8_dynamic=bool(getattr(args, "int8_base_dynamic", False)),
+            int8_convrot_base=bool(getattr(args, "int8_convrot_base", False)),
+            int8_convrot_dynamic=bool(getattr(args, "int8_convrot_dynamic", False)),
+            int8_convrot_groupsize=getattr(args, "int8_convrot_groupsize", "auto"),
+            int8_convrot_mse_clip=not bool(getattr(args, "int8_convrot_no_mse_clip", False)),
+            int8_convrot_quality_report=getattr(args, "int8_convrot_quality_report", None),
             nf4_base=bool(getattr(args, "nf4_base", False)),
             nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
             loftq_init=bool(getattr(args, "loftq_init", False)),
@@ -4133,6 +4147,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             or getattr(args, "fp8_scaled", False)
             or getattr(args, "int8_base", False)
             or getattr(args, "int8_base_dynamic", False)
+            or getattr(args, "int8_convrot_base", False)
+            or getattr(args, "int8_convrot_dynamic", False)
         ):
             self._ensure_fp8_buffers_on_device(transformer)
         forward_args = (model_input,)
@@ -4851,6 +4867,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "fp8_scaled", False)
                 or getattr(args, "int8_base", False)
                 or getattr(args, "int8_base_dynamic", False)
+                or getattr(args, "int8_convrot_base", False)
+                or getattr(args, "int8_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(transformer)
             elif getattr(args, "nf4_base", False):
@@ -5454,6 +5472,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "fp8_scaled", False)
                 or getattr(args, "int8_base", False)
                 or getattr(args, "int8_base_dynamic", False)
+                or getattr(args, "int8_convrot_base", False)
+                or getattr(args, "int8_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -5849,6 +5869,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "fp8_scaled", False)
                 or getattr(args, "int8_base", False)
                 or getattr(args, "int8_base_dynamic", False)
+                or getattr(args, "int8_convrot_base", False)
+                or getattr(args, "int8_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -6469,6 +6491,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "fp8_scaled", False)
                 or getattr(args, "int8_base", False)
                 or getattr(args, "int8_base_dynamic", False)
+                or getattr(args, "int8_convrot_base", False)
+                or getattr(args, "int8_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):

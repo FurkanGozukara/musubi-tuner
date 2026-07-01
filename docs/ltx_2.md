@@ -96,6 +96,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [NF4 Quantization](#nf4-quantization)
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
+    - [INT8 ConvRot Base](#int8-convrot-base)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Function Type](#loss-function-type)
@@ -1527,17 +1528,18 @@ For additional training and inference speedups, see the [torch.compile Support](
 | `--nf4_base` | ~10 GB | 0.0678 (60x BF16) | 21.2 dB | 0.996188 |
 | `--nf4_base --loftq_init` | ~10 GB | 0.0654 (60x BF16) | 21.5 dB | 0.996437 |
 
-*Approximate values measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). The VRAM column is base-weight storage (parameters × bytes-per-weight), not measured training peak — actual peak also includes activations, gradients, optimizer state, and the LoRA. No benchmark script is included in this repo.*
+*Approximate values measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). The VRAM column is base-weight storage (parameters × bytes-per-weight), not measured training peak — actual peak also includes activations, gradients, optimizer state, and the LoRA.*
 
 NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
 - `--fp8_base`: keep base model weights in FP8 path (~19 GB base weights).
 - `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
-- `--fp8_keep_blocks "0,1,2,45"`: with `--fp8_scaled`, keep selected transformer blocks in high precision instead of FP8. Comma lists and ranges such as `0-2,45` are accepted. Use to test whether boundary or otherwise sensitive blocks should avoid FP8 quantization.
+- `--fp8_keep_blocks "0,1,2,45"`: with `--fp8_scaled`, keep selected transformer blocks in high precision instead of FP8 (comma lists and ranges such as `0-2,45`). By default all transformer blocks are quantized. For reference, the official `Lightricks/LTX-2.3-fp8` checkpoints leave their boundary blocks in bf16 (dev `0,1,46,47`, distilled `0,1,2,3,47`); replicating that here is optional and off by default. Ignored when `--fp8_scaled` is not set.
 - `--fp8_w8a8`: with `--fp8_base --fp8_scaled`, use W8A8 activation quantization for LoRA training. `--w8a8_mode int8` is the default; `--w8a8_mode fp8` keeps FP8 weights and dequantizes transiently.
 - `--w8a8_backend torch|triton|cutlass`: explicit backend selector for int8 W8A8 Linear matmuls. Omit it to preserve the default W8A8 backend resolution. `torch` uses `torch._int_mm` and the standard int32-to-compute-dtype scale/bias epilogue. `triton` uses the Triton int8 matmul and, when dtype/layout constraints are met, fuses row scale, column scale, bias, and output cast into the forward matmul epilogue. `cutlass` builds a native CUTLASS extension from headers supplied by `LTX2_CUTLASS_INCLUDE_DIR`; by default it returns an int32 accumulator to the standard epilogue, while `LTX2_CUTLASS_SCALED_EPILOGUE=1` enables the extension's scale/bias epilogue.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB base weights). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
+- `--int8_convrot_dynamic`: quantize a standard checkpoint to INT8 ConvRot at load time. See [INT8 ConvRot Base](#int8-convrot-base) below.
 - `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 
 #### Other Memory Options
@@ -1725,10 +1727,63 @@ Notes:
 - Requires LoRA training (`--network_module`); the int8 base is frozen.
 - `--int8_base` / `--int8_base_dynamic` are mutually exclusive with each other and with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
 - For `--int8_base` the checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
-- **Triton is required for the fused int8 kernels and the lower-memory path, and is not installed by default.** Install it separately: `pip install triton` on Linux, or [`triton-windows`](https://github.com/woct0rdho/triton-windows) on Windows. Without Triton the int8 path still works: on PyTorch ≥ 2.1 it runs int8 matmul via `torch._int_mm` using a transposed int8 weight copy (more memory, and none of the fused-kernel speedups); only on PyTorch < 2.1 (no `torch._int_mm`) does it fall back to an eager dequantize-and-matmul path, which still saves VRAM but gets no int8 speedup.
+- **Triton is required for the fused int8 kernels and the lower-memory path, and is not installed by default.** Install it separately: `pip install triton` on Linux, or [`triton-windows`](https://github.com/woct0rdho/triton-windows) on Windows. Without Triton, PyTorch >= 2.1 uses `torch._int_mm` with a transposed int8 weight copy. On PyTorch < 2.1, the fallback path dequantizes the int8 weight for `F.linear`.
 - With Triton, the int8 dequantization is fused into one pass. Passing `--int8_fused_quant` (or setting `LTX2_INT8_FUSED_QUANT=1`) additionally fuses the activation quantization (forward) and gradient quantization (backward) into single Triton kernels; this is off by default and also applies to `--fp8_w8a8 --w8a8_mode int8`.
 
-Speed is hardware- and shape-dependent; measure it for your GPU. int8 is faster than bf16 only where the GPU's INT8 path is faster than its bf16 path. In isolated Linear forward+backward microbenchmarks, `--int8_fused_quant` reached roughly 2× bf16; with attention (which stays bf16) included, the per-block gain was smaller and decreased as sequence length grew, and the end-to-end step is lower still (VAE, text encoder, and optimizer stay bf16). On GPUs with fast bf16/FP8 tensor cores int8 was not faster than bf16 and only reduced memory. Without `--int8_fused_quant` the Linear-layer speedup was roughly neutral.
+Performance is hardware- and shape-dependent. Benchmark the target configuration with the intended backend, precision, attention mode, sequence length, and optimizer settings.
+
+### INT8 ConvRot Base
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--int8_convrot_dynamic` quantizes eligible LTX-2 transformer block Linear weights to INT8 ConvRot while loading a standard bf16/fp16 checkpoint. ConvRot rotates weights offline with a group-wise Hadamard matrix, then rotates activations online before the dynamic int8 matmul. The base is frozen, so this path is for LoRA training.
+
+```bat
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
+  --int8_convrot_dynamic ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  --int8_convrot_quality_report output\int8-convrot-quality.json ^
+  (other training options)
+```
+
+For repeat runs, pre-quantize once and train from the saved INT8 ConvRot checkpoint. This removes the dynamic conversion cost from training startup and gives you a reusable, Comfy-compatible base file:
+
+```bat
+python ltx2_quantize_int8_convrot.py ^
+  --input_model path\to\ltx-2.3-22b-dev.safetensors ^
+  --output_model path\to\ltx-2.3-22b-dev-int8-convrot.safetensors
+
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev-int8-convrot.safetensors ^
+  --int8_convrot_base ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  (other training options)
+```
+
+Options:
+- `--int8_convrot_base`: load a pre-quantized INT8 ConvRot checkpoint with Comfy-compatible metadata (`.weight`, `.weight_scale`, `.comfy_quant`).
+- `--int8_convrot_dynamic`: quantize a standard checkpoint at load time.
+- `--int8_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16` and uses the largest divisor of each weight input dimension.
+- `--int8_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
+- `--int8_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
+- `ltx2_quantize_int8_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
+
+Quality reports include per-layer cosine similarity, MSE, MAE, max absolute error, and SQNR for the reconstructed weight (`dequantize + inverse rotate`) versus the source weight. Inspect `summary.min_cosine`, `summary.weighted_sqnr_db`, and the worst layers by `mse` or `max_abs_error`.
+
+Reference calibration for `ltx-2.3-22b-dev.safetensors` from the original bf16/fp32 source, using `--int8_convrot_groupsize auto` and MSE clipping:
+
+| Candidate | Targeted layers / params | Weighted SQNR | Weighted MSE | Min / mean cosine | Max abs error |
+|---|---:|---:|---:|---:|---:|
+| scaled FP8 comparison | 1344 / 18.52B | 32.20 dB | 1.26e-6 | 0.999683 / 0.999697 | 0.2266 |
+| INT8 ConvRot | 1344 / 18.52B | 41.27 dB | 1.56e-7 | 0.999895 / 0.999963 | 0.0229 |
+
+Notes:
+- Prefer converting from the original bf16/fp16 checkpoint when available. Scaled FP8 checkpoints are supported as sources and are dequantized through their `.weight_scale` tensors before INT8 ConvRot quantization, but any error already introduced by FP8 remains part of the source.
+- Requires LoRA training (`--network_module`); full-parameter fine-tuning of the frozen INT8 ConvRot base is not supported.
+- Mutually exclusive with `--int8_base`, `--int8_base_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
+- The runtime uses the same int8 backend selector as the existing int8 path (`--w8a8_backend torch|triton|cutlass`). Pre-quantized INT8 ConvRot defaults to `torch._int_mm` when available; pass `--w8a8_backend triton` or `--w8a8_backend cutlass` to force a backend.
+- With Triton installed and ConvRot group sizes up to 256, `--int8_fused_quant` fuses forward ConvRot activation rotation + rowwise quantization and backward grad-input scale + inverse ConvRot epilogue. When the native CUDA ConvRot quantizer can be built, it is used for the forward ConvRot activation quantization; set `LTX2_INT8_CONVROT_CUDA_QUANT=0` to force the Triton path.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
