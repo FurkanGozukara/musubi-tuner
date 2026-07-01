@@ -19,7 +19,22 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
+from musubi_tuner.modules.int8_convrot_utils import (
+    best_int8_convrot_groupsize,
+    build_hadamard,
+    parse_int8_convrot_groupsizes,
+    rotate_weight,
+)
+
 aten = torch.ops.aten
+
+
+def _resolve_convrot_group(in_features: int, spec) -> int:
+    """Resolve a ConvRot rotation group spec ('auto' / int / comma-list / 0) to the largest
+    power-of-4 group that divides in_features, or 0 (rotation off) when none fits."""
+    if spec in (None, 0, "", "0"):
+        return 0
+    return best_int8_convrot_groupsize(in_features, parse_int8_convrot_groupsizes(spec)) or 0
 
 
 @torch.no_grad()
@@ -30,6 +45,7 @@ def quantize_int8(
     eps: float = 1e-12,
     outlier_clip_quantile: float = 1.0,
     sparse_ratio: float = 0.0,
+    convrot_group: int = 0,
 ):
     """Symmetric int8 quantization.
 
@@ -54,6 +70,14 @@ def quantize_int8(
     exactly) — use one or the other.
     """
     out_features, in_features = tensor.shape
+    if convrot_group and convrot_group > 0:
+        # ConvRot: rotate the weight into Hadamard space before the int8 grid so per-group
+        # outliers are spread out; dequantize() applies the inverse rotation. The rotation is
+        # exact/loss-free (H orthonormal), so it does not change what the bf16 GEMM sees.
+        if in_features % convrot_group != 0:
+            raise ValueError(f"ConvRot group {convrot_group} does not divide in_features={in_features}")
+        _H = build_hadamard(convrot_group, device=tensor.device, dtype=tensor.dtype)
+        tensor = rotate_weight(tensor, _H, convrot_group)
     sparse_idx = None
     sparse_val = None
     work = tensor
@@ -117,7 +141,11 @@ class _Int8Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         input, weight = ctx.saved_tensors
-        w = weight.dequantize()
+        # Under mixed precision grad_output can arrive as fp32 while the saved activation and the
+        # dequantized weight are bf16; align all three to the forward compute dtype so the GEMMs match.
+        dt = input.dtype
+        grad_output = grad_output.to(dt)
+        w = weight.dequantize().to(dt)
         grad_input = grad_output @ w
         grad_weight = grad_output.reshape(-1, weight.shape[0]).T @ input.reshape(-1, weight.shape[1])
         grad_bias = grad_output.reshape(-1, weight.shape[0]).sum(0) if ctx.has_bias else None
@@ -156,6 +184,7 @@ class Int8QTWeight(Tensor):
         sparse_idx: Tensor | None = None,
         sparse_val: Tensor | None = None,
         sparse_ratio: float = 0.0,
+        convrot_group: int = 0,
     ):
         return Tensor._make_wrapper_subclass(cls, int_data.shape, dtype=scale.dtype, device=int_data.device, requires_grad=False)
 
@@ -168,6 +197,7 @@ class Int8QTWeight(Tensor):
         sparse_idx: Tensor | None = None,
         sparse_val: Tensor | None = None,
         sparse_ratio: float = 0.0,
+        convrot_group: int = 0,
     ):
         assert int_data.dtype is torch.int8 and int_data.ndim == 2
         self.int_data = int_data
@@ -175,6 +205,8 @@ class Int8QTWeight(Tensor):
         self.group_size = int(group_size)
         self.outlier_clip_quantile = float(outlier_clip_quantile)
         self.sparse_ratio = float(sparse_ratio)
+        # int_data is stored in ConvRot-rotated space when convrot_group>0; dequantize() inverts it.
+        self.convrot_group = int(convrot_group)
         # dense-and-sparse outlier side-vectors (None when sparse_ratio<=0).
         self.sparse_idx = sparse_idx
         self.sparse_val = sparse_val
@@ -183,12 +215,13 @@ class Int8QTWeight(Tensor):
         inner = ["int_data", "scale"]
         if self.sparse_val is not None:
             inner = inner + ["sparse_idx", "sparse_val"]
-        return inner, [self.group_size, self.outlier_clip_quantile, self.sparse_ratio]
+        return inner, [self.group_size, self.outlier_clip_quantile, self.sparse_ratio, self.convrot_group]
 
     @classmethod
     def __tensor_unflatten__(cls, inner_tensors, meta, outer_size, outer_stride):
         ocq = meta[1] if len(meta) > 1 else 1.0
         sr = meta[2] if len(meta) > 2 else 0.0
+        cg = meta[3] if len(meta) > 3 else 0
         return cls(
             inner_tensors["int_data"],
             inner_tensors["scale"],
@@ -197,6 +230,7 @@ class Int8QTWeight(Tensor):
             inner_tensors.get("sparse_idx"),
             inner_tensors.get("sparse_val"),
             sr,
+            cg,
         )
 
     def dequantize(self) -> Tensor:
@@ -205,6 +239,10 @@ class Int8QTWeight(Tensor):
             # w is fresh (int_data*scale); scatter outliers in place, no clone
             w = w.contiguous()
             w.view(-1)[self.sparse_idx] = self.sparse_val.to(w.dtype)
+        if self.convrot_group > 0:
+            # invert the encode-time ConvRot rotation to recover the real-space weight for the GEMM
+            _H = build_hadamard(self.convrot_group, device=w.device, dtype=w.dtype)
+            w = rotate_weight(w, _H, self.convrot_group, inverse=True)
         return w
 
     @torch.no_grad()
@@ -224,6 +262,7 @@ class Int8QTWeight(Tensor):
                 stochastic_rounding=stochastic_rounding,
                 outlier_clip_quantile=self.outlier_clip_quantile,
                 sparse_ratio=self.sparse_ratio,
+                convrot_group=self.convrot_group,
             )
             self.int_data.copy_(int_data)
             self.scale.copy_(scale)
@@ -237,6 +276,7 @@ class Int8QTWeight(Tensor):
             self.group_size,
             stochastic_rounding=stochastic_rounding,
             outlier_clip_quantile=self.outlier_clip_quantile,
+            convrot_group=self.convrot_group,
         )
         self.int_data.copy_(int_data)
         self.scale.copy_(scale)
@@ -250,7 +290,9 @@ class Int8QTWeight(Tensor):
         group_size: int = 0,
         outlier_clip_quantile: float = 1.0,
         sparse_ratio: float = 0.0,
+        convrot_group: int = 0,
     ) -> "Int8QTWeight":
+        cg = _resolve_convrot_group(weight.shape[1], convrot_group)
         if sparse_ratio and sparse_ratio > 0.0:
             int_data, scale, sidx, sval = quantize_int8(
                 weight.detach(),
@@ -258,12 +300,13 @@ class Int8QTWeight(Tensor):
                 stochastic_rounding=False,
                 outlier_clip_quantile=outlier_clip_quantile,
                 sparse_ratio=sparse_ratio,
+                convrot_group=cg,
             )
-            return cls(int_data, scale, group_size, outlier_clip_quantile, sidx, sval, sparse_ratio)
+            return cls(int_data, scale, group_size, outlier_clip_quantile, sidx, sval, sparse_ratio, cg)
         int_data, scale = quantize_int8(
-            weight.detach(), group_size, stochastic_rounding=False, outlier_clip_quantile=outlier_clip_quantile
+            weight.detach(), group_size, stochastic_rounding=False, outlier_clip_quantile=outlier_clip_quantile, convrot_group=cg
         )
-        return cls(int_data, scale, group_size, outlier_clip_quantile)
+        return cls(int_data, scale, group_size, outlier_clip_quantile, None, None, 0.0, cg)
 
     def __repr__(self):
         return f"Int8QTWeight(shape={tuple(self.shape)}, group_size={self.group_size}, dtype={self.dtype})"
@@ -298,6 +341,7 @@ def _(func, types, args, kwargs):
         func(sidx) if sidx is not None else None,
         func(sval) if sval is not None else None,
         getattr(a, "sparse_ratio", 0.0),
+        getattr(a, "convrot_group", 0),
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -317,6 +361,7 @@ def _(func, types, args, kwargs):
         sidx.to(device=device) if sidx is not None else None,  # idx stays int64
         sval.to(device=device) if sval is not None else None,  # val stays fp32
         getattr(a, "sparse_ratio", 0.0),
+        getattr(a, "convrot_group", 0),
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -351,6 +396,7 @@ def _(func, types, args, kwargs):
                 stochastic_rounding=True,  # SR on update
                 outlier_clip_quantile=getattr(dst, "outlier_clip_quantile", 1.0),
                 sparse_ratio=dst.sparse_ratio,
+                convrot_group=getattr(dst, "convrot_group", 0),
             )
             dst.int_data.copy_(int_data)
             dst.scale.copy_(scale)
@@ -362,6 +408,7 @@ def _(func, types, args, kwargs):
                 dst.group_size,
                 stochastic_rounding=True,  # SR on update
                 outlier_clip_quantile=getattr(dst, "outlier_clip_quantile", 1.0),
+                convrot_group=getattr(dst, "convrot_group", 0),
             )
             dst.int_data.copy_(int_data)
             dst.scale.copy_(scale)
@@ -393,7 +440,13 @@ def _(func, types, args, kwargs):
 
 
 def convert_to_int8_training(
-    model: nn.Module, *, filter_fn=None, group_size: int = 0, outlier_clip_quantile: float = 1.0, sparse_ratio: float = 0.0
+    model: nn.Module,
+    *,
+    filter_fn=None,
+    group_size: int = 0,
+    outlier_clip_quantile: float = 1.0,
+    sparse_ratio: float = 0.0,
+    convrot_group=0,
 ) -> int:
     """Swap eligible nn.Linear weights to Int8QTWeight in place. Returns count."""
     replaced = 0
@@ -404,7 +457,13 @@ def convert_to_int8_training(
             continue
         w = module.weight
         module.weight = nn.Parameter(
-            Int8QTWeight.from_float(w.data, group_size, outlier_clip_quantile=outlier_clip_quantile, sparse_ratio=sparse_ratio),
+            Int8QTWeight.from_float(
+                w.data,
+                group_size,
+                outlier_clip_quantile=outlier_clip_quantile,
+                sparse_ratio=sparse_ratio,
+                convrot_group=convrot_group,
+            ),
             requires_grad=w.requires_grad,
         )
         replaced += 1

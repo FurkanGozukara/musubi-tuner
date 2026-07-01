@@ -936,10 +936,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--int8_fused_quant",
         action="store_true",
         help=(
-            "Opt-in: also fuse the int8 activation/gradient quantization into Triton kernels "
-            "(~2x faster int8 Linear layers on Ampere; needs Triton). Equivalent to setting "
-            "LTX2_INT8_FUSED_QUANT=1. Applies to --int8_base/--int8_base_dynamic, INT8 ConvRot, and "
-            "--fp8_w8a8 --w8a8_mode int8."
+            "Fuse the int8 activation/gradient quantization (and the ConvRot rotation) into single "
+            "Triton kernels for faster int8 Linear layers. On by default when Triton is available; this "
+            "flag forces it on, and LTX2_INT8_FUSED_QUANT=0 disables it (eager fallback). The fused path "
+            "is Triton-first; set LTX2_INT8_CONVROT_CUDA_QUANT=1 to use the native CUDA ConvRot kernels "
+            "instead. Applies to --int8_base/--int8_base_dynamic, INT8 ConvRot, and --fp8_w8a8 --w8a8_mode int8."
         ),
     )
     parser.add_argument(
@@ -1022,6 +1023,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Keep the top fraction of |w| as an exact fp32 side-vector, excluded from the int8 grid so "
         "outliers don't coarsen the bulk weights. Default 0.0 = off; try 0.01. Alternative to "
         "--int8_weights_outlier_quantile (which clips the tail); use one or the other.",
+    )
+    parser.add_argument(
+        "--int8_weights_convrot",
+        type=str,
+        default="",
+        help="Apply ConvRot (group-wise Hadamard rotation) to the int8 weight grid for --int8_weights: each "
+        "weight is rotated into Hadamard space before quantizing and inverted on dequantize, spreading "
+        "per-group outliers so the grid is tighter (lower per-step requantization error). '' = off (default); "
+        "'auto' picks the largest power-of-4 group (256/64/16) dividing each layer's input dim, or pass a "
+        "group size / comma list. The GEMM stays real-space bf16, so gradients and the optimizer are unchanged.",
     )
     parser.add_argument(
         "--nf4_base",

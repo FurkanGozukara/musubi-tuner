@@ -154,11 +154,12 @@ __global__ void dequant_epilogue_kernel(
   out[idx] = from_float<output_t>(v);
 }
 
-template <typename output_t, bool HAS_COL_SCALE>
+template <typename output_t, bool HAS_COL_SCALE, bool HAS_BIAS>
 __global__ void dequant_epilogue_vec4_kernel(
     const int32_t* __restrict__ acc,
     const float* __restrict__ row_scale,
     const float* __restrict__ col_scale,
+    const float* __restrict__ bias,
     output_t* __restrict__ out,
     int64_t total_vec4,
     int N) {
@@ -171,18 +172,28 @@ __global__ void dequant_epilogue_vec4_kernel(
   const int row = static_cast<int>(idx / N);
   const int4 acc4 = reinterpret_cast<const int4*>(acc)[idx4];
   const float xs = row_scale[row];
+  float v0 = static_cast<float>(acc4.x) * xs;
+  float v1 = static_cast<float>(acc4.y) * xs;
+  float v2 = static_cast<float>(acc4.z) * xs;
+  float v3 = static_cast<float>(acc4.w) * xs;
   if constexpr (HAS_COL_SCALE) {
     const float4 ws = reinterpret_cast<const float4*>(col_scale)[col / 4];
-    out[idx] = from_float<output_t>(static_cast<float>(acc4.x) * xs * ws.x);
-    out[idx + 1] = from_float<output_t>(static_cast<float>(acc4.y) * xs * ws.y);
-    out[idx + 2] = from_float<output_t>(static_cast<float>(acc4.z) * xs * ws.z);
-    out[idx + 3] = from_float<output_t>(static_cast<float>(acc4.w) * xs * ws.w);
-  } else {
-    out[idx] = from_float<output_t>(static_cast<float>(acc4.x) * xs);
-    out[idx + 1] = from_float<output_t>(static_cast<float>(acc4.y) * xs);
-    out[idx + 2] = from_float<output_t>(static_cast<float>(acc4.z) * xs);
-    out[idx + 3] = from_float<output_t>(static_cast<float>(acc4.w) * xs);
+    v0 *= ws.x;
+    v1 *= ws.y;
+    v2 *= ws.z;
+    v3 *= ws.w;
   }
+  if constexpr (HAS_BIAS) {
+    const float4 b = reinterpret_cast<const float4*>(bias)[col / 4];
+    v0 += b.x;
+    v1 += b.y;
+    v2 += b.z;
+    v3 += b.w;
+  }
+  out[idx] = from_float<output_t>(v0);
+  out[idx + 1] = from_float<output_t>(v1);
+  out[idx + 2] = from_float<output_t>(v2);
+  out[idx + 3] = from_float<output_t>(v3);
 }
 
 template <typename output_t, int GROUP, int BLOCK_THREADS>
@@ -438,10 +449,11 @@ void launch_dequant_no_bias(
   if ((total % 4) == 0 && (N % 4) == 0) {
     const int64_t total_vec4 = total / 4;
     const int blocks = static_cast<int>((total_vec4 + threads - 1) / threads);
-    dequant_epilogue_vec4_kernel<output_t, HAS_COL_SCALE><<<blocks, threads, 0, stream>>>(
+    dequant_epilogue_vec4_kernel<output_t, HAS_COL_SCALE, false><<<blocks, threads, 0, stream>>>(
         acc.data_ptr<int32_t>(),
         row_scale.data_ptr<float>(),
         col_scale,
+        nullptr,
         out.data_ptr<output_t>(),
         total_vec4,
         N);
@@ -456,6 +468,29 @@ void launch_dequant_no_bias(
         total,
         N);
   }
+}
+
+template <typename output_t, bool HAS_COL_SCALE>
+void launch_dequant_bias_vec4(
+    torch::Tensor acc,
+    torch::Tensor row_scale,
+    const float* col_scale,
+    const float* bias,
+    torch::Tensor out,
+    int64_t total,
+    int N,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int64_t total_vec4 = total / 4;
+  const int blocks = static_cast<int>((total_vec4 + threads - 1) / threads);
+  dequant_epilogue_vec4_kernel<output_t, HAS_COL_SCALE, true><<<blocks, threads, 0, stream>>>(
+      acc.data_ptr<int32_t>(),
+      row_scale.data_ptr<float>(),
+      col_scale,
+      bias,
+      out.data_ptr<output_t>(),
+      total_vec4,
+      N);
 }
 
 template <typename output_t, typename bias_t, bool HAS_COL_SCALE>
@@ -644,6 +679,18 @@ torch::Tensor dequant_epilogue(
       } else {
         ltx2_cuda_int8_convrot::launch_dequant_no_bias<output_t, false>(
             out_int32, row_scale, col_scale_ptr, out, total, N, stream.stream());
+      }
+      return;
+    }
+    if (bias.value().scalar_type() == torch::kFloat32 && (total % 4) == 0 && (N % 4) == 0) {
+      // fp32 bias + vec4-eligible: keep the vectorized epilogue instead of the scalar fallback.
+      const float* bias_ptr = bias.value().data_ptr<float>();
+      if (use_col_scale) {
+        ltx2_cuda_int8_convrot::launch_dequant_bias_vec4<output_t, true>(
+            out_int32, row_scale, col_scale_ptr, bias_ptr, out, total, N, stream.stream());
+      } else {
+        ltx2_cuda_int8_convrot::launch_dequant_bias_vec4<output_t, false>(
+            out_int32, row_scale, col_scale_ptr, bias_ptr, out, total, N, stream.stream());
       }
       return;
     }

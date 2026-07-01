@@ -1536,7 +1536,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 - `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
 - `--fp8_keep_blocks "0,1,2,45"`: with `--fp8_scaled`, keep selected transformer blocks in high precision instead of FP8 (comma lists and ranges such as `0-2,45`). By default all transformer blocks are quantized. For reference, the official `Lightricks/LTX-2.3-fp8` checkpoints leave their boundary blocks in bf16 (dev `0,1,46,47`, distilled `0,1,2,3,47`); replicating that here is optional and off by default. Ignored when `--fp8_scaled` is not set.
 - `--fp8_w8a8`: with `--fp8_base --fp8_scaled`, use W8A8 activation quantization for LoRA training. `--w8a8_mode int8` is the default; `--w8a8_mode fp8` keeps FP8 weights and dequantizes transiently.
-- `--w8a8_backend torch|triton|cutlass`: explicit backend selector for int8 W8A8 Linear matmuls. Omit it to preserve the default W8A8 backend resolution. `torch` uses `torch._int_mm` and the standard int32-to-compute-dtype scale/bias epilogue. `triton` uses the Triton int8 matmul and, when dtype/layout constraints are met, fuses row scale, column scale, bias, and output cast into the forward matmul epilogue. `cutlass` builds a native CUTLASS extension from headers supplied by `LTX2_CUTLASS_INCLUDE_DIR`; by default it returns an int32 accumulator to the standard epilogue, while `LTX2_CUTLASS_SCALED_EPILOGUE=1` enables the extension's scale/bias epilogue.
+- `--w8a8_backend torch|triton|cutlass`: explicit backend selector for int8 W8A8 Linear matmuls. Omit it to preserve the default W8A8 backend resolution. `torch` uses `torch._int_mm` and the standard int32-to-compute-dtype scale/bias epilogue. `triton` uses the Triton int8 matmul and, when dtype/layout constraints are met, fuses row scale, column scale, bias, and output cast into the forward matmul epilogue. `cutlass` builds a native CUTLASS extension from headers supplied by `LTX2_CUTLASS_INCLUDE_DIR` and returns an int32 accumulator to the standard scale/bias epilogue.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB base weights). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
 - `--int8_convrot_dynamic`: quantize a standard checkpoint to INT8 ConvRot at load time. See [INT8 ConvRot Base](#int8-convrot-base) below.
@@ -1728,7 +1728,7 @@ Notes:
 - `--int8_base` / `--int8_base_dynamic` are mutually exclusive with each other and with `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
 - For `--int8_base` the checkpoint must be an Optimum-Quanto `qint8` export. The model config is read from the checkpoint metadata when present, otherwise inferred from the weights.
 - **Triton is required for the fused int8 kernels and the lower-memory path, and is not installed by default.** Install it separately: `pip install triton` on Linux, or [`triton-windows`](https://github.com/woct0rdho/triton-windows) on Windows. Without Triton, PyTorch >= 2.1 uses `torch._int_mm` with a transposed int8 weight copy. On PyTorch < 2.1, the fallback path dequantizes the int8 weight for `F.linear`.
-- With Triton, the int8 dequantization is fused into one pass. Passing `--int8_fused_quant` (or setting `LTX2_INT8_FUSED_QUANT=1`) additionally fuses the activation quantization (forward) and gradient quantization (backward) into single Triton kernels; this is off by default and also applies to `--fp8_w8a8 --w8a8_mode int8`.
+- With Triton, the int8 dequantization is fused into one pass. The activation quantization (forward) and gradient quantization (backward) are also fused into single Triton kernels by default; set `LTX2_INT8_FUSED_QUANT=0` to force the eager multi-pass path. This also applies to `--fp8_w8a8 --w8a8_mode int8`.
 
 Performance is hardware- and shape-dependent. Benchmark the target configuration with the intended backend, precision, attention mode, sequence length, and optimizer settings.
 
@@ -1746,7 +1746,7 @@ python src/musubi_tuner/ltx2_train_network.py ^
   (other training options)
 ```
 
-For repeat runs, pre-quantize once and train from the saved INT8 ConvRot checkpoint. This removes the dynamic conversion cost from training startup and gives you a reusable, Comfy-compatible base file:
+To skip the load-time conversion on later runs, pre-quantize once and train from the saved INT8 ConvRot checkpoint (a reusable Comfy-compatible base):
 
 ```bat
 python ltx2_quantize_int8_convrot.py ^
@@ -1770,12 +1770,11 @@ Options:
 
 Quality reports include per-layer cosine similarity, MSE, MAE, max absolute error, and SQNR for the reconstructed weight (`dequantize + inverse rotate`) versus the source weight. Inspect `summary.min_cosine`, `summary.weighted_sqnr_db`, and the worst layers by `mse` or `max_abs_error`.
 
-Reference calibration for `ltx-2.3-22b-dev.safetensors` from the original bf16/fp32 source, using `--int8_convrot_groupsize auto` and MSE clipping:
+Reference calibration for `ltx-2.3-22b-dev.safetensors` from the original bf16/fp32 source, using `--int8_convrot_groupsize auto` and MSE clipping (weight-reconstruction metrics, not generation quality):
 
-| Candidate | Targeted layers / params | Weighted SQNR | Weighted MSE | Min / mean cosine | Max abs error |
-|---|---:|---:|---:|---:|---:|
-| scaled FP8 comparison | 1344 / 18.52B | 32.20 dB | 1.26e-6 | 0.999683 / 0.999697 | 0.2266 |
-| INT8 ConvRot | 1344 / 18.52B | 41.27 dB | 1.56e-7 | 0.999895 / 0.999963 | 0.0229 |
+| Targeted layers / params | Weighted SQNR | Weighted MSE | Min / mean cosine | Max abs error |
+|---:|---:|---:|---:|---:|
+| 1344 / 18.52B | 41.27 dB | 1.56e-7 | 0.999895 / 0.999963 | 0.0229 |
 
 Notes:
 - Prefer converting from the original bf16/fp16 checkpoint when available. Scaled FP8 checkpoints are supported as sources and are dequantized through their `.weight_scale` tensors before INT8 ConvRot quantization, but any error already introduced by FP8 remains part of the source.
@@ -1783,7 +1782,7 @@ Notes:
 - Mutually exclusive with `--int8_base`, `--int8_base_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
 - Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
 - The runtime uses the same int8 backend selector as the existing int8 path (`--w8a8_backend torch|triton|cutlass`). Pre-quantized INT8 ConvRot defaults to `torch._int_mm` when available; pass `--w8a8_backend triton` or `--w8a8_backend cutlass` to force a backend.
-- With Triton installed and ConvRot group sizes up to 256, `--int8_fused_quant` fuses forward ConvRot activation rotation + rowwise quantization and backward grad-input scale + inverse ConvRot epilogue. When the native CUDA ConvRot quantizer can be built, it is used for the forward ConvRot activation quantization; set `LTX2_INT8_CONVROT_CUDA_QUANT=0` to force the Triton path.
+- The forward ConvRot activation rotation + rowwise quantization and the backward grad-input scale + inverse ConvRot epilogue are fused into single Triton kernels by default (group sizes up to 256); set `LTX2_INT8_FUSED_QUANT=0` for the eager path. The fused path is Triton-first; set `LTX2_INT8_CONVROT_CUDA_QUANT=1` to build and use the native CUDA ConvRot kernels instead (one-time compile). Both fall back to eager when Triton/CUDA are unavailable.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4669,7 +4668,7 @@ The `optim_bits=8` QAPOLLO path was checked for finite loss and non-noise previe
 
 The loss trajectory diverges from a bf16 run; `--int8_weights_group_size` and `--int8_weights_outlier_quantile` are tuning knobs that change the per-step quantization grid.
 
-Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size N` (`0` = row-wise, `>0` = group-wise along the input dim), `--int8_weights_outlier_quantile q` (`1.0` = absmax, `<1.0` = clip the scale to a per-row/group quantile of `|w|`), `--int8_weights_sparse_ratio r` (dense-and-sparse, [arXiv:2310.07147](https://arxiv.org/abs/2310.07147): keep the top fraction `r` of `|w|` as an exact fp32 side-vector excluded from the int8 grid; an alternative to `--int8_weights_outlier_quantile`, use one or the other), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size N` (`0` = row-wise, `>0` = group-wise along the input dim), `--int8_weights_outlier_quantile q` (`1.0` = absmax, `<1.0` = clip the scale to a per-row/group quantile of `|w|`), `--int8_weights_sparse_ratio r` (dense-and-sparse, [arXiv:2310.07147](https://arxiv.org/abs/2310.07147): keep the top fraction `r` of `|w|` as an exact fp32 side-vector excluded from the int8 grid; an alternative to `--int8_weights_outlier_quantile`, use one or the other), `--int8_weights_convrot` (`''` = off; `auto` or a group size rotates the int8 weight grid with a group-wise Hadamard so per-group outliers are spread and the grid is tighter — the GEMM stays bf16, so gradients and the optimizer are unchanged), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
 
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>

@@ -8,7 +8,6 @@ ConvRot rotate + row-wise activation quantization step.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import torch
@@ -47,7 +46,7 @@ def _load_extension():
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             ],
             with_cuda=True,
-            verbose=os.getenv("LTX2_CUDA_INT8_CONVROT_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"},
+            verbose=logger.isEnabledFor(logging.DEBUG),
         )
     except Exception as exc:  # pragma: no cover - build environment dependent
         _LOAD_ERROR = exc

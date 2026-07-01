@@ -3657,8 +3657,15 @@ def main() -> None:
         raise ValueError(f"--qgalore_load_device must be 'cuda' or 'cpu', got {qgalore_load_device!r}")
     args.qgalore_load_device = qgalore_load_device
     qgalore_cpu_load = bool(getattr(args, "qgalore_full_ft", False)) and qgalore_load_device == "cpu"
+    # --int8_weights loads + quantizes on CPU so the full bf16 model never materializes on the GPU:
+    # convert_to_int8_training (below) shrinks it to int8 on CPU, then accelerator.prepare moves the
+    # int8 model to the GPU. This lets int8-weight FFT fit without --blocks_to_swap (which is slow).
+    # The resulting Int8QTWeight is identical to converting on the GPU (from_float is deterministic).
+    int8_weights_cpu_load = bool(getattr(args, "int8_weights", False))
     loading_device = (
-        "cpu" if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load else accelerator.device
+        "cpu"
+        if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
+        else accelerator.device
     )
     if qgalore_cpu_load:
         logger.info("Q-GaLore CPU load enabled: load/replace/quantize transformer on CPU before moving to %s", accelerator.device)
@@ -3798,20 +3805,23 @@ def main() -> None:
         _i8_group = int(getattr(args, "int8_weights_group_size", 0) or 0)
         _i8_outlier_q = float(getattr(args, "int8_weights_outlier_quantile", 1.0) or 1.0)
         _i8_sparse = float(getattr(args, "int8_weights_sparse_ratio", 0.0) or 0.0)
+        _i8_convrot = getattr(args, "int8_weights_convrot", "") or 0
         int8_weights_summary = convert_to_int8_training(
             transformer,
             filter_fn=_i8_keep,
             group_size=_i8_group,
             outlier_clip_quantile=_i8_outlier_q,
             sparse_ratio=_i8_sparse,
+            convrot_group=_i8_convrot,
         )
         logger.info(
-            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g sparse_ratio=%g (1 byte/param, stochastic-rounding updates)",
+            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g sparse_ratio=%g convrot=%s (1 byte/param, stochastic-rounding updates)",
             int8_weights_summary,
             getattr(args, "int8_weights_targets", "video"),
             _i8_group,
             _i8_outlier_q,
             _i8_sparse,
+            _i8_convrot or "off",
         )
         if int8_weights_summary <= 0:
             raise ValueError(

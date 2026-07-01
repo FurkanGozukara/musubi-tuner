@@ -80,6 +80,14 @@ def best_int8_convrot_groupsize(in_features: int, groupsizes: Iterable[int] | No
 
 
 def build_hadamard(size: int, device: str | torch.device = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Group-wise regular Hadamard matrix (Kronecker power of the 4x4 block, scaled by 1/sqrt(size)).
+
+    The base block is symmetric, so H is symmetric and orthonormal: ``H == H.T`` and ``H @ H == I``.
+    The whole path relies on this involution: offline weight rotation uses ``H.T`` and online
+    activation rotation uses ``H``, and they cancel -- ``(x @ H) @ (W @ H.T).T == x @ W.T``. The fused
+    CUDA/Triton butterfly reuses the forward transform as its own inverse in the backward. Swapping in
+    a non-symmetric base block, or mixing kron factors, would silently break the fused path only.
+    """
     if not _is_power_of_four(size):
         raise ValueError(f"Regular Hadamard size must be a power of 4 >= 4, got {size}")
     device = torch.device(device)
@@ -230,7 +238,7 @@ def quantize_int8_convrot_weight(
         raise ValueError(f"in_features {in_features} is not divisible by ConvRot group size {group_size}")
 
     if max_chunk_elements is None:
-        max_chunk_elements = int(os.getenv("LTX2_INT8_CONVROT_CHUNK_ELEMENTS", DEFAULT_INT8_CONVROT_CHUNK_ELEMENTS))
+        max_chunk_elements = DEFAULT_INT8_CONVROT_CHUNK_ELEMENTS
     calc_device = torch.device(calc_device)
     q_out = torch.empty((out_features, in_features), device=calc_device, dtype=torch.int8)
     scale_out = torch.empty((out_features, 1), device=calc_device, dtype=torch.float32)

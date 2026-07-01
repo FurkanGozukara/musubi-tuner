@@ -40,6 +40,8 @@ if _HAVE_TRITON:
         out = tl.permute(out, (0, 1, 3, 2))
         return tl.reshape(out, (BLOCK // GROUP, GROUP))
 
+    # Staged radix-4 butterfly; equals build_hadamard(GROUP) exactly. Relies on the base h4 being
+    # symmetric, so this forward transform is also its own inverse (used as such in the backward).
     @triton.jit
     def _convrot_hadamard4(y, BLOCK: tl.constexpr, GROUP: tl.constexpr):
         y = tl.reshape(y, (BLOCK // GROUP, GROUP))
@@ -160,8 +162,10 @@ def quantize_rowwise(x, col_scale=None, *, convrot_groupsize=0):
             raise ValueError("ConvRot fused quantization cannot be combined with col_scale")
         if N % convrot_groupsize != 0:
             raise ValueError(f"ConvRot group size {convrot_groupsize} does not divide N={N}")
-        if convrot_groupsize > 256:
-            raise ValueError(f"ConvRot fused quantization supports group sizes up to 256, got {convrot_groupsize}")
+        if convrot_groupsize not in (4, 16, 64, 256):
+            raise ValueError(
+                f"ConvRot fused quantization requires a power-of-4 group size in (4, 16, 64, 256), got {convrot_groupsize}"
+            )
         _quantize_rowwise_convrot_kernel[(M,)](
             x,
             q,
@@ -220,8 +224,8 @@ def dequant_epilogue_convrot(out_int32, row_scale, group_size, out_dtype):
     group_size = int(group_size)
     if N % group_size != 0:
         raise ValueError(f"ConvRot group size {group_size} does not divide N={N}")
-    if group_size > 256:
-        raise ValueError(f"ConvRot fused epilogue supports group sizes up to 256, got {group_size}")
+    if group_size not in (4, 16, 64, 256):
+        raise ValueError(f"ConvRot fused epilogue requires a power-of-4 group size in (4, 16, 64, 256), got {group_size}")
     out = torch.empty((M, N), device=out_int32.device, dtype=out_dtype)
     _dequant_epilogue_convrot_kernel[(M,)](
         out_int32,

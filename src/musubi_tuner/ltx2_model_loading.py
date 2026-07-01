@@ -1185,7 +1185,8 @@ def load_ltx2_model(
         model_files = model_path if isinstance(model_path, list) else [model_path]
         sd = load_quanto_int8_state_dict(
             model_files,
-            non_quant_dtype=torch_dtype or torch.bfloat16,
+            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             key_filter=state_dict_key_filter,
         )
     elif int8_convrot_base:
@@ -1193,7 +1194,8 @@ def load_ltx2_model(
         model_files = model_path if isinstance(model_path, list) else [model_path]
         sd = load_comfy_int8_convrot_state_dict(
             model_files,
-            non_quant_dtype=torch_dtype or torch.bfloat16,
+            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             key_filter=state_dict_key_filter,
         )
     elif int8_dynamic:
@@ -1203,7 +1205,8 @@ def load_ltx2_model(
             model_files,
             target_keys=["transformer_blocks"],
             exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
-            non_quant_dtype=torch_dtype or torch.bfloat16,
+            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
         )
@@ -1217,7 +1220,8 @@ def load_ltx2_model(
             groupsizes=int8_convrot_groupsize,
             mse_clip=bool(int8_convrot_mse_clip),
             quality_report=int8_convrot_quality_report,
-            non_quant_dtype=torch_dtype or torch.bfloat16,
+            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
         )
