@@ -2697,7 +2697,7 @@ class LTX2SamplingMixin:
 
         # first_frame (conditioning_latent) + inpaint masks + latent_idx guides are composed on the PURE
         # v2v path via composable target conditioning (_do_v2v_denoising builds them through the ltx_2
-        # ConditioningItem API + our OR-merge; latent_idx@k generalizes the first_frame@0 anchor to any slot).
+        # ConditioningItem API plus an OR-merge; latent_idx@k generalizes the first_frame@0 anchor to any slot).
         # NOT supported: keyframe (token-append) guides on any v2v path (the dedicated helpers bypass the
         # append path), and any guide / first_frame on the audio-bearing av_ic / video_ref_only_av paths.
         _pure_v2v = v2v_ref_latents is not None and not av_ic_sampling and not video_ref_only_av_sampling
@@ -2771,10 +2771,14 @@ class LTX2SamplingMixin:
             )
             return video, audio_waveform
 
-        # ===== V2V / IC-LoRA sampling path =====
+        # ===== V2V / IC-LoRA sampling path (also: reference-free masked inpaint) =====
         # Mirrors the training forward pass: patchify ref+target, build Modality with
-        # per-token timesteps (ref=0, target=sigma), call base_model directly.
-        if v2v_ref_latents is not None:
+        # per-token timesteps (ref=0, target=sigma), call base_model directly. Entered either with a
+        # v2v reference, OR reference-free when a spatial inpaint mask is supplied (mask + text only):
+        # _do_v2v_denoising tolerates v2v_ref_latents=None and composes the target-side inpaint mask
+        # (clean-paste source outside the mask, generate inside) with no reference prefix.
+        _reffree_inpaint = v2v_ref_latents is None and sample_parameter.get("inpaint_mask") is not None
+        if v2v_ref_latents is not None or _reffree_inpaint:
             video, audio_waveform = self._do_v2v_denoising(
                 latents=latents,
                 v2v_ref_latents=v2v_ref_latents,
@@ -4035,62 +4039,73 @@ class LTX2SamplingMixin:
         patchifier = VideoLatentPatchifier(patch_size=1)
         stepper = EulerDiffusionStep()
 
-        # Prepare reference latents
-        v2v_ref_latents = v2v_ref_latents.to(device=transformer_device, dtype=dit_dtype)
+        # Prepare reference latents. The reference (v2v_ref_latents) is OPTIONAL: when it is None this
+        # runs reference-free masked inpaint (mask + text only) — the target-side composable conditioning
+        # below (first_frame / inpaint / latent_idx) is independent of any reference prefix. The reference
+        # prefix is built only inside the `if _has_ref` branch; in the reference-free case ref_seq_len
+        # stays 0 so every `ref_seq_len:` slice and ref-prefix concatenation collapses to target-only.
         bsz = latents.shape[0]
-        ref_frames = int(v2v_ref_latents.shape[2])
         tgt_frames = int(latents.shape[2])
-        ref_height = int(v2v_ref_latents.shape[3])
-        ref_width = int(v2v_ref_latents.shape[4])
         tgt_height = int(latents.shape[3])
         tgt_width = int(latents.shape[4])
-
-        if ref_height == tgt_height and ref_width == tgt_width:
-            reference_downscale_factor = 1
-        else:
-            h_ratio = tgt_height / ref_height
-            w_ratio = tgt_width / ref_width
-            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
-                raise ValueError(
-                    f"V2V spatial mismatch: target HxW={tgt_height}x{tgt_width} vs ref HxW={ref_height}x{ref_width}. "
-                    f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
-                )
-            reference_downscale_factor = round(h_ratio)
-
-        # Patchify reference tokens (constant across denoising steps)
-        ref_tokens = patchifier.patchify(v2v_ref_latents)  # [B, ref_seq, D]
-        ref_seq_len = ref_tokens.shape[1]
-
-        # Conditioning mask: ref=True (conditioned, t=0), target=False (denoised, t=sigma)
-        ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=transformer_device, dtype=torch.bool)
-
-        # Compute position embeddings (constant across steps)
-        ref_coords = patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape(
-                batch=bsz,
-                channels=int(v2v_ref_latents.shape[1]),
-                frames=ref_frames,
-                height=ref_height,
-                width=ref_width,
-            ),
-            device=transformer_device,
-        )
         frame_rate_v2v = float(sample_parameter.get("frame_rate", 25))
-        ref_positions = get_pixel_coords(
-            latent_coords=ref_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
-            causal_fix=True,
-        ).to(dtype=dit_dtype)
-        ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / frame_rate_v2v
-        if reference_downscale_factor != 1:
-            ref_positions = ref_positions.clone()
-            ref_positions[:, 1, ...] *= reference_downscale_factor
-            ref_positions[:, 2, ...] *= reference_downscale_factor
-        # Reference temporal scale: mirror the train-time rewrite so a temporally-subsampled reference
-        # aligns at inference exactly as it did during training. S == 1 is a no-op (byte-identical).
-        ref_temporal_scale = _infer_reference_temporal_scale(ref_frames, tgt_frames)
-        if ref_temporal_scale != 1:
-            ref_positions = _apply_reference_temporal_scale(ref_positions, ref_temporal_scale, frame_rate_v2v)
+        _has_ref = v2v_ref_latents is not None
+        ref_tokens = None
+        ref_seq_len = 0
+        ref_conditioning_mask = None
+        ref_positions = None
+        ref_frames = 0
+        if _has_ref:
+            v2v_ref_latents = v2v_ref_latents.to(device=transformer_device, dtype=dit_dtype)
+            ref_frames = int(v2v_ref_latents.shape[2])
+            ref_height = int(v2v_ref_latents.shape[3])
+            ref_width = int(v2v_ref_latents.shape[4])
+
+            if ref_height == tgt_height and ref_width == tgt_width:
+                reference_downscale_factor = 1
+            else:
+                h_ratio = tgt_height / ref_height
+                w_ratio = tgt_width / ref_width
+                if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                    raise ValueError(
+                        f"V2V spatial mismatch: target HxW={tgt_height}x{tgt_width} vs ref HxW={ref_height}x{ref_width}. "
+                        f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                    )
+                reference_downscale_factor = round(h_ratio)
+
+            # Patchify reference tokens (constant across denoising steps)
+            ref_tokens = patchifier.patchify(v2v_ref_latents)  # [B, ref_seq, D]
+            ref_seq_len = ref_tokens.shape[1]
+
+            # Conditioning mask: ref=True (conditioned, t=0), target=False (denoised, t=sigma)
+            ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=transformer_device, dtype=torch.bool)
+
+            # Compute position embeddings (constant across steps)
+            ref_coords = patchifier.get_patch_grid_bounds(
+                output_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=int(v2v_ref_latents.shape[1]),
+                    frames=ref_frames,
+                    height=ref_height,
+                    width=ref_width,
+                ),
+                device=transformer_device,
+            )
+            ref_positions = get_pixel_coords(
+                latent_coords=ref_coords,
+                scale_factors=SpatioTemporalScaleFactors.default(),
+                causal_fix=True,
+            ).to(dtype=dit_dtype)
+            ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / frame_rate_v2v
+            if reference_downscale_factor != 1:
+                ref_positions = ref_positions.clone()
+                ref_positions[:, 1, ...] *= reference_downscale_factor
+                ref_positions[:, 2, ...] *= reference_downscale_factor
+            # Reference temporal scale: mirror the train-time rewrite so a temporally-subsampled reference
+            # aligns at inference exactly as it did during training. S == 1 is a no-op.
+            ref_temporal_scale = _infer_reference_temporal_scale(ref_frames, tgt_frames)
+            if ref_temporal_scale != 1:
+                ref_positions = _apply_reference_temporal_scale(ref_positions, ref_temporal_scale, frame_rate_v2v)
 
         tgt_coords = patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(
@@ -4109,7 +4124,7 @@ class LTX2SamplingMixin:
         ).to(dtype=dit_dtype)
         tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / frame_rate_v2v
 
-        combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
+        combined_positions = torch.cat([ref_positions, tgt_positions], dim=2) if _has_ref else tgt_positions
 
         # Get base model (bypass LTX2Wrapper)
         base_model = transformer.model if hasattr(transformer, "model") else transformer
@@ -4129,10 +4144,11 @@ class LTX2SamplingMixin:
         ).to(device=transformer_device, dtype=torch.float32)
 
         # ---- Composable target-side conditioning (first_frame + inpaint) ----
-        # Built through the ltx_2 ConditioningItem API + our OR-merge mask item, mirroring the training
+        # Built through the ltx_2 ConditioningItem API plus an OR-merge mask item, mirroring the training
         # composition in call_dit (ref ∪ first_frame ∪ inpaint). The reference stays the ref-FIRST prefix
-        # above; this only pins TARGET tokens clean. Gated on inputs => byte-identical to a plain v2v run
-        # when none are supplied (regression invariant). bsz is 1 for inference; mask builder is per-sample.
+        # above; this only pins TARGET tokens clean, and is fully gated on the conditioning inputs, so a
+        # plain v2v run with none supplied takes none of these paths. bsz is 1 for inference; mask builder
+        # is per-sample.
         cond_region_5d = None  # [B, 1, F, H, W] bool: True where the target token is pinned clean
         clean_target_5d = None  # [B, C, F, H, W]: clean content for the pinned region (frame0 edit / source bg)
         target_cond_tokens = None  # [B, tgt_seq] bool: pinned-clean tokens -> timestep 0, excluded from denoise
@@ -4231,8 +4247,8 @@ class LTX2SamplingMixin:
                 target_tokens = patchifier.patchify(latents.to(dtype=dit_dtype))
                 target_seq_len = target_tokens.shape[1]
 
-                # Concatenate ref + target
-                combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
+                # Concatenate ref + target (target-only when reference-free)
+                combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1) if _has_ref else target_tokens
 
                 # Target conditioning mask: pinned-clean tokens (first_frame / inpaint) ride timestep 0;
                 # all-False (plain v2v) when no composable conditioning was supplied.
@@ -4240,7 +4256,9 @@ class LTX2SamplingMixin:
                     target_conditioning_mask = target_cond_tokens
                 else:
                     target_conditioning_mask = torch.zeros((bsz, target_seq_len), device=transformer_device, dtype=torch.bool)
-                conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
+                conditioning_mask = (
+                    torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1) if _has_ref else target_conditioning_mask
+                )
 
                 # Per-token timesteps: ref=0, target=sigma
                 step_sigma = sigma.view(1).expand(bsz)
