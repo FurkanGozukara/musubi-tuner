@@ -3535,6 +3535,10 @@ def main() -> None:
 
     # datasets
     current_epoch = Value("i", 0)
+    # TE full fine-tune runs Gemma live and keeps no te cache, so let dataset enumeration accept
+    # latent-only items (BaseDataset reads LTX2_TE_CACHE_OPTIONAL into text_encoder_cache_optional).
+    if bool(getattr(args, "full_ft_train_text_encoder", False)) and os.environ.get("LTX2_TE_CACHE_OPTIONAL") is None:
+        os.environ["LTX2_TE_CACHE_OPTIONAL"] = "1"
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     manifest_validation_dataset_group = None
     if getattr(args, "dataset_manifest", None) is not None:

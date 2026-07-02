@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from musubi_tuner.dataset.architectures import (
@@ -432,8 +433,20 @@ class BucketBatchManager:
                         )
                     sd_latent = {**sd_latent, **sd_ref_audio}
 
-            sd_te = load_file(item_info.text_encoder_output_cache_path)
+            sd_te = load_file(item_info.text_encoder_output_cache_path) if item_info.text_encoder_output_cache_path else {}
             sd = {**sd_latent, **sd_te}
+            # When the text encoder is trained (full fine-tune), Gemma runs live at train
+            # time and needs the original caption string. Training-item enumeration leaves
+            # item_info.caption empty, so recover it from the te-cache metadata and cache it
+            # on the item so the header is read at most once.
+            item_caption = item_info.caption
+            if not item_caption and item_info.text_encoder_output_cache_path:
+                try:
+                    with safe_open(item_info.text_encoder_output_cache_path, framework="pt") as f_te:
+                        item_caption = (f_te.metadata() or {}).get("caption1", "") or ""
+                except Exception:
+                    item_caption = ""
+                item_info.caption = item_caption
 
             item_audio_latents = None
             item_audio_lengths = None
@@ -482,7 +495,7 @@ class BucketBatchManager:
                 latent_cache_paths.append(item_info.latent_cache_path)
                 audio_cache_paths.append(audio_latent_cache_path)
                 text_cache_paths.append(item_info.text_encoder_output_cache_path)
-            captions.append(item_info.caption)
+            captions.append(item_caption)
 
             # TODO refactor this
             for key in sd.keys():

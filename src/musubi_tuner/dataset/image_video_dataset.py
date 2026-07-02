@@ -2005,6 +2005,9 @@ class BaseDataset(torch.utils.data.Dataset):
         self.video_loss_weight = video_loss_weight
         self.audio_loss_weight = audio_loss_weight
         self.cache_directory = cache_directory
+        # LTX-2 text-encoder full fine-tune runs Gemma live and keeps no te cache; when set,
+        # training-item enumeration accepts latent-only items and recovers the caption from disk.
+        self.text_encoder_cache_optional = os.getenv("LTX2_TE_CACHE_OPTIONAL", "0") == "1"
         self.reference_cache_directories = _normalize_optional_path_list(
             reference_cache_directory,
             reference_cache_directories,
@@ -2292,6 +2295,33 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
         raise NotImplementedError
+
+    def _caption_for_te_optional_item(self, item_key: str) -> Optional[str]:
+        """Best-effort caption for a training item that has no text-encoder cache.
+
+        Used only when ``text_encoder_cache_optional`` is set (LTX-2 text-encoder full
+        fine-tune, which must run Gemma live and therefore keeps no te cache). Reads the
+        original caption file for directory datasets; returns None when it cannot be
+        resolved (jsonl datasets, missing file) so the caller falls back to skipping the
+        item — i.e. the pre-existing behavior.
+        """
+        directory = (
+            getattr(self, "video_directory", None)
+            or getattr(self, "image_directory", None)
+            or getattr(self, "audio_directory", None)
+        )
+        ext = getattr(self, "caption_extension", None)
+        if not directory or not ext:
+            return None
+        caption_path = os.path.join(directory, item_key + ext)
+        if not os.path.isfile(caption_path):
+            return None
+        try:
+            with open(caption_path, "r", encoding="utf-8") as handle:
+                caption = handle.read().strip()
+        except Exception:
+            return None
+        return caption or None
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         pass
@@ -2763,9 +2793,14 @@ class ImageDataset(BaseDataset):
 
             item_key = "_".join(tokens[:-2])
             text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            _live_caption = ""
             if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+                if self.text_encoder_cache_optional:
+                    _live_caption = self._caption_for_te_optional_item(item_key) or ""
+                if not _live_caption:
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+                text_encoder_output_cache_file = None
 
             audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
 
@@ -2788,7 +2823,7 @@ class ImageDataset(BaseDataset):
             has_audio = os.path.exists(audio_latent_cache_file)
             bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
             bucket_reso = self._append_latent_guide_bucket_key(bucket_reso)
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
+            item_info = ItemInfo(item_key, _live_caption, image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
             # LTX-2: attach the dataset-level spatial-crop region to the TRAINING item.
@@ -3676,9 +3711,14 @@ class VideoDataset(BaseDataset):
 
             item_key = "_".join(tokens[:-3])
             text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            _live_caption = ""
             if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+                if self.text_encoder_cache_optional:
+                    _live_caption = self._caption_for_te_optional_item(item_key) or ""
+                if not _live_caption:
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+                text_encoder_output_cache_file = None
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
             bucket_reso = (*bucket_reso, frame_count)
@@ -3686,7 +3726,9 @@ class VideoDataset(BaseDataset):
             has_audio = os.path.exists(audio_latent_cache_file)
             bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
             bucket_reso = self._append_latent_guide_bucket_key(bucket_reso)
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
+            item_info = ItemInfo(
+                item_key, _live_caption, image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file
+            )
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
             # LTX-2: attach the dataset-level spatial-crop region to the training item.

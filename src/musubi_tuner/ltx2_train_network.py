@@ -4313,6 +4313,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             text_embeds = batch.get("text")
             text_mask = batch.get("text_mask")
 
+        # Full fine-tune of the text encoder requires running Gemma live at train time.
+        # Cached embeddings are detached tensors with no path back to Gemma's weights, so
+        # training on them silently produces zero gradient. Drop any cached embeddings for
+        # this step and take the live-encoding path below.
+        if bool(getattr(args, "full_ft_train_text_encoder", False)):
+            text_embeds = None
+            text_mask = None
+
         if text_embeds is None:
             use_full_ft_fallback = bool(getattr(args, "full_ft_train_text_encoder", False)) and bool(
                 getattr(args, "full_ft_text_encoder_fallback", False)
