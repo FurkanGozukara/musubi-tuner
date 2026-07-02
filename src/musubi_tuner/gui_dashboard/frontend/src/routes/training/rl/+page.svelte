@@ -94,7 +94,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Prompts &amp; cache</div>
 					<div class="space-y-2">
-						<PathInput label="Prompts File" fieldPath="rl.rl_prompts" value={$projectConfig?.rl?.rl_prompts || ''} oninput={(e) => update('rl_prompts', e.target.value)} showFiles placeholder="rl_prompts.txt" tooltip="Text file of prompts (one per line). Diversity matters more than count; 8 is a smoke test, 50+ is a real run." />
+						<PathInput label="Prompts File" fieldPath="rl.rl_prompts" value={$projectConfig?.rl?.rl_prompts || ''} oninput={(e) => update('rl_prompts', e.target.value)} showFiles placeholder="rl_prompts.txt" tooltip="Text file of prompts (one per line). Diversity matters more than count; ~8 for a quick check, 50+ for full training." />
 						<PathInput label="Rollout Cache (output)" fieldPath="rl.rl_rollout_cache" value={$projectConfig?.rl?.rl_rollout_cache || ''} oninput={(e) => update('rl_rollout_cache', e.target.value)} tooltip="Directory the rollouts + scores + advantages are written to. Phase B reads this same path." />
 						<PathInput label="Save `old` Snapshot (optional)" fieldPath="rl.rl_save_old_lora" value={$projectConfig?.rl?.rl_save_old_lora || ''} oninput={(e) => update('rl_save_old_lora', e.target.value)} showFiles placeholder="old_snapshot_r0.safetensors" tooltip="Writes the fp32 `old` snapshot that generated this cache. Load it as Network Weights in Phase B so `default` starts equal to `old` (the snapshot-hash invariant)." />
 					</div>
@@ -148,7 +148,7 @@
 					</div>
 				</div>
 				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
-					The cheap phase (~8 GB at fp8 + block-swap + gradient checkpointing). Load the Phase A <code>old</code> snapshot as
+					The low-memory phase (roughly 8 GB with fp8 + block swap + gradient checkpointing). Load the Phase A <code>old</code> snapshot as
 					Network Weights on the Training tab so <code>default</code> starts equal to <code>old</code>.
 				</p>
 			</div>
@@ -158,7 +158,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-2">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Rollout source</span>
-						<FormToggle label="Online (generate inline)" fieldPath="rl.online" checked={online} onchange={(e) => update('online', e.target.checked)} tooltip="Off (recommended): replay a Phase A cache. On: generate rollouts inline each step (experimental, not VRAM-flat)." />
+						<FormToggle label="Online (generate inline)" fieldPath="rl.online" checked={online} onchange={(e) => update('online', e.target.checked)} tooltip="Off (recommended): replay a Phase A cache. On: generate rollouts inline each step (uses more, non-constant VRAM)." />
 					</div>
 					{#if !online}
 						<PathInput label="Rollout Cache (from Phase A)" fieldPath="rl.rl_rollout_cache" value={$projectConfig?.rl?.rl_rollout_cache || ''} oninput={(e) => update('rl_rollout_cache', e.target.value)} tooltip="The directory written by Phase A. Phase B aborts if its `old` snapshot hash does not match the cache." />

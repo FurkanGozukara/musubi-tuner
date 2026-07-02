@@ -1835,7 +1835,7 @@ class LTX2SamplingMixin:
 
         # ---- LTX-2 latent-guide specs (--gl / --gk in prompt lines) ----
         # Encode each spec into a 5D latent and convert into LatentIndexGuide /
-        # KeyframeGuide for the inferencer. For now we re-use the same pixel
+        # KeyframeGuide for the inferencer. We re-use the same pixel
         # resolution as the target video (no per-guide resolution override).
         latent_idx_guides_resolved = None
         keyframe_guides_resolved = None

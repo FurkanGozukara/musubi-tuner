@@ -45,7 +45,7 @@ def _stack_audio_cond_masks(masks_per_item, item_count: int, target_t: int, devi
     """Stack per-item audio conditioning masks into ``[B, target_t]``.
 
     Items lacking a mask default to ZEROS (no conditioning) — unlike the audio loss mask, which defaults
-    to ones. Returns None when no item has a mask, so the batch key is omitted (off-path byte-identical).
+    to ones. Returns None when no item has a mask, so the batch key is omitted (output unchanged when no masks are present).
     """
     if not any(isinstance(m, torch.Tensor) for m in masks_per_item):
         return None
@@ -933,7 +933,7 @@ class BucketBatchManager:
             batch_tensor_data["text_cache_paths"] = text_cache_paths
         # LTX-2: attach per-item spatial-crop regions as a plain Python list (never
         # stacked). Key is absent unless some item carries a region (only when the
-        # dataset's spatial_crop_enabled flag is set), so off-mode is byte-identical.
+        # dataset's spatial_crop_enabled flag is set), so behavior is unchanged when the flag is off.
         if any(r is not None for r in spatial_crop_regions_per_item):
             batch_tensor_data["spatial_crop_region"] = spatial_crop_regions_per_item
         batch_tensor_data["captions"] = captions

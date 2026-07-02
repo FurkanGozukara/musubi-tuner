@@ -1,9 +1,9 @@
 """Placeholder reward: deterministic, dependency-free.
 
-Used to wire the RL pipeline (registry -> rollout cache -> NFT loop) end-to-end on
-video-only BEFORE porting a real model (e.g. HPSv3). Produces a stable pseudo-random
-score per sample so prompt groups have non-zero variance (exercising GRPO) without
-needing any model, checkpoint, or decoded media.
+Wires the RL pipeline (registry -> rollout cache -> NFT loop) end-to-end without a
+real model or checkpoint (a stand-in for a model-backed reward such as HPSv3). Produces
+a stable pseudo-random score per sample so prompt groups have non-zero variance
+(exercising GRPO) without needing any model, checkpoint, or decoded media.
 """
 
 from __future__ import annotations

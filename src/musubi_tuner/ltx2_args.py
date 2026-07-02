@@ -1035,6 +1035,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "group size / comma list. The GEMM stays real-space bf16, so gradients and the optimizer are unchanged.",
     )
     parser.add_argument(
+        "--int8_weights_w8a8",
+        action="store_true",
+        help="Run the forward and grad-input GEMMs in int8 (W8A8) with rotations applied to the "
+        "activations; the grad-weight GEMM stays bf16. Requires --int8_weights_group_size 0 and "
+        "--int8_weights_sparse_ratio 0. Speedup is hardware-dependent (int8 tensor cores).",
+    )
+    parser.add_argument(
+        "--int8_weights_prequant",
+        type=str,
+        default=None,
+        help="Path to a pre-quantized INT8 weight sidecar produced by ltx2_export_int8_weights.py. When set, "
+        "--int8_weights rebuilds each target Int8QTWeight from the stored int_data/scale instead of running the "
+        "slow startup quantization. The base checkpoint (--ltx2_checkpoint) still loads normally; only the "
+        "quantization compute is skipped. The sidecar's grid (group_size / outlier_quantile / sparse_ratio / "
+        "convrot / dtype) must match the --int8_weights_* flags or the run aborts.",
+    )
+    parser.add_argument(
         "--nf4_base",
         action="store_true",
         help="use NF4 4-bit quantization for base DiT model (reduces VRAM ~75%%)",

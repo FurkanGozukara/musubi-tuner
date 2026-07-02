@@ -625,3 +625,289 @@ async def get_extract_lora_status(job_id: str, request: Request):
     if job is None:
         raise HTTPException(status_code=404, detail="Extraction job not found")
     return _snapshot_job(job)
+
+
+class QuantizeInt8ConvRotRequest(BaseModel):
+    checkpoint_path: str
+    output_path: str = ""
+    groupsize: str = "auto"
+    mse_clip: bool = True
+    calc_device: str = "cpu"
+    quality_report: bool = True
+
+
+@dataclasses.dataclass
+class QuantizeInt8ConvRotJob:
+    job_id: str
+    checkpoint_path: str
+    output_path: str = ""
+    groupsize: str = "auto"
+    mse_clip: bool = True
+    calc_device: str = "cpu"
+    quality_report: bool = True
+    state: str = "queued"
+    message: str = "Queued"
+    error: str = ""
+    created_at: float = dataclasses.field(default_factory=time.time)
+    updated_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+def _get_quantize_int8cr_jobs(request: Request) -> dict[str, QuantizeInt8ConvRotJob]:
+    jobs = getattr(request.app.state, "quantize_int8cr_jobs", None)
+    if jobs is None:
+        jobs = {}
+        request.app.state.quantize_int8cr_jobs = jobs
+    return jobs
+
+
+def _default_int8cr_output_path(input_path: str) -> str:
+    path = Path(input_path)
+    return str(path.parent / f"{path.stem}.int8cr{path.suffix}")
+
+
+def _run_quantize_int8cr_job(job: QuantizeInt8ConvRotJob, config: ProjectConfig) -> None:
+    try:
+        _set_job_state(job, state="running", message="Pre-quantizing transformer weights to INT8 ConvRot")
+        cmd = [
+            sys.executable,
+            "-m",
+            "musubi_tuner.ltx2_quantize_int8_convrot",
+            "--input_model",
+            job.checkpoint_path,
+            "--output_model",
+            job.output_path,
+            "--groupsize",
+            job.groupsize or "auto",
+            "--calc_device",
+            job.calc_device or "cpu",
+        ]
+        if not job.mse_clip:
+            cmd.append("--no_mse_clip")
+        if not job.quality_report:
+            cmd.append("--no_quality_report")
+
+        result = subprocess.run(
+            cmd,
+            cwd=config.project_dir or None,
+            env=_converter_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            output_tail = "\n".join((result.stdout or "").splitlines()[-40:])
+            raise RuntimeError(output_tail or f"Quantizer exited with code {result.returncode}")
+
+        _set_job_state(
+            job,
+            state="completed",
+            message=f"Saved to {job.output_path}",
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        logger.exception("INT8 ConvRot pre-quantization failed")
+        _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
+
+
+@router.post("/quantize-int8cr")
+async def start_quantize_int8cr(req: QuantizeInt8ConvRotRequest, request: Request):
+    config = _get_config(request)
+    try:
+        checkpoint_path = _resolve_project_path(config, req.checkpoint_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Checkpoint must be a .safetensors file")
+
+    try:
+        output_path = (
+            _resolve_project_path(config, req.output_path)
+            if req.output_path.strip()
+            else Path(_default_int8cr_output_path(str(checkpoint_path)))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if output_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Output path must be a .safetensors file")
+    if output_path == checkpoint_path:
+        raise HTTPException(status_code=400, detail="Output path must differ from the input checkpoint")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    device = (req.calc_device or "cpu").strip().lower()
+    if device not in {"cpu", "cuda"}:
+        raise HTTPException(status_code=400, detail="calc_device must be 'cpu' or 'cuda'")
+
+    jobs = _get_quantize_int8cr_jobs(request)
+    _prune_finished_jobs(jobs)
+    job = QuantizeInt8ConvRotJob(
+        job_id=uuid.uuid4().hex,
+        checkpoint_path=str(checkpoint_path),
+        output_path=str(output_path),
+        groupsize=(req.groupsize or "auto").strip(),
+        mse_clip=bool(req.mse_clip),
+        calc_device=device,
+        quality_report=bool(req.quality_report),
+    )
+    jobs[job.job_id] = job
+    thread = threading.Thread(target=_run_quantize_int8cr_job, args=(job, config), daemon=True)
+    thread.start()
+    return _snapshot_job(job)
+
+
+@router.get("/quantize-int8cr/{job_id}")
+async def get_quantize_int8cr_status(job_id: str, request: Request):
+    jobs = _get_quantize_int8cr_jobs(request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Quantization job not found")
+    return _snapshot_job(job)
+
+
+class QuantizeInt8WeightsRequest(BaseModel):
+    checkpoint_path: str
+    output_path: str = ""
+    targets: str = "video"
+    group_size: str = "0"
+    convrot: str = "auto"
+    dtype: str = "bfloat16"
+    calc_device: str = "cpu"
+
+
+@dataclasses.dataclass
+class QuantizeInt8WeightsJob:
+    job_id: str
+    checkpoint_path: str
+    output_path: str = ""
+    targets: str = "video"
+    group_size: str = "0"
+    convrot: str = "auto"
+    dtype: str = "bfloat16"
+    calc_device: str = "cpu"
+    state: str = "queued"
+    message: str = "Queued"
+    error: str = ""
+    created_at: float = dataclasses.field(default_factory=time.time)
+    updated_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+def _get_quantize_int8w_jobs(request: Request) -> dict[str, QuantizeInt8WeightsJob]:
+    jobs = getattr(request.app.state, "quantize_int8w_jobs", None)
+    if jobs is None:
+        jobs = {}
+        request.app.state.quantize_int8w_jobs = jobs
+    return jobs
+
+
+def _default_int8w_output_path(input_path: str) -> str:
+    path = Path(input_path)
+    return str(path.parent / f"{path.stem}.int8w{path.suffix}")
+
+
+def _run_quantize_int8w_job(job: QuantizeInt8WeightsJob, config: ProjectConfig) -> None:
+    try:
+        _set_job_state(job, state="running", message="Pre-quantizing transformer weights to the INT8 weight-only grid")
+        cmd = [
+            sys.executable,
+            "-m",
+            "musubi_tuner.ltx2_export_int8_weights",
+            "--input_model",
+            job.checkpoint_path,
+            "--output_model",
+            job.output_path,
+            "--targets",
+            job.targets or "video",
+            "--group_size",
+            str(job.group_size or "0"),
+            "--convrot",
+            job.convrot or "auto",
+            "--dtype",
+            job.dtype or "bfloat16",
+            "--calc_device",
+            job.calc_device or "cpu",
+        ]
+        result = subprocess.run(
+            cmd,
+            cwd=config.project_dir or None,
+            env=_converter_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            output_tail = "\n".join((result.stdout or "").splitlines()[-40:])
+            raise RuntimeError(output_tail or f"Exporter exited with code {result.returncode}")
+
+        _set_job_state(job, state="completed", message=f"Saved to {job.output_path}", finished_at=time.time())
+    except Exception as exc:
+        logger.exception("INT8 weight-only pre-quantization failed")
+        _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
+
+
+@router.post("/quantize-int8w")
+async def start_quantize_int8w(req: QuantizeInt8WeightsRequest, request: Request):
+    config = _get_config(request)
+    try:
+        checkpoint_path = _resolve_project_path(config, req.checkpoint_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Checkpoint must be a .safetensors file")
+
+    try:
+        output_path = (
+            _resolve_project_path(config, req.output_path)
+            if req.output_path.strip()
+            else Path(_default_int8w_output_path(str(checkpoint_path)))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if output_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Output path must be a .safetensors file")
+    if output_path == checkpoint_path:
+        raise HTTPException(status_code=400, detail="Output path must differ from the input checkpoint")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    device = (req.calc_device or "cpu").strip().lower()
+    if device not in {"cpu", "cuda"}:
+        raise HTTPException(status_code=400, detail="calc_device must be 'cpu' or 'cuda'")
+    dtype = (req.dtype or "bfloat16").strip().lower()
+    if dtype not in {"bfloat16", "float16", "float32"}:
+        raise HTTPException(status_code=400, detail="dtype must be bfloat16, float16, or float32")
+
+    jobs = _get_quantize_int8w_jobs(request)
+    _prune_finished_jobs(jobs)
+    job = QuantizeInt8WeightsJob(
+        job_id=uuid.uuid4().hex,
+        checkpoint_path=str(checkpoint_path),
+        output_path=str(output_path),
+        targets=(req.targets or "video").strip(),
+        group_size=(str(req.group_size) or "0").strip(),
+        convrot=(req.convrot or "auto").strip(),
+        dtype=dtype,
+        calc_device=device,
+    )
+    jobs[job.job_id] = job
+    thread = threading.Thread(target=_run_quantize_int8w_job, args=(job, config), daemon=True)
+    thread.start()
+    return _snapshot_job(job)
+
+
+@router.get("/quantize-int8w/{job_id}")
+async def get_quantize_int8w_status(job_id: str, request: Request):
+    jobs = _get_quantize_int8w_jobs(request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Quantization job not found")
+    return _snapshot_job(job)

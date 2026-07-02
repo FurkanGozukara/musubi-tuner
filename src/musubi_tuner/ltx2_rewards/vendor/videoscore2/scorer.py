@@ -22,7 +22,7 @@ Runtime notes:
     flag is harmless.
   * attn_implementation follows the same flash_attn->sdpa policy as the vendored hpsv3 /
     videoreward copies: pin flash_attention_2 when flash_attn is importable, else sdpa, for
-    parity with the sibling rewards on the same box.
+    parity with the sibling rewards.
   * Generation defaults: do_sample=True, temperature=0.7, max_new_tokens=1024; a seed arg is
     added so a reward can be reproducible, and do_sample can be set False for
     greedy/deterministic scoring.

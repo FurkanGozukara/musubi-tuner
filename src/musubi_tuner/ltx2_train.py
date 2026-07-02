@@ -174,6 +174,20 @@ def _is_self_attention_geometry_param(param_name: str) -> bool:
     )
 
 
+def _ema_param_value(param: torch.nn.Parameter) -> torch.Tensor:
+    """Real-space value of a parameter for EMA tracking.
+
+    Int8-backed weights are dequantized on their current device so the shadow
+    averages real-space weights; other parameters return their data unchanged.
+    """
+    from musubi_tuner.modules.int8_training import Int8QTWeight
+
+    data = param.data
+    if isinstance(data, Int8QTWeight):
+        return data.dequantize()
+    return data
+
+
 class EMAModel:
     """Exponential Moving Average of model weights.
 
@@ -211,17 +225,18 @@ class EMAModel:
         self.shadow_params = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
+                value = _ema_param_value(param)
                 if device is not None:
-                    self.shadow_params[name] = param.data.clone().to(device)
+                    self.shadow_params[name] = value.clone().to(device)
                 else:
-                    self.shadow_params[name] = param.data.clone()
+                    self.shadow_params[name] = value.clone()
 
     def _copy_to_shadow(self, model: torch.nn.Module) -> None:
         """Copy current model weights to shadow (used during warmup)."""
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name in self.shadow_params and param.requires_grad:
-                    self.shadow_params[name].copy_(param.data.to(self.shadow_params[name].device))
+                    self.shadow_params[name].copy_(_ema_param_value(param).to(self.shadow_params[name].device))
 
     def update(self, model: torch.nn.Module) -> None:
         """Update EMA weights.
@@ -231,10 +246,13 @@ class EMAModel:
         """
         self.step += 1
 
-        # During warmup period, just copy current weights to shadow
-        # This ensures EMA starts from a reasonable state
+        # During warmup period, keep shadow = current weights so the EMA starts from a
+        # reasonable state. Refresh only on update_every boundaries (plus the final warmup
+        # step, so the first post-warmup lerp starts from fresh weights) — a full copy per
+        # step is redundant, and for quantized weights each copy dequantizes the model.
         if self.step <= self.update_after_step:
-            self._copy_to_shadow(model)
+            if self.step == self.update_after_step or self.step % self.update_every == 0:
+                self._copy_to_shadow(model)
             return
 
         # Check if this is an update step
@@ -247,7 +265,7 @@ class EMAModel:
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name in self.shadow_params and param.requires_grad:
-                    self.shadow_params[name].lerp_(param.data.to(self.shadow_params[name].device), 1.0 - self.decay)
+                    self.shadow_params[name].lerp_(_ema_param_value(param).to(self.shadow_params[name].device), 1.0 - self.decay)
 
     def apply_to(self, model: torch.nn.Module) -> dict:
         """Apply EMA weights to model, returning original weights for restoration."""
@@ -3909,23 +3927,86 @@ def main() -> None:
         _i8_outlier_q = float(getattr(args, "int8_weights_outlier_quantile", 1.0) or 1.0)
         _i8_sparse = float(getattr(args, "int8_weights_sparse_ratio", 0.0) or 0.0)
         _i8_convrot = getattr(args, "int8_weights_convrot", "") or 0
-        int8_weights_summary = convert_to_int8_training(
-            transformer,
-            filter_fn=_i8_keep,
-            group_size=_i8_group,
-            outlier_clip_quantile=_i8_outlier_q,
-            sparse_ratio=_i8_sparse,
-            convrot_group=_i8_convrot,
-        )
-        logger.info(
-            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g sparse_ratio=%g convrot=%s (1 byte/param, stochastic-rounding updates)",
-            int8_weights_summary,
-            getattr(args, "int8_weights_targets", "video"),
-            _i8_group,
-            _i8_outlier_q,
-            _i8_sparse,
-            _i8_convrot or "off",
-        )
+        _i8_w8a8 = bool(getattr(args, "int8_weights_w8a8", False))
+        if _i8_w8a8 and _i8_group > 0:
+            raise ValueError("--int8_weights_w8a8 requires --int8_weights_group_size 0 (per-row weight scale for the int8 GEMM).")
+        if _i8_w8a8 and _i8_sparse > 0:
+            raise ValueError(
+                "--int8_weights_w8a8 requires --int8_weights_sparse_ratio 0 (a dense-sparse side vector breaks the pure int8 GEMM)."
+            )
+        _i8_prequant = getattr(args, "int8_weights_prequant", None)
+        if _i8_prequant:
+            # Load a pre-quantized sidecar instead of running from_float on every target matrix.
+            from musubi_tuner.modules.int8_training import load_int8_prequant_into_training
+            from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+
+            def _pq_require(field, got, exp):
+                if str(got) != str(exp):
+                    raise ValueError(
+                        f"--int8_weights_prequant grid mismatch on {field}: file has {got!r}, training flags have "
+                        f"{exp!r}. Re-export the sidecar (ltx2_export_int8_weights.py) with matching --int8_weights_* flags."
+                    )
+
+            # sample a target weight dtype so the sidecar's quantization precision is validated to match
+            _tgt_dtype = None
+            for _n, _m in transformer.named_modules():
+                if isinstance(_m, torch.nn.Linear) and _i8_keep(_m, _n):
+                    _tgt_dtype = str(_m.weight.dtype).replace("torch.", "")
+                    break
+            with MemoryEfficientSafeOpen(_i8_prequant) as _f:
+                _meta = _f.metadata() or {}
+                if _meta.get("int8_weights_prequant") != "true":
+                    raise ValueError(
+                        f"--int8_weights_prequant file {_i8_prequant!r} is not an int8-weights pre-quantized sidecar "
+                        "(missing marker). Produce it with ltx2_export_int8_weights.py."
+                    )
+                _pq_require("group_size", _meta.get("group_size"), _i8_group)
+                _pq_require("outlier_clip_quantile", _meta.get("outlier_clip_quantile"), _i8_outlier_q)
+                _pq_require("sparse_ratio", _meta.get("sparse_ratio"), _i8_sparse)
+                _pq_require("w8a8_compute", _meta.get("w8a8_compute"), _i8_w8a8)
+                _pq_require("convrot", _meta.get("convrot"), _i8_convrot)
+                if _tgt_dtype is not None:
+                    _pq_require("dtype", _meta.get("dtype"), _tgt_dtype)
+                _pq_tensors = {k: _f.get_tensor(k) for k in _f.keys()}
+            int8_weights_summary = load_int8_prequant_into_training(
+                transformer,
+                _pq_tensors,
+                filter_fn=_i8_keep,
+                group_size=_i8_group,
+                outlier_clip_quantile=_i8_outlier_q,
+                sparse_ratio=_i8_sparse,
+                w8a8=_i8_w8a8,
+            )
+            logger.info(
+                "int8 weight-only QT: rebuilt %d PRE-QUANTIZED Linear layers from %s (startup quantization skipped) "
+                "targets=%s group_size=%d convrot=%s w8a8=%s",
+                int8_weights_summary,
+                _i8_prequant,
+                getattr(args, "int8_weights_targets", "video"),
+                _i8_group,
+                _i8_convrot or "off",
+                _i8_w8a8,
+            )
+        else:
+            int8_weights_summary = convert_to_int8_training(
+                transformer,
+                filter_fn=_i8_keep,
+                group_size=_i8_group,
+                outlier_clip_quantile=_i8_outlier_q,
+                sparse_ratio=_i8_sparse,
+                convrot_group=_i8_convrot,
+                w8a8=_i8_w8a8,
+            )
+            logger.info(
+                "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g sparse_ratio=%g convrot=%s w8a8=%s (1 byte/param, stochastic-rounding updates)",
+                int8_weights_summary,
+                getattr(args, "int8_weights_targets", "video"),
+                _i8_group,
+                _i8_outlier_q,
+                _i8_sparse,
+                _i8_convrot or "off",
+                _i8_w8a8,
+            )
         if int8_weights_summary <= 0:
             raise ValueError(
                 "--int8_weights did not replace any Linear modules; check --int8_weights_targets / --int8_weights_min_numel."
@@ -5145,7 +5226,8 @@ def main() -> None:
             if name in ema_model.shadow_params:
                 ema_state_dict[name] = ema_model.shadow_params[name].cpu()
             else:
-                ema_state_dict[name] = param.data.cpu()
+                # untracked int8-backed weights are dequantized so the EMA checkpoint is a standard, directly loadable file
+                ema_state_dict[name] = _ema_param_value(param).cpu()
 
         # Add non-parameter state (buffers)
         for name, buf in save_model_ref.named_buffers():

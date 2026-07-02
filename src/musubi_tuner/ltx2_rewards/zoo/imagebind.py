@@ -69,7 +69,7 @@ class ImageBindReward(BaseReward):
                 from imagebind import data as imagebind_data
                 from imagebind.models import imagebind_model
                 from imagebind.models.imagebind_model import ModalityType
-            except ImportError as exc:  # pragma: no cover - GPU box only
+            except ImportError as exc:  # pragma: no cover - requires a CUDA GPU
                 raise ImportError(
                     "imagebind reward requires the vendored copy "
                     "(musubi_tuner.ltx2_rewards.vendor.imagebind) or an external "

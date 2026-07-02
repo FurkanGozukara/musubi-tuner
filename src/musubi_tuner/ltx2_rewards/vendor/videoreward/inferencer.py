@@ -94,7 +94,7 @@ def _find_target_linear_names(model, num_lora_modules=-1, lora_namespan_exclude=
 
 
 # The released ``model_config.json`` hard-codes the trainer's local base-model path
-# (``/pfs/.../Qwen2-VL-2B-Instruct``), which does not exist outside the original box. When
+# (``/pfs/.../Qwen2-VL-2B-Instruct``), which will not exist in a fresh checkout. When
 # it is missing we fall back to the public HF id (the checkpoint's ``base_model``), which
 # resolves from the HF cache (works with ``HF_HUB_OFFLINE=1``). Only the architecture/config
 # skeleton is taken from here; the actual weights come from the merged checkpoint.

@@ -145,7 +145,7 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     """Register Phase B (``ltx2_train_rl.py``) NFT training-loop flags.
 
     Mirrors ``ltx2_train_rl.rl_setup_parser`` (kept identical: same names + defaults).
-    Covers the offline cache-replay path plus the experimental online path.
+    Covers the offline cache-replay path plus the online path.
     """
     seen = _existing_options(parser)
     if "--rl_rollout_cache" not in seen:

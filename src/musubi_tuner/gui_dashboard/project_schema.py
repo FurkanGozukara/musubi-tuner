@@ -800,7 +800,7 @@ class TrainingConfig(BaseModel):
 class FullFinetuneConfig(TrainingConfig):
     model_config = ConfigDict(extra="ignore")
 
-    # Defaults are tuned for real runs rather than dashboard smoke tests.
+    # Defaults target typical training runs.
     learning_rate: float = 1e-6
     optimizer_type: str = "Adafactor"
     lr_scheduler: str = "constant_with_warmup"

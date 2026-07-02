@@ -179,7 +179,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [BAdam Block-Coordinate](#badam-block-coordinate)
     - [Q-GaLore Quantized](#q-galore-quantized)
     - [APOLLO and QAPOLLO](#apollo-and-qapollo)
-    - [Int8 Weight Training](#int8-weight-training)
+    - [Int8 / Int8 ConvRot / EMA](#int8--int8-convrot--ema)
     - [Optimizing VRAM Usage](#optimizing-vram-usage)
   - [References](#references)
 
@@ -2663,7 +2663,7 @@ accelerate launch ... ltx2_train_network.py ^
 ### HFATO (High-Frequency Awareness Training Objective)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Adapted from [ViBe (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326). Experimental — not yet validated on LTX-2.
+Adapted from [ViBe (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326). Experimental for LTX-2 — evaluate on your own data before relying on it.
 
 **HFATO** is a training objective designed for image-only fine-tuning of video models. Before adding noise, clean latents are spatially degraded via the ViBe Stage 2 downsample-upsample operator: 5D trilinear interpolation with `scale_factor=(1.0, 0.5, 0.5)` and `align_corners=False`, destroying high-frequency details. The model is then supervised to reconstruct the original clean latents (x₀-prediction loss instead of standard velocity loss). Can be combined with the Relay LoRA workflow below for two-stage image-only training.
 
@@ -3917,7 +3917,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ```
 
 Notes:
-- Audio reference sliders are an MVP path built for `--ltx2_mode audio`.
+- Audio reference sliders are supported in `--ltx2_mode audio`.
 - The trainer uses the same paired positive/negative audio latents plus shared text cache, and masks loss with cached `audio_lengths`.
 - `--lora_target_preset audio` is recommended; if omitted, the slider trainer selects it automatically for audio reference sliders.
 - `--ltx2_first_frame_conditioning_p` has no effect for audio sliders.
@@ -4280,7 +4280,7 @@ The NFT update and several of the reward checkpoints derive from [OmniNFT](https
 <sub>[↑ contents](#table-of-contents)</sub>
 
 > [!NOTE]
-> **Scope.** Single-GPU full-rank fine-tuning of large video models is a lightly-documented area, so this section is written as a collection of engineering notes rather than settled training doctrine. Several techniques are adapted from the broader LLM optimization literature and have not been extensively validated on video models; measure on your own hardware before committing to long runs.
+> **Scope.** Single-GPU full-rank fine-tuning of large video models is a lightly-documented area. Several techniques here are adapted from the broader LLM optimization literature; measure on your own hardware before committing to long runs.
 
 Full-parameter fine-tuning updates LTX-2 transformer checkpoint weights directly, without attaching or saving a LoRA adapter. Large video transformer training must hold base weights, gradients, optimizer state, activations, and checkpoint-save buffers rather than only a small adapter, so dense full-parameter setups require substantially more GPU memory than LoRA training.
 
@@ -4416,9 +4416,9 @@ With `switch_block_every=25` on the measured 48-block LTX-2.3 transformer, the o
 
 When `use_fp32_active_copy=True` (the recommended memory-safe path), keep `reset_state_on_switch=True`. The base optimizer state is attached to temporary fp32 copies of the active block parameters; this implementation does not remap Adam state from one active window to the next.
 
-**Technical tradeoffs**. BAdam reduces active optimizer and gradient state by updating only the active block window. It does not remove the dense base weights, and it still runs the full transformer computation every step. A full block sweep takes many optimizer steps, so learning is distributed over the model more slowly than dense Adafactor. In the LTX-2.3 long runs measured for this section, BAdam reached a loss plateau and reduced loss more slowly than Adafactor. For LTX-2.3 FFT, treat BAdam as an experimental low-VRAM fallback, not the preferred path; prefer dense Adafactor when it fits, or Q-GaLore/QAPOLLO/int8-weight training for 24 GB-class video-only experiments. The [BREAD paper](https://openreview.net/pdf?id=zs6bRl05g8) analyzes suboptimal landscapes in block-coordinate LLM fine-tuning and proposes inactive-block correction as a mitigation.
+**Technical tradeoffs**. BAdam reduces active optimizer and gradient state by updating only the active block window. It does not remove the dense base weights, and it still runs the full transformer computation every step. A full block sweep takes many optimizer steps, so learning is distributed over the model more slowly than dense Adafactor. Because each block updates less often, convergence can be slower and BAdam may reach a higher loss plateau than dense Adafactor on this model. For LTX-2.3 FFT, use BAdam as a lower-VRAM fallback: prefer dense Adafactor when it fits, or Q-GaLore/QAPOLLO/int8-weight training for 24 GB-class video-only setups. The [BREAD paper](https://openreview.net/pdf?id=zs6bRl05g8) analyzes suboptimal landscapes in block-coordinate LLM fine-tuning and proposes inactive-block correction as a mitigation.
 
-BREAD-SGD is available here for convergence experiments, not as a confirmed fix for LTX-2.3. The in-repo path is a lightweight BREAD-SGD-style correction implemented through post-accumulate gradient hooks, so treat it as an ablation rather than a validated replacement for dense FFT. In the measured LTX-2.3 runs, memory-bounded BREAD did not remove the observed BAdam plateau behavior. `bread_sgd_mode=all` applies the correction to all inactive parameters and has the highest extra memory cost. `bread_sgd_mode=partial` applies it only to downstream block groups that already sit on the backward path after the active block. `bread_sgd_mode=window` bounds that correction to `bread_sgd_window_blocks` downstream block groups. The `partial` and `window` modes reduce extra weight-gradient pressure compared with `all`, but they still need quality and convergence validation.
+BREAD-SGD is an optional block-coordinate correction, implemented through post-accumulate gradient hooks. It applies a correction to inactive-block parameters to mitigate the block-coordinate plateau; evaluate convergence and quality on your own data before relying on it. `bread_sgd_mode=all` applies the correction to all inactive parameters and has the highest extra memory cost. `bread_sgd_mode=partial` applies it only to downstream block groups that already sit on the backward path after the active block. `bread_sgd_mode=window` bounds that correction to `bread_sgd_window_blocks` downstream block groups. The `partial` and `window` modes reduce extra weight-gradient pressure compared with `all`.
 
 References: [BAdam paper](https://arxiv.org/abs/2404.02827), [BREAD paper](https://openreview.net/forum?id=zs6bRl05g8), [BlockOptimizers implementation](https://github.com/microsoft/BlockOptimizers).
 
@@ -4672,17 +4672,110 @@ The `optim_bits=8` QAPOLLO path was checked for finite loss and non-noise previe
 | 1280x720 | 193 | 38.1 GB / 21.76 s | 55.4 GB / 26.22 s | 57.3 GB / 42.16 s | 79.0 GB / 48.74 s |
 | 1280x720 | 241 | 43.3 GB / 28.27 s | 61.8 GB / 32.95 s | 66.2 GB / 57.67 s | OOM (>80 GB) |
 
-### Int8 Weight Training
+### Int8 / Int8 ConvRot / EMA
 <sub>[↑ contents](#table-of-contents)</sub>
 
-> [!CAUTION]
-> **Experimental.** Storing trainable weights in int8 is a quantization-lossy training path that trades some output fidelity for a lower VRAM footprint, so it is not recommended for final-quality runs. Treat it as a VRAM-of-last-resort option for fitting full fine-tuning into ~24 GB, and train in bf16 when quality matters.
+> [!WARNING]
+> **Experimental.** Int8 weight storage is an inherently lossy training path: updates land on an int8 grid through stochastic rounding with no high-precision master copy, so the final weights carry residual rounding noise that shows up as lost high-frequency detail in samples. In the checked runs, pairing the run with an EMA of the dequantized weights (described below) recovered that detail, at the cost of host RAM and save-time disk. Train in bf16 when the hardware allows it.
 
-`--int8_weights` (experimental) stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place via stochastic rounding, while forward/backward dequantize to bf16 for the GEMM. Requires `--fused_backward_pass`; there is no automatic optimizer default for this path, so pass `--optimizer_type` explicitly. `--fused_backward_pass` accepts Adafactor, CAME/CAME8bit, Lion, APOLLO, BAdam, and others, but with `--int8_weights` choose a non-quantized optimizer — Q-GaLore conflicts with `--int8_weights` (`--qgalore_full_ft` is mutually exclusive). With `--max_grad_norm 0` (gradient clipping off), short-context video-only training fits in roughly 21-23 GB: int8 storage roughly halves the trainable weight bytes, and without the global-norm clip the gradient buffer need not stay resident. `--max_grad_norm 1.0` keeps that buffer resident and raises peak VRAM. Saving a full checkpoint dequantizes the int8 weights back to bf16; pass `--mem_eff_save` to stream that conversion one tensor at a time so the save's peak memory stays within the training envelope (the resulting checkpoint is identical either way). Validate save/resume on the target GPU before long runs.
+**Int8 storage.** `--int8_weights` stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place through stochastic rounding, while forward/backward dequantize to bf16 for the GEMM.
 
-The loss trajectory diverges from a bf16 run; `--int8_weights_group_size` and `--int8_weights_outlier_quantile` are tuning knobs that change the per-step quantization grid.
+- Requires `--fused_backward_pass`; there is no automatic optimizer default for this path, so pass `--optimizer_type` explicitly. `--fused_backward_pass` accepts Adafactor, CAME/CAME8bit, Lion, APOLLO, BAdam, and others; with `--int8_weights` choose a non-quantized optimizer. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+- With `--max_grad_norm 0` (gradient clipping off), short-context video-only training fits in roughly 21-23 GB: int8 storage roughly halves the trainable weight bytes, and without the global-norm clip each gradient is freed as its parameter is stepped. `--max_grad_norm 1.0` keeps the full gradient buffer resident and raises peak VRAM.
+- Saving a full checkpoint dequantizes the int8 weights back to bf16; pass `--mem_eff_save` to stream that conversion one tensor at a time so the save's peak memory stays within the training envelope (the resulting checkpoint is identical either way).
+- Validate save/resume on the target GPU before long runs. The loss trajectory diverges from a bf16 run.
 
-Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size N` (`0` = row-wise, `>0` = group-wise along the input dim), `--int8_weights_outlier_quantile q` (`1.0` = absmax, `<1.0` = clip the scale to a per-row/group quantile of `|w|`), `--int8_weights_sparse_ratio r` (dense-and-sparse, [arXiv:2310.07147](https://arxiv.org/abs/2310.07147): keep the top fraction `r` of `|w|` as an exact fp32 side-vector excluded from the int8 grid; an alternative to `--int8_weights_outlier_quantile`, use one or the other), `--int8_weights_convrot` (`''` = off; `auto` or a group size rotates the int8 weight grid with a group-wise Hadamard so per-group outliers are spread and the grid is tighter — the GEMM stays bf16, so gradients and the optimizer are unchanged), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+Grid controls: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size N` (`0` = row-wise scale, `>0` = group-wise along the input dimension; smaller groups give a tighter grid for a small VRAM cost in extra scales), `--int8_weights_outlier_quantile q` (`1.0` = absmax, `<1.0` = clip the scale to a per-row/group quantile of `|w|`), `--int8_weights_sparse_ratio r` (dense-and-sparse, [arXiv:2310.07147](https://arxiv.org/abs/2310.07147): keep the top fraction `r` of `|w|` as an exact fp32 side-vector excluded from the int8 grid; an alternative to `--int8_weights_outlier_quantile`, use one or the other), `--int8_weights_min_numel` to skip small layers.
+
+**Int8 ConvRot.** `--int8_weights_convrot` (`''` = off; `auto` or an explicit group size) rotates the int8 weight grid with a group-wise Hadamard transform at quantization and inverts the rotation at dequantization. The rotation spreads per-group outliers, so the grid is tighter and per-step quantization error is lower; the GEMM still runs on real-space bf16 weights, so gradients and the optimizer are unchanged. `auto` picks the group size per layer.
+
+**EMA compensation.** Stochastic-rounding noise is zero-mean, so an exponential moving average of the dequantized weights averages it out across update events — and because the average is not constrained to the int8 grid, the saved `*_ema.safetensors` checkpoint can express detail that the rounded weights cannot. Enable it with `--use_ema --ema_decay 0.95 --ema_update_after_step 200 --ema_update_every 25 --ema_cpu_offload`, and sample/publish the EMA checkpoint rather than the final weights. Costs to plan for:
+
+- **Host RAM:** with `--ema_cpu_offload` the shadow stores about two bytes per trainable parameter in host RAM (~40 GB for video-target training on the 22B model), on top of the trainer's normal host usage. Without `--ema_cpu_offload` the shadow lives on the GPU and adds the same amount to VRAM, which defeats the low-VRAM point of this path — keep the offload on for VRAM-constrained cards.
+- **Wall time:** each EMA update dequantizes the tracked weights and copies them to the shadow's device; at 22B scale this takes seconds per event, so the amortized overhead is set by `--ema_update_every`.
+- **Disk:** every save writes an additional full-size `*_ema.safetensors` next to the regular checkpoint.
+
+Example LTX-2.3 int8 ConvRot + EMA command:
+
+```bash
+accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train.py \
+  --mixed_precision bf16 \
+  --full_bf16 \
+  --dataset_config dataset.toml \
+  --ltx2_checkpoint /path/to/ltx-2.3-22b-dev.safetensors \
+  --ltx2_mode video \
+  --ltx_version 2.3 \
+  --ltx_version_check_mode error \
+  --flash_attn \
+  --gradient_checkpointing \
+  --blocks_to_swap 0 \
+  --int8_weights \
+  --int8_weights_convrot auto \
+  --int8_weights_targets video \
+  --int8_weights_group_size 64 \
+  --learning_rate 3e-5 \
+  --optimizer_type Adafactor \
+  --optimizer_args scale_parameter=False relative_step=False warmup_init=False weight_decay=0.1 \
+  --max_grad_norm 0 \
+  --lr_scheduler constant_with_warmup \
+  --lr_warmup_steps 500 \
+  --timestep_sampling shifted_logit_normal \
+  --fused_backward_pass \
+  --use_ema \
+  --ema_decay 0.95 \
+  --ema_update_after_step 200 \
+  --ema_update_every 25 \
+  --ema_cpu_offload \
+  --mem_eff_save \
+  --save_every_n_steps 5000 \
+  --save_state \
+  --save_state_on_train_end \
+  --max_train_steps 50000 \
+  --output_dir output/full_ft_int8cr \
+  --output_name ltx23_int8cr_video
+```
+
+The learning rate is set modestly higher than the equivalent bf16 Adafactor command: updates far below the int8 grid step are realized only occasionally under stochastic rounding, so a larger step partially offsets that. Sample the `*_ema.safetensors` checkpoint, not the final weights.
+
+This path was validated on short video-only fine-tuning runs: finite loss, save/resume, and sample checks in which the EMA checkpoint restored high-frequency detail that the final stochastically-rounded weights lost. Long-run convergence behavior and numerical-stability margins are not established.
+
+The int8 grid is rebuilt from the bf16 weights at the start of every run. To skip that step, pre-export the grid once with `ltx2_export_int8_weights.py`, passing the same `--int8_weights_*` values, and add `--int8_weights_prequant` to the training command. The base checkpoint still loads normally; only the quantization is skipped.
+
+```bash
+python -m musubi_tuner.ltx2_export_int8_weights \
+  --input_model /path/to/ltx-2.3-22b-dev.safetensors \
+  --output_model /path/to/ltx-2.3-22b-dev.int8w.safetensors \
+  --targets video --group_size 64 --convrot auto
+```
+
+Then add `--int8_weights_prequant /path/to/ltx-2.3-22b-dev.int8w.safetensors` to the training command. The sidecar's grid (`--group_size`, `--targets`, `--convrot`, `--dtype`) must match the `--int8_weights_*` flags or the run aborts.
+
+Measured int8 ConvRot rows (`--int8_weights --int8_weights_convrot auto --int8_weights_targets video --int8_weights_group_size 64`, Adafactor with fused backward, `--max_grad_norm 0`, no EMA in the measured path — the EMA shadow adds host RAM, not VRAM). Same measurement conventions and columns as the matrices above. Each row is `peak VRAM / s per optimizer step`:
+
+| Resolution | Frames | video | av | v2v | v2v_av |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 832x480 | 49 | 18.3 GB / 3.86 s | — | — | — |
+| 832x480 | 65 | 19.0 GB / 4.45 s | — | — | — |
+| 832x480 | 81 | 19.7 GB / 4.85 s | — | — | — |
+| 832x480 | 97 | 20.3 GB / 5.47 s | — | — | — |
+| 832x480 | 113 | 21.0 GB / 6.08 s | — | — | — |
+| 832x480 | 129 | 21.6 GB / 6.74 s | — | — | — |
+| 832x480 | 145 | 22.3 GB / 7.36 s | — | — | — |
+| 832x480 | 161 | 23.0 GB / 8.04 s | — | — | — |
+| 832x480 | 193 | 24.3 GB / 9.43 s | — | — | — |
+| 832x480 | 241 | 26.3 GB / 11.66 s | — | — | — |
+| 1280x720 | 17 | 18.3 GB / 3.66 s | — | — | — |
+| 1280x720 | 33 | 19.9 GB / 5.05 s | — | — | — |
+| 1280x720 | 49 | 21.4 GB / 6.48 s | — | — | — |
+| 1280x720 | 65 | 23.0 GB / 8.02 s | — | — | — |
+| 1280x720 | 81 | 24.6 GB / 9.54 s | — | — | — |
+| 1280x720 | 97 | 26.1 GB / 11.20 s | — | — | — |
+| 1280x720 | 113 | — | — | — | — |
+| 1280x720 | 129 | — | — | — | — |
+| 1280x720 | 145 | — | — | — | — |
+| 1280x720 | 161 | — | — | — | — |
+| 1280x720 | 193 | — | — | — | — |
+| 1280x720 | 241 | — | — | — | — |
 
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4692,6 +4785,7 @@ Dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughl
 For 24 GB-class video-only tests, use a quantized `Linear` replacement path:
 
 - Start with Q-GaLore: `--qgalore_full_ft --qgalore_load_device cpu --qgalore_targets video --qgalore_rank 256`.
+- Int8 weight storage is the other 24 GB-class route (see [Int8 / Int8 ConvRot / EMA](#int8--int8-convrot--ema)): with `--max_grad_norm 0`, short-context video-only training fits in roughly 21-23 GB while keeping a standard non-quantized optimizer through `--fused_backward_pass`; pair it with the EMA to recover sample fidelity, and budget the EMA's host-RAM cost (about two bytes per trainable parameter with `--ema_cpu_offload`).
 - To test QAPOLLO in the same 24 GB-class envelope, start from the QAPOLLO command above and use `--qgalore_load_device cpu --qgalore_targets video` with `optim_bits=8`. QAPOLLO uses `QAPOLLOAdamW` and the `--apollo_*` optimizer settings instead of Q-GaLore's SVD projection settings.
 - For `832x480x49`, expect roughly 21-23 GB on a 24 GB GPU, depending on rank, desktop VRAM use, and the local CUDA stack. Use `rank=128` for more headroom; try `rank=384` only after the lower-rank run leaves headroom.
 - On a display-attached RTX 3090, measured video-only 24 GB-class fit checks were roughly `10-12 s/it`, depending on frame count and method. On an RTX 4090, a conservative expectation is roughly `7-10 s/it`, but this is an estimate rather than a measured result in this document. Treat these as speed orientations only; storage, driver, desktop VRAM use, and attention backend can move them.
@@ -4750,10 +4844,10 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
-**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). As an orientation figure (not a measured matrix) on Ada/Hopper at `832x480x49`: roughly bf16-minus-~10 GB peak and a small step-time overhead (~1.05x) with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). The compiled GEMM roughly halves the FP8 GEMM-op time; measure end-to-end on your hardware. Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
+**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`, expect roughly bf16-minus-~10 GB peak VRAM and a small step-time overhead (~1.05x) with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). The compiled GEMM roughly halves the FP8 GEMM-op time; measure end-to-end on your hardware. Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
 
 > [!CAUTION]
-> **Experimental.** Loss parity with bf16 has been confirmed on limited runs; long-run stability and final sample quality are not yet validated. Validate on your own long runs (and monitor gradient norms) before relying on it for production.
+> **Experimental.** Validate loss, long-run stability, and final sample quality on your own runs (and monitor gradient norms) before relying on it for production.
 
 ---
 

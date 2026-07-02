@@ -113,7 +113,7 @@ class LTX2RolloutCacher:
             # TRANSFORMED state dict for weight-transforming adapters (adaptive-rank lambda scaling,
             # DoRA magnitude, LoKr/DoKr factorization) -> the file Phase B reloads would not reproduce
             # this hash and assert_snapshot would wrongly fail. The RL snapshot path supports plain
-            # LoRA only for now.
+            # LoRA only.
             _transforming = sorted(
                 {
                     type(m).__name__

@@ -11,7 +11,7 @@ tokens), so this copy needs no ``model.py``: it loads the model verbatim and rep
 the model-card scoring pipeline (query template, ``.generate`` with
 ``output_scores=True``, the soft-score parsing) in-process.
 
-Dependency surface: torch, transformers (>=4.56, the workbox pin), torchvision,
+Dependency surface: torch, transformers (>=4.56), torchvision,
 safetensors (the shard loader transformers uses), PIL, packaging, requests (http image
 paths only) and numpy. ``qwen_vl_utils`` is PREFERRED when installed (it is exactly what
 the model card uses, so it gives byte-identical preprocessing); a local

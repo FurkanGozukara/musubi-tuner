@@ -484,7 +484,7 @@ class Offloader:
         with T.section("find modules"):
             modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()} if layer_to_cpu is not None else {}
             for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
-                # We only offload Linear layers for now to avoid excessive overhead with small parameters
+                # We only offload Linear layers to avoid excessive overhead with small parameters
                 if not module_to_cuda.__class__.__name__.endswith("Linear"):
                     continue
 

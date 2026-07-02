@@ -49,11 +49,11 @@ from ..registry import BaseReward, register_reward
 
 logger = logging.getLogger(__name__)
 
-# Default on-box checkpoint (workbox OmniNFT-Reward-Series mirror); override via
-# --reward_args checkpoint_path=... . The vendored predictor requires a local
-# checkpoint; if it is None *and* the external pip package is in use, that package
-# falls back to HF ``facebook/audiobox-aesthetics`` (needs network / HF cache).
-_DEFAULT_CHECKPOINT = "/mnt/data2/sgornostaev/models/OmniNFT-Reward-Series/audiobox-aesthetics/checkpoint.pt"
+# Optional default checkpoint path; override via --reward_args checkpoint_path=... .
+# The vendored predictor requires a local checkpoint; when this is None *and* the
+# external pip package is in use, that package falls back to HF
+# ``facebook/audiobox-aesthetics`` (needs network / HF cache).
+_DEFAULT_CHECKPOINT = None
 
 # Axis keys emitted by the predictor (audiobox_aesthetics.infer.AXES_NAME).
 _AXES = ("CE", "CU", "PC", "PQ")
@@ -112,7 +112,7 @@ class AudioboxReward(BaseReward):
         self,
         device,
         *,
-        checkpoint_path: str = _DEFAULT_CHECKPOINT,
+        checkpoint_path: str | None = _DEFAULT_CHECKPOINT,
         sample_rate=16000,
         **_ignored,
     ) -> None:
@@ -125,13 +125,13 @@ class AudioboxReward(BaseReward):
             try:
                 # Fall back to the external 'audiobox_aesthetics' package if installed.
                 from audiobox_aesthetics.infer import initialize_predictor
-            except ImportError as exc:  # pragma: no cover - exercised only on the GPU box
+            except ImportError as exc:  # pragma: no cover - requires a CUDA GPU
                 raise ImportError(
                     "audiobox reward requires the vendored copy "
                     "(musubi_tuner.ltx2_rewards.vendor.audiobox) or the external "
                     "'audiobox_aesthetics' package (pip install audiobox_aesthetics==0.0.4). "
                     "Then pass --reward_args checkpoint_path=<checkpoint.pt> (or leave it to "
-                    "use the default on-box checkpoint)."
+                    "use the configured default checkpoint)."
                 ) from exc
 
         # checkpoint_path=None -> package loads facebook/audiobox-aesthetics from HF.

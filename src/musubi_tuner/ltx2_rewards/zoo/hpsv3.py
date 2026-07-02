@@ -110,7 +110,7 @@ class HPSv3Reward(BaseReward):
             try:
                 # Fall back to the external 'hpsv3' package if it is installed.
                 from hpsv3 import HPSv3RewardInferencer
-            except ImportError as exc:  # pragma: no cover - exercised only on the GPU box
+            except ImportError as exc:  # pragma: no cover - requires a CUDA GPU
                 raise ImportError(
                     "hpsv3 reward requires the vendored copy "
                     "(musubi_tuner.ltx2_rewards.vendor.hpsv3) or the external 'hpsv3' package "

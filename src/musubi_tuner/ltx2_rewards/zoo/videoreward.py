@@ -126,7 +126,7 @@ class VideoRewardReward(BaseReward):
 
         try:
             from ..vendor.videoreward import VideoVLMRewardInference
-        except ImportError as exc:  # pragma: no cover - exercised only on the GPU box
+        except ImportError as exc:  # pragma: no cover - requires a CUDA GPU
             raise ImportError(
                 "videoreward reward requires the vendored copy "
                 "(musubi_tuner.ltx2_rewards.vendor.videoreward) and its torch/transformers deps."

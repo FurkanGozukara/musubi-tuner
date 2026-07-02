@@ -1183,7 +1183,7 @@
 								<FormField fieldPath="remote_stage_launcher.remote_python" value={rl.remote_python || 'python'} oninput={(e) => updateRemoteStageLauncher('remote_python', e.target.value)} tooltip="Python executable on each remote machine" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
-								<FormField fieldPath="remote_stage_launcher.remote_root" value={rl.remote_root || ''} oninput={(e) => updateRemoteStageLauncher('remote_root', e.target.value)} placeholder="G:\\repos\\ltx2-tuner" tooltip="Repository root path on each remote machine" />
+								<FormField fieldPath="remote_stage_launcher.remote_root" value={rl.remote_root || ''} oninput={(e) => updateRemoteStageLauncher('remote_root', e.target.value)} placeholder="/path/to/musubi-tuner" tooltip="Repository root path on each remote machine" />
 								<FormField type="number" fieldPath="remote_stage_launcher.ready_timeout" value={rl.ready_timeout ?? 120} oninput={(e) => updateRemoteStageLauncher('ready_timeout', Number(e.target.value))} min={1} step="1" tooltip="Seconds to wait for each remote stage TCP port to come up" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
