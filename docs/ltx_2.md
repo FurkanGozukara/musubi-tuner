@@ -4387,20 +4387,6 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 > [!WARNING]
 > The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
 
-### Gradient Noise Scale Probe (batch-size estimate)
-<sub>[↑ contents](#table-of-contents)</sub>
-
-`--noise_scale_probe K` runs a diagnostic instead of training: it estimates the gradient noise scale (McCandlish et al. 2018, *An Empirical Model of Large-Batch Training*) and prints the critical batch `B_simple = tr(Σ)/|G|²`, then exits. `B_simple` is the batch size below which increasing the batch reduces gradient noise roughly linearly (proportional convergence gain per step) and above which returns diminish. It is measured on the real training gradient — the same `shifted_logit_normal` timestep sampling and weighted velocity loss — so it reflects the actual full fine-tune, not a proxy.
-
-Each round draws `K` microbatches and compares the mean single-microbatch squared gradient norm (`b=1`) with the squared norm of the mean gradient over all `K` (`b=K`); `--noise_scale_probe_rounds` median-averages across rounds. Because the dense gradient cannot compute a norm through fused backward (the probe needs `.grad` to persist after `backward()`), run the probe **without** `--fused_backward_pass`; and because the full bf16 gradient and the weights do not co-reside on a single GPU, `--noise_scale_probe_param_frac` (e.g. `0.25`–`0.5`) freezes all but a stratified fraction of parameter tensors and measures over the rest. The subset estimate is unbiased for the coordinate-averaged noise scale, since the gradient on the measured coordinates is identical whether or not the other parameters are frozen.
-
-Read the result as an order of magnitude, not a precise value: individual rounds are heavy-tailed (occasional microbatches carry outsized gradients — take the median), and `B_simple` typically rises as training progresses, so an early estimate is a lower bound. Set the effective batch (`micro_bs × gradient_accumulation_steps × num_gpus`) near `B_simple`. Requires `K > 1`; larger `K` (e.g. 96) resolves `|G|²` more reliably when the gradient is strongly noise-dominated.
-
-```bash
-# Append to the Adafactor command above; drop --fused_backward_pass for the probe.
---noise_scale_probe 96 --noise_scale_probe_rounds 8 --noise_scale_probe_param_frac 0.34
-```
-
 ### BAdam Block-Coordinate
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -4770,12 +4756,12 @@ Measured int8 ConvRot rows (`--int8_weights --int8_weights_convrot auto --int8_w
 | 1280x720 | 65 | 23.0 GB / 8.02 s | — | — | — |
 | 1280x720 | 81 | 24.6 GB / 9.54 s | — | — | — |
 | 1280x720 | 97 | 26.1 GB / 11.20 s | — | — | — |
-| 1280x720 | 113 | — | — | — | — |
-| 1280x720 | 129 | — | — | — | — |
-| 1280x720 | 145 | — | — | — | — |
-| 1280x720 | 161 | — | — | — | — |
-| 1280x720 | 193 | — | — | — | — |
-| 1280x720 | 241 | — | — | — | — |
+| 1280x720 | 113 | 27.7 GB / 12.91 s | — | — | — |
+| 1280x720 | 129 | 29.2 GB / 14.67 s | — | — | — |
+| 1280x720 | 145 | 30.8 GB / 16.50 s | — | — | — |
+| 1280x720 | 161 | 32.3 GB / 18.44 s | — | — | — |
+| 1280x720 | 193 | 35.2 GB / 22.32 s | — | — | — |
+| 1280x720 | 241 | 39.8 GB / 28.82 s | — | — | — |
 
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4848,6 +4834,8 @@ For longer runs, start with video-only short-context training until checkpoint s
 
 > [!CAUTION]
 > **Experimental.** Validate loss, long-run stability, and final sample quality on your own runs (and monitor gradient norms) before relying on it for production.
+
+**Gradient noise scale probe (batch-size estimate).** `--noise_scale_probe K` runs a diagnostic instead of training: it estimates the gradient noise scale ([McCandlish et al. 2018](https://arxiv.org/abs/1812.06162)) and prints the critical batch `B_simple = tr(Σ)/|G|²` before exiting — the batch size below which raising the batch cuts gradient noise roughly linearly and above which returns diminish. Run it **without** `--fused_backward_pass` (the probe needs `.grad` to persist after `backward()`), and because the full bf16 gradient and the weights do not co-reside, use `--noise_scale_probe_param_frac` (e.g. `0.25`–`0.5`) to measure over a stratified parameter subset; `--noise_scale_probe_rounds` median-averages across rounds. Read it as an order of magnitude (it rises as training progresses), then set the effective batch (`micro_bs × gradient_accumulation_steps × num_gpus`) near `B_simple`. Append to the Adafactor command, dropping `--fused_backward_pass`: `--noise_scale_probe 96 --noise_scale_probe_rounds 8 --noise_scale_probe_param_frac 0.34`.
 
 ---
 
