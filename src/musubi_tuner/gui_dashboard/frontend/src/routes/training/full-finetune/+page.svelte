@@ -611,6 +611,16 @@
 			</div>
 		</FormGroup>
 
+		<FormGroup title="Diagnostics">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-3 gap-2">
+					<FormField type="number" fieldPath="full_finetune.noise_scale_probe" value={t.noise_scale_probe ?? 0} oninput={(e) => update('noise_scale_probe', Number(e.target.value))} min={0} tooltip="Gradient noise-scale probe. If > 0, skip training and estimate the critical batch B_simple over this many microbatches per round, print it, then exit. Leave 0 for normal training." />
+					<FormField type="number" fieldPath="full_finetune.noise_scale_probe_rounds" value={t.noise_scale_probe_rounds ?? 5} oninput={(e) => update('noise_scale_probe_rounds', Number(e.target.value))} min={1} tooltip="Rounds to median-average the B_simple estimate over (only used when the probe is on)." />
+					<FormField type="number" fieldPath="full_finetune.noise_scale_probe_param_frac" value={t.noise_scale_probe_param_frac ?? 1.0} oninput={(e) => update('noise_scale_probe_param_frac', Number(e.target.value))} min={0} max={1} step="0.01" tooltip="Fraction of parameter tensors to measure the gradient over; the rest are frozen so the dense gradient co-resides with the weights on a single GPU. 0.25-0.5 is typical. Unbiased subset." />
+				</div>
+			</div>
+		</FormGroup>
+
 		<FormGroup title="Memory">
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">

@@ -1647,6 +1647,27 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="EMA decay for per-modality loss tracking in the freezer (default: 0.99).",
     )
 
+    parser.add_argument(
+        "--noise_scale_probe",
+        type=int,
+        default=0,
+        help="If >0: skip normal training and run a gradient-noise-scale probe over this many "
+        "microbatches per round (McCandlish B_simple), print the critical/optimal effective batch, exit.",
+    )
+    parser.add_argument(
+        "--noise_scale_probe_rounds",
+        type=int,
+        default=5,
+        help="Rounds to average the noise-scale estimate over (default: 5).",
+    )
+    parser.add_argument(
+        "--noise_scale_probe_param_frac",
+        type=float,
+        default=1.0,
+        help="Full-FT noise-scale probe: fraction of parameter TENSORS to measure the gradient over "
+        "(freeze the rest so the dense gradient co-resides with the weights on a single GPU). Unbiased "
+        "subset; 0.25 is a good default.",
+    )
     return parser
 
 

@@ -3138,6 +3138,109 @@ def _setup_ltx2_full_ft_pre_train_hooks(
     trainer._setup_av_attention_loss_weighting(args, accelerator, transformer=transformer)
 
 
+def _run_noise_scale_probe_ft(trainer, args, accelerator, transformer, noise_scheduler, train_dataloader):
+    """Gradient noise-scale probe (McCandlish et al. 2018) on the REAL full-FT gradient. Estimates the
+    critical/optimal effective batch B_simple = tr(Sigma)/|G|^2 by comparing the mean single-microbatch
+    squared grad norm (b=1) to the squared norm of the mean gradient over K microbatches (b=K), using
+    the faithful shifted_logit_normal sigma sampling + weighted video velocity loss. Measured over a
+    stratified subset of parameter TENSORS (noise_scale_probe_param_frac) so the dense gradient co-resides
+    with the weights on a single GPU; the gradient on those coords equals the full-FT gradient, so the
+    ratio is unbiased. Prints B_simple per round + summary, then returns (skips training)."""
+    import itertools
+    import math
+    import statistics
+    import traceback
+
+    K = int(getattr(args, "noise_scale_probe", 0))
+    rounds = int(getattr(args, "noise_scale_probe_rounds", 5))
+    frac = float(getattr(args, "noise_scale_probe_param_frac", 1.0))
+    dtype = trainer.dit_dtype
+
+    all_params = list(transformer.parameters())
+    if 0.0 < frac < 1.0:
+        stride = max(1, int(round(1.0 / frac)))
+        for i, p in enumerate(all_params):
+            p.requires_grad_(i % stride == 0)
+    params = [p for p in transformer.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in params)
+    n_total = sum(p.numel() for p in all_params)
+    transformer.train()
+    accelerator.print(
+        f"[noise-scale/FT] start: K={K} microbatches/round, rounds={rounds}, param_frac={frac}, "
+        f"measured={n_params / 1e6:.1f}M / {n_total / 1e6:.1f}M params, device={accelerator.device}, dtype={dtype}"
+    )
+
+    def _zero():
+        for p in params:
+            p.grad = None
+
+    def _g2():
+        return float(sum(p.grad.detach().float().pow(2).sum() for p in params if p.grad is not None))
+
+    def _micro_loss(batch):
+        batch = _normalize_ltx2_batch_for_call_dit(batch)
+        latents = batch["latents"]
+        lt = latents["latents"] if isinstance(latents, dict) else latents
+        lt = trainer.scale_shift_latents(lt)
+        noise = torch.randn_like(lt)
+        nmi, timesteps = trainer.get_noisy_model_input_and_timesteps(
+            args, noise, lt, batch["timesteps"], noise_scheduler, accelerator.device, dtype
+        )
+        weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dtype)
+        trainer._current_train_global_step = 0
+        model_pred, target = trainer.call_dit(args, accelerator, transformer, lt, batch, noise, nmi, timesteps, dtype)
+        out = model_pred if isinstance(model_pred, dict) else {"video_pred": model_pred, "video_target": target}
+        return _masked_mse(
+            out["video_pred"],
+            out["video_target"],
+            out.get("video_loss_mask"),
+            weighting=weighting,
+            dtype=dtype,
+            loss_type=getattr(args, "loss_type", "mse"),
+            huber_delta=float(getattr(args, "huber_delta", 1.0)),
+        )
+
+    data = itertools.cycle(train_dataloader)
+    rows = []
+    try:
+        for r in range(rounds):
+            # g2_small: mean single-microbatch squared grad norm (b=1)
+            g2s_acc = 0.0
+            for _ in range(K):
+                _zero()
+                loss = _micro_loss(next(data))
+                accelerator.backward(loss)
+                g2s_acc += _g2()
+            g2_small = g2s_acc / K
+            # g2_big: squared norm of the mean gradient over K microbatches (b=K)
+            _zero()
+            for _ in range(K):
+                loss = _micro_loss(next(data)) / K
+                accelerator.backward(loss)
+            g2_big = _g2()
+            B = float(K)
+            trS = (g2_small - g2_big) / (1.0 - 1.0 / B)
+            G2 = (B * g2_big - g2_small) / (B - 1.0)
+            b_simple = (trS / G2) if G2 > 0 else float("nan")
+            rows.append(b_simple)
+            accelerator.print(
+                f"[noise-scale/FT] round {r}: B_simple={b_simple:.1f} "
+                f"(trS={trS:.3e}, |G|^2={G2:.3e}, g2_small={g2_small:.3e}, g2_big={g2_big:.3e})"
+            )
+    except Exception:
+        accelerator.print("[noise-scale/FT] ERROR:\n" + traceback.format_exc())
+    _zero()
+    good = [x for x in rows if math.isfinite(x) and x > 0]
+    if good:
+        accelerator.print(
+            f"[noise-scale/FT] RESULT B_simple median={statistics.median(good):.1f} "
+            f"mean={statistics.mean(good):.1f} (n={len(good)}/{rounds}). Effective batch "
+            f"~= B_simple = micro x grad_accum x n_gpu; below it batch helps ~linearly, above it diminishing."
+        )
+    else:
+        accelerator.print("[noise-scale/FT] RESULT: no finite estimate (raise K / check setup).")
+
+
 def main() -> None:
     parser = setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -6142,6 +6245,10 @@ def main() -> None:
             audio_loss_balance_min,
             audio_loss_balance_max,
         )
+
+    if int(getattr(args, "noise_scale_probe", 0)) > 0:
+        _run_noise_scale_probe_ft(trainer, args, accelerator, transformer, noise_scheduler, train_dataloader)
+        return
 
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1

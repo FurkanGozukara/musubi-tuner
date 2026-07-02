@@ -815,6 +815,11 @@ class FullFinetuneConfig(TrainingConfig):
     save_every_n_steps: Optional[int] = 1000
     network_module: Optional[str] = None
 
+    # Gradient noise-scale probe (diagnostic; skips training when noise_scale_probe > 0).
+    noise_scale_probe: int = 0
+    noise_scale_probe_rounds: int = 5
+    noise_scale_probe_param_frac: float = 1.0
+
     # Full fine-tune optimizer/saving options.
     base_optimizer_args: str = ""
     no_final_save: bool = False

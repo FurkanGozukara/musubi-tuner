@@ -2409,6 +2409,14 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     # LoRA-only and not emitted for full fine-tune; a recipe's reference still derives the strategy.
     _append_ltx2_conditioning(cmd, t, config, "conditioning_config.fft.toml")
 
+    # Gradient noise-scale probe (diagnostic): when > 0 the trainer skips training and estimates the
+    # critical batch B_simple, then exits. param_frac only matters while probing.
+    if t.noise_scale_probe and t.noise_scale_probe > 0:
+        cmd += ["--noise_scale_probe", str(t.noise_scale_probe)]
+        cmd += ["--noise_scale_probe_rounds", str(t.noise_scale_probe_rounds)]
+        if t.noise_scale_probe_param_frac != 1.0:
+            cmd += ["--noise_scale_probe_param_frac", str(t.noise_scale_probe_param_frac)]
+
     cmd += _split_cli_args(t.extra_args)
     return cmd
 
