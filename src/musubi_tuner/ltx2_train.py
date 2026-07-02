@@ -5039,7 +5039,27 @@ def main() -> None:
             # dequantize Int8QTWeight -> bf16 so the checkpoint is a standard, directly loadable file
             from musubi_tuner.modules.int8_training import Int8QTWeight
 
-            state_dict = {k: (v.dequantize() if isinstance(v, Int8QTWeight) else v) for k, v in state_dict.items()}
+            if bool(getattr(args, "mem_eff_save", False)):
+                # Materialize (and free) one dequantized bf16 tensor at a time on the CPU rather than
+                # building the full bf16 state dict on the GPU at once, keeping the save's peak memory
+                # low. Uses the same streaming mechanism as the Q-GaLore dequantized save.
+                from musubi_tuner.utils.safetensors_utils import LazyTensorForSave
+
+                accelerator.print("Using streaming int8->bf16 dequantized save (per-tensor, device=cpu)")
+
+                def _lazy_int8_dequant(w: Int8QTWeight) -> LazyTensorForSave:
+                    # dequantize() returns int_data(int8) * scale -> scale.dtype (bf16); shape == w.shape.
+                    # Both are known without materializing, so the safetensors header is built lazily and
+                    # each bf16 tensor is produced then moved to CPU only when the writer reaches it.
+                    return LazyTensorForSave(
+                        shape=tuple(w.shape),
+                        dtype=w.scale.dtype,
+                        materialize_fn=lambda w=w: w.dequantize().to("cpu"),
+                    )
+
+                state_dict = {k: (_lazy_int8_dequant(v) if isinstance(v, Int8QTWeight) else v) for k, v in state_dict.items()}
+            else:
+                state_dict = {k: (v.dequantize() if isinstance(v, Int8QTWeight) else v) for k, v in state_dict.items()}
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)
