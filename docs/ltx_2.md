@@ -4675,6 +4675,8 @@ Grid controls: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `-
 
 **Int8 ConvRot.** `--int8_weights_convrot` (`''` = off; `auto` or an explicit group size) rotates the int8 weight grid with a group-wise Hadamard transform at quantization and inverts the rotation at dequantization. The rotation spreads per-group outliers, so the grid is tighter and per-step quantization error is lower; the GEMM still runs on real-space bf16 weights, so gradients and the optimizer are unchanged. `auto` picks the group size per layer.
 
+**Int8 W8A8 compute.** `--int8_weights_w8a8` keeps the `--int8_weights` resident-weight path, but runs the forward and grad-input GEMMs through int8 W8A8 compute when the activation/device support it. Grad-weight stays bf16 for stochastic-rounding update quality. This requires `--int8_weights_group_size 0` and `--int8_weights_sparse_ratio 0`; otherwise the trainer rejects the run.
+
 **EMA compensation.** Stochastic-rounding noise is zero-mean, so an exponential moving average of the dequantized weights averages it out across update events — and because the average is not constrained to the int8 grid, the saved `*_ema.safetensors` checkpoint can express detail that the rounded weights cannot. Enable it with `--use_ema --ema_decay 0.95 --ema_update_after_step 200 --ema_update_every 25 --ema_cpu_offload`, and sample/publish the EMA checkpoint rather than the final weights. Costs to plan for:
 
 - **Host RAM:** with `--ema_cpu_offload` the shadow stores about two bytes per trainable parameter in host RAM (~40 GB for video-target training on the 22B model), on top of the trainer's normal host usage. Without `--ema_cpu_offload` the shadow lives on the GPU and adds the same amount to VRAM, which defeats the low-VRAM point of this path — keep the offload on for VRAM-constrained cards.
@@ -4734,34 +4736,34 @@ python -m musubi_tuner.ltx2_export_int8_weights \
   --targets video --group_size 64 --convrot auto
 ```
 
-Then add `--int8_weights_prequant /path/to/ltx-2.3-22b-dev.int8w.safetensors` to the training command. The sidecar's grid (`--group_size`, `--targets`, `--convrot`, `--dtype`) must match the `--int8_weights_*` flags or the run aborts.
+Then add `--int8_weights_prequant /path/to/ltx-2.3-22b-dev.int8w.safetensors` to the training command. The sidecar's grid (`--group_size`, `--outlier_quantile`, `--sparse_ratio`, `--convrot`, `--dtype`) must match the `--int8_weights_*` flags or the run aborts. `--int8_weights_w8a8` is a runtime compute choice and is not baked into the sidecar, so the same matched sidecar can be used with or without W8A8 compute.
 
 Measured int8 ConvRot rows (`--int8_weights --int8_weights_convrot auto --int8_weights_targets video --int8_weights_group_size 64`, Adafactor with fused backward, `--max_grad_norm 0`, no EMA in the measured path — the EMA shadow adds host RAM, not VRAM). Same measurement conventions and columns as the matrices above. Each row is `peak VRAM / s per optimizer step`:
 
 | Resolution | Frames | video | av | v2v | v2v_av |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 832x480 | 49 | 18.3 GB / 3.86 s | — | — | — |
-| 832x480 | 65 | 19.0 GB / 4.45 s | — | — | — |
-| 832x480 | 81 | 19.7 GB / 4.85 s | — | — | — |
-| 832x480 | 97 | 20.3 GB / 5.47 s | — | — | — |
-| 832x480 | 113 | 21.0 GB / 6.08 s | — | — | — |
-| 832x480 | 129 | 21.6 GB / 6.74 s | — | — | — |
-| 832x480 | 145 | 22.3 GB / 7.36 s | — | — | — |
-| 832x480 | 161 | 23.0 GB / 8.04 s | — | — | — |
-| 832x480 | 193 | 24.3 GB / 9.43 s | — | — | — |
-| 832x480 | 241 | 26.3 GB / 11.66 s | — | — | — |
-| 1280x720 | 17 | 18.3 GB / 3.66 s | — | — | — |
-| 1280x720 | 33 | 19.9 GB / 5.05 s | — | — | — |
-| 1280x720 | 49 | 21.4 GB / 6.48 s | — | — | — |
-| 1280x720 | 65 | 23.0 GB / 8.02 s | — | — | — |
-| 1280x720 | 81 | 24.6 GB / 9.54 s | — | — | — |
-| 1280x720 | 97 | 26.1 GB / 11.20 s | — | — | — |
-| 1280x720 | 113 | 27.7 GB / 12.91 s | — | — | — |
-| 1280x720 | 129 | 29.2 GB / 14.67 s | — | — | — |
-| 1280x720 | 145 | 30.8 GB / 16.50 s | — | — | — |
-| 1280x720 | 161 | 32.3 GB / 18.44 s | — | — | — |
-| 1280x720 | 193 | 35.2 GB / 22.32 s | — | — | — |
-| 1280x720 | 241 | 39.8 GB / 28.82 s | — | — | — |
+| 832x480 | 49 | 18.3 GB / 3.86 s | 30.9 GB / 5.38 s | 18.7 GB / 3.80 s | 31.4 GB / 5.42 s |
+| 832x480 | 65 | 19.0 GB / 4.45 s | 31.8 GB / 5.94 s | 19.3 GB / 4.38 s | 32.2 GB / 6.06 s |
+| 832x480 | 81 | 19.7 GB / 4.85 s | 32.6 GB / 6.56 s | 20.0 GB / 4.99 s | 33.1 GB / 6.75 s |
+| 832x480 | 97 | 20.3 GB / 5.47 s | 33.5 GB / 7.23 s | 20.6 GB / 5.65 s | 34.0 GB / 7.40 s |
+| 832x480 | 113 | 21.0 GB / 6.08 s | 34.4 GB / 7.92 s | 21.3 GB / 6.23 s | 34.9 GB / 8.14 s |
+| 832x480 | 129 | 21.6 GB / 6.74 s | 35.3 GB / 8.66 s | 22.0 GB / 6.89 s | 35.8 GB / 8.81 s |
+| 832x480 | 145 | 22.3 GB / 7.36 s | 36.2 GB / 9.34 s | 22.6 GB / 7.50 s | 36.7 GB / 9.55 s |
+| 832x480 | 161 | 23.0 GB / 8.04 s | 37.0 GB / 10.04 s | 23.3 GB / 8.17 s | 37.6 GB / 10.33 s |
+| 832x480 | 193 | 24.3 GB / 9.43 s | 38.8 GB / 11.78 s | 24.6 GB / 9.60 s | 39.3 GB / 11.88 s |
+| 832x480 | 241 | 26.3 GB / 11.66 s | 41.4 GB / 14.08 s | 26.6 GB / 11.86 s | 42.0 GB / 14.38 s |
+| 1280x720 | 17 | 18.3 GB / 3.66 s | 30.9 GB / 5.30 s | 19.1 GB / 3.98 s | 31.9 GB / 5.66 s |
+| 1280x720 | 33 | 19.9 GB / 5.05 s | 32.9 GB / 6.74 s | 20.7 GB / 5.40 s | 34.0 GB / 7.16 s |
+| 1280x720 | 49 | 21.4 GB / 6.48 s | 35.0 GB / 8.30 s | 22.2 GB / 6.87 s | 36.0 GB / 8.83 s |
+| 1280x720 | 65 | 23.0 GB / 8.02 s | 37.0 GB / 10.05 s | 23.8 GB / 8.41 s | 38.1 GB / 10.56 s |
+| 1280x720 | 81 | 24.6 GB / 9.54 s | 39.1 GB / 11.77 s | 25.3 GB / 10.03 s | 40.1 GB / 12.33 s |
+| 1280x720 | 97 | 26.1 GB / 11.20 s | 41.1 GB / 13.57 s | 26.9 GB / 11.60 s | 42.2 GB / 14.10 s |
+| 1280x720 | 113 | 27.7 GB / 12.91 s | 43.1 GB / 15.38 s | 28.4 GB / 13.44 s | 44.2 GB / 16.05 s |
+| 1280x720 | 129 | 29.2 GB / 14.67 s | 45.2 GB / 17.37 s | 30.0 GB / 15.20 s | 46.3 GB / 18.01 s |
+| 1280x720 | 145 | 30.8 GB / 16.50 s | 47.2 GB / 19.36 s | 31.5 GB / 17.08 s | 48.3 GB / 20.14 s |
+| 1280x720 | 161 | 32.3 GB / 18.44 s | 49.3 GB / 21.41 s | 33.1 GB / 19.12 s | 50.4 GB / 22.17 s |
+| 1280x720 | 193 | 35.2 GB / 22.32 s | 53.0 GB / 25.77 s | 35.9 GB / 23.10 s | 54.1 GB / 26.42 s |
+| 1280x720 | 241 | 39.8 GB / 28.82 s | 59.1 GB / 32.78 s | 40.5 GB / 29.90 s | 60.2 GB / 34.03 s |
 
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>

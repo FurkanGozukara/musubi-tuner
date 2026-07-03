@@ -718,6 +718,7 @@
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 					<FormToggle fieldPath="full_finetune.int8_weights" checked={t.int8_weights ?? false} onchange={(e) => update('int8_weights', e.target.checked)} tooltip="Store trainable Linear weights as int8 with stochastic-rounding updates. Requires fused_backward_pass and a factored optimizer. Mutually exclusive with fp8_gemm / qgalore_full_ft / fp8_scaled." />
+					<FormToggle fieldPath="full_finetune.int8_weights_w8a8" checked={t.int8_weights_w8a8 ?? false} onchange={(e) => update('int8_weights_w8a8', e.target.checked)} disabled={!(t.int8_weights ?? false)} tooltip="Run forward and grad-input GEMMs in int8 W8A8. Requires group size 0 and sparse ratio 0." />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField fieldPath="full_finetune.int8_weights_targets" value={t.int8_weights_targets || 'video'} oninput={(e) => update('int8_weights_targets', e.target.value)} placeholder="video" tooltip="Which LTX-2 Linear layers to store in int8 (video/audio/attn/ff/blocks/all)." />

@@ -146,7 +146,7 @@ def quantize_model(
     output_metadata["outlier_clip_quantile"] = str(float(outlier_quantile))
     output_metadata["sparse_ratio"] = str(float(sparse_ratio))
     output_metadata["convrot"] = str(convrot_spec)
-    output_metadata["w8a8_compute"] = "False"  # compute mode is chosen at train time, not baked into the grid
+    output_metadata["w8a8_compute"] = "runtime"  # compute mode is chosen at train time, not baked into the grid
     output_metadata["targets"] = str(targets)
     output_metadata["min_numel"] = str(int(min_numel))
     output_metadata["dtype"] = dtype

@@ -1418,6 +1418,36 @@ def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "full_finetune.full_fp16", message, label="Full FP16", page="full_finetune"))
         errors.append(_make_issue("error", "full_finetune.full_bf16", message, label="Full BF16", page="full_finetune"))
 
+    if getattr(t, "int8_weights_w8a8", False):
+        if not getattr(t, "int8_weights", False):
+            message = "Int8 W8A8 requires Int8 Weights."
+            errors.append(_make_issue("error", "full_finetune.int8_weights_w8a8", message, label="Int8 W8A8", page="full_finetune"))
+            errors.append(_make_issue("error", "full_finetune.int8_weights", message, label="Int8 Weights", page="full_finetune"))
+        if int(getattr(t, "int8_weights_group_size", 0) or 0) != 0:
+            message = "Int8 W8A8 requires Int8 Weights Group Size = 0."
+            errors.append(_make_issue("error", "full_finetune.int8_weights_w8a8", message, label="Int8 W8A8", page="full_finetune"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.int8_weights_group_size",
+                    message,
+                    label="Int8 Weights Group Size",
+                    page="full_finetune",
+                )
+            )
+        if float(getattr(t, "int8_weights_sparse_ratio", 0.0) or 0.0) != 0.0:
+            message = "Int8 W8A8 requires Int8 Weights Sparse Ratio = 0."
+            errors.append(_make_issue("error", "full_finetune.int8_weights_w8a8", message, label="Int8 W8A8", page="full_finetune"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.int8_weights_sparse_ratio",
+                    message,
+                    label="Int8 Weights Sparse Ratio",
+                    page="full_finetune",
+                )
+            )
+
     if t.qgalore_full_ft:
         opt = str(t.optimizer_type or "").lower()
         qgalore_aliases = {

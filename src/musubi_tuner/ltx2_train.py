@@ -3967,7 +3967,6 @@ def main() -> None:
                 _pq_require("group_size", _meta.get("group_size"), _i8_group)
                 _pq_require("outlier_clip_quantile", _meta.get("outlier_clip_quantile"), _i8_outlier_q)
                 _pq_require("sparse_ratio", _meta.get("sparse_ratio"), _i8_sparse)
-                _pq_require("w8a8_compute", _meta.get("w8a8_compute"), _i8_w8a8)
                 _pq_require("convrot", _meta.get("convrot"), _i8_convrot)
                 if _tgt_dtype is not None:
                     _pq_require("dtype", _meta.get("dtype"), _tgt_dtype)
