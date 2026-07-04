@@ -847,6 +847,16 @@ def _build_prompt_list(
         # File-based prompts: reuse training's prompt loading + defaults
         args.sample_num_frames = args.frame_count
         prompts = trainer.process_sample_prompts(args, accelerator, args.sample_prompts) or []
+        # Forward CLI generation params into file prompts.
+        for _p in prompts:
+            if isinstance(_p, dict):
+                _p["frame_count"] = args.frame_count
+                _p["frame_rate"] = args.frame_rate
+                _p["sample_steps"] = args.sample_steps
+                if getattr(args, "guidance_scale", None) is not None:
+                    _p["guidance_scale"] = args.guidance_scale
+                _p.setdefault("height", args.height)
+                _p.setdefault("width", args.width)
         return prompts
 
     # Single prompt from CLI
