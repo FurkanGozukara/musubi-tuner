@@ -1123,6 +1123,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._dit_attn_mode: Optional[str] = None
         self._latent_norm_cache: Dict = {}
         self._warned_missing_audio = False
+        self._warned_video_ref_only_av_no_audio = False
         self._warned_ignored_ref_latents = False
         self._warned_text_encoder_fallback = False
         # Directional training (a2v/v2a): resolved once at setup, read on the call_dit hot path.
@@ -6274,8 +6275,19 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
             from musubi_tuner.networks.lora_ltx2 import _split_av_context, build_keyframe_extension
 
-            if not audio_enabled_for_batch or audio_latents is None or noisy_audio is None or audio_target is None:
-                raise ValueError("--ic_lora_strategy video_ref_only_av requires target audio_latents in every AV batch")
+            # Per-batch audio fork. Bucket separation guarantees homogeneous batches, so this switch is
+            # safe: batches WITH target audio take the full AV path; batches
+            # WITHOUT audio train the reference-conditioned video branch only, mirroring how the regular
+            # (non-IC) av path gracefully skips the audio branch for audio-less batches.
+            vroa_audio_active = (
+                audio_enabled_for_batch and audio_latents is not None and noisy_audio is not None and audio_target is not None
+            )
+            if not vroa_audio_active and not self._warned_video_ref_only_av_no_audio:
+                logger.warning(
+                    "video_ref_only_av: batch has no target audio latents; training reference-conditioned "
+                    "video only for this batch (audio branch skipped)."
+                )
+                self._warned_video_ref_only_av_no_audio = True
 
             unwrapped_transformer = accelerator.unwrap_model(transformer)
             base_model = unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
@@ -6427,68 +6439,80 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 kf_force_keep_mask,
             )
 
-            audio_patchifier = getattr(unwrapped_transformer, "_audio_patchifier", None)
-            if audio_patchifier is None and hasattr(unwrapped_transformer, "module"):
-                audio_patchifier = getattr(unwrapped_transformer.module, "_audio_patchifier", None)
-            if audio_patchifier is None:
-                raise ValueError("video_ref_only_av requires an audio patchifier on the model (LTXAV model expected)")
+            # Audio-side setup only runs when this batch carries target audio. For an audio-less batch
+            # everything below is skipped and audio_modality stays None, so the forward runs the
+            # reference-conditioned video branch only (LTXModel.forward accepts audio=None).
+            if vroa_audio_active:
+                audio_patchifier = getattr(unwrapped_transformer, "_audio_patchifier", None)
+                if audio_patchifier is None and hasattr(unwrapped_transformer, "module"):
+                    audio_patchifier = getattr(unwrapped_transformer.module, "_audio_patchifier", None)
+                if audio_patchifier is None:
+                    raise ValueError("video_ref_only_av requires an audio patchifier on the model (LTXAV model expected)")
 
-            target_audio_tokens = audio_patchifier.patchify(noisy_audio)
-            tgt_audio_seq_len = target_audio_tokens.shape[1]
-            # Use the intrinsic-aware timestep: _maybe_apply_audio_extend/inpaint (run in the AV block
-            # above) zero the conditioned audio timesteps in audio_timestep_for_model and clean-paste
-            # them into noisy_audio. When no audio intrinsic is active audio_timestep_for_model is just
-            # audio_model_timesteps, so this is byte-identical off-path.
-            _tgt_audio_ts_src = audio_timestep_for_model if audio_timestep_for_model is not None else audio_model_timesteps
-            target_audio_ts = (
-                _tgt_audio_ts_src
-                if _tgt_audio_ts_src.shape[1] == tgt_audio_seq_len
-                else _tgt_audio_ts_src[:, :1].expand(bsz, tgt_audio_seq_len)
-            )
-            channels_audio = int(audio_latents.shape[1])
-            mel_bins = int(audio_latents.shape[3])
-            tgt_audio_shape = AudioLatentShape(batch=bsz, channels=channels_audio, frames=tgt_audio_seq_len, mel_bins=mel_bins)
-            target_audio_pos = audio_patchifier.get_patch_grid_bounds(tgt_audio_shape, device=accelerator.device).to(
-                dtype=network_dtype
-            )
-
-            video_ctx, audio_ctx = _split_av_context(base_model, text_embeds)
-            av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
-            av_audio_to_video_enabled = av_cross_attention_mode in {"both", "a2v_only"}
-            av_video_to_audio_enabled = av_cross_attention_mode in {"both", "v2a_only"}
-            total_video_seq = ref_video_seq_len + tgt_video_seq_len + kf_count
-            total_audio_seq = tgt_audio_seq_len
-            audio_force_keep_mask = None
-            if self._tread_wants_audio():
-                audio_force_keep_mask = self._normalize_video_force_keep_mask(
-                    batch.get("audio_force_keep_mask"),
-                    batch_size=bsz,
-                    seq_len=tgt_audio_seq_len,
-                    device=accelerator.device,
-                    label="audio_force_keep_mask",
+                target_audio_tokens = audio_patchifier.patchify(noisy_audio)
+                tgt_audio_seq_len = target_audio_tokens.shape[1]
+                # Use the intrinsic-aware timestep: _maybe_apply_audio_extend/inpaint (run in the AV block
+                # above) zero the conditioned audio timesteps in audio_timestep_for_model and clean-paste
+                # them into noisy_audio. When no audio intrinsic is active audio_timestep_for_model is just
+                # audio_model_timesteps, so this is byte-identical off-path.
+                _tgt_audio_ts_src = audio_timestep_for_model if audio_timestep_for_model is not None else audio_model_timesteps
+                target_audio_ts = (
+                    _tgt_audio_ts_src
+                    if _tgt_audio_ts_src.shape[1] == tgt_audio_seq_len
+                    else _tgt_audio_ts_src[:, :1].expand(bsz, tgt_audio_seq_len)
                 )
-            mask_dtype = (
-                network_dtype if network_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
-            )
-            neg_inf = torch.finfo(mask_dtype).min
-
-            a2v_cross_attention_mask = None
-            if not av_audio_to_video_enabled:
-                a2v_cross_attention_mask = torch.full(
-                    (bsz, total_video_seq, total_audio_seq),
-                    neg_inf,
-                    device=accelerator.device,
-                    dtype=mask_dtype,
+                channels_audio = int(audio_latents.shape[1])
+                mel_bins = int(audio_latents.shape[3])
+                tgt_audio_shape = AudioLatentShape(batch=bsz, channels=channels_audio, frames=tgt_audio_seq_len, mel_bins=mel_bins)
+                target_audio_pos = audio_patchifier.get_patch_grid_bounds(tgt_audio_shape, device=accelerator.device).to(
+                    dtype=network_dtype
                 )
 
-            v2a_cross_attention_mask = None
-            if not av_video_to_audio_enabled:
-                v2a_cross_attention_mask = torch.full(
-                    (bsz, total_audio_seq, total_video_seq),
-                    neg_inf,
-                    device=accelerator.device,
-                    dtype=mask_dtype,
+                video_ctx, audio_ctx = _split_av_context(base_model, text_embeds)
+                av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
+                av_audio_to_video_enabled = av_cross_attention_mode in {"both", "a2v_only"}
+                av_video_to_audio_enabled = av_cross_attention_mode in {"both", "v2a_only"}
+                total_video_seq = ref_video_seq_len + tgt_video_seq_len + kf_count
+                total_audio_seq = tgt_audio_seq_len
+                audio_force_keep_mask = None
+                if self._tread_wants_audio():
+                    audio_force_keep_mask = self._normalize_video_force_keep_mask(
+                        batch.get("audio_force_keep_mask"),
+                        batch_size=bsz,
+                        seq_len=tgt_audio_seq_len,
+                        device=accelerator.device,
+                        label="audio_force_keep_mask",
+                    )
+                mask_dtype = (
+                    network_dtype
+                    if network_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16)
+                    else torch.float32
                 )
+                neg_inf = torch.finfo(mask_dtype).min
+
+                a2v_cross_attention_mask = None
+                if not av_audio_to_video_enabled:
+                    a2v_cross_attention_mask = torch.full(
+                        (bsz, total_video_seq, total_audio_seq),
+                        neg_inf,
+                        device=accelerator.device,
+                        dtype=mask_dtype,
+                    )
+
+                v2a_cross_attention_mask = None
+                if not av_video_to_audio_enabled:
+                    v2a_cross_attention_mask = torch.full(
+                        (bsz, total_audio_seq, total_video_seq),
+                        neg_inf,
+                        device=accelerator.device,
+                        dtype=mask_dtype,
+                    )
+            else:
+                # No target audio: text_embeds was already reduced to the video-only dim upstream by
+                # select_video_text_embeds_for_av_no_audio, so it is the video context as-is. No audio
+                # tokens exist, so a2v cross-attention has nothing to gate — leave the mask None.
+                video_ctx = text_embeds
+                a2v_cross_attention_mask = None
 
             video_modality = Modality(
                 enabled=True,
@@ -6501,17 +6525,20 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
                 force_keep_mask=video_force_keep_mask if self._tread_enabled else None,
             )
-            audio_modality = Modality(
-                enabled=True,
-                latent=target_audio_tokens,
-                timesteps=target_audio_ts,
-                positions=target_audio_pos,
-                context=audio_ctx,
-                sigma=audio_sigma,
-                context_mask=text_mask,
-                v2a_cross_attention_mask=v2a_cross_attention_mask,
-                force_keep_mask=audio_force_keep_mask,
-            )
+            if vroa_audio_active:
+                audio_modality = Modality(
+                    enabled=True,
+                    latent=target_audio_tokens,
+                    timesteps=target_audio_ts,
+                    positions=target_audio_pos,
+                    context=audio_ctx,
+                    sigma=audio_sigma,
+                    context_mask=text_mask,
+                    v2a_cross_attention_mask=v2a_cross_attention_mask,
+                    force_keep_mask=audio_force_keep_mask,
+                )
+            else:
+                audio_modality = None
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
 
@@ -6539,18 +6566,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     video_pred_all, audio_pred_all = base_model(video_modality, audio_modality, perturbations)
 
             target_video_pred = video_pred_all[:, ref_video_seq_len : ref_video_seq_len + tgt_video_seq_len, :]
-            target_audio_pred = audio_pred_all
             video_velocity = video_patchifier.patchify(noise - latents)
-            audio_velocity = audio_patchifier.patchify(audio_target)
-
-            target_audio_loss_mask = _compose_target_audio_loss_mask(
-                audio_loss_mask,
-                _cached_audio_loss_mask(tgt_audio_seq_len, bsz),
-                batch_size=bsz,
-                target_seq_len=tgt_audio_seq_len,
-                device=accelerator.device,
-                audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
-            )
 
             video_loss_mask = ~tgt_video_cond_mask
             # When inpaint is live the cached video_loss_mask is the inpaint CONDITIONING source, not
@@ -6563,12 +6579,25 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "video_target": video_velocity,
                 "video_loss_mask": video_loss_mask,
                 "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
-                "audio_pred": target_audio_pred,
-                "audio_target": audio_velocity,
-                "audio_loss_mask": target_audio_loss_mask,
-                "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight"),
-                "audio_sigma": audio_sigma,
             }
+            # Only supervise audio for batches that carry target audio; audio-less batches contribute a
+            # video-only loss dict (same key set as the v2v branch), so the loss reducer skips audio.
+            if vroa_audio_active:
+                target_audio_pred = audio_pred_all
+                audio_velocity = audio_patchifier.patchify(audio_target)
+                target_audio_loss_mask = _compose_target_audio_loss_mask(
+                    audio_loss_mask,
+                    _cached_audio_loss_mask(tgt_audio_seq_len, bsz),
+                    batch_size=bsz,
+                    target_seq_len=tgt_audio_seq_len,
+                    device=accelerator.device,
+                    audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
+                )
+                out_video_ref_av["audio_pred"] = target_audio_pred
+                out_video_ref_av["audio_target"] = audio_velocity
+                out_video_ref_av["audio_loss_mask"] = target_audio_loss_mask
+                out_video_ref_av["audio_loss_weight"] = _resolve_loss_weight("audio_loss_weight", "audio_loss_weight")
+                out_video_ref_av["audio_sigma"] = audio_sigma
             self._last_dit_inputs = None
             return out_video_ref_av, torch.tensor(0.0, device=accelerator.device)
 
