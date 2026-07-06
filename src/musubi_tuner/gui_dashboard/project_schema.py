@@ -244,6 +244,11 @@ class TrainingConfig(BaseModel):
     int8_convrot_groupsize: str = "auto"
     int8_convrot_no_mse_clip: bool = False
     int8_convrot_quality_report: str = ""
+    int4_convrot_base: bool = False
+    int4_convrot_dynamic: bool = False
+    int4_convrot_groupsize: str = "auto"
+    int4_convrot_no_mse_clip: bool = False
+    int4_convrot_quality_report: str = ""
     int8_fused_quant: bool = False
     awq_calibration: bool = False
     awq_alpha: float = 0.25

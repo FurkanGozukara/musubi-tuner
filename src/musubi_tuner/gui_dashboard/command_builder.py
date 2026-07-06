@@ -1085,6 +1085,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--int8_convrot_no_mse_clip")
     if getattr(t, "int8_convrot_quality_report", ""):
         cmd += ["--int8_convrot_quality_report", str(t.int8_convrot_quality_report)]
+    if getattr(t, "int4_convrot_base", False):
+        cmd.append("--int4_convrot_base")
+    if getattr(t, "int4_convrot_dynamic", False):
+        cmd.append("--int4_convrot_dynamic")
+    if getattr(t, "int4_convrot_groupsize", "auto") not in (None, "", "auto"):
+        cmd += ["--int4_convrot_groupsize", str(t.int4_convrot_groupsize)]
+    if getattr(t, "int4_convrot_no_mse_clip", False):
+        cmd.append("--int4_convrot_no_mse_clip")
+    if getattr(t, "int4_convrot_quality_report", ""):
+        cmd += ["--int4_convrot_quality_report", str(t.int4_convrot_quality_report)]
     if getattr(t, "int8_fused_quant", False):
         cmd.append("--int8_fused_quant")
     if t.awq_calibration:

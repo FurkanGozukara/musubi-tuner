@@ -655,10 +655,19 @@
 								<FormToggle fieldPath="training.int8_base_dynamic" checked={t.int8_base_dynamic ?? false} onchange={(e) => update('int8_base_dynamic', e.target.checked)} tooltip="Quantize a standard (bf16) checkpoint to int8 on the fly at load time (no pre-quantized file needed)." />
 								<FormToggle fieldPath="training.int8_fused_quant" checked={t.int8_fused_quant ?? false} onchange={(e) => update('int8_fused_quant', e.target.checked)} tooltip="Also fuse the int8 activation/gradient quantization (faster int8 on Ampere; needs Triton)." />
 							</div>
+							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+								<FormToggle label="INT4 ConvRot Base" fieldPath="training.int4_convrot_base" checked={t.int4_convrot_base ?? false} onchange={(e) => update('int4_convrot_base', e.target.checked)} tooltip="Train a LoRA over a pre-quantized packed INT4 ConvRot checkpoint. Mutually exclusive with FP8/NF4/INT8 base modes." />
+								<FormToggle label="INT4 ConvRot Dynamic" fieldPath="training.int4_convrot_dynamic" checked={t.int4_convrot_dynamic ?? false} onchange={(e) => update('int4_convrot_dynamic', e.target.checked)} tooltip="Quantize a standard checkpoint to packed INT4 ConvRot at load time." />
+								<FormToggle label="INT4 No MSE Clip" fieldPath="training.int4_convrot_no_mse_clip" checked={t.int4_convrot_no_mse_clip ?? false} onchange={(e) => update('int4_convrot_no_mse_clip', e.target.checked)} disabled={!t.int4_convrot_dynamic} tooltip="Use plain absmax row scales instead of MSE-optimal clipping during dynamic INT4 ConvRot quantization." />
+							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormField type="number" fieldPath="training.nf4_block_size" value={t.nf4_block_size ?? 32} oninput={(e) => update('nf4_block_size', Number(e.target.value))} disabled={!t.nf4_base} tooltip="Block size for NF4 quantization" />
 								<FormField type="number" fieldPath="training.loftq_iters" value={t.loftq_iters ?? 2} oninput={(e) => update('loftq_iters', Number(e.target.value))} min={1} disabled={!t.loftq_init} tooltip="LoftQ alternating iterations" />
 								<FormSelect fieldPath="training.w8a8_mode" value={t.w8a8_mode || 'int8'} options={['int8', 'fp8']} onchange={(e) => update('w8a8_mode', e.target.value)} disabled={!t.fp8_w8a8} tooltip="int8 (Turing+) or fp8 (Ada+)" />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="INT4 Groupsize" fieldPath="training.int4_convrot_groupsize" value={t.int4_convrot_groupsize || 'auto'} oninput={(e) => update('int4_convrot_groupsize', e.target.value || 'auto')} disabled={!t.int4_convrot_base && !t.int4_convrot_dynamic} placeholder="auto" tooltip="INT4 ConvRot group size or comma list. Auto tries 256,64,16." />
+								<FormField label="INT4 Quality Report" fieldPath="training.int4_convrot_quality_report" value={t.int4_convrot_quality_report || ''} oninput={(e) => update('int4_convrot_quality_report', e.target.value)} disabled={!t.int4_convrot_dynamic} placeholder="Optional JSON path" tooltip="Write per-layer reconstruction metrics during dynamic INT4 ConvRot quantization." />
 							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormSelect fieldPath="training.w8a8_backend" value={t.w8a8_backend || ''} options={[{value:'',label:'Default'},{value:'torch',label:'torch'},{value:'triton',label:'triton'},{value:'cutlass',label:'cutlass'}]} onchange={(e) => update('w8a8_backend', e.target.value || null)} disabled={(!t.fp8_w8a8 || (t.w8a8_mode || 'int8') !== 'int8') && !t.int8_base && !t.int8_base_dynamic} tooltip="Manual int8 matmul backend selector; leave blank to preserve existing behavior." />

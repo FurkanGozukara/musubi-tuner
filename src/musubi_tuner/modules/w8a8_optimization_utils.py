@@ -309,6 +309,26 @@ def _torch_dtype_code_supported(dtype: torch.dtype) -> bool:
     return dtype in {torch.float16, torch.bfloat16, torch.float32}
 
 
+def _autocast_output_dtype(x: torch.Tensor) -> torch.dtype:
+    if not x.is_floating_point():
+        return x.dtype
+    device_type = x.device.type
+    try:
+        autocast_enabled = torch.is_autocast_enabled(device_type)
+    except TypeError:
+        autocast_enabled = torch.is_autocast_enabled()
+    if not autocast_enabled:
+        return x.dtype
+    try:
+        return torch.get_autocast_dtype(device_type)
+    except (AttributeError, RuntimeError):
+        if device_type == "cuda" and hasattr(torch, "get_autocast_gpu_dtype"):
+            return torch.get_autocast_gpu_dtype()
+        if device_type == "cpu" and hasattr(torch, "get_autocast_cpu_dtype"):
+            return torch.get_autocast_cpu_dtype()
+    return x.dtype
+
+
 def _resolve_int8_backend(w8a8_backend: str, *, use_int_mm: bool):
     """Resolve an explicitly selected int8 matmul backend.
 
@@ -464,6 +484,7 @@ class _W8A8Int8Function(torch.autograd.Function):
         # weight_int8_t: optional [in, out] contiguous int8 fallback for fast backward RHS layout
         # weight_scale: [out, 1] float32
         original_shape = x.shape
+        output_dtype = _autocast_output_dtype(x)
         convrot_groupsize = int(convrot_groupsize or 0)
         quantize = _get_int8_quantize()
         convrot_quantize = (
@@ -499,14 +520,14 @@ class _W8A8Int8Function(torch.autograd.Function):
         # no .contiguous() needed on weight_int8.t(), which avoids a 16MB transient copy.
         out_int32 = None
         triton_scaled = getattr(triton_mm, "scaled", None) if use_triton_scaled_forward and triton_mm is not None else None
-        if triton_scaled is not None and _torch_dtype_code_supported(x.dtype):
+        if triton_scaled is not None and _torch_dtype_code_supported(output_dtype):
             output = triton_scaled(
                 x_int8.contiguous(),
                 weight_int8.t(),
                 x_scale.contiguous(),
                 weight_scale.reshape(-1).contiguous(),
                 bias.float().contiguous() if bias is not None else None,
-                output_dtype=x.dtype,
+                output_dtype=output_dtype,
             )
             output = output.reshape(*original_shape[:-1], weight_int8.shape[0])
         elif cutlass_mm is not None and weight_int8_t is not None:
@@ -522,19 +543,22 @@ class _W8A8Int8Function(torch.autograd.Function):
             out_features = weight_int8.shape[0]
             epilogue = (
                 _get_int8_cuda_epilogue()
-                if _use_fused_quant() and _use_cuda_convrot_quant() and out_int32.is_cuda and _torch_dtype_code_supported(x.dtype)
+                if _use_fused_quant()
+                and _use_cuda_convrot_quant()
+                and out_int32.is_cuda
+                and _torch_dtype_code_supported(output_dtype)
                 else None
             )
             if epilogue is None:
                 epilogue = _get_int8_epilogue() if out_int32.is_cuda else None
             if epilogue is not None and weight_scale.numel() == out_features:
-                output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, x.dtype)
+                output = epilogue(out_int32, x_scale, weight_scale, bias.float() if bias is not None else None, output_dtype)
                 output = output.reshape(*original_shape[:-1], out_features)
             else:
                 output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
                 if bias is not None:
                     output = output + bias.float()
-                output = output.to(x.dtype).reshape(*original_shape[:-1], -1)
+                output = output.to(output_dtype).reshape(*original_shape[:-1], -1)
 
         # Save ONLY references to existing module buffers.
         if cutlass_mm is not None:

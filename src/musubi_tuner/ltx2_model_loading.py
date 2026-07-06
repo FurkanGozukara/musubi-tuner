@@ -30,6 +30,16 @@ from musubi_tuner.modules.int8_convrot_utils import (
     summarize_quality,
     write_quality_report,
 )
+from musubi_tuner.modules.int4_convrot_utils import (
+    apply_int4_convrot_monkey_patch,
+    best_int4_convrot_groupsize,
+    parse_comfy_quant_tensor as parse_int4_comfy_quant_tensor,
+    parse_int4_convrot_groupsizes,
+    quantize_int4_convrot_weight,
+    register_int4_convrot_buffers,
+    summarize_quality as summarize_int4_quality,
+    write_quality_report as write_int4_quality_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -784,6 +794,248 @@ def load_safetensors_dynamic_int8_convrot(
     return sd
 
 
+def load_comfy_int4_convrot_state_dict(
+    model_files: List[str],
+    *,
+    non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
+    key_filter: Optional[Callable[[str], bool]] = None,
+) -> dict[str, torch.Tensor]:
+    """Load a packed INT4 ConvRot checkpoint with Comfy-compatible metadata.
+
+    Expected quantized layer layout:
+      - ``<name>.weight`` uint8 [out, ceil(padded_in / 2)] signed-int4 nibbles
+      - ``<name>.weight_scale`` fp32 [out, 1]
+      - ``<name>.int4_shape`` int32 [out, in, padded_in] or metadata fields in ``<name>.comfy_quant``
+      - ``<name>.comfy_quant`` uint8 JSON with ``bits=4`` and ``convrot_groupsize``
+    """
+
+    sd: dict[str, torch.Tensor] = {}
+    quantized = 0
+    convrot = 0
+    passthrough = 0
+    for model_file in model_files:
+        with MemoryEfficientSafeOpen(model_file) as f:
+            keys = list(f.keys())
+            scale_bases = {k[: -len(".weight_scale")] for k in keys if k.endswith(".weight_scale")}
+            shape_bases = {k[: -len(".int4_shape")] for k in keys if k.endswith(".int4_shape")}
+            group_bases = {k[: -len(".int4_convrot_groupsize")] for k in keys if k.endswith(".int4_convrot_groupsize")}
+            comfy_cfg: dict[str, dict[str, Any]] = {}
+            for key in keys:
+                if not key.endswith(".comfy_quant"):
+                    continue
+                base = key[: -len(".comfy_quant")]
+                try:
+                    comfy_cfg[base] = parse_int4_comfy_quant_tensor(f.get_tensor(key))
+                except Exception as exc:
+                    logger.warning("INT4 ConvRot: failed to parse %s in %s: %s", key, model_file, exc)
+
+            for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                if key.endswith(".comfy_quant"):
+                    continue
+                if key.endswith(".weight_scale"):
+                    base = key[: -len(".weight_scale")]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    scale = f.get_tensor(key).float()
+                    if scale.ndim == 1:
+                        scale = scale.reshape(-1, 1)
+                    sd[base + ".scale_weight"] = scale
+                    continue
+                if key.endswith(".int4_shape"):
+                    base = key[: -len(".int4_shape")]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    sd[key] = f.get_tensor(key).to(torch.int32)
+                    continue
+                if key.endswith(".int4_convrot_groupsize"):
+                    base = key[: -len(".int4_convrot_groupsize")]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    sd[key] = f.get_tensor(key).to(torch.int32)
+                    continue
+
+                if key_filter is not None and not key_filter(key):
+                    continue
+                value = f.get_tensor(key)
+                if key.endswith(".weight") and key[: -len(".weight")] in scale_bases and value.dtype == torch.uint8:
+                    base = key[: -len(".weight")]
+                    cfg = comfy_cfg.get(base) or {}
+                    cfg_bits = int(cfg.get("bits", 0) or 0)
+                    if cfg_bits not in (0, 4):
+                        raise ValueError(f"{key} has unsupported comfy_quant bits={cfg_bits}; expected INT4 bits=4")
+                    if base not in shape_bases and not cfg:
+                        raise ValueError(
+                            f"INT4 ConvRot checkpoint has packed uint8 weight without .int4_shape or .comfy_quant metadata: {key}"
+                        )
+                    group_size = int(cfg.get("convrot_groupsize", 0) or 0)
+                    if group_size <= 0 and base in group_bases:
+                        group_size = int(f.get_tensor(base + ".int4_convrot_groupsize").reshape(-1)[0].item())
+                    if group_size <= 0:
+                        raise ValueError(f"INT4 ConvRot checkpoint is missing convrot_groupsize metadata for {key}")
+                    in_features = int(cfg.get("in_features", 0) or 0)
+                    padded_features = int(cfg.get("padded_in_features", 0) or 0)
+                    if padded_features <= 0:
+                        padded_features = int(value.shape[1]) * 2
+                    if in_features <= 0:
+                        in_features = padded_features
+
+                    sd[key] = value
+                    if base + ".int4_shape" not in sd:
+                        sd[base + ".int4_shape"] = torch.tensor(
+                            [int(value.shape[0]), in_features, padded_features],
+                            dtype=torch.int32,
+                        )
+                    if group_size > 0 and base + ".int4_convrot_groupsize" not in sd:
+                        sd[base + ".int4_convrot_groupsize"] = torch.tensor(group_size, dtype=torch.int32)
+                    quantized += 1
+                    if bool(cfg.get("convrot", True)):
+                        convrot += 1
+                    continue
+                if (
+                    key.endswith(".weight")
+                    and key[: -len(".weight")] in scale_bases
+                    and value.is_floating_point()
+                    and value.dtype.itemsize == 1
+                ):
+                    raise ValueError(
+                        f"{key} looks like a scaled FP8 weight, not an INT4 ConvRot weight. "
+                        "Use --int4_convrot_dynamic to convert FP8/BF16 sources, or pass an INT4 ConvRot checkpoint "
+                        "with .int4_shape/.comfy_quant metadata."
+                    )
+                if value.is_floating_point() and non_quant_dtype is not None:
+                    value = value.to(non_quant_dtype)
+                sd[key] = value
+                passthrough += 1
+    logger.info(
+        "INT4 ConvRot: loaded %d quantized layers (%d ConvRot), %d passthrough tensors, %d tensors total",
+        quantized,
+        convrot,
+        passthrough,
+        len(sd),
+    )
+    return sd
+
+
+def load_safetensors_dynamic_int4_convrot(
+    model_files: List[str],
+    *,
+    target_keys: List[str],
+    exclude_keys: List[str],
+    groupsizes: str | int | Iterable[int] | None = None,
+    mse_clip: bool = True,
+    quality_report: Optional[str] = None,
+    non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
+    calc_device: Union[str, torch.device] = "cpu",
+    key_filter: Optional[Callable[[str], bool]] = None,
+) -> dict[str, torch.Tensor]:
+    """Stream a standard checkpoint and quantize targeted Linear weights to packed INT4 ConvRot."""
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+
+    calc_device = torch.device(calc_device)
+    group_candidates = parse_int4_convrot_groupsizes(groupsizes)
+    collect_quality = bool(quality_report)
+    sd: dict[str, torch.Tensor] = {}
+    quality_layers = []
+    quantized = 0
+
+    for model_file in model_files:
+        with MemoryEfficientSafeOpen(model_file) as f:
+            all_keys = list(f.keys())
+            fp8_scale_keys = {k for k in all_keys if k.endswith(".weight_scale") or k.endswith(".input_scale")}
+            if fp8_scale_keys:
+                logger.info(
+                    "INT4 ConvRot dynamic: detected %d FP8 scale tensors; FP8 weights will be dequantized before ConvRot",
+                    len(fp8_scale_keys),
+                )
+            for key in tqdm(all_keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                if key in fp8_scale_keys:
+                    continue
+                renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(key)
+                mkey = renamed if renamed is not None else key
+                if key_filter is not None and not key_filter(mkey):
+                    continue
+                value = f.get_tensor(key)
+                if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
+                    scale_key = key.replace(".weight", ".weight_scale")
+                    if scale_key not in fp8_scale_keys:
+                        raise ValueError(
+                            f"INT4 ConvRot dynamic source has FP8 weight without weight_scale: {key}. "
+                            "Use a bf16/fp16 checkpoint or a scaled FP8 checkpoint with matching scale tensors."
+                        )
+                    value = value.to(torch.bfloat16) * f.get_tensor(scale_key).to(value.device)
+                is_candidate = (
+                    mkey.endswith(".weight")
+                    and value.ndim == 2
+                    and value.shape[0] >= 8
+                    and any(t in mkey for t in target_keys)
+                    and not any(e in mkey for e in exclude_keys)
+                )
+
+                if is_candidate:
+                    group_size = best_int4_convrot_groupsize(value.shape[1], group_candidates)
+                    q, scale, shape, quality = quantize_int4_convrot_weight(
+                        value,
+                        group_size=int(group_size),
+                        calc_device=calc_device,
+                        mse_clip=mse_clip,
+                        collect_quality=collect_quality,
+                        key=mkey,
+                    )
+                    base = mkey[: -len(".weight")]
+                    sd[mkey] = q
+                    sd[base + ".scale_weight"] = scale
+                    sd[base + ".int4_shape"] = shape
+                    sd[base + ".int4_convrot_groupsize"] = torch.tensor(int(group_size), dtype=torch.int32, device=q.device)
+                    if quality is not None:
+                        quality_layers.append(quality)
+                    quantized += 1
+                else:
+                    if value.is_floating_point() and non_quant_dtype is not None:
+                        value = value.to(non_quant_dtype)
+                    if calc_device.type == "cuda":
+                        value = value.to(calc_device)
+                    sd[mkey] = value
+
+    logger.info("INT4 ConvRot dynamic: quantized %d Linear weights to packed INT4 (%d tensors total)", quantized, len(sd))
+    if quality_layers:
+        summary = summarize_int4_quality(quality_layers)
+        logger.info(
+            "INT4 ConvRot quality: min_cosine=%.6f mean_cosine=%.6f weighted_sqnr=%.2f dB max_abs_error=%.6g",
+            summary["min_cosine"],
+            summary["mean_cosine"],
+            summary["weighted_sqnr_db"],
+            summary["max_abs_error"],
+        )
+        if quality_report:
+            write_int4_quality_report(
+                quality_report,
+                source=", ".join(model_files),
+                options={
+                    "mode": "dynamic",
+                    "groupsizes": list(group_candidates),
+                    "mse_clip": bool(mse_clip),
+                    "target_keys": target_keys,
+                    "exclude_keys": exclude_keys,
+                    "calc_device": str(calc_device),
+                    "storage": "packed_signed_int4",
+                },
+                layers=quality_layers,
+            )
+            logger.info("INT4 ConvRot quality report written to %s", quality_report)
+    elif quality_report:
+        write_int4_quality_report(
+            quality_report,
+            source=", ".join(model_files),
+            options={"mode": "dynamic", "groupsizes": list(group_candidates), "mse_clip": bool(mse_clip)},
+            layers=[],
+        )
+        logger.warning("INT4 ConvRot quality report requested, but no layers were quantized.")
+    return sd
+
+
 def load_ltx2_model(
     model_path: str,
     device: Union[str, torch.device] = "cpu",
@@ -812,6 +1064,11 @@ def load_ltx2_model(
     int8_convrot_groupsize: str | int | Iterable[int] | None = None,
     int8_convrot_mse_clip: bool = True,
     int8_convrot_quality_report: Optional[str] = None,
+    int4_convrot_base: bool = False,
+    int4_convrot_dynamic: bool = False,
+    int4_convrot_groupsize: str | int | Iterable[int] | None = None,
+    int4_convrot_mse_clip: bool = True,
+    int4_convrot_quality_report: Optional[str] = None,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -895,7 +1152,7 @@ def load_ltx2_model(
         config = loader.metadata(_config_path)
     except (KeyError, TypeError):
         # Quantized exports may carry no "config" metadata; rebuild it from weights.
-        if not (int8_base or int8_convrot_base):
+        if not (int8_base or int8_convrot_base or int4_convrot_base):
             raise
         config = infer_ltx2_transformer_config_from_weights(_config_path)
     attn_mode = (attn_mode or "torch").lower()
@@ -987,7 +1244,7 @@ def load_ltx2_model(
 
     # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
     _is_nvfp4 = False
-    if not nf4_base and not fp8_scaled:
+    if not nf4_base and not fp8_scaled and not int4_convrot_base and not int4_convrot_dynamic:
         from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
 
         _check_path = model_path if isinstance(model_path, str) else model_path[0]
@@ -1185,7 +1442,7 @@ def load_ltx2_model(
         model_files = model_path if isinstance(model_path, list) else [model_path]
         sd = load_quanto_int8_state_dict(
             model_files,
-            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             key_filter=state_dict_key_filter,
         )
@@ -1194,7 +1451,7 @@ def load_ltx2_model(
         model_files = model_path if isinstance(model_path, list) else [model_path]
         sd = load_comfy_int8_convrot_state_dict(
             model_files,
-            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             key_filter=state_dict_key_filter,
         )
@@ -1205,7 +1462,7 @@ def load_ltx2_model(
             model_files,
             target_keys=["transformer_blocks"],
             exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
-            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
@@ -1220,7 +1477,31 @@ def load_ltx2_model(
             groupsizes=int8_convrot_groupsize,
             mse_clip=bool(int8_convrot_mse_clip),
             quality_report=int8_convrot_quality_report,
-            # Frozen base: keep non-quantized weights at bf16; an fp32 dtype doubles their footprint and is never trained.
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
+            calc_device=_resolved_quant_device,
+            key_filter=state_dict_key_filter,
+        )
+    elif int4_convrot_base:
+        logger.info("LTX-2 INT4 ConvRot: loading pre-quantized packed INT4 checkpoint")
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        sd = load_comfy_int4_convrot_state_dict(
+            model_files,
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
+            non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
+            key_filter=state_dict_key_filter,
+        )
+    elif int4_convrot_dynamic:
+        logger.info("LTX-2 INT4 ConvRot: dynamic INT4 weight quantization of standard checkpoint")
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        sd = load_safetensors_dynamic_int4_convrot(
+            model_files,
+            target_keys=["transformer_blocks"],
+            exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
+            groupsizes=int4_convrot_groupsize,
+            mse_clip=bool(int4_convrot_mse_clip),
+            quality_report=int4_convrot_quality_report,
+            # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
@@ -1239,8 +1520,8 @@ def load_ltx2_model(
             key_filter=state_dict_key_filter,
         )
 
-    # Dynamic int8 loaders already rename keys during streaming quantization.
-    if not (int8_dynamic or int8_convrot_dynamic or (nf4_base and locals().get("_skip_rename", False))):
+    # Dynamic int8/int4 loaders already rename keys during streaming quantization.
+    if not (int8_dynamic or int8_convrot_dynamic or int4_convrot_dynamic or (nf4_base and locals().get("_skip_rename", False))):
         renamed_sd: dict[str, torch.Tensor] = {}
         for k, v in sd.items():
             nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
@@ -1263,6 +1544,8 @@ def load_ltx2_model(
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+    elif int4_convrot_base or int4_convrot_dynamic:
+        register_int4_convrot_buffers(base_model, sd)
     elif int8_base or int8_dynamic or int8_convrot_base or int8_convrot_dynamic:
         register_quanto_int8_scale_buffers(base_model, sd)
     _trace_vram_ltx2("AFTER apply monkey patch")
@@ -1279,6 +1562,9 @@ def load_ltx2_model(
     if int8_base or int8_dynamic or int8_convrot_base or int8_convrot_dynamic:
         apply_quanto_int8_monkey_patch(base_model, w8a8_backend=w8a8_backend)
         _trace_vram_ltx2("AFTER quanto int8 monkey patch")
+    if int4_convrot_base or int4_convrot_dynamic:
+        apply_int4_convrot_monkey_patch(base_model)
+        _trace_vram_ltx2("AFTER int4 ConvRot monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")

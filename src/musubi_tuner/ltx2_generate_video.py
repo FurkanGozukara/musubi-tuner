@@ -855,8 +855,10 @@ def _build_prompt_list(
                 _p["sample_steps"] = args.sample_steps
                 if getattr(args, "guidance_scale", None) is not None:
                     _p["guidance_scale"] = args.guidance_scale
-                _p.setdefault("height", args.height)
-                _p.setdefault("width", args.width)
+                if getattr(args, "height", None) is not None:
+                    _p["height"] = args.height
+                if getattr(args, "width", None) is not None:
+                    _p["width"] = args.width
         return prompts
 
     # Single prompt from CLI

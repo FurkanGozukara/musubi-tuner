@@ -20,6 +20,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 ## Table of Contents
 
+- [Supported Model Versions](#supported-model-versions)
 - [Part I — Getting Started](#part-i--getting-started)
   - [Installation](#installation)
     - [CUDA Version](#cuda-version)
@@ -97,6 +98,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
     - [INT8 ConvRot Base](#int8-convrot-base)
+    - [INT4 ConvRot W4A8/W4A4](#int4-convrot-w4a8w4a4)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Function Type](#loss-function-type)
@@ -110,6 +112,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Adaptive LoRA Rank](#adaptive-lora-rank)
     - [Per-Module LoRA Dropout](#per-module-lora-dropout)
     - [Standalone Inference](#standalone-inference)
+      - [Rendering Trained Conditioning](#rendering-trained-conditioning)
     - [Audio Quality Metrics](#audio-quality-metrics)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
@@ -145,7 +148,27 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
       - [Audio Inpaint / Mask Conditioning](#audio-inpaint--mask-conditioning)
     - [Reference Conditioning (IC-LoRA)](#reference-conditioning-ic-lora)
       - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
+        - [Step 1: Prepare Dataset](#step-1-prepare-dataset)
+        - [Step 2: Dataset Config](#step-2-dataset-config)
+        - [Step 3: Cache Latents](#step-3-cache-latents)
+        - [Step 4: Cache Text Encoder Outputs](#step-4-cache-text-encoder-outputs)
+        - [Step 5: Train](#step-5-train)
+        - [Step 6: Sample Prompts](#step-6-sample-prompts)
+        - [IC-LoRA Arguments](#ic-lora-arguments)
+        - [IC-LoRA Dataset Config Options](#ic-lora-dataset-config-options)
+        - [Notes](#notes-1)
+        - [Recommended settings](#recommended-settings)
+        - [How it works](#how-it-works-2)
       - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
+        - [Step 1: Prepare Data](#step-1-prepare-data)
+        - [Step 2: Dataset Config](#step-2-dataset-config-1)
+        - [Step 3: Cache Latents](#step-3-cache-latents-1)
+        - [Step 4: Cache Text Encoder Outputs](#step-4-cache-text-encoder-outputs-1)
+        - [Step 5: Train](#step-5-train-1)
+        - [Step 6: Sample Prompts](#step-6-sample-prompts-1)
+        - [Audio-Reference IC-LoRA Arguments](#audio-reference-ic-lora-arguments)
+        - [Audio-Reference Dataset Config Options](#audio-reference-dataset-config-options)
+        - [Notes](#notes-2)
     - [Directional Training (A2V / V2A)](#directional-training-a2v--v2a)
     - [Latent Guides](#latent-guides)
       - [Dataset Config Options](#latent-guide-dataset-config-options)
@@ -157,14 +180,19 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Slider LoRA Training](#slider-lora-training)
     - [Text-Only Mode](#text-only-mode)
       - [Slider Config (`ltx2_slider.toml`)](#slider-config-ltx2_slidertoml)
+        - [Anchors (concept preservation)](#anchors-concept-preservation)
       - [Example Command (Text-Only)](#example-command-text-only)
       - [Text-Only Arguments](#text-only-arguments)
     - [Reference Mode](#reference-mode)
       - [Step 1: Prepare Paired Data](#step-1-prepare-paired-data)
       - [Step 2: Cache Latents and Text](#step-2-cache-latents-and-text)
       - [Step 3: Configure and Train](#step-3-configure-and-train)
+        - [Slider Config (`ltx2_slider_reference.toml`)](#slider-config-ltx2_slider_referencetoml)
+        - [Example Command (Reference)](#example-command-reference)
+        - [Audio Reference Sliders](#audio-reference-sliders)
     - [IC-slider](#ic-slider)
       - [Slider Config (`ltx2_slider_ic_reference.toml`)](#slider-config-ltx2_slider_ic_referencetoml)
+        - [Example Command (IC-Aware Reference)](#example-command-ic-aware-reference)
     - [Slider Tips](#slider-tips)
   - [Reinforcement-Learning Post-Training (RL-LoRA)](#reinforcement-learning-post-training-rl-lora)
     - [Overview](#overview)
@@ -176,6 +204,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning)
     - [Dataset Preparation](#dataset-preparation)
     - [Dense bf16 (Adafactor)](#dense-bf16-adafactor)
+      - [Using Full-Finetune Checkpoints for Inference](#using-full-finetune-checkpoints-for-inference)
     - [BAdam Block-Coordinate](#badam-block-coordinate)
     - [Q-GaLore Quantized](#q-galore-quantized)
     - [APOLLO and QAPOLLO](#apollo-and-qapollo)
@@ -1527,10 +1556,11 @@ For additional training and inference speedups, see the [torch.compile Support](
 | `--fp8_base --fp8_scaled` | ~19 GB | 0.0171 (15x BF16) | 32.0 dB | 0.999686 |
 | `--nf4_base` | ~10 GB | 0.0678 (60x BF16) | 21.2 dB | 0.996188 |
 | `--nf4_base --loftq_init` | ~10 GB | 0.0654 (60x BF16) | 21.5 dB | 0.996437 |
+| INT4 ConvRot weights (MSE-clipped g256) | ~10 GB | 0.0037 | 18.9 dB | 0.993353 |
 
-*Approximate values measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). The VRAM column is base-weight storage (parameters × bytes-per-weight), not measured training peak — actual peak also includes activations, gradients, optimizer state, and the LoRA.*
+*Approximate values measured with representative LTX-2 transformer shapes, except the INT4 ConvRot row, which is from a full LTX-2.3 transformer-block quality report. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). The VRAM column is base-weight storage (parameters × bytes-per-weight), not measured training peak — actual peak also includes activations, gradients, optimizer state, and the LoRA.*
 
-NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
+NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot weights are accurate enough for clean weight-only samples, but W4A4 activation quantization can visibly degrade video samples. The default INT4 ConvRot runtime is W4A8: weights stay packed INT4, while forward activations and backward grad-output use row-wise INT8. The base model is frozen during LoRA training, so weight quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
 - `--fp8_base`: keep base model weights in FP8 path (~19 GB base weights).
 - `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
@@ -1540,7 +1570,8 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 - `--nf4_base`: NF4 4-bit quantization (~10 GB base weights). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
 - `--int8_convrot_dynamic`: quantize a standard checkpoint to INT8 ConvRot at load time. See [INT8 ConvRot Base](#int8-convrot-base) below.
-- `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
+- `--int4_convrot_dynamic`: INT4 ConvRot path. Weights are stored as packed signed INT4. The default runtime is W4A8; W4A4 remains available as an explicit experimental mode. See [INT4 ConvRot W4A8/W4A4](#int4-convrot-w4a8w4a4) below.
+- `--quantize_device cpu|cuda|gpu`: Device for startup quantization in NF4/FP8 and dynamic INT8/INT4 ConvRot paths (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves the quantized result to GPU; this avoids load-time GPU high-water marks at the cost of more host RAM and startup time. `cuda` loads and quantizes directly on GPU. For NF4/FP8 it overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE`.
 
 #### Other Memory Options
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -1783,6 +1814,72 @@ Notes:
 - Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
 - The runtime uses the same int8 backend selector as the existing int8 path (`--w8a8_backend torch|triton|cutlass`). Pre-quantized INT8 ConvRot defaults to `torch._int_mm` when available; pass `--w8a8_backend triton` or `--w8a8_backend cutlass` to force a backend.
 - The forward ConvRot activation rotation + rowwise quantization and the backward grad-input scale + inverse ConvRot epilogue are fused into single Triton kernels by default (group sizes up to 256); set `LTX2_INT8_FUSED_QUANT=0` for the eager path. The fused path is Triton-first; set `LTX2_INT8_CONVROT_CUDA_QUANT=1` to build and use the native CUDA ConvRot kernels instead (one-time compile). Both fall back to eager when Triton/CUDA are unavailable.
+
+### INT4 ConvRot W4A8/W4A4
+<sub>[↑ contents](#table-of-contents)</sub>
+
+> [!WARNING]
+> INT4 ConvRot LoRA training is experimental. W4A8 is the default and is the safer INT4 ConvRot mode, but this path should still be validated with short runs and sample videos before committing long training jobs. The fully 4-bit W4A4 activation mode is for diagnostics and backend experiments only.
+
+`--int4_convrot_dynamic` rotates eligible transformer-block Linear weights offline, stores the frozen base as packed signed INT4 nibbles, rotates activations online, and runs quantized matmuls through the selected backend. The default activation mode is W4A8: weights stay packed INT4, while forward activations and backward grad-output are quantized to row-wise INT8. Set `LTX2_INT4_CONVROT_ACT_BITS=4` only to test the experimental fully 4-bit W4A4 activation path.
+
+```bat
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
+  --int4_convrot_dynamic ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  --int4_convrot_quality_report output\int4-convrot-quality.json ^
+  (other training options)
+```
+
+To reuse the quantized base, pre-quantize once:
+
+```bat
+python ltx2_quantize_int4_convrot.py ^
+  --input_model path\to\ltx-2.3-22b-dev.safetensors ^
+  --output_model path\to\ltx-2.3-22b-dev-int4-convrot.safetensors
+
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev-int4-convrot.safetensors ^
+  --int4_convrot_base ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  (other training options)
+```
+
+Options:
+- `--int4_convrot_base`: load a pre-quantized packed INT4 ConvRot checkpoint (`.weight`, `.weight_scale`, `.int4_shape`, and `.comfy_quant` metadata).
+- `--int4_convrot_dynamic`: quantize a standard checkpoint at load time.
+- `--int4_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16`. Unlike the INT8 ConvRot path, W4A4 pads the rotated input dimension internally, so the weight input dimension does not need to be divisible by the group size.
+- `--int4_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
+- `--int4_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
+- `ltx2_quantize_int4_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
+
+Notes:
+- Requires LoRA training (`--network_module`); full-parameter fine-tuning of the frozen INT4 ConvRot base is not supported.
+- Mutually exclusive with `--int8_base`, `--int8_base_dynamic`, `--int8_convrot_base`, `--int8_convrot_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
+- `LTX2_INT4_CONVROT_BACKEND=auto` uses the torch tensor-core bridge when available. Optional backend values are `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, and `scalar`; the native CUTLASS path requires headers from `LTX2_CUTLASS_INCLUDE_DIR`. The torch bridge is the recommended default for LoRA training.
+- `LTX2_INT4_CONVROT_ACT_BITS=8` is the default. It keeps resident weights packed as INT4 but quantizes forward activations and backward grad-output to row-wise INT8 before the tensor-core bridge (`W4A8`). This keeps the INT4 weight-storage benefit while avoiding the per-token A4 activation error.
+- `LTX2_INT4_CONVROT_ACT_BITS=4` enables the experimental W4A4 activation path. Use it for diagnostics or backend experiments; validate samples before long training runs.
+- No Blackwell performance claim is made for the native INT4 kernels.
+- ConvRot's paper reports W4A4 as the intended advantage of the method, but also notes quality sensitivity for fully 4-bit diffusion transformers. Use the quality report and sample checks before committing a long run.
+- For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--int4_convrot_base` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
+
+**LoRA EMA with INT4 ConvRot.** `--use_ema` enables an exponential moving average of the trainable LoRA adapter weights. This can make validation previews and saved LoRA checkpoints less sensitive to noisy individual optimizer steps, which is useful when training over a very low-precision frozen base such as INT4 ConvRot. It does not average or modify the packed INT4 base model itself.
+
+When EMA is enabled, validation and training samples are rendered with the EMA adapter, then the live training weights are restored before the next optimizer step. Checkpoints save both the live LoRA (`name.safetensors`) and EMA LoRA (`name_ema.safetensors`) unless `--save_ema_only` is set.
+
+Example starting point for short INT4 ConvRot LoRA trials:
+
+```bat
+--use_ema ^
+--ema_decay 0.95 ^
+--ema_update_after_step 100 ^
+--ema_update_every 10 ^
+--ema_cpu_offload
+```
+
+Use `--ema_cpu_offload` when VRAM is tight; for LoRA this stores only the adapter EMA shadow on CPU. If INT4 base-model-only samples differ strongly from bf16 base-model samples under identical sampling settings, EMA should be treated as a LoRA-stability tool rather than a base-quantization quality fix.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4386,6 +4483,19 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 
 > [!WARNING]
 > The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
+
+#### Using Full-Finetune Checkpoints for Inference
+
+`ltx2_train.py` saves a transformer-only checkpoint with internal key naming (`model.<...>`) and without the `config` safetensors metadata. The LTX-2 loaders (generation, caching, LoRA training) expect a self-contained bundle in the base-checkpoint layout (`model.diffusion_model.<...>` plus VAE / vocoder / audio VAE / text-projection weights and the `config` metadata), so the trainer output cannot be passed to `--ltx2_checkpoint` directly. Merge it into a copy of the base bundle first:
+
+```bash
+python ltx2_merge_fft_to_model.py \
+  --fft_checkpoint output/full_ft_adafactor/ltx23_adafactor_full.safetensors \
+  --base_checkpoint /path/to/ltx-2.3-22b-dev.safetensors \
+  --output output/full_ft_adafactor/ltx23_adafactor_full_bundle.safetensors
+```
+
+The merged bundle loads anywhere the base checkpoint does. The utility fails loudly if any trained tensor cannot be matched to the bundle, so a successful merge guarantees nothing was silently dropped.
 
 ### BAdam Block-Coordinate
 <sub>[↑ contents](#table-of-contents)</sub>

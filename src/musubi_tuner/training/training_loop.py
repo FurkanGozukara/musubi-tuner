@@ -66,6 +66,7 @@ from musubi_tuner.training.runtime_utils import (
     offload_optimizer_state_during_validation,
     update_global_peak as _update_global_peak,
 )
+from musubi_tuner.training.network_ema import NetworkEMAModel
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 from musubi_tuner.training.weight_noise import apply_weight_noise_to_optimizer, validate_weight_noise_args
@@ -751,6 +752,40 @@ def train(self, args):
     accelerator.unwrap_model(network).prepare_grad_etc(transformer)
     self._current_call_network = accelerator.unwrap_model(network)
 
+    ema_model = None
+    ema_state_filename = "network_ema.pt"
+    ema_state_loaded = False
+    if bool(getattr(args, "use_ema", False)):
+        if not (0.0 <= float(args.ema_decay) < 1.0):
+            raise ValueError("--ema_decay must be in [0, 1)")
+        if int(args.ema_update_after_step) < 0:
+            raise ValueError("--ema_update_after_step must be >= 0")
+        if int(args.ema_update_every) <= 0:
+            raise ValueError("--ema_update_every must be >= 1")
+
+        ema_device = torch.device("cpu") if bool(getattr(args, "ema_cpu_offload", False)) else None
+        ema_model = NetworkEMAModel(
+            accelerator.unwrap_model(network),
+            decay=float(args.ema_decay),
+            update_after_step=int(args.ema_update_after_step),
+            update_every=int(args.ema_update_every),
+            device=ema_device,
+        )
+        ema_param_count = sum(t.numel() for t in ema_model.shadow_params.values())
+        logger.info(
+            "Network EMA enabled: decay=%.6f update_after_step=%d update_every=%d device=%s tracked_params=%d (%.3fM)",
+            float(args.ema_decay),
+            int(args.ema_update_after_step),
+            int(args.ema_update_every),
+            "cpu" if bool(getattr(args, "ema_cpu_offload", False)) else "same as network",
+            len(ema_model.shadow_params),
+            ema_param_count / 1_000_000.0,
+        )
+        if not bool(getattr(args, "ema_cpu_offload", False)):
+            logger.warning("Network EMA shadow weights are stored with the network. Use --ema_cpu_offload to avoid extra VRAM.")
+    elif bool(getattr(args, "save_ema_only", False)):
+        logger.warning("--save_ema_only is ignored because --use_ema is not enabled")
+
     if args.full_fp16:
         # patch accelerator for fp16 training
         # def patch_accelerator_for_fp16_training(accelerator):
@@ -828,8 +863,16 @@ def train(self, args):
                 except Exception as e:
                     logger.warning(f"Failed to save uncertainty log-variance params: {e}")
 
+            if ema_model is not None:
+                try:
+                    ema_state_file = os.path.join(output_dir, ema_state_filename)
+                    torch.save(ema_model.state_dict(), ema_state_file)
+                    logger.info("Network EMA: saved state to %s (step=%d)", ema_state_file, ema_model.step)
+                except Exception as e:
+                    logger.warning(f"Failed to save Network EMA state to state dir: {e}")
+
     def load_model_hook(models, input_dir):
-        nonlocal lr_descriptions
+        nonlocal lr_descriptions, ema_state_loaded
 
         # remove models except network
         remove_indices = []
@@ -927,6 +970,20 @@ def train(self, args):
             except Exception as e:
                 logger.warning(f"Failed to load uncertainty log-variance params: {e}")
 
+        if ema_model is not None:
+            try:
+                ema_state_file = os.path.join(input_dir, ema_state_filename)
+                if os.path.exists(ema_state_file):
+                    try:
+                        ema_state = torch.load(ema_state_file, map_location="cpu", weights_only=True)
+                    except TypeError:
+                        ema_state = torch.load(ema_state_file, map_location="cpu")
+                    ema_model.load_state_dict(ema_state)
+                    ema_state_loaded = True
+                    logger.info("Network EMA: loaded state from %s (step=%d)", ema_state_file, ema_model.step)
+            except Exception as e:
+                logger.warning(f"Failed to load Network EMA state from checkpoint dir: {e}")
+
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -960,6 +1017,12 @@ def train(self, args):
         resume_metadata = train_utils.load_resume_metadata(args.resume)
 
     initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+    if ema_model is not None and args.resume and not ema_state_loaded:
+        ema_model.reset(accelerator.unwrap_model(network), step=initial_global_step)
+        logger.info(
+            "Network EMA: no EMA state found in resume directory; initialized shadow from resumed network weights at step=%d",
+            initial_global_step,
+        )
     if dashboard_metrics_enabled and accelerator.is_main_process:
         from musubi_tuner.gui_dashboard import create_metrics_writer
 
@@ -1071,6 +1134,11 @@ def train(self, args):
         "ss_nf4_base": bool(getattr(args, "nf4_base", False)),
         "ss_loftq_init": bool(getattr(args, "loftq_init", False)),
         "ss_awq_calibration": bool(getattr(args, "awq_calibration", False)),
+        "ss_use_ema": bool(getattr(args, "use_ema", False)),
+        "ss_ema_decay": getattr(args, "ema_decay", None) if bool(getattr(args, "use_ema", False)) else None,
+        "ss_ema_update_after_step": getattr(args, "ema_update_after_step", None) if bool(getattr(args, "use_ema", False)) else None,
+        "ss_ema_update_every": getattr(args, "ema_update_every", None) if bool(getattr(args, "use_ema", False)) else None,
+        "ss_ema_cpu_offload": bool(getattr(args, "ema_cpu_offload", False)) if bool(getattr(args, "use_ema", False)) else None,
         # "ss_fp8_llm": bool(args.fp8_llm), # remove this because this is only for HuanyuanVideo TODO set architecure dependent metadata
         "ss_full_fp16": bool(args.full_fp16),
         "ss_full_bf16": bool(args.full_bf16),
@@ -1186,7 +1254,20 @@ def train(self, args):
         + (f" (--save_precision {args.save_precision})" if args.save_precision is not None else " (default)")
     )
 
-    def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+    def _ema_ckpt_name(ckpt_name: str) -> str:
+        base, ext = os.path.splitext(ckpt_name)
+        return f"{base}_ema{ext or '.safetensors'}"
+
+    def apply_ema_weights_for_eval() -> dict[str, torch.Tensor] | None:
+        if ema_model is None:
+            return None
+        return ema_model.apply_to(accelerator.unwrap_model(network))
+
+    def restore_ema_weights_for_eval(original_params: dict[str, torch.Tensor] | None) -> None:
+        if ema_model is not None and original_params is not None:
+            ema_model.restore(accelerator.unwrap_model(network), original_params)
+
+    def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False, extra_metadata=None):
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -1195,7 +1276,7 @@ def train(self, args):
         metadata["ss_steps"] = str(steps)
         metadata["ss_epoch"] = str(epoch_no)
 
-        metadata_to_save = minimum_metadata if args.no_metadata else metadata
+        metadata_to_save = dict(minimum_metadata if args.no_metadata else metadata)
 
         title = args.metadata_title if args.metadata_title is not None else args.output_name
         if args.min_timestep is not None or args.max_timestep is not None:
@@ -1225,6 +1306,8 @@ def train(self, args):
         extra_md = self.get_checkpoint_metadata(args)
         if extra_md:
             metadata_to_save.update({k: str(v) for k, v in extra_md.items()})
+        if extra_metadata:
+            metadata_to_save.update({k: str(v) for k, v in extra_metadata.items()})
 
         unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 
@@ -1283,17 +1366,54 @@ def train(self, args):
                 _md["loss_audio"] = audio_loss_value
             train_utils.save_checkpoint_metadata(ckpt_file, _md)
 
+    def save_ema_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        if ema_model is None:
+            return
+
+        ema_ckpt_name = _ema_ckpt_name(ckpt_name)
+        original_params = ema_model.apply_to(unwrapped_nw)
+        try:
+            save_model(
+                ema_ckpt_name,
+                unwrapped_nw,
+                steps,
+                epoch_no,
+                force_sync_upload=force_sync_upload,
+                extra_metadata={
+                    "ss_is_ema": True,
+                    "ss_ema_decay": args.ema_decay,
+                    "ss_ema_update_after_step": args.ema_update_after_step,
+                    "ss_ema_update_every": args.ema_update_every,
+                },
+            )
+        finally:
+            ema_model.restore(unwrapped_nw, original_params)
+
+    def save_checkpoint_with_optional_ema(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        if bool(getattr(args, "save_ema_only", False)) and ema_model is not None:
+            save_ema_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+            return
+
+        save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+        if ema_model is not None:
+            save_ema_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+
     def remove_model(old_ckpt_name):
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-        if os.path.exists(old_ckpt_file):
-            accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
-            os.remove(old_ckpt_file)
-        if getattr(args, "convert_to_comfy", True):
-            comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", ".comfy.safetensors")
-            if os.path.exists(comfy_old_ckpt_file):
-                accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
-                os.remove(comfy_old_ckpt_file)
-        train_utils.remove_checkpoint_metadata(old_ckpt_file)
+        ckpt_files = [old_ckpt_file]
+        if not old_ckpt_name.endswith("_ema.safetensors"):
+            ckpt_files.append(os.path.join(args.output_dir, _ema_ckpt_name(old_ckpt_name)))
+
+        for ckpt_file in ckpt_files:
+            if os.path.exists(ckpt_file):
+                accelerator.print(f"removing old checkpoint: {ckpt_file}")
+                os.remove(ckpt_file)
+            if getattr(args, "convert_to_comfy", True):
+                comfy_ckpt_file = ckpt_file.replace(".safetensors", ".comfy.safetensors")
+                if os.path.exists(comfy_ckpt_file):
+                    accelerator.print(f"removing old Comfy checkpoint: {comfy_ckpt_file}")
+                    os.remove(comfy_ckpt_file)
+            train_utils.remove_checkpoint_metadata(ckpt_file)
 
     def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
         if not train_utils.dashboard_stop_requested():
@@ -1376,6 +1496,7 @@ def train(self, args):
         val_audio_presence_ema = float(audio_presence_ema)
         val_audio_loss_ema = float(audio_loss_ema)
         val_video_loss_ema = float(video_loss_ema)
+        ema_original_params = apply_ema_weights_for_eval()
         validation_self_flow_network = None
         validation_self_flow_prev_training = None
         if bool(getattr(args, "self_flow", False)):
@@ -1710,6 +1831,7 @@ def train(self, args):
                     total_loss += loss.detach().item()
                     total_count += 1
         finally:
+            restore_ema_weights_for_eval(ema_original_params)
             if validation_self_flow_network is not None and validation_self_flow_prev_training is not None:
                 validation_self_flow_network.training = validation_self_flow_prev_training
 
@@ -1737,6 +1859,13 @@ def train(self, args):
         network.train()
         set_trainer_train_mode()
 
+    def sample_images_with_optional_ema(epoch_no, step_no):
+        ema_original_params = apply_ema_weights_for_eval()
+        try:
+            self.sample_images(accelerator, args, epoch_no, step_no, vae, transformer, sample_parameters, dit_dtype)
+        finally:
+            restore_ema_weights_for_eval(ema_original_params)
+
     # For --sample_at_first (skip on resume — samples were already generated)
     if global_step == 0 and should_sample_images(args, global_step, epoch=0):
         set_trainer_eval_mode()
@@ -1746,7 +1875,7 @@ def train(self, args):
             bool(getattr(args, "offload_optimizer_during_validation", False)),
             logger=logger,
         ):
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            sample_images_with_optional_ema(0, global_step)
         set_trainer_train_mode()
     if len(accelerator.trackers) > 0:
         # log empty object to commit the sample images to wandb
@@ -2471,6 +2600,8 @@ def train(self, args):
                             reallocate_report["fixed_budget"],
                             reallocate_report["remaining_budget"],
                         )
+                if ema_model is not None:
+                    ema_model.update(unwrapped_network)
                 if timestep_tb_buffers is not None and (global_step == 1 or global_step % timestep_tb_interval == 0):
                     for name, chunks in timestep_tb_buffers.items():
                         if not chunks:
@@ -2513,7 +2644,7 @@ def train(self, args):
                             bool(getattr(args, "offload_optimizer_during_validation", False)),
                             logger=logger,
                         ):
-                            self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            sample_images_with_optional_ema(None, global_step)
                         if gui_metrics is not None:
                             gui_metrics.log_event("sample", global_step)
 
@@ -2521,7 +2652,7 @@ def train(self, args):
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                            save_checkpoint_with_optional_ema(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
                             if gui_metrics is not None:
                                 gui_metrics.log_event("checkpoint", global_step)
 
@@ -2706,7 +2837,7 @@ def train(self, args):
             saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
             if is_main_process and saving:
                 ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
-                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                save_checkpoint_with_optional_ema(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
                 remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
                 if remove_epoch_no is not None:
@@ -2738,7 +2869,7 @@ def train(self, args):
             offload_epoch_sample_optimizer,
             logger=logger,
         ):
-            self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            sample_images_with_optional_ema(epoch + 1, global_step)
         set_trainer_train_mode()
 
         # end of epoch
@@ -2778,6 +2909,6 @@ def train(self, args):
 
     if is_main_process:
         ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
-        save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+        save_checkpoint_with_optional_ema(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
         logger.info("model saved.")

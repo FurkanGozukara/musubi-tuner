@@ -2582,7 +2582,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             self._ltx2_checkpoint_config = SafetensorsModelStateDictLoader().metadata(str(checkpoint_path))
         except (KeyError, TypeError):
             # Quantized exports may carry no "config" metadata; rebuild from weights.
-            if not (getattr(args, "int8_base", False) or getattr(args, "int8_convrot_base", False)):
+            if not (
+                getattr(args, "int8_base", False)
+                or getattr(args, "int8_convrot_base", False)
+                or getattr(args, "int4_convrot_base", False)
+            ):
                 raise
             from musubi_tuner.ltx2_model_loading import infer_ltx2_transformer_config_from_weights
 
@@ -3422,22 +3426,26 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         _int8_dynamic = getattr(args, "int8_base_dynamic", False)
         _int8_convrot_base = getattr(args, "int8_convrot_base", False)
         _int8_convrot_dynamic = getattr(args, "int8_convrot_dynamic", False)
-        _int8_flags = {
+        _int4_convrot_base = getattr(args, "int4_convrot_base", False)
+        _int4_convrot_dynamic = getattr(args, "int4_convrot_dynamic", False)
+        _quantized_base_flags = {
             "--int8_base": _int8_base,
             "--int8_base_dynamic": _int8_dynamic,
             "--int8_convrot_base": _int8_convrot_base,
             "--int8_convrot_dynamic": _int8_convrot_dynamic,
+            "--int4_convrot_base": _int4_convrot_base,
+            "--int4_convrot_dynamic": _int4_convrot_dynamic,
         }
-        _enabled_int8_flags = [flag for flag, enabled in _int8_flags.items() if enabled]
-        if len(_enabled_int8_flags) > 1:
-            raise ValueError(f"int8 base modes are mutually exclusive: {', '.join(_enabled_int8_flags)}")
-        if _enabled_int8_flags:
-            _flag = _enabled_int8_flags[0]
+        _enabled_quantized_flags = [flag for flag, enabled in _quantized_base_flags.items() if enabled]
+        if len(_enabled_quantized_flags) > 1:
+            raise ValueError(f"quantized base modes are mutually exclusive: {', '.join(_enabled_quantized_flags)}")
+        if _enabled_quantized_flags:
+            _flag = _enabled_quantized_flags[0]
             for _conflict in ("fp8_base", "fp8_scaled", "nf4_base"):
                 if getattr(args, _conflict, False):
                     raise ValueError(f"{_flag} and --{_conflict} are mutually exclusive")
             if not getattr(args, "network_module", None):
-                raise ValueError(f"{_flag} requires LoRA training (--network_module); the int8 base is frozen")
+                raise ValueError(f"{_flag} requires LoRA training (--network_module); the quantized base is frozen")
             if _int8_base and getattr(args, "train_connectors", False):
                 raise ValueError(
                     "--int8_base is incompatible with --train_connectors (the quanto DiT checkpoint carries no connector weights)"
@@ -3943,6 +3951,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             int8_convrot_groupsize=getattr(args, "int8_convrot_groupsize", "auto"),
             int8_convrot_mse_clip=not bool(getattr(args, "int8_convrot_no_mse_clip", False)),
             int8_convrot_quality_report=getattr(args, "int8_convrot_quality_report", None),
+            int4_convrot_base=bool(getattr(args, "int4_convrot_base", False)),
+            int4_convrot_dynamic=bool(getattr(args, "int4_convrot_dynamic", False)),
+            int4_convrot_groupsize=getattr(args, "int4_convrot_groupsize", "auto"),
+            int4_convrot_mse_clip=not bool(getattr(args, "int4_convrot_no_mse_clip", False)),
+            int4_convrot_quality_report=getattr(args, "int4_convrot_quality_report", None),
             nf4_base=bool(getattr(args, "nf4_base", False)),
             nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
             loftq_init=bool(getattr(args, "loftq_init", False)),
@@ -4149,6 +4162,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             or getattr(args, "int8_base_dynamic", False)
             or getattr(args, "int8_convrot_base", False)
             or getattr(args, "int8_convrot_dynamic", False)
+            or getattr(args, "int4_convrot_base", False)
+            or getattr(args, "int4_convrot_dynamic", False)
         ):
             self._ensure_fp8_buffers_on_device(transformer)
         forward_args = (model_input,)
@@ -4877,6 +4892,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_base_dynamic", False)
                 or getattr(args, "int8_convrot_base", False)
                 or getattr(args, "int8_convrot_dynamic", False)
+                or getattr(args, "int4_convrot_base", False)
+                or getattr(args, "int4_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(transformer)
             elif getattr(args, "nf4_base", False):
@@ -5482,6 +5499,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_base_dynamic", False)
                 or getattr(args, "int8_convrot_base", False)
                 or getattr(args, "int8_convrot_dynamic", False)
+                or getattr(args, "int4_convrot_base", False)
+                or getattr(args, "int4_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -5879,6 +5898,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_base_dynamic", False)
                 or getattr(args, "int8_convrot_base", False)
                 or getattr(args, "int8_convrot_dynamic", False)
+                or getattr(args, "int4_convrot_base", False)
+                or getattr(args, "int4_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -6501,6 +6522,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_base_dynamic", False)
                 or getattr(args, "int8_convrot_base", False)
                 or getattr(args, "int8_convrot_dynamic", False)
+                or getattr(args, "int4_convrot_base", False)
+                or getattr(args, "int4_convrot_dynamic", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):

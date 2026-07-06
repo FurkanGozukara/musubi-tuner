@@ -807,9 +807,9 @@ class LoRAStreamOffloader:
             self.copier = _StagedCopier(device, num_staging=self.B, debug=self.debug)
 
         # ---- runtime state (GPU buffers allocated lazily in prepare_block_devices_before_forward) ----
-        self.cpu_master = {}  # block_idx -> [CPU (pinned) Parameter per swap weight] (views into cpu_flat)
+        self.cpu_master = {}  # block_idx -> [CPU (pinned) Parameter/Tensor per swap weight] (views into cpu_flat)
         self.cpu_flat = {}  # block_idx -> flat (pinned) uint8 CPU tensor backing the masters
-        self.ring_param = None  # [slot] -> [GPU nn.Parameter per swap weight] (views into ring_flat)
+        self.ring_param = None  # [slot] -> [GPU nn.Parameter/Tensor per swap weight] (views into ring_flat)
         self.ring_flat = None  # [slot] -> flat uint8 GPU tensor backing the ring params
         self._layout = None  # ([byte offset per swap weight], total bytes) shared by all streaming blocks
         self.in_slot = [None] * self.B  # slot -> block_idx currently bound to this slot (or None)
@@ -851,9 +851,24 @@ class LoRAStreamOffloader:
             self._module_cache[block_idx] = cached
         return cached
 
-    def _bind(self, block_idx: int, params: list[nn.Parameter]):
+    @staticmethod
+    def _assign_weight(module: nn.Module, weight: torch.Tensor | nn.Parameter) -> None:
+        if isinstance(weight, nn.Parameter):
+            if "weight" in module._buffers:
+                del module._buffers["weight"]
+            module.weight = weight
+            return
+
+        if "weight" in module._parameters:
+            del module._parameters["weight"]
+        if "weight" in module._buffers:
+            module._buffers["weight"] = weight
+        else:
+            module.register_buffer("weight", weight, persistent=True)
+
+    def _bind(self, block_idx: int, params: list[torch.Tensor | nn.Parameter]):
         for m, p in zip(self._modules(block_idx), params):
-            m.weight = p
+            self._assign_weight(m, p)
 
     @staticmethod
     def _compute_layout(weights: list[torch.Tensor]) -> tuple[list[int], int]:
@@ -945,8 +960,12 @@ class LoRAStreamOffloader:
                 master = []
                 for m, view in zip(mods, self._flat_views(flat, weights)):
                     view.copy_(m.weight.data)  # one-time D2H into the flat master
-                    m.weight.data = view
-                    master.append(m.weight)  # keep the original Parameter object as the persistent master
+                    if "weight" in m._parameters:
+                        m.weight.data = view
+                        master.append(m.weight)  # keep the original Parameter object as the persistent master
+                    else:
+                        self._assign_weight(m, view)
+                        master.append(m.weight)  # INT4/INT8 quantized weights may be registered buffers
                 self.cpu_flat[i] = flat
                 self.cpu_master[i] = master
             else:
@@ -970,7 +989,10 @@ class LoRAStreamOffloader:
             template_weights = [p.data for p in template]
             self.ring_flat = [torch.empty(self._layout[1], dtype=torch.uint8, device=self.device) for _ in range(self.B)]
             self.ring_param = [
-                [nn.Parameter(view, requires_grad=False) for view in self._flat_views(flat, template_weights)]
+                [
+                    nn.Parameter(view, requires_grad=False) if isinstance(template_ref, nn.Parameter) else view
+                    for template_ref, view in zip(template, self._flat_views(flat, template_weights))
+                ]
                 for flat in self.ring_flat
             ]
 

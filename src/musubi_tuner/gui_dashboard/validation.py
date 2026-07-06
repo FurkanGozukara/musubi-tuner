@@ -404,27 +404,29 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
-    _int8_modes = [
+    _quantized_base_modes = [
         ("training.int8_base", getattr(t, "int8_base", False), "int8 Base"),
         ("training.int8_base_dynamic", getattr(t, "int8_base_dynamic", False), "int8 Base (dynamic)"),
         ("training.int8_convrot_base", getattr(t, "int8_convrot_base", False), "INT8 ConvRot Base"),
         ("training.int8_convrot_dynamic", getattr(t, "int8_convrot_dynamic", False), "INT8 ConvRot (dynamic)"),
+        ("training.int4_convrot_base", getattr(t, "int4_convrot_base", False), "INT4 ConvRot Base"),
+        ("training.int4_convrot_dynamic", getattr(t, "int4_convrot_dynamic", False), "INT4 ConvRot (dynamic)"),
     ]
-    _enabled_int8_modes = [mode for mode in _int8_modes if mode[1]]
-    if len(_enabled_int8_modes) > 1:
-        message = "Only one int8 base mode can be enabled."
-        for field, _enabled, label in _enabled_int8_modes:
+    _enabled_quantized_base_modes = [mode for mode in _quantized_base_modes if mode[1]]
+    if len(_enabled_quantized_base_modes) > 1:
+        message = "Only one quantized base mode can be enabled."
+        for field, _enabled, label in _enabled_quantized_base_modes:
             errors.append(_make_issue("error", field, message, label=label, page="training"))
-    if len(_enabled_int8_modes) == 1:
-        _int8_field, _enabled, _int8_label = _enabled_int8_modes[0]
+    if len(_enabled_quantized_base_modes) == 1:
+        _quantized_field, _enabled, _quantized_label = _enabled_quantized_base_modes[0]
         for _conf_field, _conf_val, _conf_label in (
             ("training.fp8_base", t.fp8_base, "FP8 Base"),
             ("training.fp8_scaled", t.fp8_scaled, "FP8 Scaled"),
             ("training.nf4_base", t.nf4_base, "NF4 Base"),
         ):
             if _conf_val:
-                message = f"{_int8_label} is mutually exclusive with {_conf_label}."
-                errors.append(_make_issue("error", _int8_field, message, label=_int8_label, page="training"))
+                message = f"{_quantized_label} is mutually exclusive with {_conf_label}."
+                errors.append(_make_issue("error", _quantized_field, message, label=_quantized_label, page="training"))
                 errors.append(_make_issue("error", _conf_field, message, label=_conf_label, page="training"))
 
     network_module = t.network_module or get_ltx2_training_network_module_default()

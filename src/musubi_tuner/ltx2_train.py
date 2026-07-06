@@ -2406,40 +2406,6 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     )
     add_ltx2_model_parallel_args(parser)
     add_ltx2_fsdp_args(parser)
-    # EMA arguments
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        help="Use Exponential Moving Average of model weights for more stable training",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.9999,
-        help="EMA decay rate (higher = slower update, more smoothing). Default: 0.9999",
-    )
-    parser.add_argument(
-        "--ema_update_after_step",
-        type=int,
-        default=100,
-        help="Start EMA updates after this many steps. Default: 100",
-    )
-    parser.add_argument(
-        "--ema_update_every",
-        type=int,
-        default=1,
-        help="Update EMA every N steps. Default: 1",
-    )
-    parser.add_argument(
-        "--save_ema_only",
-        action="store_true",
-        help="When using EMA, only save EMA weights (not training weights)",
-    )
-    parser.add_argument(
-        "--ema_cpu_offload",
-        action="store_true",
-        help="Store EMA shadow weights on CPU to save GPU memory (slower updates but no extra VRAM)",
-    )
     # Validation arguments
     parser.add_argument(
         "--validation_dataset_config",

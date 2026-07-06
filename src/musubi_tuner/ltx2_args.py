@@ -28,6 +28,43 @@ from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_ch
 logger = logging.getLogger(__name__)
 
 
+def add_ltx2_ema_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Use Exponential Moving Average weights for LTX-2 validation/sampling and save *_ema checkpoints.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate (higher = slower update, more smoothing). Default: 0.9999.",
+    )
+    parser.add_argument(
+        "--ema_update_after_step",
+        type=int,
+        default=100,
+        help="Start EMA updates after this many optimizer steps. Default: 100.",
+    )
+    parser.add_argument(
+        "--ema_update_every",
+        type=int,
+        default=1,
+        help="Update EMA every N optimizer steps. Default: 1.",
+    )
+    parser.add_argument(
+        "--save_ema_only",
+        action="store_true",
+        help="When using EMA, save only EMA weights instead of both live and EMA checkpoints.",
+    )
+    parser.add_argument(
+        "--ema_cpu_offload",
+        action="store_true",
+        help="Store EMA shadow weights on CPU to avoid extra VRAM at the cost of slower EMA updates.",
+    )
+    return parser
+
+
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add LTX-2-specific arguments to parser"""
 
@@ -133,6 +170,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "This is a CLI-only debug flag, not a dataset TOML key."
         ),
     )
+    add_ltx2_ema_args(parser)
     add_ltx2_model_parallel_args(parser)
     add_ltx2_remote_stage_args(parser)
     add_ltx2_intrinsic_cond_args(parser)
@@ -931,6 +969,44 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Optional JSON path for per-layer INT8 ConvRot reconstruction metrics during dynamic quantization.",
+    )
+    parser.add_argument(
+        "--int4_convrot_base",
+        action="store_true",
+        help=(
+            "Load a pre-quantized packed INT4 ConvRot DiT checkpoint and train a LoRA over it. "
+            "The checkpoint stores signed int4 .weight nibbles, .weight_scale tensors, and "
+            ".int4_shape or .comfy_quant metadata. Uses W4A8 activations by default; mutually exclusive with other quantized-base modes."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_dynamic",
+        action="store_true",
+        help=(
+            "Quantize a standard bf16/fp16 DiT checkpoint to packed INT4 ConvRot at load time. "
+            "Weights are rotated offline, activations are rotated and dynamically quantized online, "
+            "and Linear layers use W4A8 activations by default. Requires LoRA training."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_groupsize",
+        type=str,
+        default="auto",
+        help=(
+            "INT4 ConvRot group size or comma list. Default: auto (256,64,16). "
+            "Unlike INT8 ConvRot, INT4 pads internally when a weight width is not divisible by the group size."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_no_mse_clip",
+        action="store_true",
+        help="Disable MSE-optimal per-row clipping during INT4 ConvRot weight quantization; use plain absmax scales.",
+    )
+    parser.add_argument(
+        "--int4_convrot_quality_report",
+        type=str,
+        default=None,
+        help="Optional JSON path for per-layer INT4 ConvRot reconstruction metrics during dynamic quantization.",
     )
     parser.add_argument(
         "--int8_fused_quant",
