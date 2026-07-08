@@ -514,7 +514,7 @@ python ltx2_cache_latents.py ^
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 - `--precache_sample_latents`: Cache I2V / V2V / reference-audio conditioning latents for sample prompts, then continue with normal latent caching. Requires `--sample_prompts`.
 - `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
-- `--reference_frames`: Number of reference frames to cache for IC-LoRA / V2V (default: `1`).
+- `--reference_frames`: Number of reference frames to cache for IC-LoRA / V2V (default: `1`). With `--skip_existing`, an existing reference cache is re-encoded automatically when its stored frame count no longer matches the requested `--reference_frames` / `--reference_temporal_scale`.
 - `--reference_downscale`: Spatial downscale factor for cached reference latents (default: `1`).
 - `--reference_temporal_scale`: Temporal subsample factor for cached references (default: `1`). `2` keeps the first frame then every other frame, storing the reference at a lower temporal resolution; its time positions are rescaled to the target at train/inference. Requires `--reference_frames` = `8*k + 1` with the factor dividing `k`, and the reference must span the same number of frames as the target. Validated at cache time.
 - `--atomic_cache_writes`: Opt-in safety mode. Writes cache files to a temporary sibling file first, then replaces the final cache path only after a successful save.

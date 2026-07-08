@@ -890,6 +890,25 @@ def _reference_temporal_geometry(num_frames: int, temporal_scale: int, target_pi
     return ref_latent_frames, tgt_latent_frames
 
 
+def _expected_reference_frame_count(num_frames: int, temporal_scale: int) -> int:
+    """Pre-pad frame count the reference encode path stores in the cache's ``frame_count`` metadata."""
+    if temporal_scale > 1 and num_frames > 1:
+        return len([0, *range(1, num_frames, temporal_scale)])
+    return num_frames
+
+
+def _read_cached_frame_count(cache_path: str) -> Optional[int]:
+    """``frame_count`` from a latent cache's safetensors metadata, or None if absent/unreadable."""
+    try:
+        from safetensors import safe_open
+
+        with safe_open(cache_path, framework="pt") as f:
+            stored = (f.metadata() or {}).get("frame_count")
+        return int(stored) if stored is not None else None
+    except Exception:
+        return None
+
+
 def encode_and_save_reference_latents(
     vae,
     datasets: Sequence[BaseDataset],
@@ -966,6 +985,7 @@ def encode_and_save_reference_latents(
         cached_count = 0
         skipped_count = 0
         missing_count = 0
+        stale_count = 0
 
         for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
             for item_info in batch:
@@ -1010,28 +1030,25 @@ def encode_and_save_reference_latents(
                     ) or ds.get_reference_latent_cache_paths(item_info)
                     for ref_idx, (ref_dir, ref_cache_path) in enumerate(zip(ref_dirs, ref_cache_paths)):
                         if skip_existing and os.path.exists(ref_cache_path):
-                            if temporal_scale > 1 and num_frames > 1:
-                                # The cache encodes the temporal subsample, so a cache written at a
-                                # different --reference_temporal_scale is stale: its frame_count no longer
-                                # matches the requested subsample. Re-encode instead of silently reusing
-                                # the wrong frame count (which would train as if unsubsampled).
-                                expected_frames = len([0, *range(1, num_frames, temporal_scale)])
-                                stored_frames = None
-                                try:
-                                    from safetensors import safe_open
-
-                                    with safe_open(ref_cache_path, framework="pt") as _f:
-                                        _stored = (_f.metadata() or {}).get("frame_count")
-                                    stored_frames = int(_stored) if _stored is not None else None
-                                except Exception:
-                                    stored_frames = None
-                                if stored_frames == expected_frames:
-                                    skipped_count += 1
-                                    continue
-                                # stale or unreadable -> fall through and re-encode
-                            else:
+                            # The cache path encodes only basename/resolution/architecture, so a cache
+                            # written at a different --reference_frames / --reference_temporal_scale
+                            # would otherwise be silently reused with the wrong frame count. Compare the
+                            # stored pre-pad frame_count and re-encode on mismatch (or when unreadable).
+                            expected_frames = _expected_reference_frame_count(num_frames, temporal_scale)
+                            stored_frames = _read_cached_frame_count(ref_cache_path)
+                            if stored_frames == expected_frames:
                                 skipped_count += 1
                                 continue
+                            stale_count += 1
+                            if stale_count <= 5:
+                                logger.info(
+                                    "Re-encoding stale reference cache for '%s' (stored frame_count=%s, expected %s)",
+                                    stem,
+                                    stored_frames,
+                                    expected_frames,
+                                )
+                            elif stale_count == 6:
+                                logger.info("(suppressing further stale-reference-cache notices)")
 
                         ref_path = _find_reference_file(ref_dir, stem)
                         if ref_path is None:
@@ -1088,9 +1105,10 @@ def encode_and_save_reference_latents(
                     logger.warning(f"Failed to cache reference for '{stem}': {e}")
                     continue
 
+        stale_summary = f", {stale_count} re-encoded (stale)" if stale_count else ""
         logger.info(
             f"[Dataset {ds_idx}] Reference caching done: {cached_count} cached, "
-            f"{skipped_count} skipped (existing), {missing_count} missing"
+            f"{skipped_count} skipped (existing), {missing_count} missing{stale_summary}"
         )
 
 
