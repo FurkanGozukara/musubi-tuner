@@ -27,6 +27,8 @@ DEFAULT_INT4_CONVROT_GROUP_SIZES = (256, 64, 16)
 DEFAULT_INT4_CONVROT_CLIP_MIN = 0.35
 DEFAULT_INT4_CONVROT_CLIP_STEPS = 80
 DEFAULT_INT4_CONVROT_CHUNK_ELEMENTS = 4 * 1024 * 1024
+INT4_CONVROT_STABILIZER_L1_SUFFIX = ".int4_stabilizer_l1"
+INT4_CONVROT_STABILIZER_L2_SUFFIX = ".int4_stabilizer_l2"
 
 logger = logging.getLogger(__name__)
 _CUTLASS_INT4 = "unset"
@@ -51,6 +53,7 @@ class Int4ConvRotLayerQuality:
     q_absmax: int
     scale_min: float
     scale_max: float
+    stabilizer_rank: int = 0
 
 
 def _is_power_of_four(value: int) -> bool:
@@ -201,12 +204,61 @@ def dequantize_int4_convrot_weight(
     padded_features: int,
     *,
     dtype: torch.dtype = torch.float32,
+    stabilizer: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     q = unpack_int4(packed, padded_features).float()
     deq_rot = q * scale.float()
+    if stabilizer is not None:
+        stab_l1, stab_l2 = stabilizer
+        deq_rot = deq_rot + stab_l1.to(device=deq_rot.device, dtype=torch.float32) @ stab_l2.to(
+            device=deq_rot.device, dtype=torch.float32
+        )
     h = build_hadamard(group_size, device=deq_rot.device, dtype=torch.float32)
     dense_padded = rotate_weight(deq_rot, h, group_size, inverse=True)
     return dense_padded[:, :in_features].to(dtype)
+
+
+@torch.no_grad()
+def compute_int4_convrot_stabilizer(
+    weight: torch.Tensor,
+    *,
+    group_size: int,
+    rank: int,
+    calc_device: str | torch.device = "cpu",
+    niter: int = 4,
+    max_chunk_elements: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Low-rank stabilizer of the rotated weight (SVDQuant-style outlier branch).
+
+    Returns ``(L1, L2)`` in bfloat16 with shapes ``[out, rank]`` and ``[rank, padded]``
+    such that ``rotate(pad(weight)) ~= L1 @ L2 + residual``; the residual is what gets
+    INT4-quantized. The pair is cast to bfloat16 *before* the residual is formed so the
+    stored tensors reconstruct exactly what was subtracted.
+    """
+
+    if weight.ndim != 2:
+        raise ValueError(f"INT4 ConvRot stabilizer expects a 2D weight, got shape {tuple(weight.shape)}")
+    if rank <= 0:
+        raise ValueError(f"INT4 ConvRot stabilizer rank must be positive, got {rank}")
+    out_features, in_features = weight.shape
+    padded_features = padded_features_for_group(in_features, group_size)
+    if max_chunk_elements is None:
+        max_chunk_elements = DEFAULT_INT4_CONVROT_CHUNK_ELEMENTS
+    calc_device = torch.device(calc_device)
+    rank = min(int(rank), out_features, padded_features)
+
+    h = build_hadamard(group_size, device=calc_device, dtype=torch.float32)
+    rotated = torch.empty((out_features, padded_features), device=calc_device, dtype=torch.float32)
+    for row_slice in _row_slices(out_features, padded_features, int(max_chunk_elements)):
+        w_chunk = weight[row_slice].to(device=calc_device, dtype=torch.float32)
+        rotated[row_slice] = rotate_weight(pad_last_dim(w_chunk, padded_features), h, group_size)
+
+    q = min(rank + 8, out_features, padded_features)
+    u, s, v = torch.svd_lowrank(rotated, q=q, niter=int(niter))
+    sqrt_s = s[:rank].clamp(min=0.0).sqrt()
+    stab_l1 = (u[:, :rank] * sqrt_s.reshape(1, -1)).to(torch.bfloat16).contiguous()
+    stab_l2 = (sqrt_s.reshape(-1, 1) * v[:, :rank].t()).to(torch.bfloat16).contiguous()
+    return stab_l1, stab_l2
 
 
 def _row_slices(num_rows: int, in_features: int, max_chunk_elements: int) -> Iterable[slice]:
@@ -230,6 +282,7 @@ def _quality_from_accumulators(
     q_absmax: int,
     scale_min: float,
     scale_max: float,
+    stabilizer_rank: int = 0,
 ) -> Int4ConvRotLayerQuality:
     numel = max(shape[0] * shape[1], 1)
     denom = math.sqrt(max(ref_norm_sq, 0.0) * max(deq_norm_sq, 0.0))
@@ -251,6 +304,7 @@ def _quality_from_accumulators(
         q_absmax=int(q_absmax),
         scale_min=float(scale_min),
         scale_max=float(scale_max),
+        stabilizer_rank=int(stabilizer_rank),
     )
 
 
@@ -264,6 +318,7 @@ def quantize_int4_convrot_weight(
     collect_quality: bool = False,
     key: str = "",
     max_chunk_elements: int | None = None,
+    stabilizer: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Int4ConvRotLayerQuality | None]:
     if weight.ndim != 2:
         raise ValueError(f"INT4 ConvRot expects a 2D weight, got shape {tuple(weight.shape)}")
@@ -278,6 +333,20 @@ def quantize_int4_convrot_weight(
     shape = torch.tensor([out_features, in_features, padded_features], device=calc_device, dtype=torch.int32)
     h = build_hadamard(group_size, device=calc_device, dtype=torch.float32)
 
+    stab_l1_f32 = stab_l2_f32 = None
+    stabilizer_rank = 0
+    if stabilizer is not None:
+        stab_l1_f32 = stabilizer[0].to(device=calc_device, dtype=torch.float32)
+        stab_l2_f32 = stabilizer[1].to(device=calc_device, dtype=torch.float32)
+        if stab_l1_f32.shape[0] != out_features or stab_l2_f32.shape[1] != padded_features:
+            raise ValueError(
+                f"INT4 ConvRot stabilizer shapes {tuple(stab_l1_f32.shape)}/{tuple(stab_l2_f32.shape)} "
+                f"do not match weight [out={out_features}, padded={padded_features}]"
+            )
+        if stab_l1_f32.shape[1] != stab_l2_f32.shape[0]:
+            raise ValueError("INT4 ConvRot stabilizer L1/L2 inner ranks differ")
+        stabilizer_rank = int(stab_l1_f32.shape[1])
+
     dot = ref_norm_sq = deq_norm_sq = sqerr_sum = abserr_sum = 0.0
     max_abs_error = 0.0
     q_absmax = 0
@@ -288,13 +357,20 @@ def quantize_int4_convrot_weight(
         w_chunk = weight[row_slice].to(device=calc_device, dtype=torch.float32)
         w_padded = pad_last_dim(w_chunk, padded_features)
         rotated = rotate_weight(w_padded, h, group_size)
+        stab_chunk = None
+        if stab_l1_f32 is not None:
+            stab_chunk = stab_l1_f32[row_slice] @ stab_l2_f32
+            rotated = rotated - stab_chunk
         q_packed, scale_chunk = quantize_int4_rowwise(rotated, mse_clip=mse_clip)
         packed_out[row_slice].copy_(q_packed)
         scale_out[row_slice].copy_(scale_chunk)
 
         if collect_quality:
             q_unpacked = unpack_int4(q_packed, padded_features).float()
-            deq = rotate_weight(q_unpacked * scale_chunk, h, group_size, inverse=True)[:, :in_features]
+            deq_rot = q_unpacked * scale_chunk
+            if stab_chunk is not None:
+                deq_rot = deq_rot + stab_chunk
+            deq = rotate_weight(deq_rot, h, group_size, inverse=True)[:, :in_features]
             ref = w_chunk
             err = deq - ref
             dot += float((deq * ref).sum().item())
@@ -323,6 +399,7 @@ def quantize_int4_convrot_weight(
             q_absmax=q_absmax,
             scale_min=scale_min if scale_min != float("inf") else 0.0,
             scale_max=scale_max,
+            stabilizer_rank=stabilizer_rank,
         )
     return packed_out, scale_out, shape, quality
 
@@ -334,6 +411,7 @@ def comfy_quant_tensor(
     *,
     convrot: bool = True,
     awq: bool = False,
+    stabilizer_rank: int = 0,
 ) -> torch.Tensor:
     cfg = {
         "format": "int4_tensorwise",
@@ -345,6 +423,8 @@ def comfy_quant_tensor(
         "packing": "signed_low_high",
         "awq": bool(awq),
     }
+    if stabilizer_rank > 0:
+        cfg["stabilizer_rank"] = int(stabilizer_rank)
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
 
@@ -432,6 +512,23 @@ def _module_int4_awq_scales(module: nn.Module, in_features: int) -> torch.Tensor
     if not torch.isfinite(scales.float()).all() or (scales.float() <= 0).any():
         raise ValueError("INT4 ConvRot AWQ scales must be positive finite values")
     return scales
+
+
+def _module_int4_stabilizer(module: nn.Module, out_features: int, padded_features: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    stab_l1 = getattr(module, "int4_stabilizer_l1", None)
+    stab_l2 = getattr(module, "int4_stabilizer_l2", None)
+    if not isinstance(stab_l1, torch.Tensor) or not isinstance(stab_l2, torch.Tensor):
+        return None
+    if stab_l1.ndim != 2 or stab_l2.ndim != 2 or stab_l1.shape[1] != stab_l2.shape[0]:
+        raise ValueError(
+            f"INT4 ConvRot stabilizer shapes {tuple(stab_l1.shape)}/{tuple(stab_l2.shape)} are not a rank factorization"
+        )
+    if stab_l1.shape[0] != int(out_features) or stab_l2.shape[1] != int(padded_features):
+        raise ValueError(
+            f"INT4 ConvRot stabilizer shapes {tuple(stab_l1.shape)}/{tuple(stab_l2.shape)} "
+            f"do not match layer [out={out_features}, padded={padded_features}]"
+        )
+    return stab_l1, stab_l2
 
 
 def _apply_int4_awq_activation_scale(module: nn.Module, x: torch.Tensor, in_features: int) -> torch.Tensor:
@@ -872,6 +969,168 @@ def _grad_input_w4a8_fallback(
     return (acc.float() * grad_scale.float()).to(out_dtype)
 
 
+# ---------------------------------------------------------------------------
+# Optional fused Triton activation path for the W4A8 default mode.
+#
+# On Hopper (no int4 tensor cores) the W4A8 GEMM already runs through the int8
+# ``torch._int_mm`` bridge, so the activation-side elementwise passes -- online
+# ConvRot rotation, per-token int8 quantization, and the int32->compute-dtype
+# rescale -- are the only memory-bound overhead left around the matmul. They are
+# byte-for-byte the same shape as the INT8 ConvRot path, so we reuse its proven
+# fused Triton kernels verbatim. Opt-in via ``LTX2_INT4_CONVROT_FUSE``; when it is
+# off (default), unavailable, or the kernel fails, every other code path is left
+# byte-identical to the eager implementation.
+# ---------------------------------------------------------------------------
+
+_INT4_FUSE: bool | None = None
+_INT4_TRITON_FUSED_BROKEN = False
+_INT4_FUSED_GROUP_SIZES = (4, 16, 64, 256)
+
+
+def _int4_fuse_enabled() -> bool:
+    global _INT4_FUSE
+    if _INT4_FUSE is None:
+        _INT4_FUSE = os.getenv("LTX2_INT4_CONVROT_FUSE", "0").strip().lower() in ("1", "true", "yes", "on")
+    return _INT4_FUSE
+
+
+def _mark_int4_triton_fused_broken() -> None:
+    global _INT4_TRITON_FUSED_BROKEN
+    if not _INT4_TRITON_FUSED_BROKEN:
+        _INT4_TRITON_FUSED_BROKEN = True
+        logger.warning("INT4 ConvRot fused Triton kernel failed; using the eager rotate+quant path for the rest of this run.")
+
+
+def _get_int4_fused_quant():
+    try:
+        from musubi_tuner.modules.triton_int8_epilogue import have_triton, quantize_rowwise
+    except Exception:
+        return None
+    return quantize_rowwise if have_triton() else None
+
+
+def _get_int4_fused_epilogue():
+    try:
+        from musubi_tuner.modules.triton_int8_epilogue import dequant_epilogue, have_triton
+    except Exception:
+        return None
+    return dequant_epilogue if have_triton() else None
+
+
+def _get_int4_fused_convrot_epilogue():
+    try:
+        from musubi_tuner.modules.triton_int8_epilogue import dequant_epilogue_convrot, have_triton
+    except Exception:
+        return None
+    return dequant_epilogue_convrot if have_triton() else None
+
+
+def _unpack_weight_to_int8(packed_weight: torch.Tensor, k_values: int) -> torch.Tensor:
+    cuda_int4 = _get_cuda_int4() if packed_weight.is_cuda else None
+    if cuda_int4 is not None:
+        try:
+            return cuda_int4.unpack_to_int8(packed_weight, k_values)
+        except Exception:
+            pass
+    return unpack_int4(packed_weight, k_values).to(torch.int8)
+
+
+def _forward_w4a8_fused(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    group_size: int,
+    padded_features: int,
+    out_dtype: torch.dtype,
+    need_rotated: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Fused W4A8 forward activation path.
+
+    Returns ``(output_2d, x_rot_2d_or_None)`` on success, or ``None`` to tell the
+    caller to fall back to the eager path. ``x_rot_2d`` is the rotated padded
+    activation, materialized only when ``need_rotated`` (a stabilizer branch reads
+    it); otherwise the online rotation is fused into the quant kernel and ``None`` is
+    returned in its place.
+    """
+    if not _int4_fuse_enabled() or _INT4_TRITON_FUSED_BROKEN:
+        return None
+    if not x.is_cuda or not _supports_torch_int_mm(x.device):
+        return None
+    quant = _get_int4_fused_quant()
+    epilogue = _get_int4_fused_epilogue()
+    if quant is None or epilogue is None:
+        return None
+    fuse_rotation = (not need_rotated) and group_size in _INT4_FUSED_GROUP_SIZES
+    try:
+        if fuse_rotation:
+            x_2d = pad_last_dim(x, padded_features).reshape(-1, padded_features).contiguous()
+            qx, x_scale = quant(x_2d, None, convrot_groupsize=group_size)
+            x_rot_2d = None
+        else:
+            x_rot = rotate_activation_padded(x, group_size, padded_features)
+            x_rot_2d = x_rot.reshape(-1, padded_features).contiguous()
+            qx, x_scale = quant(x_rot_2d, None)
+        w_int8 = _unpack_weight_to_int8(packed_weight, padded_features)
+        acc = _int_mm_allow_small_m(qx.contiguous(), w_int8.t())
+        output = epilogue(acc, x_scale, weight_scale, bias.float() if bias is not None else None, out_dtype)
+    except Exception as exc:  # pragma: no cover - defensive: fall back to eager
+        _mark_int4_triton_fused_broken()
+        logger.debug("INT4 ConvRot fused forward failed; reverting to eager path: %s", exc)
+        return None
+    return output, x_rot_2d
+
+
+def _grad_input_w4a8_fused(
+    go: torch.Tensor,
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    group_size: int,
+    padded_features: int,
+    out_features: int,
+    out_dtype: torch.dtype,
+    fuse_inverse_rotation: bool,
+) -> tuple[torch.Tensor, bool] | None:
+    """Fused W4A8 grad-input path.
+
+    ``go`` is the 2D grad_output ``[M, out_features]`` in its original dtype. Folds
+    the per-output-channel weight scale into grad_output and quantizes in a single
+    pass, runs the int8-bridge matmul, then rescales. When ``fuse_inverse_rotation``
+    the inverse ConvRot is folded into the rescale epilogue and the returned tensor
+    is grad_input in the padded input space (second element ``True``); otherwise the
+    returned tensor is still in the rotated space so a stabilizer term can be added
+    before an eager inverse rotation (second element ``False``). Returns ``None`` to
+    signal an eager fallback.
+    """
+    if not _int4_fuse_enabled() or _INT4_TRITON_FUSED_BROKEN:
+        return None
+    if not go.is_cuda or not _supports_torch_int_mm(go.device):
+        return None
+    if weight_scale.numel() != out_features:
+        return None
+    quant = _get_int4_fused_quant()
+    epilogue = _get_int4_fused_epilogue()
+    if quant is None or epilogue is None:
+        return None
+    convrot_epilogue = _get_int4_fused_convrot_epilogue()
+    do_convrot = fuse_inverse_rotation and convrot_epilogue is not None and group_size in _INT4_FUSED_GROUP_SIZES
+    try:
+        qg, grad_scale = quant(go.contiguous(), weight_scale.reshape(out_features).contiguous())
+        w_int8 = _unpack_weight_to_int8(packed_weight, padded_features)
+        acc = _int_mm_allow_small_m(qg.contiguous(), w_int8)
+        if do_convrot:
+            grad_input_padded = convrot_epilogue(acc, grad_scale, group_size, out_dtype)
+            return grad_input_padded, True
+        grad_rot = epilogue(acc, grad_scale, None, None, out_dtype)
+        return grad_rot, False
+    except Exception as exc:  # pragma: no cover - defensive: fall back to eager
+        _mark_int4_triton_fused_broken()
+        logger.debug("INT4 ConvRot fused grad-input failed; reverting to eager path: %s", exc)
+        return None
+
+
 def _linear_int4_fallback(
     qx: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -908,7 +1167,7 @@ def _grad_input_int4_fallback(
 
 class _Int4ConvRotLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, packed_weight, weight_scale, bias, int4_shape, convrot_groupsize):
+    def forward(ctx, x, packed_weight, weight_scale, bias, int4_shape, convrot_groupsize, stab_l1=None, stab_l2=None):
         out_features, in_features, padded_features = (int(v) for v in int4_shape.detach().cpu().reshape(-1).tolist())
         group_size = (
             int(convrot_groupsize.detach().reshape(-1)[0].item())
@@ -917,23 +1176,34 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
         )
         original_shape = x.shape
         output_dtype = _autocast_output_dtype(x)
-        x_rot = rotate_activation_padded(x, group_size, padded_features)
-        x_2d = x_rot.reshape(-1, padded_features)
+        has_stabilizer = stab_l1 is not None and stab_l2 is not None
 
         activation_bits = _int4_activation_bits()
+        # ``x_2d`` is the rotated, padded activation. The fused W4A8 path can fold the
+        # rotation into the quant kernel and leave it unmaterialized; it is only needed
+        # for the stabilizer branch, so materialize it lazily.
+        x_2d = None
+        output = None
         if activation_bits == 8:
-            qx, x_scale = _quantize_activation_int8(x_2d)
-            output = _linear_w4a8_tensorcore(
-                qx,
+            fused = _forward_w4a8_fused(
+                x,
                 packed_weight,
-                x_scale,
                 weight_scale,
                 bias,
+                group_size=group_size,
+                padded_features=padded_features,
                 out_dtype=output_dtype,
-                k_values=padded_features,
+                need_rotated=has_stabilizer,
             )
-            if output is None:
-                output = _linear_w4a8_fallback(
+            if fused is not None:
+                output, x_2d = fused
+
+        if output is None:
+            x_rot = rotate_activation_padded(x, group_size, padded_features)
+            x_2d = x_rot.reshape(-1, padded_features)
+            if activation_bits == 8:
+                qx, x_scale = _quantize_activation_int8(x_2d)
+                output = _linear_w4a8_tensorcore(
                     qx,
                     packed_weight,
                     x_scale,
@@ -942,26 +1212,19 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
                     out_dtype=output_dtype,
                     k_values=padded_features,
                 )
-        else:
-            qx, x_scale = _quantize_activation_int4(x_2d)
-            output = _linear_int4_tensorcore(
-                qx,
-                packed_weight,
-                x_scale,
-                weight_scale,
-                bias,
-                out_dtype=output_dtype,
-                k_values=padded_features,
-            )
-            cuda_int4 = _get_cuda_int4() if output is None and qx.is_cuda else None
-            if output is not None:
-                pass
-            elif cuda_int4 is not None:
-                output = cuda_int4.linear_forward(
-                    qx, packed_weight, x_scale.reshape(-1), weight_scale.reshape(-1), bias, output_dtype
-                )
+                if output is None:
+                    output = _linear_w4a8_fallback(
+                        qx,
+                        packed_weight,
+                        x_scale,
+                        weight_scale,
+                        bias,
+                        out_dtype=output_dtype,
+                        k_values=padded_features,
+                    )
             else:
-                output = _linear_int4_fallback(
+                qx, x_scale = _quantize_activation_int4(x_2d)
+                output = _linear_int4_tensorcore(
                     qx,
                     packed_weight,
                     x_scale,
@@ -970,7 +1233,42 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
                     out_dtype=output_dtype,
                     k_values=padded_features,
                 )
-        ctx.save_for_backward(packed_weight, weight_scale, int4_shape, torch.tensor(group_size, device=x.device, dtype=torch.int32))
+                cuda_int4 = _get_cuda_int4() if output is None and qx.is_cuda else None
+                if output is not None:
+                    pass
+                elif cuda_int4 is not None:
+                    output = cuda_int4.linear_forward(
+                        qx, packed_weight, x_scale.reshape(-1), weight_scale.reshape(-1), bias, output_dtype
+                    )
+                else:
+                    output = _linear_int4_fallback(
+                        qx,
+                        packed_weight,
+                        x_scale,
+                        weight_scale,
+                        bias,
+                        out_dtype=output_dtype,
+                        k_values=padded_features,
+                    )
+        if has_stabilizer:
+            # Frozen high-precision outlier branch: shares the rotated/padded input with the
+            # INT4 backbone, evaluated as two skinny GEMMs (never materializes L1 @ L2).
+            compute_dtype = x_2d.dtype if x_2d.is_floating_point() else torch.float32
+            y_stab = (x_2d.to(compute_dtype) @ stab_l2.t().to(compute_dtype)) @ stab_l1.t().to(compute_dtype)
+            output = output + y_stab.to(output.dtype)
+            ctx.save_for_backward(
+                packed_weight,
+                weight_scale,
+                int4_shape,
+                torch.tensor(group_size, device=x.device, dtype=torch.int32),
+                stab_l1,
+                stab_l2,
+            )
+        else:
+            ctx.save_for_backward(
+                packed_weight, weight_scale, int4_shape, torch.tensor(group_size, device=x.device, dtype=torch.int32)
+            )
+        ctx.has_stabilizer = has_stabilizer
         ctx.input_dtype = x.dtype
         ctx.activation_bits = activation_bits
         ctx.original_shape = original_shape
@@ -980,48 +1278,62 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
             raise RuntimeError("INT4 ConvRot base weights are frozen; full fine-tuning is not supported.")
-        packed_weight, weight_scale, int4_shape, group_tensor = ctx.saved_tensors
+        if ctx.has_stabilizer:
+            packed_weight, weight_scale, int4_shape, group_tensor, stab_l1, stab_l2 = ctx.saved_tensors
+        else:
+            packed_weight, weight_scale, int4_shape, group_tensor = ctx.saved_tensors
+            stab_l1 = stab_l2 = None
         out_features, in_features, padded_features = (int(v) for v in int4_shape.detach().cpu().reshape(-1).tolist())
         group_size = int(group_tensor.detach().reshape(-1)[0].item())
         go = grad_output.reshape(-1, out_features)
-        go_scaled = go.float() * weight_scale.reshape(1, out_features).float()
+        has_stabilizer = stab_l1 is not None
 
+        # ``grad_rot`` is the grad w.r.t. the rotated activation. The fused W4A8 path can
+        # also fold the inverse rotation into its rescale epilogue -- but only when there
+        # is no stabilizer term to add first (the stabilizer contributes in the rotated
+        # space). ``grad_input_ready`` is set when the inverse rotation is already applied.
+        grad_rot = None
+        grad_input_ready = None
         if ctx.activation_bits == 8:
-            qg, grad_scale = _quantize_activation_int8(go_scaled.to(grad_output.dtype))
-            grad_rot = _grad_input_w4a8_tensorcore(
-                qg,
+            fused = _grad_input_w4a8_fused(
+                go,
                 packed_weight,
-                grad_scale,
-                out_dtype=ctx.input_dtype,
+                weight_scale,
+                group_size=group_size,
                 padded_features=padded_features,
+                out_features=out_features,
+                out_dtype=ctx.input_dtype,
+                fuse_inverse_rotation=not has_stabilizer,
             )
-            if grad_rot is None:
-                grad_rot = _grad_input_w4a8_fallback(
+            if fused is not None:
+                tensor, inverse_applied = fused
+                if inverse_applied:
+                    grad_input_ready = tensor
+                else:
+                    grad_rot = tensor
+
+        if grad_input_ready is None and grad_rot is None:
+            go_scaled = go.float() * weight_scale.reshape(1, out_features).float()
+            if ctx.activation_bits == 8:
+                qg, grad_scale = _quantize_activation_int8(go_scaled.to(grad_output.dtype))
+                grad_rot = _grad_input_w4a8_tensorcore(
                     qg,
                     packed_weight,
                     grad_scale,
                     out_dtype=ctx.input_dtype,
                     padded_features=padded_features,
                 )
-        else:
-            qg, grad_scale = _quantize_activation_int4(go_scaled.to(grad_output.dtype))
-            grad_rot = _grad_input_int4_tensorcore(
-                qg,
-                packed_weight,
-                grad_scale,
-                out_dtype=ctx.input_dtype,
-                out_features=out_features,
-                padded_features=padded_features,
-            )
-            cuda_int4 = _get_cuda_int4() if grad_rot is None and qg.is_cuda else None
-            if grad_rot is not None:
-                pass
-            elif cuda_int4 is not None:
-                grad_rot = cuda_int4.linear_backward_input(
-                    qg, packed_weight, grad_scale.reshape(-1), padded_features, ctx.input_dtype
-                )
+                if grad_rot is None:
+                    grad_rot = _grad_input_w4a8_fallback(
+                        qg,
+                        packed_weight,
+                        grad_scale,
+                        out_dtype=ctx.input_dtype,
+                        padded_features=padded_features,
+                    )
             else:
-                grad_rot = _grad_input_int4_fallback(
+                qg, grad_scale = _quantize_activation_int4(go_scaled.to(grad_output.dtype))
+                grad_rot = _grad_input_int4_tensorcore(
                     qg,
                     packed_weight,
                     grad_scale,
@@ -1029,14 +1341,44 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
                     out_features=out_features,
                     padded_features=padded_features,
                 )
-        grad_input = rotate_activation_padded(grad_rot, group_size, padded_features, inverse=True)[..., :in_features]
+                cuda_int4 = _get_cuda_int4() if grad_rot is None and qg.is_cuda else None
+                if grad_rot is not None:
+                    pass
+                elif cuda_int4 is not None:
+                    grad_rot = cuda_int4.linear_backward_input(
+                        qg, packed_weight, grad_scale.reshape(-1), padded_features, ctx.input_dtype
+                    )
+                else:
+                    grad_rot = _grad_input_int4_fallback(
+                        qg,
+                        packed_weight,
+                        grad_scale,
+                        out_dtype=ctx.input_dtype,
+                        out_features=out_features,
+                        padded_features=padded_features,
+                    )
+
+        if grad_input_ready is not None:
+            # Fused path already applied the rescale and the inverse rotation; no
+            # stabilizer term is present in this branch (fuse_inverse_rotation was gated
+            # on its absence).
+            grad_input = grad_input_ready[..., :in_features]
+        else:
+            if stab_l1 is not None:
+                # Stabilizer pathway: propagated from the unscaled high-precision grad_output,
+                # not from the weight-scale-folded quantized gradient used by the backbone GEMM.
+                compute_dtype = go.dtype if go.is_floating_point() else torch.float32
+                grad_stab = (go.to(compute_dtype) @ stab_l1.to(compute_dtype)) @ stab_l2.to(compute_dtype)
+                grad_rot = grad_rot + grad_stab.to(grad_rot.dtype)
+            grad_input = rotate_activation_padded(grad_rot, group_size, padded_features, inverse=True)[..., :in_features]
         grad_input = grad_input.reshape(*ctx.original_shape)
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 def int4_convrot_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     out_features, in_features, padded_features = _module_int4_shape(self)
     x = _apply_int4_awq_activation_scale(self, x, in_features)
+    stabilizer = _module_int4_stabilizer(self, out_features, padded_features)
     if _use_weight_only_diagnostic():
         weight = dequantize_int4_convrot_weight(
             self.weight,
@@ -1045,13 +1387,15 @@ def int4_convrot_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tenso
             in_features,
             padded_features,
             dtype=x.dtype if x.is_floating_point() else torch.float32,
+            stabilizer=stabilizer,
         )
         return F.linear(x, weight, self.bias)
     group_size = _module_int4_group(self)
     shape = getattr(self, "int4_shape")
     group = getattr(self, "int4_convrot_groupsize")
+    stab_l1, stab_l2 = stabilizer if stabilizer is not None else (None, None)
     return _Int4ConvRotLinearFunction.apply(
-        x, self.weight, self.scale_weight, self.bias, shape, group_size if group is None else group
+        x, self.weight, self.scale_weight, self.bias, shape, group_size if group is None else group, stab_l1, stab_l2
     )
 
 
@@ -1083,6 +1427,11 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
         )
         if awq_key in state_dict:
             module.register_buffer("int4_awq_scales", torch.zeros_like(state_dict[awq_key].float()), persistent=True)
+        stab_l1_key = name + INT4_CONVROT_STABILIZER_L1_SUFFIX
+        stab_l2_key = name + INT4_CONVROT_STABILIZER_L2_SUFFIX
+        if stab_l1_key in state_dict and stab_l2_key in state_dict:
+            module.register_buffer("int4_stabilizer_l1", torch.zeros_like(state_dict[stab_l1_key]), persistent=True)
+            module.register_buffer("int4_stabilizer_l2", torch.zeros_like(state_dict[stab_l2_key]), persistent=True)
         registered += 1
     return registered
 
@@ -1113,6 +1462,10 @@ def apply_int4_convrot_monkey_patch(model: nn.Module) -> nn.Module:
         awq_scales = _module_int4_awq_scales(module, in_features)
         if awq_scales is not None:
             module.int4_awq_scales = awq_scales.to(device=module.weight.device, dtype=torch.float32)
+        stabilizer = _module_int4_stabilizer(module, out_features, padded_features)
+        if stabilizer is not None:
+            module.int4_stabilizer_l1 = stabilizer[0].to(device=module.weight.device).contiguous()
+            module.int4_stabilizer_l2 = stabilizer[1].to(device=module.weight.device).contiguous()
         module.forward = int4_convrot_linear_forward.__get__(module, type(module))
         patched += 1
     logger = __import__("logging").getLogger(__name__)

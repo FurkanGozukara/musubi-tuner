@@ -16,8 +16,11 @@ from tqdm import tqdm
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 from musubi_tuner.modules.int4_convrot_utils import (
+    INT4_CONVROT_STABILIZER_L1_SUFFIX,
+    INT4_CONVROT_STABILIZER_L2_SUFFIX,
     best_int4_convrot_groupsize,
     comfy_quant_tensor,
+    compute_int4_convrot_stabilizer,
     parse_int4_convrot_groupsizes,
     quantize_int4_convrot_weight,
     summarize_quality,
@@ -66,6 +69,7 @@ def quantize_model(
     awq_calibration: bool,
     awq_alpha: float,
     awq_scales: str | None,
+    stabilizer_rank: int = 0,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -78,6 +82,10 @@ def quantize_model(
     logger.info("INT4 ConvRot quantization device: %s", device)
     logger.info("INT4 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT4 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
+    if stabilizer_rank < 0:
+        raise ValueError(f"INT4 ConvRot stabilizer rank must be >= 0, got {stabilizer_rank}")
+    if stabilizer_rank > 0:
+        logger.info("INT4 ConvRot stabilizer: rank %d low-rank branch (SVD of rotated weights)", stabilizer_rank)
     if not (0.0 <= float(awq_alpha) <= 1.0):
         raise ValueError(f"INT4 ConvRot AWQ alpha must be in [0, 1], got {awq_alpha}")
     loaded_awq_scales = None
@@ -141,6 +149,14 @@ def quantize_model(
                 value = apply_int4_convrot_awq_scale_to_weight(value, awq_scale)
                 applied_awq_scales[model_key] = awq_scale
 
+            stabilizer = None
+            if stabilizer_rank > 0:
+                stabilizer = compute_int4_convrot_stabilizer(
+                    value,
+                    group_size=group_size,
+                    rank=stabilizer_rank,
+                    calc_device=device,
+                )
             q, scale, shape, quality = quantize_int4_convrot_weight(
                 value,
                 group_size=group_size,
@@ -148,6 +164,7 @@ def quantize_model(
                 mse_clip=mse_clip,
                 collect_quality=quality_report is not None,
                 key=model_key,
+                stabilizer=stabilizer,
             )
             base = key[: -len(".weight")]
             in_features = int(shape.detach().cpu().reshape(-1)[1].item())
@@ -156,10 +173,17 @@ def quantize_model(
             state_dict[base + ".weight_scale"] = scale.cpu()
             state_dict[base + ".int4_shape"] = shape.cpu()
             state_dict[base + ".comfy_quant"] = comfy_quant_tensor(
-                group_size, in_features, padded_features, awq=awq_scale is not None
+                group_size,
+                in_features,
+                padded_features,
+                awq=awq_scale is not None,
+                stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
             )
             if awq_scale is not None:
                 state_dict[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.cpu().float()
+            if stabilizer is not None:
+                state_dict[base + INT4_CONVROT_STABILIZER_L1_SUFFIX] = stabilizer[0].cpu()
+                state_dict[base + INT4_CONVROT_STABILIZER_L2_SUFFIX] = stabilizer[1].cpu()
             if quality is not None:
                 quality_layers.append(quality)
             quantized_count += 1
@@ -173,6 +197,8 @@ def quantize_model(
     output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
     output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
     output_metadata["int4_convrot_awq_alpha"] = str(float(awq_alpha))
+    if stabilizer_rank > 0:
+        output_metadata["int4_convrot_stabilizer_rank"] = str(int(stabilizer_rank))
 
     if generated_awq_scales and awq_save_path:
         save_int4_convrot_awq_scales(generated_awq_scales, awq_save_path)
@@ -223,6 +249,7 @@ def quantize_model(
                 "awq_calibration": bool(awq_calibration),
                 "awq_alpha": float(awq_alpha),
                 "awq_scales": awq_save_path or awq_scales,
+                "stabilizer_rank": int(stabilizer_rank),
             },
             layers=quality_layers,
         )
@@ -257,6 +284,16 @@ def main() -> None:
         help="ConvRot group size or comma list. Default: auto (256,64,16); tensors are padded when needed.",
     )
     parser.add_argument("--no_mse_clip", action="store_true", help="Use plain absmax scales instead of MSE clipping")
+    parser.add_argument(
+        "--stabilizer_rank",
+        type=int,
+        default=0,
+        help=(
+            "Rank of the frozen low-rank stabilizer branch split off each rotated weight before INT4 "
+            "quantization (SVDQuant-style outlier isolation). 0 disables it; 32 is the recommended value. "
+            "The stabilizer tensors are stored in the output checkpoint and applied automatically at load."
+        ),
+    )
     parser.add_argument(
         "--int4_convrot_awq_calibration",
         action="store_true",
@@ -300,6 +337,7 @@ def main() -> None:
         awq_calibration=bool(args.int4_convrot_awq_calibration),
         awq_alpha=float(args.int4_convrot_awq_alpha),
         awq_scales=args.int4_convrot_awq_scales,
+        stabilizer_rank=int(args.stabilizer_rank),
     )
 
 

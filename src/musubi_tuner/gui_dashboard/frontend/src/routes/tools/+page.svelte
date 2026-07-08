@@ -3,6 +3,7 @@
 	import LoRAExtractionPanel from '$lib/components/LoRAExtractionPanel.svelte';
 	import LoRAConversionPanel from '$lib/components/LoRAConversionPanel.svelte';
 	import Int8ConvRotQuantizePanel from '$lib/components/Int8ConvRotQuantizePanel.svelte';
+	import Int4ConvRotQuantizePanel from '$lib/components/Int4ConvRotQuantizePanel.svelte';
 	import Int8WeightsExportPanel from '$lib/components/Int8WeightsExportPanel.svelte';
 	import ProjectConfigPanel from '$lib/components/ProjectConfigPanel.svelte';
 	import { projectLoaded } from '$lib/stores/project.js';
@@ -19,6 +20,7 @@
 			<LoRAExtractionPanel />
 			<ComfyConversionPanel />
 			<Int8ConvRotQuantizePanel />
+			<Int4ConvRotQuantizePanel />
 			<Int8WeightsExportPanel />
 			<LoRAConversionPanel />
 		</div>

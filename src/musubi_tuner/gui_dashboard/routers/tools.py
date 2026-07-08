@@ -769,6 +769,157 @@ async def get_quantize_int8cr_status(job_id: str, request: Request):
     return _snapshot_job(job)
 
 
+class QuantizeInt4ConvRotRequest(BaseModel):
+    checkpoint_path: str
+    output_path: str = ""
+    groupsize: str = "auto"
+    mse_clip: bool = True
+    calc_device: str = "cpu"
+    quality_report: bool = True
+    stabilizer_rank: int = 0
+
+
+@dataclasses.dataclass
+class QuantizeInt4ConvRotJob:
+    job_id: str
+    checkpoint_path: str
+    output_path: str = ""
+    groupsize: str = "auto"
+    mse_clip: bool = True
+    calc_device: str = "cpu"
+    quality_report: bool = True
+    stabilizer_rank: int = 0
+    state: str = "queued"
+    message: str = "Queued"
+    error: str = ""
+    created_at: float = dataclasses.field(default_factory=time.time)
+    updated_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+def _get_quantize_int4cr_jobs(request: Request) -> dict[str, QuantizeInt4ConvRotJob]:
+    jobs = getattr(request.app.state, "quantize_int4cr_jobs", None)
+    if jobs is None:
+        jobs = {}
+        request.app.state.quantize_int4cr_jobs = jobs
+    return jobs
+
+
+def _default_int4cr_output_path(input_path: str) -> str:
+    path = Path(input_path)
+    return str(path.parent / f"{path.stem}.int4cr{path.suffix}")
+
+
+def _run_quantize_int4cr_job(job: QuantizeInt4ConvRotJob, config: ProjectConfig) -> None:
+    try:
+        _set_job_state(job, state="running", message="Pre-quantizing transformer weights to INT4 ConvRot")
+        cmd = [
+            sys.executable,
+            "-m",
+            "musubi_tuner.ltx2_quantize_int4_convrot",
+            "--input_model",
+            job.checkpoint_path,
+            "--output_model",
+            job.output_path,
+            "--groupsize",
+            job.groupsize or "auto",
+            "--calc_device",
+            job.calc_device or "cpu",
+        ]
+        if not job.mse_clip:
+            cmd.append("--no_mse_clip")
+        if not job.quality_report:
+            cmd.append("--no_quality_report")
+        if job.stabilizer_rank > 0:
+            cmd += ["--stabilizer_rank", str(job.stabilizer_rank)]
+
+        result = subprocess.run(
+            cmd,
+            cwd=config.project_dir or None,
+            env=_converter_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            output_tail = "\n".join((result.stdout or "").splitlines()[-40:])
+            raise RuntimeError(output_tail or f"Quantizer exited with code {result.returncode}")
+
+        _set_job_state(
+            job,
+            state="completed",
+            message=f"Saved to {job.output_path}",
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        logger.exception("INT4 ConvRot pre-quantization failed")
+        _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
+
+
+@router.post("/quantize-int4cr")
+async def start_quantize_int4cr(req: QuantizeInt4ConvRotRequest, request: Request):
+    config = _get_config(request)
+    try:
+        checkpoint_path = _resolve_project_path(config, req.checkpoint_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Checkpoint must be a .safetensors file")
+
+    try:
+        output_path = (
+            _resolve_project_path(config, req.output_path)
+            if req.output_path.strip()
+            else Path(_default_int4cr_output_path(str(checkpoint_path)))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if output_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Output path must be a .safetensors file")
+    if output_path == checkpoint_path:
+        raise HTTPException(status_code=400, detail="Output path must differ from the input checkpoint")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    device = (req.calc_device or "cpu").strip().lower()
+    if device not in {"cpu", "cuda"}:
+        raise HTTPException(status_code=400, detail="calc_device must be 'cpu' or 'cuda'")
+
+    stabilizer_rank = int(req.stabilizer_rank or 0)
+    if stabilizer_rank < 0:
+        raise HTTPException(status_code=400, detail="stabilizer_rank must be >= 0")
+
+    jobs = _get_quantize_int4cr_jobs(request)
+    _prune_finished_jobs(jobs)
+    job = QuantizeInt4ConvRotJob(
+        job_id=uuid.uuid4().hex,
+        checkpoint_path=str(checkpoint_path),
+        output_path=str(output_path),
+        groupsize=(req.groupsize or "auto").strip(),
+        mse_clip=bool(req.mse_clip),
+        calc_device=device,
+        quality_report=bool(req.quality_report),
+        stabilizer_rank=stabilizer_rank,
+    )
+    jobs[job.job_id] = job
+    thread = threading.Thread(target=_run_quantize_int4cr_job, args=(job, config), daemon=True)
+    thread.start()
+    return _snapshot_job(job)
+
+
+@router.get("/quantize-int4cr/{job_id}")
+async def get_quantize_int4cr_status(job_id: str, request: Request):
+    jobs = _get_quantize_int4cr_jobs(request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Quantization job not found")
+    return _snapshot_job(job)
+
+
 class QuantizeInt8WeightsRequest(BaseModel):
     checkpoint_path: str
     output_path: str = ""

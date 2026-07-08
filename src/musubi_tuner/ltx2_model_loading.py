@@ -31,6 +31,8 @@ from musubi_tuner.modules.int8_convrot_utils import (
     write_quality_report,
 )
 from musubi_tuner.modules.int4_convrot_utils import (
+    INT4_CONVROT_STABILIZER_L1_SUFFIX,
+    INT4_CONVROT_STABILIZER_L2_SUFFIX,
     apply_int4_convrot_monkey_patch,
     best_int4_convrot_groupsize,
     parse_comfy_quant_tensor as parse_int4_comfy_quant_tensor,
@@ -864,6 +866,18 @@ def load_comfy_int4_convrot_state_dict(
                     if key_filter is not None and not key_filter(weight_key):
                         continue
                     sd[key] = f.get_tensor(key).to(torch.float32)
+                    continue
+                if key.endswith(INT4_CONVROT_STABILIZER_L1_SUFFIX) or key.endswith(INT4_CONVROT_STABILIZER_L2_SUFFIX):
+                    suffix = (
+                        INT4_CONVROT_STABILIZER_L1_SUFFIX
+                        if key.endswith(INT4_CONVROT_STABILIZER_L1_SUFFIX)
+                        else INT4_CONVROT_STABILIZER_L2_SUFFIX
+                    )
+                    base = key[: -len(suffix)]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    sd[key] = f.get_tensor(key).to(torch.bfloat16)
                     continue
                 if key.endswith(".int4_convrot_groupsize"):
                     base = key[: -len(".int4_convrot_groupsize")]
