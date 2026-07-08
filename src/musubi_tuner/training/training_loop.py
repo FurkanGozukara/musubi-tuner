@@ -1883,6 +1883,33 @@ def train(self, args):
 
     # training loop
 
+    int4_activation_calibrator = None
+    int4_activation_calibration_batches_done = 0
+    int4_activation_calibration_target_batches = max(
+        0,
+        int(getattr(args, "int4_convrot_activation_calibration_batches", 1) or 0),
+    )
+    int4_activation_calibration_report = getattr(args, "int4_convrot_activation_calibration_report", None)
+    if int4_activation_calibration_report:
+        if not (getattr(args, "int4_convrot_base", False) or getattr(args, "int4_convrot_dynamic", False)):
+            raise ValueError("--int4_convrot_activation_calibration_report requires --int4_convrot_base or --int4_convrot_dynamic")
+        if int4_activation_calibration_target_batches <= 0:
+            raise ValueError("--int4_convrot_activation_calibration_batches must be positive when a report path is set")
+        if accelerator.is_main_process:
+            from musubi_tuner.modules.int4_convrot_activation_calibration import Int4ConvRotActivationCalibrator
+
+            int4_activation_calibrator = Int4ConvRotActivationCalibrator(
+                accelerator.unwrap_model(transformer),
+                module_regex=getattr(args, "int4_convrot_activation_calibration_regex", None),
+                max_rows=int(getattr(args, "int4_convrot_activation_calibration_max_rows", 128) or 0),
+                max_layers=int(getattr(args, "int4_convrot_activation_calibration_max_layers", 0) or 0),
+            )
+            logger.info(
+                "INT4 ConvRot activation calibration: hooked %d layers for %d training batch(es)",
+                int4_activation_calibrator.registered_layers,
+                int4_activation_calibration_target_batches,
+            )
+
     # log device and dtype for each model
     unwrapped_transformer = accelerator.unwrap_model(transformer)
     first_param = next(iter(unwrapped_transformer.parameters()), None)
@@ -2002,19 +2029,56 @@ def train(self, args):
                 if _is_first_step:
                     _log_vram("FIRST_ITER: BEFORE call_dit (forward pass)", logger)
                 self._current_train_global_step = global_step
-                model_pred, target = _unpack_dit_output(
-                    self.call_dit(
-                        args,
-                        accelerator,
-                        transformer,
-                        latents_tensor,
-                        batch,
-                        noise,
-                        noisy_model_input,
-                        timesteps,
-                        network_dtype,
-                    )
+                _calibrating_int4_activation = bool(int4_activation_calibration_report) and (
+                    int4_activation_calibration_batches_done < int4_activation_calibration_target_batches
                 )
+                if _calibrating_int4_activation and int4_activation_calibrator is not None:
+                    int4_activation_calibrator.start_step(global_step)
+                try:
+                    model_pred, target = _unpack_dit_output(
+                        self.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            network_dtype,
+                        )
+                    )
+                finally:
+                    if _calibrating_int4_activation:
+                        if int4_activation_calibrator is not None:
+                            int4_activation_calibrator.finish_step()
+                        int4_activation_calibration_batches_done += 1
+                if bool(int4_activation_calibration_report) and (
+                    int4_activation_calibration_batches_done >= int4_activation_calibration_target_batches
+                ):
+                    if int4_activation_calibrator is not None:
+                        report = int4_activation_calibrator.write_report(
+                            int4_activation_calibration_report,
+                            batches=int4_activation_calibration_batches_done,
+                            options={
+                                "module_regex": getattr(args, "int4_convrot_activation_calibration_regex", None),
+                                "max_rows": int(getattr(args, "int4_convrot_activation_calibration_max_rows", 128) or 0),
+                                "max_layers": int(getattr(args, "int4_convrot_activation_calibration_max_layers", 0) or 0),
+                            },
+                        )
+                        int4_activation_calibrator.close()
+                        int4_activation_calibrator = None
+                        logger.info(
+                            "INT4 ConvRot activation calibration report written to %s (measured_layers=%s weighted_sqnr=%.2f dB)",
+                            int4_activation_calibration_report,
+                            report["summary"]["measured_layers"],
+                            report["summary"]["weighted_sqnr_db"],
+                        )
+                    accelerator.wait_for_everyone()
+                    int4_activation_calibration_report = None
+                    if bool(getattr(args, "int4_convrot_activation_calibration_only", False)):
+                        accelerator.end_training()
+                        return
                 if timestep_tb_buffers is not None:
                     payload = self._get_timestep_distribution_logging_payload(args, timesteps)
                     for name, ts_values in payload.items():

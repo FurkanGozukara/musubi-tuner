@@ -2302,12 +2302,13 @@ class LTX2SamplingMixin:
         # Check if two-stage inference is enabled
         use_two_stage = bool(getattr(args, "sample_two_stage", False))
         spatial_upsampler_path = getattr(args, "spatial_upsampler_path", None)
+        temporal_upsampler_path = getattr(args, "temporal_upsampler_path", None)
         distilled_lora_path = getattr(args, "distilled_lora_path", None)
         enable_audio_conditioning = bool(enable_audio_preview) or bool(force_audio_conditioning)
 
         if use_two_stage:
-            if not spatial_upsampler_path:
-                raise ValueError("Two-stage inference requires --spatial_upsampler_path")
+            if not spatial_upsampler_path and not temporal_upsampler_path:
+                raise ValueError("Two-stage inference requires --spatial_upsampler_path and/or --temporal_upsampler_path")
             elif force_audio_conditioning:
                 logger.warning(
                     "Reference-audio conditioning is not supported with two-stage inference; falling back to single-stage"
@@ -2334,6 +2335,7 @@ class LTX2SamplingMixin:
                 seed=seed,
                 generator=generator,
                 spatial_upsampler_path=spatial_upsampler_path,
+                temporal_upsampler_path=temporal_upsampler_path,
                 conditioning_latent=conditioning_latent,
                 distilled_lora_path=distilled_lora_path,
                 stage2_steps=int(getattr(args, "sample_stage2_steps", 3)),
@@ -4974,7 +4976,8 @@ class LTX2SamplingMixin:
         cfg_scale: Optional[float],
         seed: Optional[int],
         generator: torch.Generator,
-        spatial_upsampler_path: str,
+        spatial_upsampler_path: Optional[str],
+        temporal_upsampler_path: Optional[str] = None,
         distilled_lora_path: Optional[str] = None,
         stage2_steps: int = 4,
         audio_decoder: Optional[torch.nn.Module] = None,
@@ -4998,8 +5001,11 @@ class LTX2SamplingMixin:
             audio_video_mode=self._audio_video,
         )
 
-        # Load upsampler
-        inferencer.load_spatial_upsampler(spatial_upsampler_path, device=torch.device("cpu"))
+        # Load upsampler(s)
+        if spatial_upsampler_path:
+            inferencer.load_spatial_upsampler(spatial_upsampler_path, device=torch.device("cpu"))
+        if temporal_upsampler_path:
+            inferencer.load_temporal_upsampler(temporal_upsampler_path, device=torch.device("cpu"))
 
         # Load distilled LoRA if provided
         if distilled_lora_path:
@@ -5045,6 +5051,7 @@ class LTX2SamplingMixin:
             seed=seed,
             two_stage=True,
             spatial_upsampler_path=spatial_upsampler_path,
+            temporal_upsampler_path=temporal_upsampler_path,
             distilled_lora_path=distilled_lora_path,
             stage2_steps=stage2_steps,
             stage1_distilled_lora_multiplier=getattr(args, "sample_stage1_distilled_lora_multiplier", None),

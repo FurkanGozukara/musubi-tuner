@@ -40,6 +40,15 @@ from musubi_tuner.modules.int4_convrot_utils import (
     summarize_quality as summarize_int4_quality,
     write_quality_report as write_int4_quality_report,
 )
+from musubi_tuner.modules.int4_convrot_awq import (
+    INT4_CONVROT_AWQ_SCALE_SUFFIX,
+    apply_int4_convrot_awq_scale_to_weight,
+    compute_int4_convrot_awq_scale,
+    default_int4_convrot_awq_scales_path,
+    load_int4_convrot_awq_scales,
+    save_int4_convrot_awq_scales,
+    summarize_int4_convrot_awq_scales,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -849,6 +858,13 @@ def load_comfy_int4_convrot_state_dict(
                         continue
                     sd[key] = f.get_tensor(key).to(torch.int32)
                     continue
+                if key.endswith(INT4_CONVROT_AWQ_SCALE_SUFFIX):
+                    base = key[: -len(INT4_CONVROT_AWQ_SCALE_SUFFIX)]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    sd[key] = f.get_tensor(key).to(torch.float32)
+                    continue
                 if key.endswith(".int4_convrot_groupsize"):
                     base = key[: -len(".int4_convrot_groupsize")]
                     weight_key = base + ".weight"
@@ -927,6 +943,10 @@ def load_safetensors_dynamic_int4_convrot(
     groupsizes: str | int | Iterable[int] | None = None,
     mse_clip: bool = True,
     quality_report: Optional[str] = None,
+    awq_calibration: bool = False,
+    awq_alpha: float = 0.25,
+    awq_scales: Optional[dict[str, torch.Tensor]] = None,
+    awq_save_path: Optional[str] = None,
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
     key_filter: Optional[Callable[[str], bool]] = None,
@@ -939,6 +959,9 @@ def load_safetensors_dynamic_int4_convrot(
     collect_quality = bool(quality_report)
     sd: dict[str, torch.Tensor] = {}
     quality_layers = []
+    generated_awq_scales: dict[str, torch.Tensor] = {}
+    applied_awq_scales: dict[str, torch.Tensor] = {}
+    awq_applied = 0
     quantized = 0
 
     for model_file in model_files:
@@ -975,6 +998,21 @@ def load_safetensors_dynamic_int4_convrot(
                 )
 
                 if is_candidate:
+                    awq_scale = None
+                    if awq_calibration:
+                        awq_scale = compute_int4_convrot_awq_scale(value, alpha=float(awq_alpha))
+                        generated_awq_scales[mkey] = awq_scale
+                    elif awq_scales is not None:
+                        awq_scale = awq_scales.get(mkey)
+                        if awq_scale is None:
+                            awq_scale = awq_scales.get(key)
+                        if awq_scale is None:
+                            raise ValueError(f"INT4 ConvRot AWQ scales missing required key for {mkey}")
+                    if awq_scale is not None:
+                        value = apply_int4_convrot_awq_scale_to_weight(value, awq_scale)
+                        applied_awq_scales[mkey] = awq_scale
+                        awq_applied += 1
+
                     group_size = best_int4_convrot_groupsize(value.shape[1], group_candidates)
                     q, scale, shape, quality = quantize_int4_convrot_weight(
                         value,
@@ -989,6 +1027,8 @@ def load_safetensors_dynamic_int4_convrot(
                     sd[base + ".scale_weight"] = scale
                     sd[base + ".int4_shape"] = shape
                     sd[base + ".int4_convrot_groupsize"] = torch.tensor(int(group_size), dtype=torch.int32, device=q.device)
+                    if awq_scale is not None:
+                        sd[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.to(device=q.device, dtype=torch.float32)
                     if quality is not None:
                         quality_layers.append(quality)
                     quantized += 1
@@ -998,6 +1038,19 @@ def load_safetensors_dynamic_int4_convrot(
                     if calc_device.type == "cuda":
                         value = value.to(calc_device)
                     sd[mkey] = value
+
+    if generated_awq_scales and awq_save_path:
+        save_int4_convrot_awq_scales(generated_awq_scales, awq_save_path)
+    if awq_applied:
+        summary = summarize_int4_convrot_awq_scales(applied_awq_scales)
+        logger.info(
+            "INT4 ConvRot AWQ: applied scales to %d layers (channels=%s min=%.4g max=%.4g mean=%.4g)",
+            awq_applied,
+            summary.get("num_channels", 0),
+            summary.get("min", 0.0),
+            summary.get("max", 0.0),
+            summary.get("mean", 0.0),
+        )
 
     logger.info("INT4 ConvRot dynamic: quantized %d Linear weights to packed INT4 (%d tensors total)", quantized, len(sd))
     if quality_layers:
@@ -1021,6 +1074,9 @@ def load_safetensors_dynamic_int4_convrot(
                     "exclude_keys": exclude_keys,
                     "calc_device": str(calc_device),
                     "storage": "packed_signed_int4",
+                    "awq_calibration": bool(awq_calibration),
+                    "awq_alpha": float(awq_alpha),
+                    "awq_scales": awq_save_path,
                 },
                 layers=quality_layers,
             )
@@ -1069,6 +1125,9 @@ def load_ltx2_model(
     int4_convrot_groupsize: str | int | Iterable[int] | None = None,
     int4_convrot_mse_clip: bool = True,
     int4_convrot_quality_report: Optional[str] = None,
+    int4_convrot_awq_calibration: bool = False,
+    int4_convrot_awq_alpha: float = 0.25,
+    int4_convrot_awq_scales: Optional[str] = None,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -1241,6 +1300,20 @@ def load_ltx2_model(
         logger.warning("--fp8_keep_blocks is set but --fp8_scaled is disabled; ignoring block FP8 exclusions.")
 
     _awq_scales = None  # populated if AWQ calibration is used
+    _int4_awq_scales = None
+    _int4_awq_save_path = None
+    if int4_convrot_dynamic and (int4_convrot_awq_calibration or int4_convrot_awq_scales):
+        if int4_convrot_awq_calibration:
+            _int4_awq_save_path = int4_convrot_awq_scales or default_int4_convrot_awq_scales_path(model_path)
+            logger.info(
+                "INT4 ConvRot AWQ: computing dataset-independent scales at load time (alpha=%.3f, save=%s)",
+                float(int4_convrot_awq_alpha),
+                _int4_awq_save_path,
+            )
+        else:
+            if int4_convrot_awq_scales is None:
+                raise ValueError("--int4_convrot_awq_scales is required when not computing INT4 ConvRot AWQ calibration")
+            _int4_awq_scales = load_int4_convrot_awq_scales(int4_convrot_awq_scales)
 
     # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
     _is_nvfp4 = False
@@ -1501,6 +1574,10 @@ def load_ltx2_model(
             groupsizes=int4_convrot_groupsize,
             mse_clip=bool(int4_convrot_mse_clip),
             quality_report=int4_convrot_quality_report,
+            awq_calibration=bool(int4_convrot_awq_calibration),
+            awq_alpha=float(int4_convrot_awq_alpha),
+            awq_scales=_int4_awq_scales,
+            awq_save_path=_int4_awq_save_path,
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,

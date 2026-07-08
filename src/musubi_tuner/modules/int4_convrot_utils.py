@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from musubi_tuner.modules.int8_convrot_utils import build_hadamard, rotate_activation, rotate_weight
+from musubi_tuner.modules.int4_convrot_awq import INT4_CONVROT_AWQ_SCALE_SUFFIX
 
 DEFAULT_INT4_CONVROT_GROUP_SIZES = (256, 64, 16)
 DEFAULT_INT4_CONVROT_CLIP_MIN = 0.35
@@ -326,7 +327,14 @@ def quantize_int4_convrot_weight(
     return packed_out, scale_out, shape, quality
 
 
-def comfy_quant_tensor(group_size: int, in_features: int, padded_features: int, *, convrot: bool = True) -> torch.Tensor:
+def comfy_quant_tensor(
+    group_size: int,
+    in_features: int,
+    padded_features: int,
+    *,
+    convrot: bool = True,
+    awq: bool = False,
+) -> torch.Tensor:
     cfg = {
         "format": "int4_tensorwise",
         "bits": 4,
@@ -335,6 +343,7 @@ def comfy_quant_tensor(group_size: int, in_features: int, padded_features: int, 
         "in_features": int(in_features),
         "padded_in_features": int(padded_features),
         "packing": "signed_low_high",
+        "awq": bool(awq),
     }
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
@@ -411,6 +420,27 @@ def _module_int4_group(module: nn.Module) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.detach().reshape(-1)[0].item()) if value.numel() else 0
     return int(value or 0)
+
+
+def _module_int4_awq_scales(module: nn.Module, in_features: int) -> torch.Tensor | None:
+    scales = getattr(module, "int4_awq_scales", None)
+    if not isinstance(scales, torch.Tensor):
+        return None
+    scales = scales.reshape(-1)
+    if scales.numel() != int(in_features):
+        raise ValueError(f"INT4 ConvRot AWQ scale length {scales.numel()} does not match in_features={in_features}")
+    if not torch.isfinite(scales.float()).all() or (scales.float() <= 0).any():
+        raise ValueError("INT4 ConvRot AWQ scales must be positive finite values")
+    return scales
+
+
+def _apply_int4_awq_activation_scale(module: nn.Module, x: torch.Tensor, in_features: int) -> torch.Tensor:
+    scales = _module_int4_awq_scales(module, in_features)
+    if scales is None:
+        return x
+    scale_dtype = x.dtype if x.is_floating_point() and x.dtype != torch.float32 else torch.float32
+    scales = scales.to(device=x.device, dtype=scale_dtype).reshape(*([1] * (x.ndim - 1)), in_features)
+    return x / scales
 
 
 def _get_cuda_int4():
@@ -1005,8 +1035,9 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
 
 
 def int4_convrot_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    out_features, in_features, padded_features = _module_int4_shape(self)
+    x = _apply_int4_awq_activation_scale(self, x, in_features)
     if _use_weight_only_diagnostic():
-        out_features, in_features, padded_features = _module_int4_shape(self)
         weight = dequantize_int4_convrot_weight(
             self.weight,
             self.scale_weight,
@@ -1033,6 +1064,7 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
         shape_key = name + ".int4_shape"
         scale_key = name + ".scale_weight"
         group_key = name + ".int4_convrot_groupsize"
+        awq_key = name + INT4_CONVROT_AWQ_SCALE_SUFFIX
         if weight_key not in state_dict or shape_key not in state_dict or scale_key not in state_dict:
             continue
         packed = state_dict[weight_key]
@@ -1049,6 +1081,8 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
             torch.zeros_like(state_dict.get(group_key, torch.tensor(0, dtype=torch.int32)).to(torch.int32)),
             persistent=True,
         )
+        if awq_key in state_dict:
+            module.register_buffer("int4_awq_scales", torch.zeros_like(state_dict[awq_key].float()), persistent=True)
         registered += 1
     return registered
 
@@ -1076,6 +1110,9 @@ def apply_int4_convrot_monkey_patch(model: nn.Module) -> nn.Module:
         if module.bias is not None:
             module.bias.requires_grad_(False)
         module.scale_weight = module.scale_weight.reshape(out_features, 1).to(device=module.weight.device, dtype=torch.float32)
+        awq_scales = _module_int4_awq_scales(module, in_features)
+        if awq_scales is not None:
+            module.int4_awq_scales = awq_scales.to(device=module.weight.device, dtype=torch.float32)
         module.forward = int4_convrot_linear_forward.__get__(module, type(module))
         patched += 1
     logger = __import__("logging").getLogger(__name__)

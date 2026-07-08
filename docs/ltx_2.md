@@ -813,16 +813,19 @@ For IC-LoRA / V2V training, also precache the conditioning image latents during 
 <sub>[↑ contents](#table-of-contents)</sub>
 
 > [!NOTE]
-> This feature is disabled by default. Two-stage inference generates at half resolution, then upsamples and refines. It is intended for larger final outputs; at `512x512`, stage 1 is only `256x256`, so compare against the single-stage baseline before using it.
+> This feature is disabled by default. Two-stage inference generates on a reduced spatial and/or temporal grid, then upsamples and refines. It is intended for larger final outputs; at `512x512`, spatial two-stage stage 1 is only `256x256`, so compare against the single-stage baseline before using it.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--sample_two_stage` | off | Enable two-stage inference during sampling |
-| `--spatial_upsampler_path` | — | Path to spatial upsampler model. Required when `--sample_two_stage` is set |
+| `--spatial_upsampler_path` | — | Path to a spatial upsampler model. Required unless `--temporal_upsampler_path` is set |
+| `--temporal_upsampler_path` | — | Path to a temporal upsampler model. Can be used alone or with `--spatial_upsampler_path` |
 | `--distilled_lora_path` | — | Path to distilled LoRA for stage refinement. External-format LTX-2 LoRAs are converted automatically |
 | `--sample_stage2_steps` | 3 | Number of denoising steps for stage 2 |
 | `--sample_stage1_distilled_lora_multiplier` | auto | Optional stage-1 distilled LoRA strength. With `res_2s`, auto uses `0.25`; with Euler, auto uses `0.0` |
 | `--sample_stage2_distilled_lora_multiplier` | auto | Optional stage-2 distilled LoRA strength. With `res_2s`, auto uses `0.5`; with Euler, auto uses `1.0` |
+
+Upsampler axes are read from checkpoint config. With `--temporal_upsampler_path`, CLI `--frame_count` and `--frame_rate` describe the final output; stage 1 runs at `(frame_count - 1) / 2 + 1` frames and half fps, then the temporal upsampler maps latent frames `F -> 2F - 1`. With the current LTX-2 video VAE, `(frame_count - 1)` must be divisible by `16`. If both spatial and temporal upsamplers are provided, temporal-only upsampling is applied before spatial upsampling, followed by one stage-2 denoising pass at the final geometry. Audio with temporal upsampling has not been validated.
 
 LTX-2.3 preview starting point:
 
@@ -1819,7 +1822,7 @@ Notes:
 <sub>[↑ contents](#table-of-contents)</sub>
 
 > [!WARNING]
-> INT4 ConvRot LoRA training is experimental. W4A8 is the default and is the safer INT4 ConvRot mode, but this path should still be validated with short runs and sample videos before committing long training jobs. The fully 4-bit W4A4 activation mode is for diagnostics and backend experiments only.
+> INT4 ConvRot LoRA training is experimental. The default W4A8 activation mode stores the frozen base weights as packed INT4 and quantizes forward activations and backward grad-output to row-wise INT8. The 4-bit base-weight representation can introduce domain-dependent output changes versus NF4/FP8/bf16 baselines, including reduced fine detail, softer texture, or changed texture statistics. Validate with short runs and sample videos before committing long training jobs. The fully 4-bit W4A4 activation mode is for diagnostics and backend experiments only.
 
 `--int4_convrot_dynamic` rotates eligible transformer-block Linear weights offline, stores the frozen base as packed signed INT4 nibbles, rotates activations online, and runs quantized matmuls through the selected backend. The default activation mode is W4A8: weights stay packed INT4, while forward activations and backward grad-output are quantized to row-wise INT8. Set `LTX2_INT4_CONVROT_ACT_BITS=4` only to test the experimental fully 4-bit W4A4 activation path.
 
@@ -1852,6 +1855,15 @@ Options:
 - `--int4_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16`. Unlike the INT8 ConvRot path, W4A4 pads the rotated input dimension internally, so the weight input dimension does not need to be divisible by the group size.
 - `--int4_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
 - `--int4_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
+- `--int4_convrot_awq_calibration`: compute dataset-independent AWQ-style per-input-channel scales before dynamic INT4 ConvRot quantization. The scales are based on weight-column importance with uniform synthetic activation assumptions, so they are reusable across LoRA datasets for the same checkpoint/config.
+- `--int4_convrot_awq_scales`: with `--int4_convrot_awq_calibration`, save reusable scales to this safetensors path; if omitted, a checkpoint-adjacent `*.int4_convrot_awq_scales.safetensors` path is used. Without calibration, load and apply an existing scales file before dynamic quantization.
+- `--int4_convrot_awq_alpha`: scaling strength for INT4 ConvRot AWQ (`0` = no effect, `1` = full column-importance scaling; default `0.25`).
+- `--int4_convrot_activation_calibration_report`: write activation-aware per-layer diagnostics from real training batches. The report compares the actual INT4 ConvRot Linear output with the same packed INT4 weights dequantized through `F.linear`, so it measures activation/backend error rather than full original-weight error.
+- `--int4_convrot_activation_calibration_batches`: number of training batches to measure for the activation calibration report (default `1`).
+- `--int4_convrot_activation_calibration_regex`: optional module-name regex for limiting measured layers.
+- `--int4_convrot_activation_calibration_max_rows`: maximum activation rows sampled per module call (default `128`; `0` measures all rows).
+- `--int4_convrot_activation_calibration_max_layers`: maximum number of matched INT4 ConvRot layers to measure (default `0`, all matched layers).
+- `--int4_convrot_activation_calibration_only`: write the activation calibration report and exit before optimizer updates.
 - `ltx2_quantize_int4_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
 
 Notes:
@@ -1864,6 +1876,10 @@ Notes:
 - No Blackwell performance claim is made for the native INT4 kernels.
 - ConvRot's paper reports W4A4 as the intended advantage of the method, but also notes quality sensitivity for fully 4-bit diffusion transformers. Use the quality report and sample checks before committing a long run.
 - For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--int4_convrot_base` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
+- INT4 ConvRot AWQ scales multiply weight columns before ConvRot packing and divide activations by the same per-channel scales at runtime. This preserves the Linear semantics while changing which input channels receive more effective quantization resolution.
+- AWQ scale files are tied to the base checkpoint, target layer set, group-size policy, and model mode. They are not tied to the LoRA dataset identity.
+- For layer ranking, use both reports: `--int4_convrot_quality_report` estimates static packed-weight reconstruction error, while `--int4_convrot_activation_calibration_report` measures runtime activation/backend error on the observed training activation distribution.
+- Activation calibration performs extra reference matmuls during the measured forward pass. Keep the batch count small, and use `--int4_convrot_activation_calibration_regex` or `--int4_convrot_activation_calibration_max_layers` when memory is tight.
 
 **LoRA EMA with INT4 ConvRot.** `--use_ema` enables an exponential moving average of the trainable LoRA adapter weights. This can make validation previews and saved LoRA checkpoints less sensitive to noisy individual optimizer steps, which is useful when training over a very low-precision frozen base such as INT4 ConvRot. It does not average or modify the packed INT4 base model itself.
 

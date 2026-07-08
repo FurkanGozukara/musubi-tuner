@@ -558,8 +558,9 @@
 								<FormToggle fieldPath="inference.sample_two_stage" checked={s.sample_two_stage ?? false} onchange={(e) => update('sample_two_stage', e.target.checked)} tooltip="Enable spatial upsampler second stage" />
 								<FormToggle fieldPath="inference.sample_tiled_vae" checked={s.sample_tiled_vae ?? false} onchange={(e) => update('sample_tiled_vae', e.target.checked)} tooltip="Enable tiled VAE decode" />
 							</div>
-							<div class="grid grid-cols-2 gap-2">
+							<div class="grid grid-cols-3 gap-2">
 								<PathInput fieldPath="inference.spatial_upsampler_path" value={s.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler checkpoint for two-stage decode" />
+								<PathInput fieldPath="inference.temporal_upsampler_path" value={s.temporal_upsampler_path || ''} oninput={(e) => update('temporal_upsampler_path', e.target.value)} showFiles tooltip="Temporal upsampler checkpoint for two-stage decode" />
 								<PathInput fieldPath="inference.distilled_lora_path" value={s.distilled_lora_path || ''} oninput={(e) => update('distilled_lora_path', e.target.value)} showFiles tooltip="Distilled LoRA for stage two" />
 							</div>
 							<div class="grid grid-cols-3 gap-2">

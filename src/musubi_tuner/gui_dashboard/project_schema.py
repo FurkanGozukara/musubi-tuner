@@ -491,6 +491,7 @@ class TrainingConfig(BaseModel):
     sample_vae_temporal_tile_overlap: Optional[int] = 8
     sample_two_stage: bool = False
     spatial_upsampler_path: str = ""
+    temporal_upsampler_path: str = ""
     distilled_lora_path: str = ""
     sample_stage2_steps: int = 3
     sample_stage1_distilled_lora_multiplier: Optional[float] = None
@@ -1028,6 +1029,7 @@ class InferenceConfig(BaseModel):
     sample_audio_subprocess: bool = True
     sample_two_stage: bool = False
     spatial_upsampler_path: str = ""
+    temporal_upsampler_path: str = ""
     distilled_lora_path: str = ""
     sample_stage2_steps: int = 3
     sample_stage1_distilled_lora_multiplier: Optional[float] = None

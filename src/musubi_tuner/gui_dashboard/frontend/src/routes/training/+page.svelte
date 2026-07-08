@@ -1092,8 +1092,11 @@
 							<FormField type="number" fieldPath="training.reference_frames" value={t.reference_frames ?? 1} oninput={(e) => update('reference_frames', Number(e.target.value))} min={1} disabled={!t.sample_include_reference} tooltip="Number of reference frames" />
 						</div>
 						{#if t.sample_two_stage}
-						<PathInput fieldPath="training.spatial_upsampler_path" value={t.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler model path" invalid={fieldInvalid('training.spatial_upsampler_path')} error={fieldError('training.spatial_upsampler_path')} />
-						<PathInput fieldPath="training.distilled_lora_path" value={t.distilled_lora_path || ''} oninput={(e) => update('distilled_lora_path', e.target.value)} showFiles tooltip="Distilled LoRA for stage 2" />
+						<div class="grid grid-cols-3 gap-2">
+							<PathInput fieldPath="training.spatial_upsampler_path" value={t.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler model path" invalid={fieldInvalid('training.spatial_upsampler_path')} error={fieldError('training.spatial_upsampler_path')} />
+							<PathInput fieldPath="training.temporal_upsampler_path" value={t.temporal_upsampler_path || ''} oninput={(e) => update('temporal_upsampler_path', e.target.value)} showFiles tooltip="Temporal upsampler model path" invalid={fieldInvalid('training.temporal_upsampler_path')} error={fieldError('training.temporal_upsampler_path')} />
+							<PathInput fieldPath="training.distilled_lora_path" value={t.distilled_lora_path || ''} oninput={(e) => update('distilled_lora_path', e.target.value)} showFiles tooltip="Distilled LoRA for stage 2" />
+						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormField type="number" fieldPath="training.sample_stage2_steps" value={t.sample_stage2_steps ?? 3} oninput={(e) => update('sample_stage2_steps', Number(e.target.value))} min={1} tooltip="Number of denoising steps for stage 2" />
 							<FormField type="number" fieldPath="training.sample_stage1_distilled_lora_multiplier" value={t.sample_stage1_distilled_lora_multiplier ?? ''} oninput={(e) => update('sample_stage1_distilled_lora_multiplier', e.target.value ? Number(e.target.value) : null)} min={0} step="0.05" placeholder="Auto" tooltip="Distilled LoRA multiplier for stage 1. Auto uses 0.25 with RES 2S." />

@@ -1009,6 +1009,68 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Optional JSON path for per-layer INT4 ConvRot reconstruction metrics during dynamic quantization.",
     )
     parser.add_argument(
+        "--int4_convrot_awq_calibration",
+        action="store_true",
+        help=(
+            "Compute dataset-independent AWQ-style per-input-channel scales before INT4 ConvRot dynamic quantization. "
+            "If --int4_convrot_awq_scales is set, the computed scales are saved there; otherwise a checkpoint-adjacent "
+            "*.int4_convrot_awq_scales.safetensors file is used."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_awq_scales",
+        type=str,
+        default=None,
+        help=(
+            "Path to reusable INT4 ConvRot AWQ scales. With --int4_convrot_awq_calibration this is the output path; "
+            "without it, scales are loaded and applied before dynamic quantization."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_awq_alpha",
+        type=float,
+        default=0.25,
+        help="INT4 ConvRot AWQ scaling strength (0=no effect, 1=full column-importance scaling; default 0.25).",
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_report",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON path for activation-aware INT4 ConvRot diagnostics on real training batches. "
+            "Compares each quantized Linear output against the same packed weights dequantized through F.linear."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_batches",
+        type=int,
+        default=1,
+        help="Number of real training batches to measure for --int4_convrot_activation_calibration_report (default: 1).",
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_regex",
+        type=str,
+        default=None,
+        help="Optional regex limiting which INT4 ConvRot module names are measured during activation calibration.",
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_max_rows",
+        type=int,
+        default=128,
+        help="Maximum activation rows sampled per measured module call during INT4 ConvRot activation calibration (default: 128; 0=all).",
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_max_layers",
+        type=int,
+        default=0,
+        help="Maximum INT4 ConvRot layers to hook during activation calibration (default: 0, all matched layers).",
+    )
+    parser.add_argument(
+        "--int4_convrot_activation_calibration_only",
+        action="store_true",
+        help="Write the INT4 ConvRot activation calibration report and exit before optimizer updates.",
+    )
+    parser.add_argument(
         "--int8_fused_quant",
         action="store_true",
         help=(
@@ -1302,6 +1364,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Path to spatial upsampler model (ltx-2-spatial-upscaler-x2-1.0.safetensors) for two-stage inference.",
+    )
+    parser.add_argument(
+        "--temporal_upsampler_path",
+        type=str,
+        default=None,
+        help="Path to temporal upsampler model (ltx-2-temporal-upscaler-x2-1.0.safetensors); chains with the spatial one (temporal applied first), stage 1 then runs at half fps and half frame count.",
     )
     parser.add_argument(
         "--distilled_lora_path",

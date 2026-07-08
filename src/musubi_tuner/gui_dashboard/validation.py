@@ -1272,12 +1272,12 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         )
 
-    if t.sample_two_stage and not _has_text(t.spatial_upsampler_path):
+    if t.sample_two_stage and not (_has_text(t.spatial_upsampler_path) or _has_text(getattr(t, "temporal_upsampler_path", ""))):
         errors.append(
             _make_issue(
                 "error",
                 "training.spatial_upsampler_path",
-                "Upsampler Path is required when Two-Stage sampling is enabled.",
+                "Spatial or Temporal Upsampler Path is required when Two-Stage sampling is enabled.",
                 label="Upsampler Path",
                 page="training",
             )
@@ -2066,12 +2066,14 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "inference.prompt", message, label="Prompt", page="inference"))
         errors.append(_make_issue("error", "inference.from_file", message, label="Sample Prompts File", page="inference"))
 
-    if (i.sample_two_stage or i.sampling_preset == "distilled_two_stage") and not _has_text(i.spatial_upsampler_path):
+    if (i.sample_two_stage or i.sampling_preset == "distilled_two_stage") and not (
+        _has_text(i.spatial_upsampler_path) or _has_text(getattr(i, "temporal_upsampler_path", ""))
+    ):
         errors.append(
             _make_issue(
                 "error",
                 "inference.spatial_upsampler_path",
-                "Upsampler Path is required when Two-Stage sampling is enabled.",
+                "Spatial or Temporal Upsampler Path is required when Two-Stage sampling is enabled.",
                 label="Upsampler Path",
                 page="inference",
             )

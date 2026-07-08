@@ -23,6 +23,15 @@ from musubi_tuner.modules.int4_convrot_utils import (
     summarize_quality,
     write_quality_report,
 )
+from musubi_tuner.modules.int4_convrot_awq import (
+    INT4_CONVROT_AWQ_SCALE_SUFFIX,
+    apply_int4_convrot_awq_scale_to_weight,
+    compute_int4_convrot_awq_scale,
+    default_int4_convrot_awq_scales_path,
+    load_int4_convrot_awq_scales,
+    save_int4_convrot_awq_scales,
+    summarize_int4_convrot_awq_scales,
+)
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
@@ -54,6 +63,9 @@ def quantize_model(
     groupsize: str,
     mse_clip: bool,
     quality_report: str | None,
+    awq_calibration: bool,
+    awq_alpha: float,
+    awq_scales: str | None,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -66,6 +78,17 @@ def quantize_model(
     logger.info("INT4 ConvRot quantization device: %s", device)
     logger.info("INT4 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT4 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
+    if not (0.0 <= float(awq_alpha) <= 1.0):
+        raise ValueError(f"INT4 ConvRot AWQ alpha must be in [0, 1], got {awq_alpha}")
+    loaded_awq_scales = None
+    generated_awq_scales: dict[str, torch.Tensor] = {}
+    applied_awq_scales: dict[str, torch.Tensor] = {}
+    awq_save_path = None
+    if awq_calibration:
+        awq_save_path = awq_scales or default_int4_convrot_awq_scales_path(output_model)
+        logger.info("INT4 ConvRot AWQ: computing dataset-independent scales (alpha=%.3f)", float(awq_alpha))
+    elif awq_scales:
+        loaded_awq_scales = load_int4_convrot_awq_scales(awq_scales)
 
     state_dict: dict[str, torch.Tensor] = {}
     quality_layers = []
@@ -104,6 +127,20 @@ def quantize_model(
                 continue
 
             assert group_size is not None
+            awq_scale = None
+            if awq_calibration:
+                awq_scale = compute_int4_convrot_awq_scale(value, alpha=float(awq_alpha))
+                generated_awq_scales[model_key] = awq_scale
+            elif loaded_awq_scales is not None:
+                awq_scale = loaded_awq_scales.get(model_key)
+                if awq_scale is None:
+                    awq_scale = loaded_awq_scales.get(key)
+                if awq_scale is None:
+                    raise ValueError(f"INT4 ConvRot AWQ scales missing required key for {model_key}")
+            if awq_scale is not None:
+                value = apply_int4_convrot_awq_scale_to_weight(value, awq_scale)
+                applied_awq_scales[model_key] = awq_scale
+
             q, scale, shape, quality = quantize_int4_convrot_weight(
                 value,
                 group_size=group_size,
@@ -118,7 +155,11 @@ def quantize_model(
             state_dict[key] = q.cpu()
             state_dict[base + ".weight_scale"] = scale.cpu()
             state_dict[base + ".int4_shape"] = shape.cpu()
-            state_dict[base + ".comfy_quant"] = comfy_quant_tensor(group_size, in_features, padded_features)
+            state_dict[base + ".comfy_quant"] = comfy_quant_tensor(
+                group_size, in_features, padded_features, awq=awq_scale is not None
+            )
+            if awq_scale is not None:
+                state_dict[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.cpu().float()
             if quality is not None:
                 quality_layers.append(quality)
             quantized_count += 1
@@ -130,6 +171,21 @@ def quantize_model(
     output_metadata["int4_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
     output_metadata["int4_convrot_mse_clip"] = "true" if mse_clip else "false"
     output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
+    output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
+    output_metadata["int4_convrot_awq_alpha"] = str(float(awq_alpha))
+
+    if generated_awq_scales and awq_save_path:
+        save_int4_convrot_awq_scales(generated_awq_scales, awq_save_path)
+    if applied_awq_scales:
+        summary = summarize_int4_convrot_awq_scales(applied_awq_scales)
+        logger.info(
+            "INT4 ConvRot AWQ scales: layers=%s channels=%s min=%.4g max=%.4g mean=%.4g",
+            summary.get("num_layers", 0),
+            summary.get("num_channels", 0),
+            summary.get("min", 0.0),
+            summary.get("max", 0.0),
+            summary.get("mean", 0.0),
+        )
 
     output_dir = os.path.dirname(output_model)
     if output_dir:
@@ -164,6 +220,9 @@ def quantize_model(
                 "exclude_keys": list(KEEP_FP8_HIGH_PRECISION_TOKENS),
                 "calc_device": str(device),
                 "storage": "packed_signed_int4",
+                "awq_calibration": bool(awq_calibration),
+                "awq_alpha": float(awq_alpha),
+                "awq_scales": awq_save_path or awq_scales,
             },
             layers=quality_layers,
         )
@@ -199,6 +258,28 @@ def main() -> None:
     )
     parser.add_argument("--no_mse_clip", action="store_true", help="Use plain absmax scales instead of MSE clipping")
     parser.add_argument(
+        "--int4_convrot_awq_calibration",
+        action="store_true",
+        help=(
+            "Compute dataset-independent AWQ-style per-input-channel scales before INT4 ConvRot quantization. "
+            "If --int4_convrot_awq_scales is omitted, writes <output>.int4_convrot_awq_scales.safetensors."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_awq_scales",
+        default=None,
+        help=(
+            "Path to reusable AWQ scales. With --int4_convrot_awq_calibration this is the output path; "
+            "without it, scales are loaded and applied."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_awq_alpha",
+        type=float,
+        default=0.25,
+        help="INT4 ConvRot AWQ scaling strength (0=no effect, 1=full column-importance scaling; default 0.25).",
+    )
+    parser.add_argument(
         "--quality_report",
         default=None,
         help="Quality JSON path. Defaults to <output_model_without_ext>.quality.json unless --no_quality_report is set.",
@@ -216,6 +297,9 @@ def main() -> None:
         groupsize=args.groupsize,
         mse_clip=not args.no_mse_clip,
         quality_report=quality_report,
+        awq_calibration=bool(args.int4_convrot_awq_calibration),
+        awq_alpha=float(args.int4_convrot_awq_alpha),
+        awq_scales=args.int4_convrot_awq_scales,
     )
 
 

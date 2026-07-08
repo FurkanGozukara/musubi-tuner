@@ -816,6 +816,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--sample_two_stage")
         if s.spatial_upsampler_path:
             cmd += ["--spatial_upsampler_path", s.spatial_upsampler_path]
+        if getattr(s, "temporal_upsampler_path", ""):
+            cmd += ["--temporal_upsampler_path", s.temporal_upsampler_path]
         if s.distilled_lora_path:
             cmd += ["--distilled_lora_path", s.distilled_lora_path]
         if s.sample_stage2_steps != 3:
@@ -1439,6 +1441,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--sample_two_stage")
         if t.spatial_upsampler_path:
             cmd += ["--spatial_upsampler_path", t.spatial_upsampler_path]
+        if getattr(t, "temporal_upsampler_path", ""):
+            cmd += ["--temporal_upsampler_path", t.temporal_upsampler_path]
         if t.distilled_lora_path:
             cmd += ["--distilled_lora_path", t.distilled_lora_path]
         if t.sample_stage2_steps != 3:
@@ -2275,6 +2279,10 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--sample_vae_temporal_tile_overlap", str(t.sample_vae_temporal_tile_overlap)]
     if t.sample_two_stage:
         cmd.append("--sample_two_stage")
+        if t.spatial_upsampler_path:
+            cmd += ["--spatial_upsampler_path", t.spatial_upsampler_path]
+        if getattr(t, "temporal_upsampler_path", ""):
+            cmd += ["--temporal_upsampler_path", t.temporal_upsampler_path]
     if t.sample_audio_only:
         cmd.append("--sample_audio_only")
     if t.sample_disable_flash_attn:

@@ -614,6 +614,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--spatial_upsampler_path", type=str, default=None, help="Path to spatial upsampler model for two-stage inference."
     )
+    parser.add_argument(
+        "--temporal_upsampler_path",
+        type=str,
+        default=None,
+        help="Path to temporal upsampler (fps x2); chains with the spatial one (temporal first), stage 1 runs at half fps.",
+    )
     parser.add_argument("--distilled_lora_path", type=str, default=None, help="Path to distilled LoRA for two-stage refinement.")
     parser.add_argument("--sample_stage2_steps", type=int, default=3, help="Number of stage-2 refinement steps (default: 3)")
     parser.add_argument(

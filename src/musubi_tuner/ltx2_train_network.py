@@ -3451,6 +3451,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 raise ValueError(
                     "--int8_base is incompatible with --train_connectors (the quanto DiT checkpoint carries no connector weights)"
                 )
+        if getattr(args, "int4_convrot_awq_calibration", False) or getattr(args, "int4_convrot_awq_scales", None):
+            if not _int4_convrot_dynamic:
+                raise ValueError("--int4_convrot_awq_calibration/--int4_convrot_awq_scales require --int4_convrot_dynamic")
+            awq_alpha = float(getattr(args, "int4_convrot_awq_alpha", 0.25))
+            if not (0.0 <= awq_alpha <= 1.0):
+                raise ValueError("--int4_convrot_awq_alpha must be in [0, 1]")
         if getattr(args, "int8_fused_quant", False):
             os.environ["LTX2_INT8_FUSED_QUANT"] = "1"
 
@@ -3957,6 +3963,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             int4_convrot_groupsize=getattr(args, "int4_convrot_groupsize", "auto"),
             int4_convrot_mse_clip=not bool(getattr(args, "int4_convrot_no_mse_clip", False)),
             int4_convrot_quality_report=getattr(args, "int4_convrot_quality_report", None),
+            int4_convrot_awq_calibration=bool(getattr(args, "int4_convrot_awq_calibration", False)),
+            int4_convrot_awq_alpha=float(getattr(args, "int4_convrot_awq_alpha", 0.25)),
+            int4_convrot_awq_scales=getattr(args, "int4_convrot_awq_scales", None),
             nf4_base=bool(getattr(args, "nf4_base", False)),
             nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
             loftq_init=bool(getattr(args, "loftq_init", False)),

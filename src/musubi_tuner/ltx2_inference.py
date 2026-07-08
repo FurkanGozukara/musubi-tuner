@@ -53,6 +53,7 @@ class InferenceConfig:
     # Two-stage inference
     two_stage: bool = False
     spatial_upsampler_path: Optional[str] = None
+    temporal_upsampler_path: Optional[str] = None
     distilled_lora_path: Optional[str] = None
     stage2_steps: int = 3  # Stage 2 uses 3 steps (4 sigma values including 0.0)
     stage1_distilled_lora_multiplier: Optional[float] = None
@@ -106,9 +107,10 @@ class LatentIndexGuide:
     Generalizes I2V: I2V is the special case latent_idx=0, strength=1.0.
     Mirrors VideoConditionByLatentIndex semantics on 5D latents (no patchify needed).
     """
-    latent: torch.Tensor       # [B, C, T_g, H_lat, W_lat] — guide latents (already VAE-encoded)
-    latent_idx: int            # Target latent-frame slot (must satisfy latent_idx + T_g <= total latent frames)
-    strength: float = 1.0      # 1.0 = fully clean (no denoising), 0.0 = no conditioning
+
+    latent: torch.Tensor  # [B, C, T_g, H_lat, W_lat] — guide latents (already VAE-encoded)
+    latent_idx: int  # Target latent-frame slot (must satisfy latent_idx + T_g <= total latent frames)
+    strength: float = 1.0  # 1.0 = fully clean (no denoising), 0.0 = no conditioning
 
 
 @dataclass
@@ -119,8 +121,9 @@ class KeyframeGuide:
     via positional encoding, but not part of the temporal grid).
     Mirrors VideoConditionByKeyframeIndex semantics.
     """
-    latent: torch.Tensor       # [B, C, T_g, H_lat, W_lat] — guide latents
-    frame_idx: int             # Frame index used to offset positional encoding (-1 = global)
+
+    latent: torch.Tensor  # [B, C, T_g, H_lat, W_lat] — guide latents
+    frame_idx: int  # Frame index used to offset positional encoding (-1 = global)
     strength: float = 1.0
     # When True, the appended token's temporal extent is collapsed to a single
     # pixel-frame (end = start + 1). Appropriate for still-image keyframes;
@@ -147,24 +150,21 @@ class LTX2Inferencer:
 
         # Cached components
         self._spatial_upsampler: Optional[torch.nn.Module] = None
+        self._temporal_upsampler: Optional[torch.nn.Module] = None
         self._distilled_lora_state: Optional[Dict[str, torch.Tensor]] = None
         self._original_lora_state: Optional[Dict[str, torch.Tensor]] = None
         self._audio_preview_config: Optional[Dict[str, Any]] = None
 
-    def load_spatial_upsampler(
+    def _build_upsampler(
         self,
         upsampler_path: str,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.nn.Module:
-        """Load the spatial upsampler model for two-stage inference."""
-        if self._spatial_upsampler is not None:
-            return self._spatial_upsampler
-
         device = device or self.device
         dtype = dtype or torch.bfloat16
 
-        logger.info("Loading spatial upsampler from %s", upsampler_path)
+        logger.info("Loading latent upsampler from %s", upsampler_path)
 
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
         from musubi_tuner.ltx_2.model.upsampler import LatentUpsamplerConfigurator
@@ -175,8 +175,31 @@ class LTX2Inferencer:
         ).build(device=device, dtype=dtype)
 
         upsampler.eval()
-        self._spatial_upsampler = upsampler
         return upsampler
+
+    def load_spatial_upsampler(
+        self,
+        upsampler_path: str,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.nn.Module:
+        """Load the primary upsampler for two-stage inference (axis read from checkpoint config)."""
+        if self._spatial_upsampler is not None:
+            return self._spatial_upsampler
+        self._spatial_upsampler = self._build_upsampler(upsampler_path, device, dtype)
+        return self._spatial_upsampler
+
+    def load_temporal_upsampler(
+        self,
+        upsampler_path: str,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.nn.Module:
+        """Load a second upsampler to chain with the primary one (e.g. temporal fps x2)."""
+        if self._temporal_upsampler is not None:
+            return self._temporal_upsampler
+        self._temporal_upsampler = self._build_upsampler(upsampler_path, device, dtype)
+        return self._temporal_upsampler
 
     def load_distilled_lora(
         self,
@@ -189,6 +212,7 @@ class LTX2Inferencer:
         logger.info("Loading distilled LoRA from %s", lora_path)
 
         from safetensors.torch import load_file
+
         state = load_file(lora_path)
         try:
             from musubi_tuner.ltx_2.convert_lora_to_comfy import (
@@ -316,26 +340,24 @@ class LTX2Inferencer:
                 logger.warning(
                     "Prompt embeddings are video-only (%d) but model expects AV (%d). "
                     "Padding with zeros. For best results, re-cache embeddings in AV mode.",
-                    current_dim, expected_dim
+                    current_dim,
+                    expected_dim,
                 )
                 padding = torch.zeros(
-                    *prompt_embeds.shape[:-1], current_dim,
-                    dtype=prompt_embeds.dtype, device=prompt_embeds.device
+                    *prompt_embeds.shape[:-1], current_dim, dtype=prompt_embeds.dtype, device=prompt_embeds.device
                 )
                 prompt_embeds = torch.cat([prompt_embeds, padding], dim=-1)
             elif current_dim == expected_dim * 2:
                 # AV embeddings but video-only model - slice to video portion
                 logger.warning(
-                    "Prompt embeddings are AV (%d) but model expects video-only (%d). "
-                    "Using video portion only.",
-                    current_dim, expected_dim
+                    "Prompt embeddings are AV (%d) but model expects video-only (%d). Using video portion only.",
+                    current_dim,
+                    expected_dim,
                 )
                 prompt_embeds = prompt_embeds[..., :expected_dim]
             else:
                 logger.warning(
-                    "Prompt embedding dimension mismatch: got %d, expected %d. "
-                    "This may cause errors.",
-                    current_dim, expected_dim
+                    "Prompt embedding dimension mismatch: got %d, expected %d. This may cause errors.", current_dim, expected_dim
                 )
 
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dit_dtype)
@@ -369,8 +391,7 @@ class LTX2Inferencer:
                     prompt_mask = torch.cat([prompt_mask, prompt_mask], dim=0)
             else:
                 logger.warning(
-                    "CFG is enabled but negative_prompt_embeds are missing; "
-                    "falling back to duplicated positive embeddings."
+                    "CFG is enabled but negative_prompt_embeds are missing; falling back to duplicated positive embeddings."
                 )
                 prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
                 prompt_mask = _normalize_mask(prompt_mask)
@@ -504,16 +525,16 @@ class LTX2Inferencer:
                 # step doesn't overwrite the latent slice with clean guide
                 # content tagged as fully noisy (denoise_mask=1).
                 if clamped_strength <= 0.0:
-                    logger.warning(
-                        "latent_idx_guide: strength=0 skipped (no conditioning effect)."
-                    )
+                    logger.warning("latent_idx_guide: strength=0 skipped (no conditioning effect).")
                     continue
                 # Substitute the clamped strength so downstream resolve uses it.
-                guides.append(LatentIndexGuide(
-                    latent=g.latent,
-                    latent_idx=int(getattr(g, "latent_idx", 0)),
-                    strength=clamped_strength,
-                ))
+                guides.append(
+                    LatentIndexGuide(
+                        latent=g.latent,
+                        latent_idx=int(getattr(g, "latent_idx", 0)),
+                        strength=clamped_strength,
+                    )
+                )
 
         if guides:
             try:
@@ -541,7 +562,8 @@ class LTX2Inferencer:
                         cond = flat.reshape(b_g, c_g, t_g, latents.shape[3], latents.shape[4])
                         logger.info(
                             "Guide %d: resized to %s for current denoising stage.",
-                            gi, tuple(cond.shape),
+                            gi,
+                            tuple(cond.shape),
                         )
                     t_g = int(cond.shape[2])
                     if t_g < 1:
@@ -550,7 +572,10 @@ class LTX2Inferencer:
                     if g.latent_idx < 0 or g.latent_idx + t_g > total_frames:
                         logger.warning(
                             "Guide %d: latent_idx %d + T %d out of range (total frames %d), skipping.",
-                            gi, g.latent_idx, t_g, total_frames,
+                            gi,
+                            g.latent_idx,
+                            t_g,
+                            total_frames,
                         )
                         continue
                     resolved.append((cond, int(g.latent_idx), float(g.strength)))
@@ -568,7 +593,9 @@ class LTX2Inferencer:
                     if use_i2v_token_timestep_mask:
                         seq_len = total_frames * h_lat * w_lat
                         i2v_conditioning_mask_tokens = torch.zeros(
-                            (bsz, seq_len), device=latents.device, dtype=torch.bool,
+                            (bsz, seq_len),
+                            device=latents.device,
+                            dtype=torch.bool,
                         )
                         for _cond, idx, strength in resolved:
                             if strength < 1.0:
@@ -580,7 +607,8 @@ class LTX2Inferencer:
                             i2v_conditioning_mask_tokens[:, start_tok:stop_tok] = True
                         logger.info(
                             "Latent guides: %d guide(s) applied at frame indices %s.",
-                            len(resolved), [r[1] for r in resolved],
+                            len(resolved),
+                            [r[1] for r in resolved],
                         )
             except Exception as e:
                 logger.error("Latent guides: failed to setup: %s", e, exc_info=True)
@@ -597,13 +625,11 @@ class LTX2Inferencer:
             for gi, kg in enumerate(keyframe_guides):
                 gl = kg.latent
                 if gl is None or gl.dim() != 5:
-                    logger.warning("KeyframeGuide %d: invalid shape %s, skipping.",
-                                   gi, tuple(getattr(gl, "shape", ())))
+                    logger.warning("KeyframeGuide %d: invalid shape %s, skipping.", gi, tuple(getattr(gl, "shape", ())))
                     continue
                 gl = gl.to(device=latents.device, dtype=latents.dtype)
                 if gl.shape[1] != latents.shape[1]:
-                    logger.warning("KeyframeGuide %d: channel mismatch (%d vs %d), skipping.",
-                                   gi, gl.shape[1], latents.shape[1])
+                    logger.warning("KeyframeGuide %d: channel mismatch (%d vs %d), skipping.", gi, gl.shape[1], latents.shape[1])
                     continue
                 if gl.shape[-2:] != latents.shape[-2:]:
                     b_g, c_g, t_g, _, _ = gl.shape
@@ -619,7 +645,8 @@ class LTX2Inferencer:
                         "KeyframeGuide %d at frame_idx=0 with strength=%.2f competes with the "
                         "conditioning_latent first-frame lock; skipping. Use strength<1.0 for an "
                         "auxiliary cue, or remove conditioning_latent if this guide should win.",
-                        gi, kf_strength,
+                        gi,
+                        kf_strength,
                     )
                     continue
                 if i2v_lock_active and kf_frame_idx == 0 and 0.9 <= kf_strength < 1.0:
@@ -627,7 +654,8 @@ class LTX2Inferencer:
                         "KeyframeGuide %d at frame_idx=0 with strength=%.2f is very close to the "
                         "locking threshold (1.0). It will pass through as an auxiliary cue but "
                         "its effect may be visually indistinguishable from a competing lock.",
-                        gi, kf_strength,
+                        gi,
+                        kf_strength,
                     )
                 kf_dict: Dict[str, Any] = {
                     "latent": gl,
@@ -644,7 +672,8 @@ class LTX2Inferencer:
             if kf_guide_dicts:
                 logger.info(
                     "Keyframe guides: %d guide(s) at frame indices %s.",
-                    len(kf_guide_dicts), [g["frame_idx"] for g in kf_guide_dicts],
+                    len(kf_guide_dicts),
+                    [g["frame_idx"] for g in kf_guide_dicts],
                 )
             else:
                 kf_guide_dicts = None
@@ -721,9 +750,11 @@ class LTX2Inferencer:
                 stg_opts: Dict[str, Any] = {
                     "patches_replace": {},
                     "perturbations": BatchedPerturbationConfig(
-                        [PerturbationConfig(perturbations=[
-                            Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
-                        ])]
+                        [
+                            PerturbationConfig(
+                                perturbations=[Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)]
+                            )
+                        ]
                     ),
                 }
                 if i2v_conditioning_mask_tokens is not None:
@@ -821,11 +852,7 @@ class LTX2Inferencer:
                 video_x0 = x0_cond
 
             # Modality guidance: extra conditional forward with A2V/V2A attention skipped.
-            if (
-                audio_latents is not None
-                and (video_modality_scale != 1.0 or audio_modality_scale != 1.0)
-                and x0_cond is not None
-            ):
+            if audio_latents is not None and (video_modality_scale != 1.0 or audio_modality_scale != 1.0) and x0_cond is not None:
                 from musubi_tuner.ltx_2.guidance.perturbations import (
                     BatchedPerturbationConfig,
                     Perturbation,
@@ -866,9 +893,7 @@ class LTX2Inferencer:
                     mod_video_vel, mod_audio_vel = mod_pred
                 else:
                     mod_video_vel, mod_audio_vel = mod_pred, None
-                mod_video_x0 = X0PredictionWrapper.velocity_to_x0(
-                    latents, mod_video_vel.to(dtype=latents.dtype), sigma_for_video
-                )
+                mod_video_x0 = X0PredictionWrapper.velocity_to_x0(latents, mod_video_vel.to(dtype=latents.dtype), sigma_for_video)
                 video_x0 = video_x0 + (video_modality_scale - 1.0) * (x0_cond - mod_video_x0)
             else:
                 mod_audio_vel = None
@@ -878,9 +903,7 @@ class LTX2Inferencer:
             x0_audio_ptb: Optional[torch.Tensor] = None
             aud_x0_cond_for_stg: Optional[torch.Tensor] = None
             stg_video_active = stg_scale > 0.0 and stg_mode in ("video", "both")
-            stg_audio_active = (
-                stg_scale > 0.0 and stg_mode in ("audio", "both") and audio_pred is not None
-            )
+            stg_audio_active = stg_scale > 0.0 and stg_mode in ("audio", "both") and audio_pred is not None
             if stg_video_active or stg_audio_active:
                 from musubi_tuner.ltx_2.guidance.perturbations import (
                     BatchedPerturbationConfig,
@@ -891,13 +914,9 @@ class LTX2Inferencer:
 
                 pert_list: List[Perturbation] = []
                 if stg_video_active:
-                    pert_list.append(
-                        Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
-                    )
+                    pert_list.append(Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks))
                 if stg_audio_active:
-                    pert_list.append(
-                        Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks)
-                    )
+                    pert_list.append(Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks))
 
                 if do_cfg:
                     _halves = prompt_embeds.shape[0] // 2
@@ -908,12 +927,8 @@ class LTX2Inferencer:
                     stg_ctx_mask = prompt_mask
 
                 stg_latent = latents.to(dtype=self.dit_dtype)
-                stg_audio_lat = (
-                    audio_latents.to(dtype=self.dit_dtype) if audio_latents is not None else None
-                )
-                stg_timestep = sigma.expand(stg_latent.shape[0]).to(
-                    device=self.device, dtype=self.dit_dtype
-                )
+                stg_audio_lat = audio_latents.to(dtype=self.dit_dtype) if audio_latents is not None else None
+                stg_timestep = sigma.expand(stg_latent.shape[0]).to(device=self.device, dtype=self.dit_dtype)
 
                 stg_opts: Dict[str, Any] = {"patches_replace": {}}
                 if i2v_conditioning_mask_tokens is not None:
@@ -948,16 +963,12 @@ class LTX2Inferencer:
 
                 if stg_video_active:
                     stg_video_vel = stg_video_vel.to(dtype=latents.dtype)
-                    x0_video_ptb = X0PredictionWrapper.velocity_to_x0(
-                        latents, stg_video_vel, sigma_for_video
-                    )
+                    x0_video_ptb = X0PredictionWrapper.velocity_to_x0(latents, stg_video_vel, sigma_for_video)
                     video_x0 = video_x0 + stg_scale * (x0_cond - x0_video_ptb)
 
                 if stg_audio_active and stg_audio_vel is not None and audio_latents is not None:
                     stg_audio_vel = stg_audio_vel.to(dtype=audio_latents.dtype)
-                    x0_audio_ptb = X0PredictionWrapper.velocity_to_x0(
-                        audio_latents, stg_audio_vel, sigma.item()
-                    )
+                    x0_audio_ptb = X0PredictionWrapper.velocity_to_x0(audio_latents, stg_audio_vel, sigma.item())
 
             # CFG★ rescaling: after CFG + STG, rescale prediction toward cond.std() to
             # prevent oversaturation from amplified guidance. Matches the MultiModalGuider behavior.
@@ -1105,8 +1116,28 @@ class LTX2Inferencer:
         # Calculate dimensions
         temporal_factor, spatial_factor = self._get_vae_factors()
 
-        # For two-stage, generate at half resolution first
+        # For two-stage, the upsampler checkpoints decide the axes: spatial upsampling
+        # halves stage-1 resolution, temporal upsampling halves the stage-1 frame grid.
+        # One checkpoint per flag; both flags together chain (temporal applied first).
+        two_stage_spatial = True
+        two_stage_temporal = False
         if config.two_stage:
+            if self._spatial_upsampler is None and config.spatial_upsampler_path:
+                self.load_spatial_upsampler(config.spatial_upsampler_path)
+            if self._temporal_upsampler is None and config.temporal_upsampler_path:
+                self.load_temporal_upsampler(config.temporal_upsampler_path)
+            upsampler_chain = [m for m in (self._temporal_upsampler, self._spatial_upsampler) if m is not None]
+            if not upsampler_chain:
+                raise ValueError("Upsampler required for two-stage inference")
+            two_stage_spatial = any(getattr(m, "spatial_upsample", False) for m in upsampler_chain)
+            two_stage_temporal = any(getattr(m, "temporal_upsample", False) for m in upsampler_chain)
+            # Apply temporal-only modules before spatial modules so the temporal
+            # expansion operates on the stage-1 spatial grid.
+            upsampler_chain.sort(
+                key=lambda m: 0 if (getattr(m, "temporal_upsample", False) and not getattr(m, "spatial_upsample", False)) else 1
+            )
+
+        if config.two_stage and two_stage_spatial:
             gen_width = config.width // 2
             gen_height = config.height // 2
         else:
@@ -1118,15 +1149,28 @@ class LTX2Inferencer:
         gen_height = (gen_height // spatial_factor) * spatial_factor
         frame_count = (config.frame_count - 1) // temporal_factor * temporal_factor + 1
 
-        latent_frames = (frame_count - 1) // temporal_factor + 1
+        stage1_frame_count = frame_count
+        stage1_frame_rate = config.frame_rate
+        if config.two_stage and two_stage_temporal:
+            # The temporal upsampler maps latent frames F -> 2F-1 (pixel (n-1)/2+1 -> n),
+            # so stage 1 runs on the half-rate grid at half fps.
+            if (frame_count - 1) % (2 * temporal_factor) != 0:
+                raise ValueError(
+                    f"frame_count={frame_count} incompatible with temporal two-stage: "
+                    f"(frame_count-1) must be divisible by {2 * temporal_factor}"
+                )
+            stage1_frame_count = (frame_count - 1) // 2 + 1
+            stage1_frame_rate = config.frame_rate / 2.0
+            if config.extra.get("audio_config"):
+                logger.warning("Temporal two-stage with audio is untested; audio timing may be wrong")
+
+        latent_frames = (stage1_frame_count - 1) // temporal_factor + 1
         latent_height = gen_height // spatial_factor
         latent_width = gen_width // spatial_factor
         in_channels = getattr(self.transformer, "in_channels", 128)
 
         # Initialize latents
-        latents = self._init_latents(
-            1, in_channels, latent_frames, latent_height, latent_width, generator
-        )
+        latents = self._init_latents(1, in_channels, latent_frames, latent_height, latent_width, generator)
 
         # I2V conditioning will be applied during denoising loop via denoise_mask
 
@@ -1136,7 +1180,7 @@ class LTX2Inferencer:
             audio_cfg = config.extra.get("audio_config", {})
             if audio_cfg:
                 video_shape = VideoPixelShape(
-                    batch=1, frames=frame_count, height=gen_height, width=gen_width, fps=config.frame_rate
+                    batch=1, frames=stage1_frame_count, height=gen_height, width=gen_width, fps=stage1_frame_rate
                 )
                 audio_shape = AudioLatentShape.from_video_pixel_shape(
                     video_shape,
@@ -1156,6 +1200,7 @@ class LTX2Inferencer:
 
         # Stage 1: Main generation
         from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
+
         sigmas = build_ltx2_sigmas(
             config.sample_steps,
             latent=latents,
@@ -1163,8 +1208,14 @@ class LTX2Inferencer:
             sampling_preset=config.sampling_preset,
         ).to(device=self.device, dtype=torch.float32)
 
-        logger.info("Stage 1: Generating at %dx%d (%d frames, %d steps)",
-                   gen_width, gen_height, frame_count, config.sample_steps)
+        logger.info(
+            "Stage 1: Generating at %dx%d (%d frames @ %.4g fps, %d steps)",
+            gen_width,
+            gen_height,
+            stage1_frame_count,
+            stage1_frame_rate,
+            config.sample_steps,
+        )
 
         resolved_sampler = resolve_ltx2_sampler(config.sample_sampler, config.sampling_preset)
         if resolved_sampler == "res_2s":
@@ -1195,8 +1246,13 @@ class LTX2Inferencer:
 
         with torch.no_grad():
             latents, audio_latents = self._denoise_loop(
-                latents, sigmas, prompt_embeds, prompt_mask,
-                do_cfg, cfg_scale, config.frame_rate,
+                latents,
+                sigmas,
+                prompt_embeds,
+                prompt_mask,
+                do_cfg,
+                cfg_scale,
+                stage1_frame_rate,
                 audio_latents=audio_latents,
                 audio_only=config.audio_only,
                 progress_desc="Stage 1" if config.two_stage else "LTX-2 inference",
@@ -1222,14 +1278,17 @@ class LTX2Inferencer:
             if stage1_lora_applied:
                 self._remove_distilled_lora(stage1_lora_multiplier)
 
-            logger.info("Stage 2: Upsampling and refining to %dx%d", config.width, config.height)
-
-            # Load upsampler if needed
-            if self._spatial_upsampler is None and config.spatial_upsampler_path:
-                self.load_spatial_upsampler(config.spatial_upsampler_path)
-
-            if self._spatial_upsampler is None:
-                raise ValueError("Spatial upsampler required for two-stage inference")
+            axes = "+".join((["temporal"] if two_stage_temporal else []) + (["spatial"] if two_stage_spatial else []))
+            logger.info(
+                "Stage 2: %s upsampling (%d module(s)) and refining to %dx%d, %d frames @ %.4g fps",
+                axes,
+                len(upsampler_chain),
+                config.width,
+                config.height,
+                frame_count,
+                config.frame_rate,
+            )
+            # Upsampler chain already loaded during dimension setup.
 
             # Optionally offload transformer to CPU while upsampling (saves VRAM)
             transformer_was_offloaded = False
@@ -1245,12 +1304,13 @@ class LTX2Inferencer:
                 if transformer_was_offloaded:
                     clean_memory_on_device(self.device)
 
-            # Upsample latents
-            self._spatial_upsampler.to(self.device)
-            with torch.no_grad():
-                latents = self._upsample_latents(latents, self._spatial_upsampler)
-            self._spatial_upsampler.to("cpu")
-            clean_memory_on_device(self.device)
+            # Upsample latents through the chain (temporal-only module first)
+            for upsampler_module in upsampler_chain:
+                upsampler_module.to(self.device)
+                with torch.no_grad():
+                    latents = self._upsample_latents(latents, upsampler_module)
+                upsampler_module.to("cpu")
+                clean_memory_on_device(self.device)
 
             # Restore transformer for stage 2
             if transformer_was_offloaded:
@@ -1270,7 +1330,7 @@ class LTX2Inferencer:
 
             # Stage 2 denoising with distilled sigmas
             stage2_sigmas = torch.tensor(
-                STAGE_2_DISTILLED_SIGMA_VALUES[:config.stage2_steps + 1],
+                STAGE_2_DISTILLED_SIGMA_VALUES[: config.stage2_steps + 1],
                 device=self.device,
                 dtype=torch.float32,
             )
@@ -1287,8 +1347,7 @@ class LTX2Inferencer:
                 if current_dim * 2 == expected_dim:
                     # Pad video-only to AV
                     padding = torch.zeros(
-                        *stage2_embeds.shape[:-1], current_dim,
-                        dtype=stage2_embeds.dtype, device=stage2_embeds.device
+                        *stage2_embeds.shape[:-1], current_dim, dtype=stage2_embeds.dtype, device=stage2_embeds.device
                     )
                     stage2_embeds = torch.cat([stage2_embeds, padding], dim=-1)
                 elif current_dim == expected_dim * 2:
@@ -1306,9 +1365,7 @@ class LTX2Inferencer:
             # Add noise at stage 2 starting sigma using flow matching formula:
             # noisy = (1 - sigma) * x0 + sigma * noise
             sigma = stage2_sigmas[0].item()
-            video_noise = torch.randn(
-                latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
-            )
+            video_noise = torch.randn(latents.shape, dtype=latents.dtype, device=latents.device, generator=generator)
             latents = (1.0 - sigma) * latents + sigma * video_noise
 
             # Also add noise to audio latents if present.
@@ -1320,8 +1377,13 @@ class LTX2Inferencer:
 
             with torch.no_grad():
                 latents, audio_latents = self._denoise_loop(
-                    latents, stage2_sigmas, stage2_embeds, stage2_mask,
-                    do_cfg=False, cfg_scale=1.0, frame_rate=config.frame_rate,
+                    latents,
+                    stage2_sigmas,
+                    stage2_embeds,
+                    stage2_mask,
+                    do_cfg=False,
+                    cfg_scale=1.0,
+                    frame_rate=config.frame_rate,
                     audio_latents=audio_latents,
                     audio_only=config.audio_only,
                     progress_desc="Stage 2 refine",
@@ -1342,11 +1404,7 @@ class LTX2Inferencer:
                 )
 
             # Remove distilled LoRA
-            if (
-                config.distilled_lora_path
-                and self._distilled_lora_state is not None
-                and stage2_lora_multiplier != 0.0
-            ):
+            if config.distilled_lora_path and self._distilled_lora_state is not None and stage2_lora_multiplier != 0.0:
                 self._remove_distilled_lora(stage2_lora_multiplier)
 
         # Decode video
