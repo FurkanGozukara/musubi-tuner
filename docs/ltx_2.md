@@ -1599,6 +1599,8 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU) |
 
+**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** Fuses the per-attention query/key RMSNorm and rotary embedding into a single CUDA kernel, covering both the interleaved and split RoPE layouts (LTX-2.3 uses split). Opt in by setting the environment variable `LTX2_FUSED_NORM_ROPE=1`; leaving it unset keeps the exact eager path. The kernel is JIT-compiled on first use and requires a CUDA GPU with a working nvcc/MSVC or nvcc/gcc toolchain; if it cannot be built the trainer prints a one-time warning and uses the eager path. It applies to bf16 activations; other cases fall back automatically. The fused forward runs the norm and rotation in one pass, and gradients come from a closed-form backward that matches the eager path within bf16 rounding, so training results are unchanged.
+
 ### Blockwise Checkpointing
 <sub>[↑ contents](#table-of-contents)</sub>
 

@@ -7,6 +7,7 @@ import os
 import torch
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
+from musubi_tuner.modules import fused_norm_rope
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -546,12 +547,20 @@ class Attention(torch.nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        fused_qk = None
+        if pe is not None and fused_norm_rope.is_enabled():
+            fused_qk = fused_norm_rope.try_qk_norm_rope(
+                q, k, self.q_norm.weight, self.k_norm.weight, pe, k_pe, self.q_norm.eps, self.rope_type
+            )
+        if fused_qk is not None:
+            q, k = fused_qk
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-        if pe is not None:
-            q = apply_rotary_emb(q, pe, self.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
         if self._motion_record_enabled:
             bsz = q.shape[0]
