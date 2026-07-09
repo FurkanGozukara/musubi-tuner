@@ -318,6 +318,11 @@ def _append_compile_args(cmd: list[str], t) -> None:
             cmd += ["--compile_backend", t.compile_backend]
         if getattr(t, "compile_mode", ""):
             cmd += ["--compile_mode", t.compile_mode]
+        inductor_config = getattr(t, "inductor_config", "")
+        if inductor_config:
+            tokens = [tok for tok in inductor_config.replace(",", " ").split() if tok]
+            if tokens:
+                cmd += ["--inductor_config", *tokens]
         compile_dynamic = _compile_dynamic_value(getattr(t, "compile_dynamic", None))
         if compile_dynamic:
             cmd += ["--compile_dynamic", compile_dynamic]
@@ -680,6 +685,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--flash_attn")
     if s.flash3:
         cmd.append("--flash3")
+    if getattr(s, "cudnn_attn", False):
+        cmd.append("--cudnn_attn")
     if s.sdpa:
         cmd.append("--sdpa")
     if s.xformers:
@@ -1029,6 +1036,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--flash_attn")
     if t.flash3:
         cmd.append("--flash3")
+    if getattr(t, "cudnn_attn", False):
+        cmd.append("--cudnn_attn")
     if t.sdpa:
         cmd.append("--sdpa")
     if t.sage_attn:
@@ -1976,6 +1985,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--flash_attn")
     if t.flash3:
         cmd.append("--flash3")
+    if getattr(t, "cudnn_attn", False):
+        cmd.append("--cudnn_attn")
     if t.sdpa:
         cmd.append("--sdpa")
     if t.sage_attn:
@@ -2140,6 +2151,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--fp8_gemm_min_numel", str(t.fp8_gemm_min_numel)]
         if not getattr(t, "fp8_gemm_compile", True):
             cmd.append("--no-fp8_gemm_compile")
+        if getattr(t, "fp8_gemm_scaling", "tensor") != "tensor":
+            cmd += ["--fp8_gemm_scaling", t.fp8_gemm_scaling]
 
     # int8 weight-only full-FT (resident int8 weights + SR update).
     if getattr(t, "int8_weights", False):
@@ -2616,6 +2629,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--flash_attn")
     if t.flash3:
         cmd.append("--flash3")
+    if getattr(t, "cudnn_attn", False):
+        cmd.append("--cudnn_attn")
     if t.sdpa:
         cmd.append("--sdpa")
     if t.sage_attn:
@@ -2740,6 +2755,11 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--compile_backend", t.compile_backend]
         if t.compile_mode:
             cmd += ["--compile_mode", t.compile_mode]
+        inductor_config = getattr(t, "inductor_config", "")
+        if inductor_config:
+            tokens = [tok for tok in inductor_config.replace(",", " ").split() if tok]
+            if tokens:
+                cmd += ["--inductor_config", *tokens]
         compile_dynamic = _compile_dynamic_value(t.compile_dynamic)
         if compile_dynamic:
             cmd += ["--compile_dynamic", compile_dynamic]

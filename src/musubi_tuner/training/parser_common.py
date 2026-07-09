@@ -83,6 +83,12 @@ def _add_attention_args(parser: argparse.ArgumentParser) -> None:
         " / CrossAttentionにFlashAttention 3を使う、FlashAttention 3が必要。HunyuanVideoは未対応。",
     )
     parser.add_argument(
+        "--cudnn_attn",
+        action="store_true",
+        help="use cuDNN-prioritized SDPA attention; fastest SDPA backend on Hopper and on Windows,"
+        " falls back per-shape to flash/efficient/math (LTX-2 only)",
+    )
+    parser.add_argument(
         "--split_attn",
         action="store_true",
         help="use split attention for attention calculation (split batch size=1, affects memory usage and speed)"
@@ -108,6 +114,15 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         default="default",  # 学習用のデフォルト
         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
         help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
+    )
+    parser.add_argument(
+        "--inductor_config",
+        nargs="*",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Set arbitrary torch._inductor.config / torch._dynamo.config attributes as KEY=VALUE (dotted keys "
+        "allowed, e.g. triton.enable_persistent_tma_matmul=true or coordinate_descent_tuning=true). Applied only "
+        "when --compile is set. Values parsed as bool/int/float else string.",
     )
     parser.add_argument(
         "--compile_dynamic",

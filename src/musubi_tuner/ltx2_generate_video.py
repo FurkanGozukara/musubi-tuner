@@ -405,12 +405,18 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa", "sageattn"],
+        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa", "sageattn", "cudnn"],
         help="Attention backend",
     )
     # Training-style boolean attention flags (for config portability)
     parser.add_argument("--flash_attn", action="store_true", help="Use FlashAttention (same as --attn_mode flash)")
     parser.add_argument("--flash3", action="store_true", help="Use FlashAttention 3 (same as --attn_mode flash3)")
+    parser.add_argument(
+        "--cudnn_attn",
+        action="store_true",
+        help="Use cuDNN-prioritized SDPA (same as --attn_mode cudnn); fastest SDPA backend on Hopper and on Windows,"
+        " falls back per-shape to flash/efficient/math",
+    )
     parser.add_argument("--sdpa", action="store_true", help="Use SDPA (same as --attn_mode sdpa)")
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument(
@@ -741,13 +747,21 @@ def parse_args() -> argparse.Namespace:
 
 def _configure_attention_flags(args: argparse.Namespace) -> None:
     # If a training-style boolean flag was explicitly set, it takes priority
-    if args.flash_attn or args.flash3 or args.sdpa or args.xformers or getattr(args, "sage_attn", False):
+    if (
+        args.flash_attn
+        or args.flash3
+        or args.sdpa
+        or args.xformers
+        or getattr(args, "sage_attn", False)
+        or getattr(args, "cudnn_attn", False)
+    ):
         # Flags already set by argparse; ensure the others are False
         args.flash_attn = bool(args.flash_attn)
         args.flash3 = bool(args.flash3)
         args.sdpa = bool(args.sdpa)
         args.xformers = bool(args.xformers)
         args.sage_attn = bool(getattr(args, "sage_attn", False))
+        args.cudnn_attn = bool(getattr(args, "cudnn_attn", False))
         return
 
     # Otherwise derive from --attn_mode
@@ -757,6 +771,7 @@ def _configure_attention_flags(args: argparse.Namespace) -> None:
     args.flash3 = attn_mode == "flash3"
     args.xformers = attn_mode == "xformers"
     args.sage_attn = attn_mode in {"sageattn", "sage_attention", "sage"}
+    args.cudnn_attn = attn_mode in {"cudnn", "pytorch_cudnn"}
 
 
 # ---------------------------------------------------------------------------

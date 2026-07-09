@@ -218,6 +218,7 @@ class TrainingConfig(BaseModel):
     flash_attn: bool = False
     flash3: bool = False
     sdpa: bool = False
+    cudnn_attn: bool = False
     sage_attn: bool = False
     xformers: bool = False
     gemma_load_in_8bit: bool = False
@@ -430,6 +431,7 @@ class TrainingConfig(BaseModel):
     compile: bool = False
     compile_backend: str = "inductor"
     compile_mode: str = "default"
+    inductor_config: str = ""
     compile_dynamic: bool | str | None = False
     compile_fullgraph: bool = False
     compile_cache_size_limit: Optional[int] = None
@@ -838,6 +840,7 @@ class FullFinetuneConfig(TrainingConfig):
     fp8_gemm_grad_dtype: Literal["e4m3", "e5m2"] = "e4m3"
     fp8_gemm_min_numel: int = 16384
     fp8_gemm_compile: bool = True
+    fp8_gemm_scaling: Literal["tensor", "rowwise"] = "tensor"
 
     # int8 weight-only FFT (requires fused_backward_pass + factored optimizer).
     int8_weights: bool = False
@@ -968,6 +971,7 @@ class InferenceConfig(BaseModel):
     flash_attn: bool = False
     flash3: bool = False
     sdpa: bool = False
+    cudnn_attn: bool = False
     xformers: bool = False
     fp8_base: bool = False
     fp8_scaled: bool = False

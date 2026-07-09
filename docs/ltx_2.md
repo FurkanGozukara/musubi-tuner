@@ -733,6 +733,9 @@ Optional torch.compile and DataLoader flags:
 | Flag | Effect |
 |---|---|
 | `--compile` | Enables block-level `torch.compile` for the LTX-2 transformer. |
+| `--compile_mode MODE` | `torch.compile` mode, e.g. `default` or `max-autotune-no-cudagraphs`. |
+| `--compile_cache_size_limit N` | Sets the Dynamo cache size limit (raise it for multi-bucket datasets to avoid recompiles). |
+| `--inductor_config KEY=VALUE ...` | Sets arbitrary `torch._inductor.config` / `torch._dynamo.config` attributes; dotted keys allowed (e.g. `coordinate_descent_tuning=true triton.enable_persistent_tma_matmul=true`). Values parse as bool/int/float/none/string; unknown keys are skipped with a warning. Applied only with `--compile`. Use `triton.enable_persistent_tma_matmul=true` to opt into TMA GEMM kernels on Hopper. |
 | `--compile_dynamic false` | Avoids dynamic-shape compile paths when the training shape is fixed. |
 | `--compile_auto_cache_size_limit` | Raises the Dynamo cache limit based on the number of compiled blocks. |
 | `--compile_fallback_to_eager` | Restores eager blocks and continues if compile setup fails. |
@@ -1596,8 +1599,9 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 | `--ddp_find_unused_parameters` | Enable DDP unused-parameter detection for branchy LoRA targets (off by default) |
 | `--gemma_bnb_use_local_rank` | For Gemma 8-bit/4-bit loading, pin the quantized model to this process's `LOCAL_RANK` GPU (off by default) |
 | `--sdpa` | Use PyTorch scaled dot-product attention (recommended default) |
+| `--cudnn_attn` | Use the cuDNN attention backend (SDPA with cuDNN prioritized, per-shape fallback to flash/efficient/math). Mask-safe. Fast on Hopper, and the fastest backend on Windows where no flash build is available. Requires no extra package. |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
-| `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU) |
+| `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU). Masked cross-attention uses the FA3 variable-length path (no fallback to slower SDPA). |
 
 **Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** Fuses the per-attention query/key RMSNorm and rotary embedding into a single CUDA kernel, covering both the interleaved and split RoPE layouts (LTX-2.3 uses split). Opt in by setting the environment variable `LTX2_FUSED_NORM_ROPE=1`; leaving it unset keeps the exact eager path. The kernel is JIT-compiled on first use and requires a CUDA GPU with a working nvcc/MSVC or nvcc/gcc toolchain; if it cannot be built the trainer prints a one-time warning and uses the eager path. It applies to bf16 activations; other cases fall back automatically. The fused forward runs the norm and rotation in one pass, and gradients come from a closed-form backward that matches the eager path within bf16 rounding, so training results are unchanged.
 
@@ -2420,7 +2424,7 @@ When `include_patterns` is set (either explicitly or via a preset), only modules
 
 `ltx2_estimate.py` runs the LTX forward/loss path on cached training batches and accumulates squared gradients ("Fisher-style importance") for LoRA-targetable weights.
 
-- It uses `setup_parser_common()` plus `ltx2_setup_parser()`, so the normal LTX argument surface is available. In the estimator path, attention backend selection (`--sdpa`, `--flash_attn`, `--flash3`, `--xformers`), `--blocks_to_swap`, `--gradient_checkpointing`, `--blockwise_checkpointing`, `--compile`, `--fp8_base` / `--fp8_scaled`, `--nf4_base`, and `--split_attn` are applied.
+- It uses `setup_parser_common()` plus `ltx2_setup_parser()`, so the normal LTX argument surface is available. In the estimator path, attention backend selection (`--sdpa`, `--cudnn_attn`, `--flash_attn`, `--flash3`, `--xformers`), `--blocks_to_swap`, `--gradient_checkpointing`, `--blockwise_checkpointing`, `--compile`, `--fp8_base` / `--fp8_scaled`, `--nf4_base`, and `--split_attn` are applied.
 - It requires `--dataset_config` and cached dataset items. If the dataset group has no training items, it exits with `No training items found in the dataset. Create latent/text caches first.`
 - It keeps up to `--estimation_batches` batches. Batches without 5D `latents` are skipped.
 - If `--network_weights` is set, the estimator attaches that LoRA to the transformer and scores the LoRA weights from the attached network (`candidate_source = "network"`).
@@ -4452,6 +4456,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --output_name ltx23_adafactor_full
 ```
 
+
 Add `--save_merged_checkpoint` if you need to write a full merged LTX-2 checkpoint instead of only the trained transformer weights. This can add save-time memory pressure, and repeated merged saves may show slow memory growth, so validate saving separately when running close to the VRAM limit.
 
 TREAD can also be enabled as a training-time token-routing option. In measured LTX-2.3 runs, `selection_ratio=0.5` reduced step time by about 15-21% depending on mode. Evaluate output quality and convergence separately before using it for long runs because TREAD changes the effective token route. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80))
@@ -4963,7 +4968,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
-**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`, expect roughly bf16-minus-~10 GB peak VRAM and a small step-time overhead (~1.05x) with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). The compiled GEMM roughly halves the FP8 GEMM-op time; measure end-to-end on your hardware. Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
+**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`, expect roughly bf16-minus-~10 GB peak VRAM and a small step-time overhead (~1.05x) with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). The compiled GEMM roughly halves the FP8 GEMM-op time; measure end-to-end on your hardware. Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`, `--fp8_gemm_scaling {tensor,rowwise}`. `--fp8_gemm_scaling tensor` (default) uses one dynamic scale per tensor; `rowwise` uses per-row dynamic scales via `torch._scaled_mm` rowwise support for better numerics on Hopper (requires torch ≥ 2.5). Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
 
 > [!CAUTION]
 > **Experimental.** Validate loss, long-run stability, and final sample quality on your own runs (and monitor gradient norms) before relying on it for production.

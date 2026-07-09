@@ -3767,6 +3767,8 @@ def main() -> None:
         attn_mode = "flash"
     elif args.flash3:
         attn_mode = "flash3"
+    elif getattr(args, "cudnn_attn", False):
+        attn_mode = "cudnn"
     elif args.xformers:
         attn_mode = "xformers"
     else:
@@ -3853,15 +3855,17 @@ def main() -> None:
             grad_dtype=resolve_fp8_dtype(getattr(args, "fp8_gemm_grad_dtype", "e4m3")),
             min_weight_numel=int(getattr(args, "fp8_gemm_min_numel", 16384) or 0),
             compile_gemm=bool(getattr(args, "fp8_gemm_compile", True)),
+            scaling=str(getattr(args, "fp8_gemm_scaling", "tensor")),
         )
         logger.info(
-            "FP8 full-FT: replaced %d Linear layers (%.3fB params) targets=%s grad_dtype=%s compile=%s "
+            "FP8 full-FT: replaced %d Linear layers (%.3fB params) targets=%s grad_dtype=%s compile=%s scaling=%s "
             "skipped_not_target=%d skipped_dims=%d skipped_small=%d",
             fp8_gemm_summary.replaced,
             float(fp8_gemm_summary.replaced_numel) / 1_000_000_000.0,
             getattr(args, "fp8_gemm_targets", "video"),
             getattr(args, "fp8_gemm_grad_dtype", "e4m3"),
             bool(getattr(args, "fp8_gemm_compile", True)),
+            str(getattr(args, "fp8_gemm_scaling", "tensor")),
             fp8_gemm_summary.skipped_not_target,
             fp8_gemm_summary.skipped_dims,
             fp8_gemm_summary.skipped_small,

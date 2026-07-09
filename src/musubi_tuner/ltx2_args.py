@@ -1118,6 +1118,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "On by default; ~halves the FP8 GEMM step time with no quality change. Use --no-fp8_gemm_compile to disable.",
     )
     parser.add_argument(
+        "--fp8_gemm_scaling",
+        type=str,
+        default="tensor",
+        choices=["tensor", "rowwise"],
+        help="FP8 scaling granularity for --fp8_gemm: tensor (per-tensor dynamic scale) or rowwise "
+        "(per-row dynamic scales via torch._scaled_mm rowwise support; better numerics on Hopper, requires torch>=2.5).",
+    )
+    parser.add_argument(
         "--int8_weights",
         action="store_true",
         help=(

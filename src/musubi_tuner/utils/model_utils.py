@@ -349,7 +349,62 @@ def _configure_compile_cache(args: argparse.Namespace, target_count: int) -> Non
         logger.info("Set torch._dynamo.config.cache_size_limit to %s", cache_size_limit)
 
 
+def _parse_inductor_config_value(raw: str) -> Any:
+    lowered = raw.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "none":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _apply_inductor_config(args: argparse.Namespace) -> None:
+    overrides = getattr(args, "inductor_config", None)
+    if not overrides:
+        return
+
+    import torch._inductor.config as _ind
+    import torch._dynamo.config as _dyn
+
+    applied: list[str] = []
+    for token in overrides:
+        if "=" not in token:
+            raise ValueError(f"--inductor_config expects KEY=VALUE tokens, got {token!r}")
+        key, raw_value = token.split("=", 1)
+        key = key.strip()
+        value = _parse_inductor_config_value(raw_value)
+
+        parts = key.split(".")
+        root = _ind if hasattr(_ind, parts[0]) else _dyn
+        target = root
+        missing = False
+        for part in parts[:-1]:
+            if not hasattr(target, part):
+                missing = True
+                break
+            target = getattr(target, part)
+        if missing or not hasattr(target, parts[-1]):
+            logger.warning("--inductor_config: skipping unknown key %s", key)
+            continue
+        setattr(target, parts[-1], value)
+        applied.append(f"{key}={value}")
+
+    if applied:
+        logger.info("Applied %d inductor/dynamo config overrides: %s", len(applied), " ".join(applied))
+
+
 def compile_module(args: argparse.Namespace, module: torch.nn.Module) -> torch.nn.Module:
+    _apply_inductor_config(args)
     compile_dynamic = compile_dynamic_arg(args)
     logger.info(
         "Compiling model with torch.compile: backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
@@ -390,6 +445,7 @@ def compile_transformer(
         for _, _, block in targets:
             disable_linear_from_compile(block)
 
+    _apply_inductor_config(args)
     compile_dynamic = compile_dynamic_arg(args)
     logger.info(
         "Compiling DiT model blocks with torch.compile: blocks=%d, backend=%s, mode=%s, dynamic=%s, fullgraph=%s",

@@ -402,6 +402,8 @@ def _resolve_attn_mode(args: argparse.Namespace) -> str:
         return "flash"
     if args.flash3:
         return "flash3"
+    if getattr(args, "cudnn_attn", False):
+        return "cudnn"
     if args.xformers:
         return "xformers"
     return "torch"

@@ -355,9 +355,11 @@ def train(self, args):
         attn_mode = "xformers"
     elif args.flash3:
         attn_mode = "flash3"
+    elif getattr(args, "cudnn_attn", False):
+        attn_mode = "cudnn"
     else:
         raise ValueError(
-            "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
+            "either --sdpa, --flash-attn, --flash3, --cudnn-attn, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --cudnn-attn, --sage-attn, --xformersのいずれかを指定してください"
         )
     transformer = self.load_transformer(accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype)
     transformer.eval()
