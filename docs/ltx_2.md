@@ -98,7 +98,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
     - [INT8 ConvRot Base](#int8-convrot-base)
-    - [INT4 ConvRot W4A8/W4A4](#int4-convrot-w4a8w4a4)
+    - [W4A4G4 Training](#w4a4g4-training)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Function Type](#loss-function-type)
@@ -1576,7 +1576,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 - `--nf4_base`: NF4 4-bit quantization (~10 GB base weights). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
 - `--int8_convrot_dynamic`: quantize a standard checkpoint to INT8 ConvRot at load time. See [INT8 ConvRot Base](#int8-convrot-base) below.
-- `--int4_convrot_dynamic`: INT4 ConvRot path. Weights are stored as packed signed INT4. The default runtime is W4A8; W4A4 remains available as an explicit experimental mode. See [INT4 ConvRot W4A8/W4A4](#int4-convrot-w4a8w4a4) below.
+- `--w4a4g4` / `--w4a8`: INT4 ConvRot path (weights stored as packed signed INT4). `--w4a8` quantizes activations to INT8; `--w4a4g4` is the fully 4-bit FourTune pipeline. Both auto-detect a pre-quantized vs bf16 checkpoint. See [W4A4G4 Training](#w4a4g4-training) below.
 - `--quantize_device cpu|cuda|gpu`: Device for startup quantization in NF4/FP8 and dynamic INT8/INT4 ConvRot paths (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves the quantized result to GPU; this avoids load-time GPU high-water marks at the cost of more host RAM and startup time. `cuda` loads and quantizes directly on GPU. For NF4/FP8 it overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE`.
 
 #### Other Memory Options
@@ -1824,24 +1824,41 @@ Notes:
 - The runtime uses the same int8 backend selector as the existing int8 path (`--w8a8_backend torch|triton|cutlass`). Pre-quantized INT8 ConvRot defaults to `torch._int_mm` when available; pass `--w8a8_backend triton` or `--w8a8_backend cutlass` to force a backend.
 - The forward ConvRot activation rotation + rowwise quantization and the backward grad-input scale + inverse ConvRot epilogue are fused into single Triton kernels by default (group sizes up to 256); set `LTX2_INT8_FUSED_QUANT=0` for the eager path. The fused path is Triton-first; set `LTX2_INT8_CONVROT_CUDA_QUANT=1` to build and use the native CUDA ConvRot kernels instead (one-time compile). Both fall back to eager when Triton/CUDA are unavailable.
 
-### INT4 ConvRot W4A8/W4A4
+### W4A4G4 Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
-> [!WARNING]
-> INT4 ConvRot LoRA training is experimental. The default W4A8 activation mode stores the frozen base weights as packed INT4 and quantizes forward activations and backward grad-output to row-wise INT8. The 4-bit base-weight representation can introduce domain-dependent output changes versus NF4/FP8/bf16 baselines, including reduced fine detail, softer texture, or changed texture statistics. Validate with short runs and sample videos before committing long training jobs. The fully 4-bit W4A4 activation mode is for diagnostics and backend experiments only.
+W4A4G4 training runs a LoRA over a frozen 4-bit base, following the FourTune fully-4-bit post-training pipeline (arXiv 2607.05711). The frozen 4-bit base, a frozen low-rank stabilizer, and the trainable LoRA form the paper's triple-branch decomposition; the forward and backward passes run 4-bit GEMMs with weights, activations, and gradients all quantized to 4 bits.
 
-`--int4_convrot_dynamic` rotates eligible transformer-block Linear weights offline, stores the frozen base as packed signed INT4 nibbles, rotates activations online, and runs quantized matmuls through the selected backend. The default activation mode is W4A8: weights stay packed INT4, while forward activations and backward grad-output are quantized to row-wise INT8. Set `LTX2_INT4_CONVROT_ACT_BITS=4` only to test the experimental fully 4-bit W4A4 activation path.
+`--w4a4g4_container` selects the numeric format ("container") of the frozen base:
+
+- `int4` (default) — INT4 integer weights run through the INT4 tensor-core backend with ConvRot Hadamard rotation. This is the container that runs on INT4-capable GPUs.
+- `nvfp4` — NVFP4 (E2M1 float) weights with no rotation, the FourTune-native format. The fast path uses Blackwell scaled-MMA kernels (compute capability `>= 10.0`); other GPUs use an emulated backend.
+
+Both containers run the same triple-branch training. They differ only in the base's numeric format and, for `int4`, the added ConvRot rotation — integer 4-bit uses that rotation to tame outliers, while NVFP4's per-block float scales do not need it. `--w4a4g4_container auto` (the default) picks the container from `--ltx2_checkpoint`: a converter-produced int4cr checkpoint → `int4`, a converter-produced NVFP4 checkpoint → `nvfp4`, a plain bf16/fp16 checkpoint → `int4`. An explicit `int4`/`nvfp4` that contradicts a pre-quantized checkpoint's format is rejected.
+
+Within the `int4` container, three peer mode flags select the activation/gradient precision:
+
+- `--w4a4g4`: fully 4-bit activations and gradients (W4A4G4). This single flag implies the whole fast path — 4-bit activation/gradient quantization, the native INT4 tensor-core (`cutlass`) backend, the fused CUDA activation/epilogue path, and the fused triple-branch LoRA path.
+- `--w4a8`: 4-bit weights with 8-bit activations (int4 container only). Weights stay packed INT4 while forward activations and backward grad-output are quantized to row-wise INT8; the default backend routing is used and no fusion is implied.
+- `--w4a4g8`: 4-bit weights and activations (the `--w4a4g4` forward) with 8-bit gradients (the `--w4a8` backward grad path). The middle step between `--w4a4g4` and `--w4a8`: it keeps the 4-bit forward but quantizes the backward grad-output to row-wise INT8 for higher gradient precision than a 4-bit gradient. It uses the same backend, fusion, and stabilizer defaults as `--w4a4g4`. int4 container only.
+
+Both flags share one nf4-style checkpoint workflow. Point `--ltx2_checkpoint` at either a plain bf16/fp16 checkpoint (quantized on the fly at load, one tensor at a time) or a converter output (the packed weights are loaded directly). The checkpoint type is detected automatically from its metadata/keys, so the same command works for both; the converter is a pay-once optimization that produces exactly the buffers the on-the-fly path would. The `nvfp4` container has no W4A8 mode; use `--w4a4g4 --w4a4g4_container nvfp4`.
+
+> [!WARNING]
+> INT4 ConvRot LoRA training is experimental. `--w4a8` stores the frozen base weights as packed INT4 and quantizes forward activations and backward grad-output to row-wise INT8. The 4-bit base-weight representation can introduce domain-dependent output changes versus NF4/FP8/bf16 baselines, including reduced fine detail, softer texture, or changed texture statistics. `--w4a4g4` additionally quantizes activations and gradients to 4 bits. Validate with short runs and sample videos before committing long training jobs.
+
+On-the-fly from a bf16 checkpoint:
 
 ```bat
 python src/musubi_tuner/ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
-  --int4_convrot_dynamic ^
+  --w4a4g4 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
   --int4_convrot_quality_report output\int4-convrot-quality.json ^
   (other training options)
 ```
 
-To reuse the quantized base, pre-quantize once:
+Pre-quantize once, then reuse (auto-detected — same flag):
 
 ```bat
 python ltx2_quantize_int4_convrot.py ^
@@ -1850,14 +1867,17 @@ python ltx2_quantize_int4_convrot.py ^
 
 python src/musubi_tuner/ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev-int4-convrot.safetensors ^
-  --int4_convrot_base ^
+  --w4a4g4 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
   (other training options)
 ```
 
 Options:
-- `--int4_convrot_base`: load a pre-quantized packed INT4 ConvRot checkpoint (`.weight`, `.weight_scale`, `.int4_shape`, and `.comfy_quant` metadata).
-- `--int4_convrot_dynamic`: quantize a standard checkpoint at load time.
+- `--w4a4g4`: fully 4-bit (W4A4G4) LoRA training following the FourTune pipeline. In the `int4` container it implies 4-bit activations/gradients, the `cutlass` INT4 tensor-core backend, and the fused CUDA + fused triple-branch LoRA paths.
+- `--w4a4g4_container`: `auto` (default), `int4`, or `nvfp4` — the numeric format of the frozen base (see above). `auto` detects it from the checkpoint (int4cr → `int4`, NVFP4 → `nvfp4`, plain bf16/fp16 → `int4`).
+- `--w4a8`: 4-bit weights with 8-bit activations (int4 container only); default backend routing, no implied fusion.
+- `--w4a4g8`: 4-bit weights/activations with 8-bit gradients (int4 container only); the `--w4a4g4` forward with the `--w4a8` backward grad path, and the same backend/fusion/stabilizer defaults as `--w4a4g4`.
+- `--w4a4g4_stabilizer_rank`: rank of the frozen low-rank stabilizer split off each weight when `--w4a4g4`/`--w4a4g8` quantizes a bf16/fp16 checkpoint on the fly. The effective default is container-dependent: `int4` → `0` (the ConvRot rotation already tames outliers), `nvfp4` → `32` (no rotation, so a stabilizer is used). Pass an explicit value to override either; `0` disables it. Ignored for a pre-quantized checkpoint (it carries its own stabilizer) and for `--w4a8`.
 - `--int4_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16`. Unlike the INT8 ConvRot path, W4A4 pads the rotated input dimension internally, so the weight input dimension does not need to be divisible by the group size.
 - `--int4_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
 - `--int4_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
@@ -1874,21 +1894,24 @@ Options:
 
 Notes:
 - Requires LoRA training (`--network_module`); full-parameter fine-tuning of the frozen INT4 ConvRot base is not supported.
-- Mutually exclusive with `--int8_base`, `--int8_base_dynamic`, `--int8_convrot_base`, `--int8_convrot_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- `--w4a4g4`, `--w4a8`, and `--w4a4g8` are mutually exclusive with each other and with `--int8_base`, `--int8_base_dynamic`, `--int8_convrot_base`, `--int8_convrot_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
+- The `LTX2_INT4_CONVROT_*` environment variables below remain expert overrides. When set explicitly they win over the value implied by `--w4a4g4`/`--w4a8`/`--w4a4g8`, and a one-line warning records the override.
 - Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
 - `LTX2_INT4_CONVROT_BACKEND=auto` uses the torch tensor-core bridge when available. Optional backend values are `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, and `scalar`; the native CUTLASS path requires headers from `LTX2_CUTLASS_INCLUDE_DIR`. The torch bridge is the recommended default for LoRA training.
-- `LTX2_INT4_CONVROT_ACT_BITS=8` is the default. It keeps resident weights packed as INT4 but quantizes forward activations and backward grad-output to row-wise INT8 before the tensor-core bridge (`W4A8`). This keeps the INT4 weight-storage benefit while avoiding the per-token A4 activation error.
-- `LTX2_INT4_CONVROT_ACT_BITS=4` enables the experimental W4A4 activation path. Use it for diagnostics or backend experiments; validate samples before long training runs.
-- `LTX2_INT4_CONVROT_FUSE=1` enables fused Triton kernels for the default `W4A8` path: the online ConvRot rotation and per-token INT8 quantization fold into one kernel, and the int32→compute-dtype rescale and backward inverse rotation into another, cutting memory traffic around the INT8-bridge matmul. It requires Triton and a CUDA device, is off by default, and applies to `W4A8` only. The `W4A4` path and the stabilizer branch stay correct with it enabled. When unset the eager path is byte-identical; with it enabled, fused reductions run in a different order so outputs match within the training noise floor rather than bitwise.
+- `LTX2_INT4_CONVROT_ACT_BITS`: `8` selects W4A8 (the `--w4a8` default; forward activations and backward grad-output are row-wise INT8), `4` selects the fully 4-bit W4A4 activation path (the `--w4a4g4` default). Setting it explicitly overrides the mode flag (for example `LTX2_INT4_CONVROT_ACT_BITS=8` with `--w4a4g4` runs the W4A8 activation path).
+- `LTX2_INT4_CONVROT_GRAD_BITS`: bit-width used to quantize the backward grad-output, decoupled from the forward activation bits. `4` selects a 4-bit gradient, `8` selects a row-wise INT8 gradient (the `--w4a4g8` default). When unset it follows the activation bits, so `--w4a4g4` uses a 4-bit gradient and `--w4a8` an 8-bit gradient. Set it explicitly to override the mode flag (for example `LTX2_INT4_CONVROT_GRAD_BITS=8` with `--w4a4g4` is the same as `--w4a4g8`).
+- `LTX2_INT4_CONVROT_BACKEND`: tensor-core backend routing. `--w4a4g4` implies `cutlass`; `--w4a8` uses `auto`. Set explicitly to override (values: `auto`, `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, `scalar`).
+- `LTX2_INT4_CONVROT_FUSE_CUDA` / `LTX2_INT4_CONVROT_FUSE_LORA`: the fused native-CUTLASS W4A4 activation/epilogue path and the fused triple-branch LoRA path. `--w4a4g4` implies both `1`; `--w4a8` implies neither (they are W4A4-only, so the fused LoRA path stays on the eager down/up path under W4A8 even if enabled). Set either explicitly to override.
+- `LTX2_INT4_CONVROT_FUSE=1` enables fused Triton kernels for the `W4A8` path: the online ConvRot rotation and per-token INT8 quantization fold into one kernel, and the int32→compute-dtype rescale and backward inverse rotation into another, cutting memory traffic around the INT8-bridge matmul. It requires Triton and a CUDA device, is off by default, and applies to `W4A8` only. When unset the eager path is byte-identical; with it enabled, fused reductions run in a different order so outputs match within the training noise floor rather than bitwise.
 - No Blackwell performance claim is made for the native INT4 kernels.
 - ConvRot's paper reports W4A4 as the intended advantage of the method, but also notes quality sensitivity for fully 4-bit diffusion transformers. Use the quality report and sample checks before committing a long run.
-- For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--int4_convrot_base` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
+- For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--w4a4g4`/`--w4a8`/`--w4a4g8` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
 - INT4 ConvRot AWQ scales multiply weight columns before ConvRot packing and divide activations by the same per-channel scales at runtime. This preserves the Linear semantics while changing which input channels receive more effective quantization resolution.
 - AWQ scale files are tied to the base checkpoint, target layer set, group-size policy, and model mode. They are not tied to the LoRA dataset identity.
 - For layer ranking, use both reports: `--int4_convrot_quality_report` estimates static packed-weight reconstruction error, while `--int4_convrot_activation_calibration_report` measures runtime activation/backend error on the observed training activation distribution.
 - Activation calibration performs extra reference matmuls during the measured forward pass. Keep the batch count small, and use `--int4_convrot_activation_calibration_regex` or `--int4_convrot_activation_calibration_max_layers` when memory is tight.
 
-**Low-rank stabilizer branch.** `ltx2_quantize_int4_convrot.py --stabilizer_rank N` splits a rank-`N` SVD component off each rotated weight before INT4 quantization and stores it as two bfloat16 factors per layer (`.int4_stabilizer_l1`/`.int4_stabilizer_l2`). At runtime the factors are added back as a frozen high-precision branch in the forward pass and the gradient-input path, so the INT4 residual has a narrower value range while the low-rank component stays in bf16. The branch loads automatically with `--int4_convrot_base` when the tensors are present — no training flag — and also applies to `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` diagnostics. Checkpoints without these tensors are unchanged. `--int4_convrot_dynamic` does not compute stabilizer factors; use the offline converter. The tensors stay resident under `--blocks_to_swap` and add a small per-layer overhead proportional to the rank.
+**Low-rank stabilizer branch.** A rank-`N` SVD component can be split off each weight before INT4 quantization and stored as two bfloat16 factors per layer (`.int4_stabilizer_l1`/`.int4_stabilizer_l2`). At runtime the factors are added back as a frozen high-precision branch in the forward pass and the gradient-input path, so the INT4 residual has a narrower value range while the low-rank component stays in bf16. Two ways to produce it: `ltx2_quantize_int4_convrot.py --stabilizer_rank N` bakes it into a reusable pre-quantized checkpoint (loaded automatically — no training flag), and `--w4a4g4`/`--w4a4g8` `--w4a4g4_stabilizer_rank N` computes the same factors on the on-the-fly (bf16 checkpoint) path. `--w4a8` and pre-quantized checkpoints ignore `--w4a4g4_stabilizer_rank` (the checkpoint carries its own stabilizer). The branch also applies to `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` diagnostics; checkpoints without these tensors are unchanged. The tensors stay resident under `--blocks_to_swap` and add a small per-layer overhead proportional to the rank.
 
 **LoRA EMA with INT4 ConvRot.** `--use_ema` enables an exponential moving average of the trainable LoRA adapter weights. This can make validation previews and saved LoRA checkpoints less sensitive to noisy individual optimizer steps, which is useful when training over a very low-precision frozen base such as INT4 ConvRot. It does not average or modify the packed INT4 base model itself.
 
@@ -1905,6 +1928,65 @@ Example starting point for short INT4 ConvRot LoRA trials:
 ```
 
 Use `--ema_cpu_offload` when VRAM is tight; for LoRA this stores only the adapter EMA shadow on CPU. If INT4 base-model-only samples differ strongly from bf16 base-model samples under identical sampling settings, EMA should be treated as a LoRA-stability tool rather than a base-quantization quality fix.
+
+#### ComfyUI inference export (convrot_w4a4)
+
+`ltx2_quantize_int4_convrot.py --export_format comfy_convrot_w4a4` writes a checkpoint in the ComfyUI `convrot_w4a4` inference format (Comfy-Org/comfy-kitchen) instead of this trainer's int4cr prepack. It is a one-way *publish for inference* artifact: it is **not** loadable by `--w4a4g4`/`--w4a8` (those want the int4cr prepack), and this trainer does not read it back.
+
+The int4 ConvRot quantization is a self-contained reproduction of comfy-kitchen's `convrot_w4a4` math (power-of-4 regular Hadamard rotation, symmetric per-row `absmax/7` int4, signed-nibble packing) — there is no runtime dependency on comfy-kitchen. For each quantized transformer-block Linear it writes `<base>.weight` (packed int8), `<base>.weight_scale`, and `<base>.comfy_quant` (the config ComfyUI's loader reads).
+
+```bat
+python src/musubi_tuner/ltx2_quantize_int4_convrot.py ^
+  --input_model path\to\ltx-2.3-22b-dev.safetensors ^
+  --output_model path\to\ltx-2.3-22b-dev-convrot_w4a4.safetensors ^
+  --export_format comfy_convrot_w4a4
+```
+
+Options and constraints:
+- `--comfy_linear_dtype`: `int4` (default) or `int8` — the matrix-mult precision recorded per layer.
+- Linear weights whose input dimension is not divisible by the ConvRot group size (256) are kept as 16-bit (unquantized) and reported in a summary line; everything outside the transformer blocks passes through unchanged.
+- `--stabilizer_rank`, `--int4_convrot_awq_calibration`/`--int4_convrot_awq_scales`, and `--no_rotation` are rejected with this export: the `convrot_w4a4` format has no stabilizer/AWQ slot and always uses Hadamard rotation.
+
+#### NVFP4 container
+
+The `nvfp4` container (`--w4a4g4 --w4a4g4_container nvfp4`) stores the frozen transformer-block Linear weights in NVFP4 (E2M1) and runs the FourTune W4A4G4 path with no rotation: the frozen base contributes `Q(X) @ Q(R)` in the forward and `Q(G) @ Q(R)^T` in the backward, an optional low-rank stabilizer branch is added in bf16, and the trainable LoRA adapter is the third branch. Only the LoRA adapter receives gradients; the packed base and stabilizer are frozen.
+
+The container works with either input, detected automatically from the checkpoint:
+
+- a **bf16/fp16 checkpoint** — quantized to NVFP4 on the fly at load, one tensor at a time. `--w4a4g4_stabilizer_rank` sets the stabilizer rank (default `32` for this container; `0` disables it).
+- a **converter output** from `ltx2_quantize_nvfp4.py` — the packed NVFP4 is loaded directly. The converter is a pay-once optimization: it produces the same buffers the on-the-fly path would, so training is identical while the quantization cost is paid once instead of every run.
+
+On the fly (single command):
+
+```bat
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
+  --w4a4g4 --w4a4g4_container nvfp4 --w4a4g4_stabilizer_rank 32 ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  (other training options)
+```
+
+Pre-quantize once, then reuse the converter output across runs (auto-detected — same flags):
+
+```bat
+python src/musubi_tuner/ltx2_quantize_nvfp4.py ^
+  --input_model path\to\ltx-2.3-22b-dev.safetensors ^
+  --output_model path\to\ltx-2.3-22b-dev-nvfp4t.safetensors ^
+  --stabilizer_rank 32
+
+python src/musubi_tuner/ltx2_train_network.py ^
+  --ltx2_checkpoint path\to\ltx-2.3-22b-dev-nvfp4t.safetensors ^
+  --w4a4g4 --w4a4g4_container nvfp4 ^
+  --network_module networks.lora_ltx2 --network_dim 32 ^
+  (other training options)
+```
+
+Notes:
+- A converter output stores packed E2M1 nibbles, a per-`16x16`-tile fp8 scale, a per-tensor fp32 scale, `.nvfp4_shape` metadata, and optional stabilizer factors, and is loaded directly.
+- `ltx2_quantize_nvfp4.py --stabilizer_rank N`: split a rank-`N` SVD component off each weight before NVFP4 quantization and store it as two bfloat16 factors (`.nvfp4_stab_l1`/`.nvfp4_stab_l2`); the residual is what gets NVFP4-quantized. `0` disables it. The factors load automatically when present. `--output_model` defaults to `<input>.nvfp4t.safetensors`; `--quality_report PATH` writes per-layer reconstruction metrics (defaults to `<output>.quality.json`; `--no_quality_report` skips it).
+- Targets the same layer set as the INT4 ConvRot converter (transformer-block attention/FFN Linear weights); norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors stay in bf16.
+- Weight scales are shared across each `16x16` tile so the transposed weight layout used in the backward pass reuses the same scale tiles without requantization. Activations and grad-outputs are quantized dynamically per NVFP4 `1x16` micro-block.
+- `LTX2_NVFP4_BACKEND=auto` (default) uses the Blackwell scaled-MMA (Triton `tl.dot_scaled`) fast path on compute capability `>= 10.0` and falls back to the emulated backend otherwise. `LTX2_NVFP4_BACKEND=emulate` forces the emulated backend on any CUDA GPU or CPU; it dequantizes the base and round-trips activations and gradients through the same NVFP4 quantization as the fast path, so results are comparable while running without Blackwell hardware. `LTX2_NVFP4_BACKEND=triton` requires a Blackwell GPU and errors otherwise.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -5001,6 +5083,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [QLoRA (arXiv 2305.14314)](https://arxiv.org/abs/2305.14314) — Introduces NF4 quantization used by the `--nf4_base` implementation
 - [LoftQ (arXiv 2310.08659)](https://arxiv.org/abs/2310.08659) — Quantization-aware LoRA initialization used by `--loftq_init`
 - [AWQ (arXiv 2306.00978)](https://arxiv.org/abs/2306.00978) — Activation-aware quantization background for `--awq_calibration`
+- [FourTune: Towards Fully 4-Bit Efficient Post-Training for Diffusion Models (arXiv 2607.05711)](https://arxiv.org/abs/2607.05711) — Fully 4-bit (W4A4G4) post-training pipeline followed by `--w4a4g4`
 - [DINOv2 (arXiv 2304.07193)](https://arxiv.org/abs/2304.07193) — External visual features used by CREPA dino mode
 - [CREPA (arXiv 2506.09229)](https://arxiv.org/abs/2506.09229) — Cross-frame Representation Alignment; basis for CREPA dino mode (`--crepa` with `--crepa_args mode=dino`, DINOv2 teacher from neighboring frames)
 - [Latent Temporal Discrepancy (arXiv 2601.20504)](https://arxiv.org/abs/2601.20504) — Motion-prior loss weighting basis for `--latent_temporal_weighting`

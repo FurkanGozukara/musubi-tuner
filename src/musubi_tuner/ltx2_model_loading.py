@@ -35,6 +35,7 @@ from musubi_tuner.modules.int4_convrot_utils import (
     INT4_CONVROT_STABILIZER_L2_SUFFIX,
     apply_int4_convrot_monkey_patch,
     best_int4_convrot_groupsize,
+    compute_int4_convrot_stabilizer,
     parse_comfy_quant_tensor as parse_int4_comfy_quant_tensor,
     parse_int4_convrot_groupsizes,
     quantize_int4_convrot_weight,
@@ -923,6 +924,10 @@ def load_comfy_int4_convrot_state_dict(
                     quantized += 1
                     if bool(cfg.get("convrot", True)):
                         convrot += 1
+                    else:
+                        # No-rotation layer: mark it so the runtime skips the online
+                        # Hadamard rotation. Rotated layers add no buffer and stay byte-identical.
+                        sd[base + ".int4_rotation"] = torch.tensor(0, dtype=torch.int32)
                     continue
                 if (
                     key.endswith(".weight")
@@ -932,8 +937,8 @@ def load_comfy_int4_convrot_state_dict(
                 ):
                     raise ValueError(
                         f"{key} looks like a scaled FP8 weight, not an INT4 ConvRot weight. "
-                        "Use --int4_convrot_dynamic to convert FP8/BF16 sources, or pass an INT4 ConvRot checkpoint "
-                        "with .int4_shape/.comfy_quant metadata."
+                        "Pass a bf16/fp16 checkpoint (--w4a4g4/--w4a8 auto-detect the on-the-fly dynamic path), "
+                        "or a converter-produced INT4 ConvRot checkpoint with .int4_shape/.comfy_quant metadata."
                     )
                 if value.is_floating_point() and non_quant_dtype is not None:
                     value = value.to(non_quant_dtype)
@@ -961,11 +966,18 @@ def load_safetensors_dynamic_int4_convrot(
     awq_alpha: float = 0.25,
     awq_scales: Optional[dict[str, torch.Tensor]] = None,
     awq_save_path: Optional[str] = None,
+    stabilizer_rank: int = 0,
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
     key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, torch.Tensor]:
-    """Stream a standard checkpoint and quantize targeted Linear weights to packed INT4 ConvRot."""
+    """Stream a standard checkpoint and quantize targeted Linear weights to packed INT4 ConvRot.
+
+    When ``stabilizer_rank > 0`` each targeted weight also gets a frozen rank-``stabilizer_rank``
+    low-rank SVD outlier branch (shared ``compute_int4_convrot_stabilizer`` implementation), so
+    the produced state dict matches what ``ltx2_quantize_int4_convrot --stabilizer_rank`` would
+    write (packed residual + scales + shape + ``.int4_stabilizer_l1/l2``).
+    """
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 
     calc_device = torch.device(calc_device)
@@ -1028,6 +1040,15 @@ def load_safetensors_dynamic_int4_convrot(
                         awq_applied += 1
 
                     group_size = best_int4_convrot_groupsize(value.shape[1], group_candidates)
+                    stabilizer = None
+                    if stabilizer_rank > 0:
+                        stabilizer = compute_int4_convrot_stabilizer(
+                            value,
+                            group_size=int(group_size),
+                            rank=int(stabilizer_rank),
+                            calc_device=calc_device,
+                            rotate=True,
+                        )
                     q, scale, shape, quality = quantize_int4_convrot_weight(
                         value,
                         group_size=int(group_size),
@@ -1035,6 +1056,7 @@ def load_safetensors_dynamic_int4_convrot(
                         mse_clip=mse_clip,
                         collect_quality=collect_quality,
                         key=mkey,
+                        stabilizer=stabilizer,
                     )
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
@@ -1043,6 +1065,9 @@ def load_safetensors_dynamic_int4_convrot(
                     sd[base + ".int4_convrot_groupsize"] = torch.tensor(int(group_size), dtype=torch.int32, device=q.device)
                     if awq_scale is not None:
                         sd[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.to(device=q.device, dtype=torch.float32)
+                    if stabilizer is not None:
+                        sd[base + INT4_CONVROT_STABILIZER_L1_SUFFIX] = stabilizer[0].to(device=q.device)
+                        sd[base + INT4_CONVROT_STABILIZER_L2_SUFFIX] = stabilizer[1].to(device=q.device)
                     if quality is not None:
                         quality_layers.append(quality)
                     quantized += 1
@@ -1142,6 +1167,9 @@ def load_ltx2_model(
     int4_convrot_awq_calibration: bool = False,
     int4_convrot_awq_alpha: float = 0.25,
     int4_convrot_awq_scales: Optional[str] = None,
+    int4_convrot_stabilizer_rank: int = 0,
+    nvfp4_training_base: bool = False,
+    nvfp4_stabilizer_rank: int = 32,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -1173,7 +1201,9 @@ def load_ltx2_model(
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
             is_quantized_linear = isinstance(module, torch.nn.Linear) and (
-                hasattr(module, "scale_weight") or hasattr(module, "_nvfp4_quantized")
+                hasattr(module, "scale_weight")
+                or hasattr(module, "_nvfp4_quantized")
+                or hasattr(module, "_nvfp4_training_quantized")
             )
             if is_quantized_linear:
                 continue
@@ -1333,7 +1363,7 @@ def load_ltx2_model(
 
     # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
     _is_nvfp4 = False
-    if not nf4_base and not fp8_scaled and not int4_convrot_base and not int4_convrot_dynamic:
+    if not nf4_base and not fp8_scaled and not int4_convrot_base and not int4_convrot_dynamic and not nvfp4_training_base:
         from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
 
         _check_path = model_path if isinstance(model_path, str) else model_path[0]
@@ -1594,11 +1624,53 @@ def load_ltx2_model(
             awq_alpha=float(int4_convrot_awq_alpha),
             awq_scales=_int4_awq_scales,
             awq_save_path=_int4_awq_save_path,
+            stabilizer_rank=int(int4_convrot_stabilizer_rank),
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
         )
+    elif nvfp4_training_base:
+        from musubi_tuner.modules.nvfp4_training import (
+            NVFP4_TARGET_PATTERNS,
+            detect_nvfp4_training_checkpoint,
+            load_nvfp4_training_state_dict,
+            load_safetensors_dynamic_nvfp4_training,
+            nvfp4_checkpoint_stabilizer_rank,
+            nvfp4_stabilizer_rank_conflict_warning,
+        )
+
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        _nvfp4_non_quant_dtype = torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype
+        if detect_nvfp4_training_checkpoint(model_files[0]):
+            logger.info("LTX-2 NVFP4: detected pre-quantized checkpoint — loading packed NVFP4 directly")
+            _rank_warning = nvfp4_stabilizer_rank_conflict_warning(
+                nvfp4_stabilizer_rank, nvfp4_checkpoint_stabilizer_rank(model_files[0])
+            )
+            if _rank_warning:
+                logger.warning(_rank_warning)
+            sd = load_nvfp4_training_state_dict(
+                model_files,
+                # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
+                non_quant_dtype=_nvfp4_non_quant_dtype,
+                key_filter=state_dict_key_filter,
+            )
+        else:
+            logger.info(
+                "LTX-2 NVFP4: quantizing bf16/fp16 checkpoint at load (stabilizer_rank=%d, device=%s)",
+                int(nvfp4_stabilizer_rank),
+                _resolved_quant_device,
+            )
+            sd = load_safetensors_dynamic_nvfp4_training(
+                model_files,
+                target_keys=list(NVFP4_TARGET_PATTERNS),
+                exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
+                stabilizer_rank=int(nvfp4_stabilizer_rank),
+                # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
+                non_quant_dtype=_nvfp4_non_quant_dtype,
+                calc_device=_resolved_quant_device,
+                key_filter=state_dict_key_filter,
+            )
     else:
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
@@ -1639,6 +1711,10 @@ def load_ltx2_model(
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
     elif int4_convrot_base or int4_convrot_dynamic:
         register_int4_convrot_buffers(base_model, sd)
+    elif nvfp4_training_base:
+        from musubi_tuner.modules.nvfp4_training import register_nvfp4_training_buffers
+
+        register_nvfp4_training_buffers(base_model, sd)
     elif int8_base or int8_dynamic or int8_convrot_base or int8_convrot_dynamic:
         register_quanto_int8_scale_buffers(base_model, sd)
     _trace_vram_ltx2("AFTER apply monkey patch")
@@ -1658,6 +1734,11 @@ def load_ltx2_model(
     if int4_convrot_base or int4_convrot_dynamic:
         apply_int4_convrot_monkey_patch(base_model)
         _trace_vram_ltx2("AFTER int4 ConvRot monkey patch")
+    if nvfp4_training_base:
+        from musubi_tuner.modules.nvfp4_training import apply_nvfp4_training_monkey_patch
+
+        apply_nvfp4_training_monkey_patch(base_model)
+        _trace_vram_ltx2("AFTER NVFP4 training monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")

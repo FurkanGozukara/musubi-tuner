@@ -971,21 +971,67 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Optional JSON path for per-layer INT8 ConvRot reconstruction metrics during dynamic quantization.",
     )
     parser.add_argument(
-        "--int4_convrot_base",
+        "--w4a4g4",
         action="store_true",
         help=(
-            "Load a pre-quantized packed INT4 ConvRot DiT checkpoint and train a LoRA over it. "
-            "The checkpoint stores signed int4 .weight nibbles, .weight_scale tensors, and "
-            ".int4_shape or .comfy_quant metadata. Uses W4A8 activations by default; mutually exclusive with other quantized-base modes."
+            "W4A4G4 training: the one-stop INT4 ConvRot mode with fully 4-bit activations/gradients "
+            "(W4A4), a native INT4 tensor-core backend, and fused CUDA + triple-branch LoRA paths, "
+            "all implied by this one flag. "
+            "Auto-detects the checkpoint passed as --ltx2_checkpoint: a converter-produced int4cr "
+            "checkpoint loads its packed INT4 directly, a plain bf16/fp16 checkpoint is quantized on "
+            "the fly. Requires LoRA training. The four LTX2_INT4_CONVROT_* env vars remain expert "
+            "overrides (env wins). Mutually exclusive with --w4a8 and other quantized-base modes."
         ),
     )
     parser.add_argument(
-        "--int4_convrot_dynamic",
+        "--w4a8",
         action="store_true",
         help=(
-            "Quantize a standard bf16/fp16 DiT checkpoint to packed INT4 ConvRot at load time. "
-            "Weights are rotated offline, activations are rotated and dynamically quantized online, "
-            "and Linear layers use W4A8 activations by default. Requires LoRA training."
+            "W4A8 INT4 ConvRot training: 4-bit weights with 8-bit activations. "
+            "Same checkpoint auto-detect as --w4a4g4 (converter-produced int4cr "
+            "loads directly; bf16/fp16 is quantized on the fly). Uses the default backend routing "
+            "and no implied fusion gates. Requires LoRA training. Mutually exclusive with --w4a4g4 "
+            "and other quantized-base modes."
+        ),
+    )
+    parser.add_argument(
+        "--w4a4g8",
+        action="store_true",
+        help=(
+            "W4A4G8 INT4 ConvRot training: 4-bit weights and activations (the --w4a4g4 forward) with "
+            "8-bit gradients (the --w4a8 backward grad path). The middle rung between --w4a4g4 (g4) and "
+            "--w4a8 (a8): keeps the 4-bit forward but quantizes the backward gradient to int8 for higher "
+            "gradient precision than a 4-bit gradient. int4-only (the nvfp4 container has no "
+            "int8 grad path). Same checkpoint auto-detect, backend routing, fusion and stabilizer defaults "
+            "as --w4a4g4. Requires LoRA training. Mutually exclusive with --w4a4g4, --w4a8 and other "
+            "quantized-base modes."
+        ),
+    )
+    parser.add_argument(
+        "--w4a4g4_stabilizer_rank",
+        type=int,
+        default=None,
+        help=(
+            "Rank of the frozen low-rank SVD stabilizer split off each weight when --w4a4g4 quantizes "
+            "a bf16/fp16 checkpoint on the fly. The effective default depends on --w4a4g4_container: int4 -> 0 "
+            "(the ConvRot rotation already tames outliers), nvfp4 -> 32 (no rotation, so a stabilizer is used). "
+            "Pass an explicit value to override either. Ignored when a pre-quantized checkpoint is passed "
+            "(it carries its own stabilizer) and for --w4a8."
+        ),
+    )
+    parser.add_argument(
+        "--w4a4g4_container",
+        type=str,
+        default="auto",
+        choices=["auto", "int4", "nvfp4"],
+        help=(
+            "Frozen-backbone container (numeric format) for --w4a4g4. "
+            "'auto' (default) detects it from --ltx2_checkpoint: a converter-produced int4cr checkpoint -> int4, "
+            "a converter-produced NVFP4 checkpoint -> nvfp4, a plain bf16/fp16 checkpoint -> int4. "
+            "'int4' uses the INT4 tensor-core backend with ConvRot Hadamard rotation (runs on INT4-capable GPUs). "
+            "'nvfp4' uses NVFP4 E2M1 with no rotation (Blackwell scaled-MMA fast path, "
+            "compute capability >= 10.0, emulated on other GPUs). Both run the same triple-branch W4A4G4 training. "
+            "Only meaningful with --w4a4g4; --w4a8 is int4-only."
         ),
     )
     parser.add_argument(

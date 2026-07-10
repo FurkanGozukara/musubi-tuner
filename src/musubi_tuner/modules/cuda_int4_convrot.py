@@ -65,6 +65,18 @@ def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale
 
 
+def quantize_rowwise_convrot(x: torch.Tensor, padded_features: int, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused ConvRot Hadamard rotation + packed signed-int4 rowwise quantization.
+
+    ``x`` is ``[M, K]`` (unpadded); the kernel zero-pads to ``padded_features``, applies
+    the group-wise regular Hadamard, then quantizes. Returns packed int4 ``[M,
+    padded_features/2]`` and fp32 row scales ``[M]``.
+    """
+
+    q, scale = _load_extension().quantize_rowwise_convrot(x.contiguous(), int(padded_features), int(group_size))
+    return q, scale
+
+
 def unpack_to_int8(packed: torch.Tensor, num_values: int) -> torch.Tensor:
     """Unpack signed-int4 nibbles to an int8 CUDA matrix."""
 

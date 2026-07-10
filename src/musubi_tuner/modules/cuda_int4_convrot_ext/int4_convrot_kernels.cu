@@ -129,6 +129,83 @@ __global__ void quantize_rowwise_kernel(
   }
 }
 
+// Fused ConvRot Hadamard rotation + row-wise INT4 quantization in one pass.
+// The regular group-wise Hadamard is block-diagonal over ``group`` contiguous
+// channels; we apply it in-place in shared memory with a staged radix-4 butterfly
+// (the same combine as the Triton _convrot_hadamard4 kernel, and algebraically equal
+// to build_hadamard(group)), then take the row absmax scale and pack signed int4.
+// One block per row; dynamic shared memory holds the padded row as float.
+template <typename scalar_t, int BLOCK_THREADS>
+__global__ void quantize_rowwise_convrot_kernel(
+    const scalar_t* __restrict__ x,
+    uint8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K,
+    int padded_K,
+    int packed_K,
+    int group) {
+  extern __shared__ float srow[];
+  constexpr int kWarps = BLOCK_THREADS / kWarp;
+  __shared__ float warp_smem[kWarps];
+  __shared__ float block_smem;
+
+  const int row = static_cast<int>(blockIdx.x);
+  const int tid = threadIdx.x;
+  const int64_t row_offset = static_cast<int64_t>(row) * K;
+  const int64_t packed_offset = static_cast<int64_t>(row) * packed_K;
+
+  for (int col = tid; col < padded_K; col += BLOCK_THREADS) {
+    srow[col] = col < K ? to_float(x[row_offset + col]) : 0.0f;
+  }
+  __syncthreads();
+
+  const int quads = padded_K / 4;
+  for (int step = 1; step < group; step *= 4) {
+    const int quads_per_group = group / 4;
+    const int subblocks = group / (4 * step);  // sub-blocks per group
+    for (int qd = tid; qd < quads; qd += BLOCK_THREADS) {
+      const int gi = qd / quads_per_group;         // group index
+      const int wq = qd - gi * quads_per_group;    // quad within group
+      const int sub = wq / step;                   // sub-block within group
+      const int s = wq - sub * step;               // lane within sub-block
+      const int base = gi * group + sub * (4 * step) + s;
+      const int i0 = base;
+      const int i1 = base + step;
+      const int i2 = base + 2 * step;
+      const int i3 = base + 3 * step;
+      const float a = srow[i0];
+      const float b = srow[i1];
+      const float c = srow[i2];
+      const float d = srow[i3];
+      srow[i0] = a + b + c - d;
+      srow[i1] = a + b - c + d;
+      srow[i2] = a - b + c + d;
+      srow[i3] = -a + b + c + d;
+      (void)subblocks;
+    }
+    __syncthreads();
+  }
+
+  const float inv_norm = rsqrtf(static_cast<float>(group));
+  float abs_max = 0.0f;
+  for (int col = tid; col < padded_K; col += BLOCK_THREADS) {
+    srow[col] *= inv_norm;
+    abs_max = fmaxf(abs_max, fabsf(srow[col]));
+  }
+  abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
+  const float scale = fmaxf(abs_max * (1.0f / 7.0f), 1.0e-30f);
+  if (tid == 0) {
+    scales[row] = scale;
+  }
+
+  for (int byte_idx = tid; byte_idx < packed_K; byte_idx += BLOCK_THREADS) {
+    const int col0 = byte_idx * 2;
+    const int low = col0 < padded_K ? quant_i4(srow[col0], scale) : 0;
+    const int high = (col0 + 1) < padded_K ? quant_i4(srow[col0 + 1], scale) : 0;
+    q[packed_offset + byte_idx] = pack_i4(low, high);
+  }
+}
+
 template <typename output_t, typename bias_t, bool HAS_BIAS>
 __global__ void linear_forward_kernel(
     const uint8_t* __restrict__ qx,
@@ -458,6 +535,45 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_rowwise(torch::Tensor x) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "int4_quantize_rowwise", [&] {
     ltx2_cuda_int4_convrot::launch_quantize<scalar_t>(x, q, scales, K, packed_K, stream.stream());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {q, scales};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_rowwise_convrot(torch::Tensor x, int64_t padded_features, int64_t group) {
+  ltx2_cuda_int4_convrot::check_float_matrix(x, "x");
+  const auto M = x.size(0);
+  const auto K64 = x.size(1);
+  TORCH_CHECK(padded_features >= K64, "padded_features must be >= K");
+  TORCH_CHECK(padded_features <= std::numeric_limits<int>::max(), "padded_features too large");
+  TORCH_CHECK(group >= 4 && (padded_features % group == 0), "group must be >= 4 and divide padded_features");
+  // group must be a power of four (the radix-4 butterfly assumes it).
+  for (int64_t g = group; g > 1; g /= 4) {
+    TORCH_CHECK(g % 4 == 0, "ConvRot group size must be a power of four");
+  }
+  const int K = static_cast<int>(K64);
+  const int padded_K = static_cast<int>(padded_features);
+  const int packed_K = (padded_K + 1) / 2;
+  auto q = torch::empty({M, (padded_K + 1) / 2}, x.options().dtype(torch::kUInt8));
+  auto scales = torch::empty({M}, x.options().dtype(torch::kFloat32));
+  if (M == 0 || padded_K == 0) {
+    return {q, scales};
+  }
+
+  const size_t smem_bytes = static_cast<size_t>(padded_K) * sizeof(float);
+  int max_smem = 0;
+  cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, x.get_device());
+  TORCH_CHECK(smem_bytes <= static_cast<size_t>(max_smem),
+              "fused ConvRot quant needs ", smem_bytes, " bytes of shared memory but device allows ", max_smem);
+
+  c10::cuda::CUDAGuard device_guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  constexpr int kThreads = 512;
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "int4_quantize_rowwise_convrot", [&] {
+    auto kernel = ltx2_cuda_int4_convrot::quantize_rowwise_convrot_kernel<scalar_t, kThreads>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    kernel<<<static_cast<unsigned int>(M), kThreads, smem_bytes, stream.stream()>>>(
+        x.data_ptr<scalar_t>(), q.data_ptr<uint8_t>(), scales.data_ptr<float>(), K, padded_K, packed_K, static_cast<int>(group));
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {q, scales};

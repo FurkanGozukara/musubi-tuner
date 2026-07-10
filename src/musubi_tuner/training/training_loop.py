@@ -1894,7 +1894,7 @@ def train(self, args):
     int4_activation_calibration_report = getattr(args, "int4_convrot_activation_calibration_report", None)
     if int4_activation_calibration_report:
         if not (getattr(args, "int4_convrot_base", False) or getattr(args, "int4_convrot_dynamic", False)):
-            raise ValueError("--int4_convrot_activation_calibration_report requires --int4_convrot_base or --int4_convrot_dynamic")
+            raise ValueError("--int4_convrot_activation_calibration_report requires --w4a4g4 or --w4a8")
         if int4_activation_calibration_target_batches <= 0:
             raise ValueError("--int4_convrot_activation_calibration_batches must be positive when a report path is set")
         if accelerator.is_main_process:

@@ -1096,10 +1096,17 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--int8_convrot_no_mse_clip")
     if getattr(t, "int8_convrot_quality_report", ""):
         cmd += ["--int8_convrot_quality_report", str(t.int8_convrot_quality_report)]
-    if getattr(t, "int4_convrot_base", False):
-        cmd.append("--int4_convrot_base")
-    if getattr(t, "int4_convrot_dynamic", False):
-        cmd.append("--int4_convrot_dynamic")
+    if getattr(t, "w4a4g4", False):
+        cmd.append("--w4a4g4")
+        if str(getattr(t, "w4a4g4_container", "auto") or "auto") != "auto":
+            cmd += ["--w4a4g4_container", str(t.w4a4g4_container)]
+    if getattr(t, "w4a4g8", False):
+        cmd.append("--w4a4g8")
+    if getattr(t, "w4a8", False):
+        cmd.append("--w4a8")
+    # Stabilizer rank applies to the int4 a4-forward modes (w4a4g4 / w4a4g8), not w4a8.
+    if (getattr(t, "w4a4g4", False) or getattr(t, "w4a4g8", False)) and int(getattr(t, "w4a4g4_stabilizer_rank", 0) or 0) > 0:
+        cmd += ["--w4a4g4_stabilizer_rank", str(int(t.w4a4g4_stabilizer_rank))]
     if getattr(t, "int4_convrot_groupsize", "auto") not in (None, "", "auto"):
         cmd += ["--int4_convrot_groupsize", str(t.int4_convrot_groupsize)]
     if getattr(t, "int4_convrot_no_mse_clip", False):

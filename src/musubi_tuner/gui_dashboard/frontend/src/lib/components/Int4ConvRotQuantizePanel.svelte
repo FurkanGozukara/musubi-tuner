@@ -110,7 +110,7 @@
 		value={checkpointPath}
 		oninput={(e) => checkpointPath = e.target.value}
 		showFiles
-		tooltip="Base bf16/fp16 (or scaled-fp8) checkpoint. Transformer-block Linear weights are packed to signed INT4 ConvRot; everything else is copied through. Load the output with --int4_convrot_base to skip on-the-fly quantization."
+		tooltip="Base bf16/fp16 (or scaled-fp8) checkpoint. Transformer-block Linear weights are packed to signed INT4 ConvRot; everything else is copied through. Load the output with --w4a4g4 or --w4a8 (auto-detected) to skip on-the-fly quantization."
 		actionLabel="Quantize"
 		actionBusyLabel="..."
 		actionDisabled={active}
@@ -152,7 +152,7 @@
 			bind:value={stabilizerRank}
 			disabled={active}
 			placeholder="0"
-			title="Rank of the frozen low-rank stabilizer branch split off each weight before INT4 packing (SVDQuant-style outlier isolation). 0 = off; 32 is a typical value. Stored in the output and applied automatically at load."
+			title="Rank of the frozen low-rank stabilizer branch split off each weight before INT4 packing (low-rank SVD outlier isolation). 0 = off; 32 is a typical value. Stored in the output and applied automatically at load."
 			class="w-full h-8 px-2 text-[12px]"
 			style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
 		/>

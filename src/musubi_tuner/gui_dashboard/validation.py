@@ -409,8 +409,9 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         ("training.int8_base_dynamic", getattr(t, "int8_base_dynamic", False), "int8 Base (dynamic)"),
         ("training.int8_convrot_base", getattr(t, "int8_convrot_base", False), "INT8 ConvRot Base"),
         ("training.int8_convrot_dynamic", getattr(t, "int8_convrot_dynamic", False), "INT8 ConvRot (dynamic)"),
-        ("training.int4_convrot_base", getattr(t, "int4_convrot_base", False), "INT4 ConvRot Base"),
-        ("training.int4_convrot_dynamic", getattr(t, "int4_convrot_dynamic", False), "INT4 ConvRot (dynamic)"),
+        ("training.w4a4g4", getattr(t, "w4a4g4", False), "W4A4G4"),
+        ("training.w4a8", getattr(t, "w4a8", False), "W4A8"),
+        ("training.w4a4g8", getattr(t, "w4a4g8", False), "W4A4G8"),
     ]
     _enabled_quantized_base_modes = [mode for mode in _quantized_base_modes if mode[1]]
     if len(_enabled_quantized_base_modes) > 1:

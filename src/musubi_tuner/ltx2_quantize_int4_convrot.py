@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import time
 
@@ -16,6 +18,7 @@ from tqdm import tqdm
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 from musubi_tuner.modules.int4_convrot_utils import (
+    INT4_CONVROT_METADATA_MARKER,
     INT4_CONVROT_STABILIZER_L1_SUFFIX,
     INT4_CONVROT_STABILIZER_L2_SUFFIX,
     best_int4_convrot_groupsize,
@@ -70,6 +73,7 @@ def quantize_model(
     awq_alpha: float,
     awq_scales: str | None,
     stabilizer_rank: int = 0,
+    no_rotation: bool = False,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -79,13 +83,25 @@ def quantize_model(
 
     groupsizes = parse_int4_convrot_groupsizes(groupsize)
     device = torch.device(calc_device)
+    rotate = not no_rotation
     logger.info("INT4 ConvRot quantization device: %s", device)
     logger.info("INT4 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT4 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
+    logger.info("INT4 ConvRot rotation: %s", "hadamard" if rotate else "none (stabilizer-only)")
     if stabilizer_rank < 0:
         raise ValueError(f"INT4 ConvRot stabilizer rank must be >= 0, got {stabilizer_rank}")
+    if no_rotation and stabilizer_rank < 1:
+        raise ValueError(
+            "INT4 ConvRot --no_rotation requires --stabilizer_rank >= 1: without the online "
+            "Hadamard rotation the low-rank SVD stabilizer is the only outlier-isolation mechanism, so INT4 "
+            "quantization of the raw weight would be catastrophic. Re-run with e.g. --stabilizer_rank 32."
+        )
     if stabilizer_rank > 0:
-        logger.info("INT4 ConvRot stabilizer: rank %d low-rank branch (SVD of rotated weights)", stabilizer_rank)
+        logger.info(
+            "INT4 ConvRot stabilizer: rank %d low-rank branch (SVD of %s weights)",
+            stabilizer_rank,
+            "rotated" if rotate else "unrotated",
+        )
     if not (0.0 <= float(awq_alpha) <= 1.0):
         raise ValueError(f"INT4 ConvRot AWQ alpha must be in [0, 1], got {awq_alpha}")
     loaded_awq_scales = None
@@ -156,6 +172,7 @@ def quantize_model(
                     group_size=group_size,
                     rank=stabilizer_rank,
                     calc_device=device,
+                    rotate=rotate,
                 )
             q, scale, shape, quality = quantize_int4_convrot_weight(
                 value,
@@ -165,6 +182,7 @@ def quantize_model(
                 collect_quality=quality_report is not None,
                 key=model_key,
                 stabilizer=stabilizer,
+                rotate=rotate,
             )
             base = key[: -len(".weight")]
             in_features = int(shape.detach().cpu().reshape(-1)[1].item())
@@ -176,6 +194,7 @@ def quantize_model(
                 group_size,
                 in_features,
                 padded_features,
+                convrot=rotate,
                 awq=awq_scale is not None,
                 stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
             )
@@ -191,10 +210,11 @@ def quantize_model(
                 clean_memory_on_device(device)
 
     output_metadata = dict(original_metadata)
-    output_metadata["int4_convrot_quantized"] = "true"
+    output_metadata[INT4_CONVROT_METADATA_MARKER] = "true"
     output_metadata["int4_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
     output_metadata["int4_convrot_mse_clip"] = "true" if mse_clip else "false"
     output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
+    output_metadata["int4_convrot_rotation"] = "hadamard" if rotate else "none"
     output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
     output_metadata["int4_convrot_awq_alpha"] = str(float(awq_alpha))
     if stabilizer_rank > 0:
@@ -269,10 +289,197 @@ def quantize_model(
         logger.info("INT4 ConvRot quality summary: %s", summary)
 
 
+_COMFY_CONVROT_GROUPSIZE = 256
+_COMFY_QUANT_GROUPSIZE = 64
+
+
+def _is_comfy_convrot_target(key: str, value: torch.Tensor) -> tuple[bool, str]:
+    """Same target set as the int4cr path (transformer-block Linear weights, precision-sensitive excluded)."""
+    renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(key)
+    model_key = renamed if renamed is not None else key
+    is_target = model_key.endswith(".weight") and any(t in model_key for t in _INT4_CONVROT_TARGET_PATTERNS)
+    is_excluded = any(e in model_key for e in KEEP_FP8_HIGH_PRECISION_TOKENS)
+    if not is_target or is_excluded or value.ndim != 2 or value.shape[0] < 8:
+        return False, model_key
+    return True, model_key
+
+
+def _comfy_quant_conf_tensor(convrot_groupsize: int, linear_dtype: str) -> torch.Tensor:
+    """The per-weight ``<base>.comfy_quant`` blob ComfyUI's loader reads (UTF-8 JSON in a uint8 tensor)."""
+    conf = {"format": "convrot_w4a4", "convrot_groupsize": int(convrot_groupsize), "linear_dtype": linear_dtype}
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+
+
+# --- Self-contained reproduction of comfy-kitchen's convrot_w4a4 weight quantization -----------
+# These mirror comfy-kitchen's eager convrot_w4a4 backend byte-for-byte so the exporter
+# has NO runtime dependency on comfy-kitchen. The dev parity test asserts equality against the real
+# comfy-kitchen package; if upstream changes the format, that test (run with comfy-kitchen present)
+# catches the drift. Do not "optimize" these — they must match upstream exactly.
+_COMFY_INT4_MAX = 7  # symmetric absmax quantizer range [-7, 7], scale = absmax/7
+
+
+def _comfy_regular_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Regular (power-of-4) Hadamard built from H4 Kronecker products, normalized by 1/sqrt(size)."""
+    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=dtype, device=device)
+    h = h4
+    current = 4
+    while current < size:
+        h = torch.kron(h, h4)
+        current *= 4
+    return h / (size**0.5)
+
+
+def _comfy_rotate_weight(weight: torch.Tensor, h: torch.Tensor, group_size: int) -> torch.Tensor:
+    out_f, in_f = weight.shape
+    n_groups = in_f // group_size
+    weight_grouped = weight.reshape(out_f, n_groups, group_size)
+    h_t = h.T.to(dtype=weight.dtype, device=weight.device)
+    return torch.matmul(weight_grouped, h_t).reshape(out_f, in_f)
+
+
+def _comfy_pack_int4_row_major(values: torch.Tensor) -> torch.Tensor:
+    lo = values[..., 0::2].to(torch.int32) & 0x0F
+    hi = values[..., 1::2].to(torch.int32) & 0x0F
+    return (lo | (hi << 4)).to(torch.int8)
+
+
+def _quantize_comfy_convrot_w4a4_weight(weight: torch.Tensor, convrot_groupsize: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate + symmetric per-row int4 quantize + pack, matching comfy-kitchen (deterministic round).
+
+    Returns (packed_int8 [out, in//2], scale_fp32 [out]).
+    """
+    h = _comfy_regular_hadamard(convrot_groupsize, weight.device, weight.dtype)
+    w_rot = _comfy_rotate_weight(weight, h, convrot_groupsize)
+    rows = w_rot.shape[0]
+    absmax = w_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    scales = absmax / _COMFY_INT4_MAX
+    q = (w_rot / scales).round_().clamp_(-_COMFY_INT4_MAX, _COMFY_INT4_MAX).to(torch.int8)
+    return _comfy_pack_int4_row_major(q), scales.reshape(rows).to(torch.float32)
+
+
+def export_comfy_convrot_w4a4(
+    input_model: str,
+    output_model: str,
+    *,
+    calc_device: str,
+    linear_dtype: str = "int4",
+) -> None:
+    """Export a ComfyUI-loadable ``convrot_w4a4`` checkpoint (Comfy-Org/comfy-kitchen format).
+
+    This is a one-way *publish for inference* artifact, NOT a trainer input: it writes the exact
+    buffers/metadata ComfyUI's quantized-weight loader expects (packed int8 ``<base>.weight`` +
+    ``<base>.weight_scale`` + ``<base>.comfy_quant`` config). The int4 ConvRot quantization is a
+    self-contained reproduction of comfy-kitchen's convrot_w4a4 math (no runtime dependency on
+    comfy-kitchen; the dev parity test asserts byte-for-byte equality against it). Weights whose
+    in_features are not divisible by the ConvRot group size (256) are kept unquantized (16-bit).
+    No stabilizer / AWQ (convrot_w4a4 has no slot for them).
+    """
+    if linear_dtype not in ("int4", "int8"):
+        raise ValueError(f"--comfy_linear_dtype must be int4 or int8, got {linear_dtype!r}")
+    if not os.path.isfile(input_model):
+        raise FileNotFoundError(f"Input model not found: {input_model}")
+
+    device = torch.device(calc_device)
+    logger.info("comfy_convrot_w4a4 export device: %s, linear_dtype: %s", device, linear_dtype)
+
+    with safetensors.safe_open(input_model, framework="pt") as f:
+        original_metadata = f.metadata() or {}
+
+    state_dict: dict[str, torch.Tensor] = {}
+    quantized_count = 0
+    passthrough_count = 0
+    fallback_layers: list[tuple[str, int]] = []
+    t0 = time.time()
+
+    with MemoryEfficientSafeOpen(input_model) as f:
+        keys = list(f.keys())
+        fp8_scale_keys = {key for key in keys if key.endswith(".weight_scale") or key.endswith(".input_scale")}
+        for key in tqdm(keys, desc="Exporting convrot_w4a4", unit="tensor"):
+            if key in fp8_scale_keys:
+                continue
+            value = f.get_tensor(key)
+            if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
+                scale_key = key.replace(".weight", ".weight_scale")
+                if scale_key not in fp8_scale_keys:
+                    raise ValueError(
+                        f"comfy_convrot_w4a4 source has FP8 weight without weight_scale: {key}. Use a bf16/fp16 checkpoint."
+                    )
+                value = value.to(torch.bfloat16) * f.get_tensor(scale_key).to(value.device)
+
+            is_target, _model_key = _is_comfy_convrot_target(key, value)
+            if not is_target:
+                state_dict[key] = value
+                passthrough_count += 1
+                continue
+
+            in_features = int(value.shape[1])
+            if in_features % _COMFY_CONVROT_GROUPSIZE != 0:
+                # 16-bit fallback tier: in_features not divisible by the ConvRot group size (256).
+                state_dict[key] = value
+                fallback_layers.append((key, in_features))
+                continue
+
+            qdata, scale = _quantize_comfy_convrot_w4a4_weight(
+                value.to(device=device, dtype=torch.float32), _COMFY_CONVROT_GROUPSIZE
+            )
+            base = key[: -len(".weight")]
+            state_dict[key] = qdata.cpu().contiguous()
+            state_dict[base + ".weight_scale"] = scale.cpu().contiguous()
+            state_dict[base + ".comfy_quant"] = _comfy_quant_conf_tensor(_COMFY_CONVROT_GROUPSIZE, linear_dtype)
+            quantized_count += 1
+            if device.type == "cuda" and quantized_count % 20 == 0:
+                clean_memory_on_device(device)
+
+    output_dir = os.path.dirname(output_model)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    # Preserve the source metadata unchanged; ComfyUI keys off the per-weight .comfy_quant blobs.
+    logger.info("Saving comfy_convrot_w4a4 checkpoint to %s", output_model)
+    save_file(state_dict, output_model, metadata=dict(original_metadata))
+
+    if fallback_layers:
+        logger.warning(
+            "comfy_convrot_w4a4: %d target Linear(s) kept 16-bit (in_features not divisible by %d): %s",
+            len(fallback_layers),
+            _COMFY_CONVROT_GROUPSIZE,
+            ", ".join(f"{k}(in={n})" for k, n in fallback_layers[:8]) + (" ..." if len(fallback_layers) > 8 else ""),
+        )
+    elapsed = time.time() - t0
+    input_size = os.path.getsize(input_model) / (1024**3)
+    output_size = os.path.getsize(output_model) / (1024**3)
+    logger.info(
+        "comfy_convrot_w4a4 export complete in %.1fs: quantized=%d fallback_16bit=%d passthrough=%d size=%.2fGB -> %.2fGB",
+        elapsed,
+        quantized_count,
+        len(fallback_layers),
+        passthrough_count,
+        input_size,
+        output_size,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pre-quantize LTX-2 model weights to packed INT4 ConvRot")
     parser.add_argument("--input_model", required=True, help="Path to original .safetensors checkpoint")
     parser.add_argument("--output_model", required=True, help="Path for INT4 ConvRot output .safetensors")
+    parser.add_argument(
+        "--export_format",
+        default="int4cr",
+        choices=["int4cr", "comfy_convrot_w4a4"],
+        help=(
+            "int4cr (default): this trainer's reusable INT4 ConvRot prepack (load with --w4a4g4/--w4a8). "
+            "comfy_convrot_w4a4: a one-way ComfyUI-loadable convrot_w4a4 checkpoint (Comfy-Org/comfy-kitchen "
+            "inference format); requires comfy-kitchen>=0.2.17; ignores stabilizer/AWQ/rotation options."
+        ),
+    )
+    parser.add_argument(
+        "--comfy_linear_dtype",
+        default="int4",
+        choices=["int4", "int8"],
+        help="Matrix-mult precision recorded per layer for --export_format comfy_convrot_w4a4 (default int4).",
+    )
     parser.add_argument(
         "--calc_device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -285,12 +492,21 @@ def main() -> None:
     )
     parser.add_argument("--no_mse_clip", action="store_true", help="Use plain absmax scales instead of MSE clipping")
     parser.add_argument(
+        "--no_rotation",
+        action="store_true",
+        help=(
+            "No-rotation mode: skip the online ConvRot Hadamard rotation entirely and INT4-quantize the raw "
+            "(unrotated) weight residual. The low-rank SVD stabilizer then becomes the sole outlier-isolation "
+            "mechanism, so --stabilizer_rank >= 1 is required. Removes the runtime rotation/inverse-rotation passes."
+        ),
+    )
+    parser.add_argument(
         "--stabilizer_rank",
         type=int,
         default=0,
         help=(
             "Rank of the frozen low-rank stabilizer branch split off each rotated weight before INT4 "
-            "quantization (SVDQuant-style outlier isolation). 0 disables it; 32 is the recommended value. "
+            "quantization (low-rank SVD outlier isolation). 0 disables it; 32 is the recommended value. "
             "The stabilizer tensors are stored in the output checkpoint and applied automatically at load."
         ),
     )
@@ -326,6 +542,27 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if args.export_format == "comfy_convrot_w4a4":
+        for opt, flag in (
+            (args.stabilizer_rank, "--stabilizer_rank"),
+            (bool(args.int4_convrot_awq_calibration), "--int4_convrot_awq_calibration"),
+            (bool(args.int4_convrot_awq_scales), "--int4_convrot_awq_scales"),
+            (bool(args.no_rotation), "--no_rotation"),
+        ):
+            if opt:
+                raise ValueError(
+                    f"{flag} is not supported with --export_format comfy_convrot_w4a4 "
+                    "(the convrot_w4a4 format has no stabilizer/AWQ slot and always uses Hadamard rotation)"
+                )
+        export_comfy_convrot_w4a4(
+            input_model=args.input_model,
+            output_model=args.output_model,
+            calc_device=args.calc_device,
+            linear_dtype=args.comfy_linear_dtype,
+        )
+        return
+
     quality_report = None if args.no_quality_report else (args.quality_report or default_quality_report_path(args.output_model))
     quantize_model(
         input_model=args.input_model,
@@ -338,6 +575,7 @@ def main() -> None:
         awq_alpha=float(args.int4_convrot_awq_alpha),
         awq_scales=args.int4_convrot_awq_scales,
         stabilizer_rank=int(args.stabilizer_rank),
+        no_rotation=bool(args.no_rotation),
     )
 
 

@@ -1529,6 +1529,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._setup_latent_temporal(args)
         self._apply_network_initialization(args, network)
         validate_lycoris_runtime(args, accelerator, transformer, network, logger)
+        from musubi_tuner.modules.int4_convrot_utils import apply_int4_convrot_fused_lora
+
+        apply_int4_convrot_fused_lora(network)
 
     def _setup_latent_temporal(self, args: argparse.Namespace) -> None:
         """Parse latent temporal objective flags. No-op when both flags are off."""
@@ -2587,6 +2590,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 getattr(args, "int8_base", False)
                 or getattr(args, "int8_convrot_base", False)
                 or getattr(args, "int4_convrot_base", False)
+                or getattr(args, "nvfp4_training_base", False)
             ):
                 raise
             from musubi_tuner.ltx2_model_loading import infer_ltx2_transformer_config_from_weights
@@ -3423,20 +3427,156 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
+        # --- W4A4G4 / W4A8: resolve the INT4 ConvRot mode flags --------------------------
+        # --w4a4g4 (W4A4G4) and --w4a8 are the two peer activation-precision flags;
+        # --w4a4g4_container selects the frozen-base format (int4 / nvfp4). The checkpoint type is
+        # auto-detected (converter-produced prepack -> base load path; plain bf16/fp16 -> on-the-fly
+        # dynamic path) and the expert gates are resolved once here, before model load / first gate
+        # read. Downstream code reads the internal args.int4_convrot_base / int4_convrot_dynamic /
+        # nvfp4_training_base booleans this sets.
+        _w4a4g4 = bool(getattr(args, "w4a4g4", False))
+        _w4a8 = bool(getattr(args, "w4a8", False))
+        _w4a4g8 = bool(getattr(args, "w4a4g8", False))
+        if not hasattr(args, "int4_convrot_base"):
+            args.int4_convrot_base = False
+        if not hasattr(args, "int4_convrot_dynamic"):
+            args.int4_convrot_dynamic = False
+        if not hasattr(args, "nvfp4_training_base"):
+            args.nvfp4_training_base = False
+        # Container-dependent stabilizer ranks resolved here and read by load_transformer.
+        args._resolved_int4_stab_rank = 0
+        args._resolved_nvfp4_stab_rank = 32
+        _container = str(getattr(args, "w4a4g4_container", "auto") or "auto").lower()
+        if sum((_w4a4g4, _w4a8, _w4a4g8)) > 1:
+            raise ValueError("--w4a4g4, --w4a8 and --w4a4g8 are mutually exclusive; pick one INT4 ConvRot activation/gradient mode")
+        if _container != "auto" and not (_w4a4g4 or _w4a8 or _w4a4g8):
+            raise ValueError("--w4a4g4_container requires --w4a4g4 (--w4a8/--w4a4g8 are int4-only)")
+        if (_w4a8 or _w4a4g8) and _container == "nvfp4":
+            _int4only_flag = "--w4a8" if _w4a8 else "--w4a4g8"
+            raise ValueError(
+                f"{_int4only_flag} is int4-only; the nvfp4 container has no int8-gradient/W4A8 mode "
+                "(use --w4a4g4 --w4a4g4_container nvfp4 for NVFP4 training)"
+            )
+        if _w4a4g4 or _w4a8 or _w4a4g8:
+            _int4cr_mode_flag = "--w4a4g4" if _w4a4g4 else ("--w4a8" if _w4a8 else "--w4a4g8")
+            # nvfp4_training_base is an internal attr set below for the nvfp4 container (not a user
+            # flag), so it must NOT appear in this conflict list.
+            for _conflict in (
+                "nf4_base",
+                "fp8_base",
+                "fp8_scaled",
+                "int8_base",
+                "int8_base_dynamic",
+                "int8_convrot_base",
+                "int8_convrot_dynamic",
+            ):
+                if getattr(args, _conflict, False):
+                    raise ValueError(f"{_int4cr_mode_flag} and --{_conflict} are mutually exclusive")
+            if not getattr(args, "network_module", None):
+                raise ValueError(f"{_int4cr_mode_flag} requires LoRA training (--network_module); the quantized base is frozen")
+            from musubi_tuner.modules.int4_convrot_utils import (
+                configure_int4cr_training_defaults,
+                detect_int4_convrot_checkpoint,
+            )
+            from musubi_tuner.modules.nvfp4_training import detect_nvfp4_training_checkpoint
+
+            _is_int4_prequant = detect_int4_convrot_checkpoint(args.ltx2_checkpoint)
+            _is_nvfp4_prequant = detect_nvfp4_training_checkpoint(args.ltx2_checkpoint)
+            # Resolve the container: --w4a8/--w4a4g8 are int4-only; an explicit choice must agree with a
+            # pre-quantized checkpoint's format; auto follows the checkpoint (bf16 -> int4).
+            if _w4a8 or _w4a4g8:
+                _resolved_container = "int4"
+            elif _container == "int4":
+                if _is_nvfp4_prequant:
+                    raise ValueError(
+                        "--w4a4g4_container int4 but --ltx2_checkpoint is a pre-quantized NVFP4 checkpoint; "
+                        "use --w4a4g4_container nvfp4 (or auto)"
+                    )
+                _resolved_container = "int4"
+            elif _container == "nvfp4":
+                if _is_int4_prequant:
+                    raise ValueError(
+                        "--w4a4g4_container nvfp4 but --ltx2_checkpoint is a pre-quantized int4cr checkpoint; "
+                        "use --w4a4g4_container int4 (or auto)"
+                    )
+                _resolved_container = "nvfp4"
+            else:  # auto
+                _resolved_container = "nvfp4" if _is_nvfp4_prequant else "int4"
+
+            _stab_rank_arg = getattr(args, "w4a4g4_stabilizer_rank", None)
+            if _stab_rank_arg is not None and int(_stab_rank_arg) < 0:
+                raise ValueError("--w4a4g4_stabilizer_rank must be >= 0")
+
+            if _resolved_container == "int4":
+                _is_prequant = _is_int4_prequant
+                args.int4_convrot_base = bool(_is_prequant)
+                args.int4_convrot_dynamic = not _is_prequant
+                args.nvfp4_training_base = False
+                logger.info(
+                    "INT4 ConvRot %s (int4 container): %s checkpoint detected -> %s path",
+                    _int4cr_mode_flag,
+                    "pre-quantized int4cr" if _is_prequant else "plain bf16/fp16",
+                    "base (direct load)" if _is_prequant else "dynamic (on-the-fly quantize)",
+                )
+                _int4_stab = 0 if _stab_rank_arg is None else int(_stab_rank_arg)
+                args._resolved_int4_stab_rank = _int4_stab
+                if _int4_stab > 0 and _w4a8:
+                    logger.warning(
+                        "--w4a4g4_stabilizer_rank=%d is ignored for --w4a8 (W4A8 uses the legacy no-stabilizer path)",
+                        _int4_stab,
+                    )
+                elif _int4_stab > 0 and _is_prequant:
+                    logger.warning(
+                        "--w4a4g4_stabilizer_rank=%d is ignored for a pre-quantized int4cr checkpoint "
+                        "(it carries its own stabilizer)",
+                        _int4_stab,
+                    )
+                if _w4a4g4:
+                    configure_int4cr_training_defaults(
+                        mode_flag="--w4a4g4", act_bits=4, backend="cutlass", fuse_cuda=True, fuse_lora=True
+                    )
+                elif _w4a4g8:
+                    # a4 forward (like w4a4g4) but int8 gradient in backward.
+                    configure_int4cr_training_defaults(
+                        mode_flag="--w4a4g8", act_bits=4, grad_bits=8, backend="cutlass", fuse_cuda=True, fuse_lora=True
+                    )
+                else:
+                    configure_int4cr_training_defaults(mode_flag="--w4a8", act_bits=8)
+            else:  # nvfp4 container: no rotation; int4cr gates left untouched
+                args.int4_convrot_base = False
+                args.int4_convrot_dynamic = False
+                args.nvfp4_training_base = True
+                _nvfp4_stab = 32 if _stab_rank_arg is None else int(_stab_rank_arg)
+                args._resolved_nvfp4_stab_rank = _nvfp4_stab
+                if _is_nvfp4_prequant and _stab_rank_arg is not None:
+                    logger.warning(
+                        "--w4a4g4_stabilizer_rank=%d is ignored for a pre-quantized NVFP4 checkpoint "
+                        "(it carries its own stabilizer)",
+                        _nvfp4_stab,
+                    )
+                logger.info(
+                    "W4A4G4 --w4a4g4 (nvfp4 container): %s checkpoint detected -> %s path",
+                    "pre-quantized NVFP4" if _is_nvfp4_prequant else "plain bf16/fp16",
+                    "base (direct load)" if _is_nvfp4_prequant else "dynamic (on-the-fly quantize)",
+                )
+
         _int8_base = getattr(args, "int8_base", False)
         _int8_dynamic = getattr(args, "int8_base_dynamic", False)
         _int8_convrot_base = getattr(args, "int8_convrot_base", False)
         _int8_convrot_dynamic = getattr(args, "int8_convrot_dynamic", False)
-        _int4_convrot_base = getattr(args, "int4_convrot_base", False)
         _int4_convrot_dynamic = getattr(args, "int4_convrot_dynamic", False)
+        # NOTE: nvfp4_training_base is intentionally NOT in this dict — it is an internal attr set by
+        # the nvfp4 container above, so listing it would double-count against the --w4a4g4 entry and
+        # raise a false "mutually exclusive" error. Real nvfp4-vs-other conflicts are caught by the
+        # --w4a4g4/--w4a8 conflict loop above.
         _quantized_base_flags = {
             "--int8_base": _int8_base,
             "--int8_base_dynamic": _int8_dynamic,
             "--int8_convrot_base": _int8_convrot_base,
             "--int8_convrot_dynamic": _int8_convrot_dynamic,
-            "--int4_convrot_base": _int4_convrot_base,
-            "--int4_convrot_dynamic": _int4_convrot_dynamic,
         }
+        if _w4a4g4 or _w4a8 or _w4a4g8:
+            _quantized_base_flags[_int4cr_mode_flag] = True
         _enabled_quantized_flags = [flag for flag, enabled in _quantized_base_flags.items() if enabled]
         if len(_enabled_quantized_flags) > 1:
             raise ValueError(f"quantized base modes are mutually exclusive: {', '.join(_enabled_quantized_flags)}")
@@ -3453,7 +3593,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 )
         if getattr(args, "int4_convrot_awq_calibration", False) or getattr(args, "int4_convrot_awq_scales", None):
             if not _int4_convrot_dynamic:
-                raise ValueError("--int4_convrot_awq_calibration/--int4_convrot_awq_scales require --int4_convrot_dynamic")
+                raise ValueError(
+                    "--int4_convrot_awq_calibration/--int4_convrot_awq_scales require --w4a4g4/--w4a8/--w4a4g8 with a "
+                    "bf16/fp16 checkpoint (the on-the-fly dynamic path)"
+                )
             awq_alpha = float(getattr(args, "int4_convrot_awq_alpha", 0.25))
             if not (0.0 <= awq_alpha <= 1.0):
                 raise ValueError("--int4_convrot_awq_alpha must be in [0, 1]")
@@ -3968,6 +4111,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             int4_convrot_awq_calibration=bool(getattr(args, "int4_convrot_awq_calibration", False)),
             int4_convrot_awq_alpha=float(getattr(args, "int4_convrot_awq_alpha", 0.25)),
             int4_convrot_awq_scales=getattr(args, "int4_convrot_awq_scales", None),
+            int4_convrot_stabilizer_rank=int(getattr(args, "_resolved_int4_stab_rank", 0) or 0),
+            nvfp4_training_base=bool(getattr(args, "nvfp4_training_base", False)),
+            nvfp4_stabilizer_rank=int(getattr(args, "_resolved_nvfp4_stab_rank", 32)),
             nf4_base=bool(getattr(args, "nf4_base", False)),
             nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
             loftq_init=bool(getattr(args, "loftq_init", False)),
@@ -4176,6 +4322,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             or getattr(args, "int8_convrot_dynamic", False)
             or getattr(args, "int4_convrot_base", False)
             or getattr(args, "int4_convrot_dynamic", False)
+            or getattr(args, "nvfp4_training_base", False)
         ):
             self._ensure_fp8_buffers_on_device(transformer)
         forward_args = (model_input,)
@@ -5513,6 +5660,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_convrot_dynamic", False)
                 or getattr(args, "int4_convrot_base", False)
                 or getattr(args, "int4_convrot_dynamic", False)
+                or getattr(args, "nvfp4_training_base", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -5912,6 +6060,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_convrot_dynamic", False)
                 or getattr(args, "int4_convrot_base", False)
                 or getattr(args, "int4_convrot_dynamic", False)
+                or getattr(args, "nvfp4_training_base", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
@@ -6562,6 +6711,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 or getattr(args, "int8_convrot_dynamic", False)
                 or getattr(args, "int4_convrot_base", False)
                 or getattr(args, "int4_convrot_dynamic", False)
+                or getattr(args, "nvfp4_training_base", False)
             ):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):

@@ -245,8 +245,11 @@ class TrainingConfig(BaseModel):
     int8_convrot_groupsize: str = "auto"
     int8_convrot_no_mse_clip: bool = False
     int8_convrot_quality_report: str = ""
-    int4_convrot_base: bool = False
-    int4_convrot_dynamic: bool = False
+    w4a4g4: bool = False
+    w4a8: bool = False
+    w4a4g8: bool = False
+    w4a4g4_stabilizer_rank: int = 0
+    w4a4g4_container: str = "auto"
     int4_convrot_groupsize: str = "auto"
     int4_convrot_no_mse_clip: bool = False
     int4_convrot_quality_report: str = ""
