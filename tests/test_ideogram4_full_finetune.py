@@ -123,6 +123,30 @@ def test_full_loader_passes_trainable_dtype_directly(monkeypatch):
     }
 
 
+def test_lora_scaled_fp8_loader_uses_configured_compute_dtype(monkeypatch):
+    loaded_model = object()
+    loader_call = {}
+
+    def fake_load_transformer(path, **kwargs):
+        loader_call.update(path=path, **kwargs)
+        return loaded_model
+
+    monkeypatch.setattr(ideogram4_utils, "load_ideogram4_transformer", fake_load_transformer)
+
+    result = Ideogram4NetworkTrainer().load_transformer(
+        SimpleNamespace(device=torch.device("cpu")),
+        SimpleNamespace(dit_dtype="bfloat16", disable_numpy_memmap=False),
+        "conditional_fp8.safetensors",
+        "torch",
+        False,
+        torch.device("cpu"),
+        None,
+    )
+
+    assert result is loaded_model
+    assert loader_call["dtype"] is torch.bfloat16
+
+
 class _PreparedTransformer:
     def __init__(self):
         self.calls = []

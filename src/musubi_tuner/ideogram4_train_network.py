@@ -240,10 +240,11 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         del accelerator
         self._attn_mode = attn_mode
         self._split_attn = split_attn
+        effective_dtype = dit_weight_dtype if dit_weight_dtype is not None else model_utils.str_to_dtype(args.dit_dtype)
         return ideogram4_utils.load_ideogram4_transformer(
             dit_path,
             device=loading_device,
-            dtype=dit_weight_dtype,
+            dtype=effective_dtype,
             expected_model_type=ideogram4_utils.IDEOGRAM4_COND_MODEL_TYPE,
             disable_mmap=args.disable_numpy_memmap,
             attn_mode=attn_mode,
