@@ -33,6 +33,10 @@ _LORA_INERT_DEFAULTS = {
 }
 
 
+class FullFineTuneResumeProgressError(NotImplementedError):
+    """Raised when a full-finetune state cannot restore its progress cursor."""
+
+
 @dataclass(eq=True)
 class TrainingProgress:
     global_step: int = 0
@@ -118,6 +122,18 @@ def save_state_all_ranks(accelerator, args, state_dir, retention_callback) -> No
             retention_callback()
     finally:
         accelerator.wait_for_everyone()
+
+
+def _require_local_training_progress(args: argparse.Namespace) -> None:
+    if not args.resume or getattr(args, "resume_from_huggingface", False):
+        return
+
+    progress_path = os.path.join(os.path.expanduser(os.fspath(args.resume)), "custom_checkpoint_0.pkl")
+    if not os.path.isfile(progress_path):
+        raise FullFineTuneResumeProgressError(
+            "--resume requires a state directory containing the registered TrainingProgress checkpoint "
+            f"custom_checkpoint_0.pkl; not found in {args.resume}"
+        )
 
 
 class FullFineTuningTrainerMixin:
@@ -470,10 +486,7 @@ class FullFineTuningTrainerMixin:
             parameter.register_post_accumulate_grad_hook(grad_hook)
 
     def train(self, args):
-        if args.resume:
-            raise NotImplementedError(
-                "--resume is not available in the shared full-finetune lifecycle until progress-aware resume is enabled"
-            )
+        _require_local_training_progress(args)
         if not self._validate_args_and_init(args):
             return
         self.validate_full_finetune_model_args(args)
@@ -533,13 +546,17 @@ class FullFineTuningTrainerMixin:
         )
 
         workers = min(args.max_data_loader_n_workers, os.cpu_count() or 1)
+        sampler_generator = torch.Generator().manual_seed(args.seed)
+        dataloader_generator = torch.Generator().manual_seed(args.seed)
+        train_sampler = torch.utils.data.RandomSampler(train_dataset_group, generator=sampler_generator)
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
-            shuffle=True,
+            sampler=train_sampler,
             collate_fn=collator,
             num_workers=workers,
             persistent_workers=bool(args.persistent_data_loader_workers and workers > 0),
+            generator=dataloader_generator,
         )
         if args.max_train_epochs is not None:
             args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -565,6 +582,17 @@ class FullFineTuningTrainerMixin:
         self.training_progress = progress
         accelerator.register_for_checkpointing(progress)
         self._patch_fused_backward(args, accelerator, optimizer, named_parameters)
+
+        resumed = False
+        if args.resume:
+            try:
+                resumed = self.resume_from_local_or_hf_if_specified(accelerator, args)
+            except RuntimeError as error:
+                if "custom checkpoint" not in str(error).lower():
+                    raise
+                raise FullFineTuneResumeProgressError(
+                    "--resume state is missing the registered TrainingProgress checkpoint"
+                ) from error
 
         self.on_train_start(args, accelerator, None, forward_model, optimizer)
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -630,10 +658,21 @@ class FullFineTuningTrainerMixin:
 
         for epoch in range(progress.epoch, num_train_epochs):
             current_epoch.value = epoch + 1
-            progress.epoch = epoch
-            progress.next_batch = 0
+            epoch_seed = args.seed + epoch
+            sampler_generator.manual_seed(epoch_seed)
+            dataloader_generator.manual_seed(epoch_seed)
 
-            for step, batch in enumerate(train_dataloader):
+            epoch_dataloader = train_dataloader
+            first_batch = 0
+            if resumed:
+                first_batch = progress.next_batch
+                epoch_dataloader = accelerator.skip_first_batches(train_dataloader, first_batch)
+                resumed = False
+
+            progress.epoch = epoch
+            progress.next_batch = first_batch
+
+            for step, batch in enumerate(epoch_dataloader, start=first_batch):
                 latents = batch["latents"]
                 with accelerator.accumulate(forward_model):
                     latents = self.scale_shift_latents(latents)
