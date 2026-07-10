@@ -468,6 +468,85 @@ def test_sampling_failure_restores_mode_rng_swap_and_runs_after_hook(tmp_path, m
     assert trainer.optimizer_mode_events[-1] == "eval"
 
 
+def test_full_loss_boundary_casts_target_before_architecture_loss_and_backward():
+    class ArchitectureSpecificLoss:
+        def compute_loss(
+            self,
+            args,
+            output,
+            timesteps,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            global_step,
+        ):
+            del timesteps, noise_scheduler, dit_dtype, network_dtype, global_step
+            self.architecture_target_dtype = output.target.dtype
+            loss = torch.nn.functional.mse_loss(output.pred, output.target, reduction="mean")
+            return loss * args.architecture_loss_scale, {"loss/architecture": args.architecture_loss_scale}
+
+    class FullArchitectureTrainer(FullFineTuningTrainerMixin, ArchitectureSpecificLoss):
+        pass
+
+    trainer = FullArchitectureTrainer()
+    prediction = torch.tensor([1.0], dtype=torch.bfloat16, requires_grad=True)
+    output = DiTOutput(pred=prediction, target=torch.zeros(1, dtype=torch.float32))
+
+    loss, metrics = trainer.compute_loss(
+        SimpleNamespace(architecture_loss_scale=3.0),
+        output,
+        torch.tensor([1.0]),
+        None,
+        torch.bfloat16,
+        torch.bfloat16,
+        0,
+    )
+    assert metrics == {"loss/architecture": 3.0}
+    loss.backward()
+
+    assert trainer.architecture_target_dtype is torch.bfloat16
+    assert prediction.grad is not None
+    assert prediction.grad.dtype is torch.bfloat16
+
+
+def test_negative_block_swap_is_rejected_before_full_model_lifecycle(tmp_path, monkeypatch):
+    trainer = TinyFullTrainer()
+    install_runtime_fakes(monkeypatch, trainer)
+
+    with pytest.raises(ValueError, match="--blocks_to_swap"):
+        trainer.train(make_args(tmp_path, blocks_to_swap=-1, sample_prompts=None))
+
+    assert not hasattr(trainer, "loaded_model")
+
+
+def test_attention_backend_is_validated_before_dataset_and_sampling_setup(tmp_path, monkeypatch):
+    trainer = TinyFullTrainer()
+    install_runtime_fakes(monkeypatch, trainer)
+    dataset_calls = []
+
+    def fail_if_dataset_is_built(_args):
+        dataset_calls.append(True)
+        raise AssertionError("dataset must not be built before attention validation")
+
+    monkeypatch.setattr(trainer, "_build_dataset", fail_if_dataset_is_built)
+
+    with pytest.raises(ValueError, match="either --sdpa"):
+        trainer.train(
+            make_args(
+                tmp_path,
+                sample_prompts=None,
+                sdpa=False,
+                flash_attn=False,
+                flash3=False,
+                sage_attn=False,
+                xformers=False,
+            )
+        )
+
+    assert dataset_calls == []
+    assert not hasattr(trainer, "loaded_model")
+
+
 @pytest.mark.parametrize("is_main_process", [False, True])
 def test_save_state_all_ranks_brackets_main_rank_retention(is_main_process):
     events = []

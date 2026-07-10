@@ -48,6 +48,7 @@ def _run_training(
     resume=None,
     save_at_step=None,
     interrupt_after_state_save=False,
+    save_state_on_train_end=False,
     seed=123,
 ):
     trainer = ResumeTrainer()
@@ -77,6 +78,7 @@ def _run_training(
         max_train_steps=max_train_steps,
         save_every_n_steps=save_at_step,
         save_state=save_at_step is not None,
+        save_state_on_train_end=save_state_on_train_end,
         resume=None if resume is None else str(resume),
         seed=seed,
     )
@@ -107,8 +109,72 @@ def test_interrupted_resume_matches_uninterrupted_training(tmp_path, monkeypatch
     assert resumed.training_progress == uninterrupted.training_progress
     assert resumed.skipped_batches == [2]
     assert resumed.training_progress.global_step == 4
-    assert resumed.training_progress.epoch == 1
-    assert resumed.training_progress.next_batch == 0
+    assert resumed.training_progress.epoch == 0
+    assert resumed.training_progress.next_batch == 4
+
+
+def test_same_max_resume_does_not_execute_an_extra_batch(tmp_path, monkeypatch):
+    interrupted_dir = tmp_path / "same-max-interrupted"
+    with pytest.raises(TrainingInterrupted) as interruption:
+        _run_training(
+            monkeypatch,
+            interrupted_dir,
+            max_train_steps=2,
+            save_at_step=2,
+            interrupt_after_state_save=True,
+        )
+    interrupted = interruption.value.args[0]
+
+    resumed = _run_training(
+        monkeypatch,
+        tmp_path / "same-max-resumed",
+        max_train_steps=2,
+        resume=interrupted_dir / "tiny-step00000002-state",
+    )
+
+    assert resumed.training_progress.global_step == 2
+    assert resumed.training_progress.epoch == 0
+    assert resumed.training_progress.next_batch == 2
+    assert resumed.skipped_batches == []
+    assert not resumed.forward_wrapper_called
+    assert resumed.scheduler.state_dict() == interrupted.scheduler.state_dict()
+    assert all(
+        torch.equal(interrupted.raw_model.state_dict()[key], resumed.raw_model.state_dict()[key])
+        for key in interrupted.raw_model.state_dict()
+    )
+
+
+def test_extending_final_mid_epoch_state_matches_uninterrupted_training(tmp_path, monkeypatch):
+    uninterrupted = _run_training(monkeypatch, tmp_path / "extended-uninterrupted", max_train_steps=4)
+    short_dir = tmp_path / "short-final"
+    short = _run_training(
+        monkeypatch,
+        short_dir,
+        max_train_steps=2,
+        save_state_on_train_end=True,
+    )
+
+    assert short.training_progress.global_step == 2
+    assert short.training_progress.epoch == 0
+    assert short.training_progress.next_batch == 2
+
+    resumed = _run_training(
+        monkeypatch,
+        tmp_path / "extended-resumed",
+        max_train_steps=4,
+        resume=short_dir / "tiny-state",
+    )
+
+    assert resumed.training_progress == uninterrupted.training_progress
+    assert resumed.training_progress.global_step == 4
+    assert resumed.training_progress.epoch == 0
+    assert resumed.training_progress.next_batch == 4
+    assert resumed.skipped_batches == [2]
+    assert resumed.scheduler.state_dict() == uninterrupted.scheduler.state_dict()
+    assert all(
+        torch.equal(uninterrupted.raw_model.state_dict()[key], resumed.raw_model.state_dict()[key])
+        for key in uninterrupted.raw_model.state_dict()
+    )
 
 
 def test_resume_requires_registered_training_progress_file(tmp_path, monkeypatch):

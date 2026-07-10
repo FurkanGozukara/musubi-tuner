@@ -1,4 +1,6 @@
 import argparse
+import importlib
+import sys
 
 import pytest
 import torch
@@ -79,7 +81,9 @@ def make_full_finetune_args(**overrides):
         "gradient_accumulation_steps": 1,
         "save_precision": None,
         "full_bf16": False,
+        "full_fp16": False,
         "mixed_precision": None,
+        "dit_dtype": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -154,6 +158,24 @@ def test_validate_full_finetune_args_rejects_accumulated_fused_backward():
         validate_full_finetune_args(args, num_processes=1)
 
 
+def test_validate_full_finetune_args_rejects_fp16_fused_backward():
+    args = make_full_finetune_args(
+        fused_backward_pass=True,
+        optimizer_type="Adafactor",
+        mixed_precision="fp16",
+    )
+
+    with pytest.raises(ValueError, match=r"--fused_backward_pass.*--mixed_precision fp16"):
+        validate_full_finetune_args(args, num_processes=1)
+
+
+def test_validate_full_finetune_args_rejects_negative_block_swap_count():
+    args = make_full_finetune_args(blocks_to_swap=-1)
+
+    with pytest.raises(ValueError, match="--blocks_to_swap"):
+        validate_full_finetune_args(args, num_processes=1)
+
+
 def test_validate_full_finetune_args_rejects_mismatched_save_precision():
     args = make_full_finetune_args(save_precision="bf16")
 
@@ -166,6 +188,41 @@ def test_validate_full_finetune_args_rejects_full_bf16_without_bf16_mixed_precis
 
     with pytest.raises(ValueError, match="--full_bf16"):
         validate_full_finetune_args(args, num_processes=1)
+
+
+def test_validate_full_finetune_args_rejects_full_fp16_injected_namespace():
+    args = make_full_finetune_args(full_fp16=True)
+
+    with pytest.raises(ValueError, match="--full_fp16"):
+        validate_full_finetune_args(args, num_processes=1)
+
+
+@pytest.mark.parametrize("dit_dtype", ["float16", "bfloat16"])
+def test_validate_full_finetune_args_rejects_mismatched_dit_dtype(dit_dtype):
+    args = make_full_finetune_args(dit_dtype=dit_dtype)
+
+    with pytest.raises(ValueError, match=r"--dit_dtype.*--full_bf16"):
+        validate_full_finetune_args(args, num_processes=1)
+
+
+@pytest.mark.parametrize(
+    ("dit_dtype", "full_bf16", "mixed_precision"),
+    [
+        (None, False, None),
+        ("float32", False, "no"),
+        ("fp32", False, "no"),
+        ("bfloat16", True, "bf16"),
+        ("bf16", True, "bf16"),
+    ],
+)
+def test_validate_full_finetune_args_accepts_matching_dit_dtype(dit_dtype, full_bf16, mixed_precision):
+    args = make_full_finetune_args(
+        dit_dtype=dit_dtype,
+        full_bf16=full_bf16,
+        mixed_precision=mixed_precision,
+    )
+
+    validate_full_finetune_args(args, num_processes=1)
 
 
 @pytest.mark.parametrize(
@@ -181,3 +238,96 @@ def test_validate_full_finetune_args_accepts_supported_combinations(overrides, n
     args = make_full_finetune_args(**overrides)
 
     validate_full_finetune_args(args, num_processes)
+
+
+def _run_validation_only_entrypoint(monkeypatch, module_name, trainer_name, argv):
+    module = importlib.import_module(module_name)
+    captured = []
+
+    class ValidationOnlyTrainer:
+        def train(self, args):
+            captured.append(args)
+            validate_full_finetune_args(args, num_processes=1)
+
+    monkeypatch.setattr(module, trainer_name, ValidationOnlyTrainer)
+    monkeypatch.setattr(sys, "argv", [module_name, *argv])
+    module.main()
+    return captured[0]
+
+
+@pytest.mark.parametrize(
+    ("module_name", "trainer_name"),
+    [
+        ("musubi_tuner.flux_kontext_train", "FluxKontextTrainer"),
+        ("musubi_tuner.flux_2_train", "Flux2Trainer"),
+        ("musubi_tuner.ideogram4_train", "Ideogram4Trainer"),
+        ("musubi_tuner.krea2_train", "Krea2Trainer"),
+    ],
+)
+def test_full_entrypoints_preserve_matching_toml_dit_dtype(
+    tmp_path,
+    monkeypatch,
+    module_name,
+    trainer_name,
+):
+    config = tmp_path / "matching.toml"
+    config.write_text(
+        'dit_dtype = "bfloat16"\nfull_bf16 = true\nmixed_precision = "bf16"\n',
+        encoding="utf-8",
+    )
+
+    args = _run_validation_only_entrypoint(
+        monkeypatch,
+        module_name,
+        trainer_name,
+        ["--config_file", str(config)],
+    )
+
+    assert args.dit_dtype == "bfloat16"
+
+
+def test_full_entrypoint_rejects_mismatched_toml_dit_dtype(tmp_path, monkeypatch):
+    config = tmp_path / "mismatched.toml"
+    config.write_text('dit_dtype = "bfloat16"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"--dit_dtype.*--full_bf16"):
+        _run_validation_only_entrypoint(
+            monkeypatch,
+            "musubi_tuner.flux_kontext_train",
+            "FluxKontextTrainer",
+            ["--config_file", str(config)],
+        )
+
+
+def test_full_entrypoint_rejects_toml_injected_full_fp16(tmp_path, monkeypatch):
+    config = tmp_path / "full-fp16.toml"
+    config.write_text("full_fp16 = true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="--full_fp16"):
+        _run_validation_only_entrypoint(
+            monkeypatch,
+            "musubi_tuner.flux_kontext_train",
+            "FluxKontextTrainer",
+            ["--config_file", str(config)],
+        )
+
+
+def test_ideogram_full_entrypoint_rejects_mismatched_cli_dit_dtype(monkeypatch):
+    with pytest.raises(ValueError, match=r"--dit_dtype.*--full_bf16"):
+        _run_validation_only_entrypoint(
+            monkeypatch,
+            "musubi_tuner.ideogram4_train",
+            "Ideogram4Trainer",
+            ["--dit_dtype", "float16"],
+        )
+
+
+def test_ideogram_full_entrypoint_preserves_matching_cli_dit_dtype(monkeypatch):
+    args = _run_validation_only_entrypoint(
+        monkeypatch,
+        "musubi_tuner.ideogram4_train",
+        "Ideogram4Trainer",
+        ["--dit_dtype", "bfloat16", "--full_bf16", "--mixed_precision", "bf16"],
+    )
+
+    assert args.dit_dtype == "bfloat16"

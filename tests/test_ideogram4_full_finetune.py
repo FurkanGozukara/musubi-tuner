@@ -15,9 +15,13 @@ def _full_train_module():
     return importlib.import_module("musubi_tuner.ideogram4_train")
 
 
-def _write_conditional_checkpoint(path: Path, tensor_key: str = "input_proj.weight") -> None:
+def _write_conditional_checkpoint(
+    path: Path,
+    tensor_key: str = "input_proj.weight",
+    tensor_dtype: torch.dtype = torch.float32,
+) -> None:
     save_file(
-        {tensor_key: torch.ones(1)},
+        {tensor_key: torch.ones(1, dtype=tensor_dtype)},
         str(path),
         metadata={"model_type": ideogram4_utils.IDEOGRAM4_COND_MODEL_TYPE},
     )
@@ -56,18 +60,31 @@ def test_quantized_conditional_header_is_rejected_before_model_construction(
     assert constructed == []
 
 
-def test_plain_conditional_header_is_accepted(tmp_path):
+@pytest.mark.parametrize(
+    ("tensor_dtype", "is_supported"),
+    [
+        (torch.float32, True),
+        (torch.float16, True),
+        (torch.bfloat16, True),
+        (torch.int32, False),
+    ],
+    ids=["fp32", "fp16", "bf16", "int32"],
+)
+def test_plain_conditional_header_dtype_allowlist(tmp_path, tensor_dtype, is_supported):
     full_train = _full_train_module()
-    checkpoint = tmp_path / "plain.safetensors"
-    _write_conditional_checkpoint(checkpoint)
-
-    full_train.Ideogram4Trainer().validate_full_finetune_model_args(
-        SimpleNamespace(
-            dit=str(checkpoint),
-            disable_numpy_memmap=False,
-            use_unconditional_dit_for_lora_sampling=False,
-        )
+    checkpoint = tmp_path / f"plain-{tensor_dtype}.safetensors"
+    _write_conditional_checkpoint(checkpoint, tensor_dtype=tensor_dtype)
+    args = SimpleNamespace(
+        dit=str(checkpoint),
+        disable_numpy_memmap=False,
+        use_unconditional_dit_for_lora_sampling=False,
     )
+
+    if is_supported:
+        full_train.Ideogram4Trainer().validate_full_finetune_model_args(args)
+    else:
+        with pytest.raises(ValueError, match=r"dtype.*F32.*F16.*BF16"):
+            full_train.Ideogram4Trainer().validate_full_finetune_model_args(args)
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype")

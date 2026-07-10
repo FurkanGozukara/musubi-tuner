@@ -37,6 +37,13 @@ class Ideogram4Trainer(FullFineTuningTrainerMixin, Ideogram4NetworkTrainer):
             {"F8_E4M3", "F8_E5M2"}
         ):
             raise ValueError("Ideogram 4 full finetuning does not support prequantized FP8 conditional DiT checkpoints")
+        unsupported_dtypes = tensor_dtypes.difference({"F32", "F16", "BF16"})
+        if unsupported_dtypes:
+            found = ", ".join(sorted(str(dtype) for dtype in unsupported_dtypes))
+            raise ValueError(
+                "Ideogram 4 full-finetune checkpoint tensor dtype must be F32, F16, or BF16; "
+                f"found {found}"
+            )
 
     def use_unconditional_dit_for_sampling(self, args: argparse.Namespace) -> bool:
         return bool(args.unconditional_dit)
@@ -54,7 +61,6 @@ def main():
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
-    args.dit_dtype = None
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 

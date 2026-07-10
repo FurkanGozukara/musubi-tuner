@@ -85,7 +85,10 @@ def validate_full_finetune_args(args: argparse.Namespace, num_processes: int) ->
     if args.block_swap_h2d_only:
         raise ValueError("--block_swap_h2d_only is only supported for frozen-base training")
 
-    if (args.blocks_to_swap or 0) > 0 and num_processes > 1:
+    blocks_to_swap = 0 if args.blocks_to_swap is None else args.blocks_to_swap
+    if blocks_to_swap < 0:
+        raise ValueError("--blocks_to_swap must be greater than or equal to 0")
+    if blocks_to_swap > 0 and num_processes > 1:
         raise ValueError("--blocks_to_swap is not supported for multi-process full finetuning")
 
     if args.fused_backward_pass:
@@ -95,11 +98,29 @@ def validate_full_finetune_args(args: argparse.Namespace, num_processes: int) ->
             raise ValueError("--fused_backward_pass is not supported for multi-process full finetuning")
         if args.gradient_accumulation_steps != 1:
             raise ValueError("--fused_backward_pass requires --gradient_accumulation_steps 1")
+        if args.mixed_precision == "fp16":
+            raise ValueError("--fused_backward_pass is incompatible with --mixed_precision fp16")
+
+    if getattr(args, "full_fp16", False):
+        raise ValueError("--full_fp16 is not supported for full finetuning; use fp32 or --full_bf16")
 
     if args.full_bf16 and args.mixed_precision != "bf16":
         raise ValueError("--full_bf16 requires --mixed_precision bf16")
 
     trainable_dtype = resolve_trainable_dtype(args)
+    requested_dit_dtype = getattr(args, "dit_dtype", None)
+    if requested_dit_dtype is not None:
+        try:
+            resolved_dit_dtype = model_utils.str_to_dtype(requested_dit_dtype)
+        except ValueError as error:
+            raise ValueError(
+                f"--dit_dtype must match the full trainable dtype selected by --full_bf16; got {requested_dit_dtype!r}"
+            ) from error
+        if resolved_dit_dtype != trainable_dtype:
+            raise ValueError(
+                "--dit_dtype must match the full trainable dtype selected by --full_bf16 "
+                f"({trainable_dtype}); got {requested_dit_dtype!r} ({resolved_dit_dtype})"
+            )
     save_dtype = train_utils.resolve_save_dtype(args.save_precision, full_bf16=args.full_bf16)
     if save_dtype != trainable_dtype:
         raise ValueError(f"--save_precision must match the trainable dtype ({trainable_dtype}); got {save_dtype}")
@@ -202,6 +223,27 @@ class FullFineTuningTrainerMixin:
     def full_finetune_metadata(self, args: argparse.Namespace) -> dict:
         del args
         return {}
+
+    def compute_loss(
+        self,
+        args,
+        output,
+        timesteps,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        global_step,
+    ):
+        output.target = output.target.to(network_dtype)
+        return super().compute_loss(
+            args,
+            output,
+            timesteps,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            global_step,
+        )
 
     @staticmethod
     def _attention_mode(args: argparse.Namespace) -> str:
@@ -438,7 +480,7 @@ class FullFineTuningTrainerMixin:
                     trainable_dtype,
                 )
             finally:
-                if self.blocks_to_swap:
+                if self.blocks_to_swap > 0:
                     raw_model.switch_block_swap_for_training()
                 raw_model.train(previous_training)
                 torch.set_rng_state(cpu_rng_state)
@@ -535,15 +577,16 @@ class FullFineTuningTrainerMixin:
             args.mixed_precision = accelerator.mixed_precision
         validate_full_finetune_args(args, accelerator.num_processes)
         trainable_dtype = resolve_trainable_dtype(args)
+        attn_mode = self._attention_mode(args)
 
         train_dataset_group, collator, current_epoch = self._build_dataset(args)
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters, vae = self._prepare_sampling(args, accelerator, vae_dtype)
 
-        blocks_to_swap = args.blocks_to_swap or 0
+        blocks_to_swap = 0 if args.blocks_to_swap is None else args.blocks_to_swap
+        has_block_swap = blocks_to_swap > 0
         self.blocks_to_swap = blocks_to_swap
-        loading_device = "cpu" if blocks_to_swap else accelerator.device
-        attn_mode = self._attention_mode(args)
+        loading_device = "cpu" if has_block_swap else accelerator.device
 
         raw_model = self.load_full_finetune_transformer(
             accelerator,
@@ -567,7 +610,7 @@ class FullFineTuningTrainerMixin:
 
         if args.gradient_checkpointing:
             raw_model.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
-        if blocks_to_swap:
+        if has_block_swap:
             swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
             raw_model.enable_block_swap(blocks_to_swap, swap_config)
             raw_model.move_to_device_except_swap_blocks(accelerator.device)
@@ -602,12 +645,12 @@ class FullFineTuningTrainerMixin:
         train_dataset_group.set_max_train_steps(args.max_train_steps)
         lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
-        if blocks_to_swap:
+        if has_block_swap:
             forward_model = accelerator.prepare(raw_model, device_placement=[False])
         else:
             forward_model = accelerator.prepare(raw_model)
         raw_model = accelerator.unwrap_model(forward_model, keep_fp32_wrapper=False)
-        if blocks_to_swap:
+        if has_block_swap:
             raw_model.move_to_device_except_swap_blocks(accelerator.device)
             raw_model.prepare_block_swap_before_forward()
 
@@ -699,6 +742,9 @@ class FullFineTuningTrainerMixin:
         clean_memory_on_device(accelerator.device)
 
         for epoch in range(progress.epoch, num_train_epochs):
+            if progress.global_step >= args.max_train_steps:
+                break
+
             current_epoch.value = epoch + 1
             epoch_seed = args.seed + epoch
             sampler_generator.manual_seed(epoch_seed)
@@ -714,7 +760,11 @@ class FullFineTuningTrainerMixin:
             progress.epoch = epoch
             progress.next_batch = first_batch
 
+            epoch_exhausted = False
             for step, batch in enumerate(epoch_dataloader, start=first_batch):
+                if progress.global_step >= args.max_train_steps:
+                    break
+
                 latents = batch["latents"]
                 with accelerator.accumulate(forward_model):
                     latents = self.scale_shift_latents(latents)
@@ -738,7 +788,7 @@ class FullFineTuningTrainerMixin:
                     if not args.fused_backward_pass:
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             accelerator.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
-                        if blocks_to_swap and args.block_swap_optimizer_patch_params:
+                        if has_block_swap and args.block_swap_optimizer_patch_params:
                             for parameter_group in optimizer.param_groups:
                                 for parameter in parameter_group["params"]:
                                     if parameter.grad is not None and parameter.device != parameter.grad.device:
@@ -825,7 +875,13 @@ class FullFineTuningTrainerMixin:
                     accelerator.log(logs, step=progress.global_step)
 
                 if progress.global_step >= args.max_train_steps:
+                    epoch_exhausted = progress.next_batch >= len(train_dataloader)
                     break
+            else:
+                epoch_exhausted = True
+
+            if not epoch_exhausted:
+                break
 
             progress.epoch = epoch + 1
             progress.next_batch = 0

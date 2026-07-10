@@ -56,7 +56,6 @@ def main():
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
-    args.dit_dtype = None
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
