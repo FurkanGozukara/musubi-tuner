@@ -1,9 +1,22 @@
 import argparse
+import json
+import math
+import os
+import shutil
+import time
 from dataclasses import asdict, dataclass
 
 import torch
+import toml
+from safetensors.torch import save_file
+from tqdm import tqdm
 
-from musubi_tuner.utils import model_utils, train_utils
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device, prepare_accelerator
+from musubi_tuner.training.sampling_prompts import should_sample_images
+from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
+from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
 
 _LORA_INERT_DEFAULTS = {
@@ -93,3 +106,711 @@ def normalize_compiled_state_dict(state_dict):
             raise ValueError(f"compiled state_dict key collision: {key}")
         normalized[key] = value
     return normalized
+
+
+def save_state_all_ranks(accelerator, args, state_dir, retention_callback) -> None:
+    """Save one Accelerate state atomically with respect to main-rank retention."""
+    del args
+    accelerator.save_state(state_dir)
+    accelerator.wait_for_everyone()
+    try:
+        if accelerator.is_main_process:
+            retention_callback()
+    finally:
+        accelerator.wait_for_everyone()
+
+
+class FullFineTuningTrainerMixin:
+    """Shared full-transformer lifecycle for image model trainers."""
+
+    def validate_full_finetune_model_args(self, args: argparse.Namespace) -> None:
+        del args
+
+    def load_full_finetune_transformer(
+        self,
+        accelerator,
+        args: argparse.Namespace,
+        dit_path: str,
+        attn_mode: str,
+        split_attn: bool,
+        loading_device,
+        trainable_dtype: torch.dtype,
+    ):
+        return self.load_transformer(
+            accelerator,
+            args,
+            dit_path,
+            attn_mode,
+            split_attn,
+            loading_device,
+            trainable_dtype,
+        )
+
+    def full_finetune_metadata(self, args: argparse.Namespace) -> dict:
+        del args
+        return {}
+
+    @staticmethod
+    def _attention_mode(args: argparse.Namespace) -> str:
+        if args.sdpa:
+            return "torch"
+        if args.flash_attn:
+            return "flash"
+        if args.sage_attn:
+            return "sageattn"
+        if args.xformers:
+            return "xformers"
+        if args.flash3:
+            return "flash3"
+        raise ValueError(
+            "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / "
+            "--sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
+        )
+
+    @staticmethod
+    def _metadata_value(value) -> str:
+        return str(value)
+
+    def _build_full_finetune_metadata(
+        self,
+        args,
+        session_id,
+        training_started_at,
+        train_dataset_group,
+        train_dataloader,
+        num_train_epochs,
+        optimizer_name,
+        optimizer_args,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        metadata = {
+            "ss_session_id": session_id,
+            "ss_training_started_at": training_started_at,
+            "ss_output_name": args.output_name,
+            "ss_learning_rate": args.learning_rate,
+            "ss_num_train_items": train_dataset_group.num_train_items,
+            "ss_num_batches_per_epoch": len(train_dataloader),
+            "ss_num_epochs": num_train_epochs,
+            "ss_gradient_checkpointing": args.gradient_checkpointing,
+            "ss_gradient_checkpointing_cpu_offload": args.gradient_checkpointing_cpu_offload,
+            "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "ss_max_train_steps": args.max_train_steps,
+            "ss_lr_warmup_steps": args.lr_warmup_steps,
+            "ss_lr_scheduler": args.lr_scheduler,
+            "ss_base_model_version": self.architecture_full_name,
+            "ss_mixed_precision": args.mixed_precision,
+            "ss_seed": args.seed,
+            "ss_training_comment": args.training_comment,
+            "ss_optimizer": optimizer_name + (f"({optimizer_args})" if optimizer_args else ""),
+            "ss_max_grad_norm": args.max_grad_norm,
+            "ss_fp8_base": False,
+            "ss_full_fp16": False,
+            "ss_full_bf16": bool(args.full_bf16),
+            "ss_training_type": "full-finetune",
+            "ss_full_finetune": True,
+            "ss_weighting_scheme": args.weighting_scheme,
+            "ss_logit_mean": args.logit_mean,
+            "ss_logit_std": args.logit_std,
+            "ss_mode_scale": args.mode_scale,
+            "ss_guidance_scale": args.guidance_scale,
+            "ss_timestep_sampling": args.timestep_sampling,
+            "ss_sigmoid_scale": args.sigmoid_scale,
+            "ss_discrete_flow_shift": args.discrete_flow_shift,
+        }
+        model_metadata = dict(self.full_finetune_metadata(args))
+        metadata.update(model_metadata)
+        metadata.update(self.extra_metadata(args))
+
+        datasets_metadata = [dataset.get_metadata() for dataset in train_dataset_group.datasets]
+        metadata["ss_datasets"] = json.dumps(datasets_metadata)
+
+        if args.dit is not None:
+            model_name = os.path.basename(args.dit) if os.path.exists(args.dit) else args.dit
+            metadata["ss_sd_model_name"] = model_name
+        if args.vae is not None:
+            vae_name = os.path.basename(args.vae) if os.path.exists(args.vae) else args.vae
+            metadata["ss_vae_name"] = vae_name
+
+        metadata = {key: self._metadata_value(value) for key, value in metadata.items()}
+        minimum_keys = {
+            "ss_base_model_version",
+            "ss_fp8_base",
+            "ss_full_bf16",
+            "ss_full_finetune",
+            "ss_training_type",
+        }
+        minimum_keys.update(model_metadata)
+        minimum_metadata = {key: metadata[key] for key in minimum_keys if key in metadata}
+        return metadata, minimum_metadata
+
+    def _save_full_finetune_model(
+        self,
+        accelerator,
+        args,
+        raw_model,
+        forward_model,
+        ckpt_name,
+        metadata,
+        minimum_metadata,
+        steps,
+        epoch_no,
+        save_dtype,
+        force_sync_upload=False,
+    ) -> None:
+        if not accelerator.is_main_process:
+            return
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
+
+        checkpoint_metadata = dict(metadata)
+        checkpoint_metadata.update(
+            {
+                "ss_training_finished_at": str(time.time()),
+                "ss_steps": str(steps),
+                "ss_epoch": str(epoch_no),
+            }
+        )
+        metadata_to_save = dict(minimum_metadata if args.no_metadata else checkpoint_metadata)
+
+        title = args.metadata_title if args.metadata_title is not None else args.output_name
+        if args.min_timestep is not None or args.max_timestep is not None:
+            min_timestep = args.min_timestep if args.min_timestep is not None else 0
+            max_timestep = args.max_timestep if args.max_timestep is not None else 1000
+            metadata_timesteps = (min_timestep, max_timestep)
+        else:
+            metadata_timesteps = None
+
+        sai_metadata = sai_model_spec.build_metadata(
+            None,
+            self.architecture,
+            time.time(),
+            title,
+            args.metadata_reso,
+            args.metadata_author,
+            args.metadata_description,
+            args.metadata_license,
+            args.metadata_tags,
+            timesteps=metadata_timesteps,
+            is_lora=False,
+            custom_arch=args.metadata_arch,
+        )
+        metadata_to_save.update(sai_metadata)
+        metadata_to_save = {key: self._metadata_value(value) for key, value in metadata_to_save.items()}
+
+        state_dict = normalize_compiled_state_dict(raw_model.state_dict())
+        floating_dtypes = {tensor.dtype for tensor in state_dict.values() if tensor.is_floating_point()}
+        if any(dtype != save_dtype for dtype in floating_dtypes):
+            raise ValueError(
+                f"full-finetune checkpoint contains floating tensors outside the save dtype {save_dtype}: "
+                f"{sorted(str(dtype) for dtype in floating_dtypes)}"
+            )
+
+        if args.mem_eff_save:
+            mem_eff_save_file(state_dict, ckpt_file, metadata_to_save)
+        else:
+            save_file(state_dict, ckpt_file, metadata=metadata_to_save)
+
+        if args.huggingface_repo_id is not None:
+            huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+
+        self.on_post_save(
+            args,
+            accelerator,
+            None,
+            forward_model,
+            ckpt_name,
+            save_dtype,
+            metadata_to_save,
+            force_sync_upload,
+        )
+
+    def _sample_full_finetune_images(
+        self,
+        accelerator,
+        args,
+        epoch,
+        steps,
+        vae,
+        raw_model,
+        forward_model,
+        sample_parameters,
+        trainable_dtype,
+    ) -> None:
+        if not should_sample_images(args, steps, epoch):
+            return
+
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_states = None
+        if torch.cuda.is_available():
+            try:
+                cuda_rng_states = torch.cuda.get_rng_state_all()
+            except Exception:
+                cuda_rng_states = None
+        previous_training = raw_model.training
+
+        try:
+            self.on_before_sample_images(
+                accelerator,
+                args,
+                epoch,
+                steps,
+                vae,
+                forward_model,
+                None,
+                sample_parameters,
+                trainable_dtype,
+            )
+            self.sample_images(
+                accelerator,
+                args,
+                epoch,
+                steps,
+                vae,
+                forward_model,
+                sample_parameters,
+                trainable_dtype,
+            )
+        finally:
+            try:
+                self.on_after_sample_images(
+                    accelerator,
+                    args,
+                    epoch,
+                    steps,
+                    vae,
+                    forward_model,
+                    None,
+                    sample_parameters,
+                    trainable_dtype,
+                )
+            finally:
+                if self.blocks_to_swap:
+                    raw_model.switch_block_swap_for_training()
+                raw_model.train(previous_training)
+                torch.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
+                clean_memory_on_device(accelerator.device)
+
+    @staticmethod
+    def _remove_checkpoint(args, ckpt_name) -> None:
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        if os.path.exists(ckpt_file):
+            os.remove(ckpt_file)
+
+    def _save_step_state(self, accelerator, args, global_step) -> None:
+        state_name = train_utils.STEP_STATE_NAME.format(args.output_name, global_step)
+        state_dir = os.path.join(args.output_dir, state_name)
+        old_state_dir = None
+        last_n_steps = args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps
+        if last_n_steps is not None:
+            remove_step = global_step - last_n_steps - 1
+            remove_step -= remove_step % args.save_every_n_steps
+            if remove_step > 0:
+                old_name = train_utils.STEP_STATE_NAME.format(args.output_name, remove_step)
+                old_state_dir = os.path.join(args.output_dir, old_name)
+
+        def retain_and_upload():
+            if args.save_state_to_huggingface:
+                huggingface_utils.upload(args, state_dir, "/" + state_name)
+            if old_state_dir is not None and os.path.exists(old_state_dir):
+                shutil.rmtree(old_state_dir)
+
+        save_state_all_ranks(accelerator, args, state_dir, retain_and_upload)
+
+    def _save_epoch_state(self, accelerator, args, epoch_no) -> None:
+        state_name = train_utils.EPOCH_STATE_NAME.format(args.output_name, epoch_no)
+        state_dir = os.path.join(args.output_dir, state_name)
+        old_state_dir = None
+        last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
+        if last_n_epochs is not None:
+            remove_epoch = epoch_no - args.save_every_n_epochs * last_n_epochs
+            old_name = train_utils.EPOCH_STATE_NAME.format(args.output_name, remove_epoch)
+            old_state_dir = os.path.join(args.output_dir, old_name)
+
+        def retain_and_upload():
+            if args.save_state_to_huggingface:
+                huggingface_utils.upload(args, state_dir, "/" + state_name)
+            if old_state_dir is not None and os.path.exists(old_state_dir):
+                shutil.rmtree(old_state_dir)
+
+        save_state_all_ranks(accelerator, args, state_dir, retain_and_upload)
+
+    def _save_final_state(self, accelerator, args) -> None:
+        state_name = train_utils.LAST_STATE_NAME.format(args.output_name)
+        state_dir = os.path.join(args.output_dir, state_name)
+
+        def upload():
+            if args.save_state_to_huggingface:
+                huggingface_utils.upload(args, state_dir, "/" + state_name)
+
+        save_state_all_ranks(accelerator, args, state_dir, upload)
+
+    @staticmethod
+    def _patch_fused_backward(args, accelerator, optimizer, named_parameters) -> None:
+        if not args.fused_backward_pass:
+            return
+
+        import musubi_tuner.modules.adafactor_fused as adafactor_fused
+
+        adafactor_fused.patch_adafactor_fused(optimizer)
+        parameter_groups = {id(parameter): group for group in optimizer.param_groups for parameter in group["params"]}
+        for _, parameter in named_parameters:
+            if not parameter.requires_grad:
+                continue
+            parameter_group = parameter_groups[id(parameter)]
+
+            def grad_hook(tensor, group=parameter_group):
+                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                    accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
+                optimizer.step_param(tensor, group)
+                tensor.grad = None
+
+            parameter.register_post_accumulate_grad_hook(grad_hook)
+
+    def train(self, args):
+        if args.resume:
+            raise NotImplementedError(
+                "--resume is not available in the shared full-finetune lifecycle until progress-aware resume is enabled"
+            )
+        if not self._validate_args_and_init(args):
+            return
+        self.validate_full_finetune_model_args(args)
+
+        session_id, training_started_at = self._init_session(args)
+
+        accelerator = prepare_accelerator(args)
+        if args.mixed_precision is None:
+            args.mixed_precision = accelerator.mixed_precision
+        validate_full_finetune_args(args, accelerator.num_processes)
+        trainable_dtype = resolve_trainable_dtype(args)
+
+        train_dataset_group, collator, current_epoch = self._build_dataset(args)
+        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+        sample_parameters, vae = self._prepare_sampling(args, accelerator, vae_dtype)
+
+        blocks_to_swap = args.blocks_to_swap or 0
+        self.blocks_to_swap = blocks_to_swap
+        loading_device = "cpu" if blocks_to_swap else accelerator.device
+        attn_mode = self._attention_mode(args)
+
+        raw_model = self.load_full_finetune_transformer(
+            accelerator,
+            args,
+            args.dit,
+            attn_mode,
+            args.split_attn,
+            loading_device,
+            trainable_dtype,
+        )
+        raw_model.requires_grad_(True)
+        self.on_transformer_loaded(args, accelerator, raw_model)
+        mismatched_parameters = [
+            name for name, parameter in raw_model.named_parameters() if parameter.is_floating_point() and parameter.dtype != trainable_dtype
+        ]
+        if mismatched_parameters:
+            raise ValueError(
+                "load_full_finetune_transformer must load parameters directly in "
+                f"{trainable_dtype}; mismatched parameters: {', '.join(mismatched_parameters[:5])}"
+            )
+
+        if args.gradient_checkpointing:
+            raw_model.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+        if blocks_to_swap:
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            raw_model.enable_block_swap(blocks_to_swap, swap_config)
+            raw_model.move_to_device_except_swap_blocks(accelerator.device)
+        if args.compile:
+            raw_model = self.compile_transformer(args, raw_model)
+
+        named_parameters = [(name, parameter) for name, parameter in raw_model.named_parameters() if parameter.requires_grad]
+        if not named_parameters:
+            raise ValueError("full finetuning requires at least one trainable transformer parameter")
+        params_to_optimize = [{"params": [parameter for _, parameter in named_parameters], "lr": args.learning_rate}]
+        optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
+            args, params_to_optimize
+        )
+
+        workers = min(args.max_data_loader_n_workers, os.cpu_count() or 1)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset_group,
+            batch_size=1,
+            shuffle=True,
+            collate_fn=collator,
+            num_workers=workers,
+            persistent_workers=bool(args.persistent_data_loader_workers and workers > 0),
+        )
+        if args.max_train_epochs is not None:
+            args.max_train_steps = args.max_train_epochs * math.ceil(
+                len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+            )
+        train_dataset_group.set_max_train_steps(args.max_train_steps)
+        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
+
+        if blocks_to_swap:
+            forward_model = accelerator.prepare(raw_model, device_placement=[False])
+        else:
+            forward_model = accelerator.prepare(raw_model)
+        raw_model = accelerator.unwrap_model(forward_model, keep_fp32_wrapper=False)
+        if blocks_to_swap:
+            raw_model.move_to_device_except_swap_blocks(accelerator.device)
+            raw_model.prepare_block_swap_before_forward()
+
+        optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        self.raw_model = raw_model
+        self.forward_model = forward_model
+
+        progress = TrainingProgress()
+        self.training_progress = progress
+        accelerator.register_for_checkpointing(progress)
+        self._patch_fused_backward(args, accelerator, optimizer, named_parameters)
+
+        self.on_train_start(args, accelerator, None, forward_model, optimizer)
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+        metadata, minimum_metadata = self._build_full_finetune_metadata(
+            args,
+            session_id,
+            training_started_at,
+            train_dataset_group,
+            train_dataloader,
+            num_train_epochs,
+            optimizer_name,
+            optimizer_args,
+        )
+        self.full_metadata = metadata
+        self.minimum_metadata = minimum_metadata
+
+        if accelerator.is_main_process:
+            init_kwargs = {}
+            if args.wandb_run_name:
+                init_kwargs["wandb"] = {"name": args.wandb_run_name}
+            if args.log_tracker_config is not None:
+                init_kwargs = toml.load(args.log_tracker_config)
+            sanitized_config = train_utils.get_sanitized_config_or_none(args) if hasattr(args, "log_config") else None
+            accelerator.init_trackers(
+                "full_finetune" if args.log_tracker_name is None else args.log_tracker_name,
+                config=sanitized_config,
+                init_kwargs=init_kwargs,
+            )
+
+        progress_bar = tqdm(
+            range(args.max_train_steps),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
+        if progress.global_step:
+            progress_bar.update(progress.global_step)
+
+        noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
+        loss_recorder = train_utils.LossRecorder()
+        save_dtype = train_utils.resolve_save_dtype(args.save_precision, full_bf16=args.full_bf16)
+
+        raw_model.train()
+        optimizer_train_fn()
+        if should_sample_images(args, progress.global_step, epoch=0):
+            optimizer_eval_fn()
+            self._sample_full_finetune_images(
+                accelerator,
+                args,
+                0,
+                progress.global_step,
+                vae,
+                raw_model,
+                forward_model,
+                sample_parameters,
+                trainable_dtype,
+            )
+            optimizer_train_fn()
+        if accelerator.trackers:
+            accelerator.log({}, step=progress.global_step)
+        clean_memory_on_device(accelerator.device)
+
+        for epoch in range(progress.epoch, num_train_epochs):
+            current_epoch.value = epoch + 1
+            progress.epoch = epoch
+            progress.next_batch = 0
+
+            for step, batch in enumerate(train_dataloader):
+                latents = batch["latents"]
+                with accelerator.accumulate(forward_model):
+                    latents = self.scale_shift_latents(latents)
+                    noise = torch.randn_like(latents)
+                    loss, loss_metrics = self.process_batch(
+                        args,
+                        accelerator,
+                        forward_model,
+                        None,
+                        batch,
+                        latents,
+                        noise,
+                        noise_scheduler,
+                        trainable_dtype,
+                        trainable_dtype,
+                        vae,
+                        progress.global_step,
+                    )
+                    accelerator.backward(loss)
+
+                    if not args.fused_backward_pass:
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            accelerator.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
+                        if blocks_to_swap and args.block_swap_optimizer_patch_params:
+                            for parameter_group in optimizer.param_groups:
+                                for parameter in parameter_group["params"]:
+                                    if parameter.grad is not None and parameter.device != parameter.grad.device:
+                                        parameter.grad = parameter.grad.to(parameter.device, non_blocking=True)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        lr_scheduler.step()
+
+                    self.on_post_optimizer_step(
+                        args,
+                        accelerator,
+                        None,
+                        forward_model,
+                        accelerator.sync_gradients,
+                        progress.global_step,
+                    )
+
+                progress.next_batch = step + 1
+                if accelerator.sync_gradients:
+                    progress.global_step += 1
+                    progress_bar.update(1)
+
+                    should_sample = should_sample_images(args, progress.global_step, epoch=None)
+                    should_save = (
+                        args.save_every_n_steps is not None
+                        and progress.global_step % args.save_every_n_steps == 0
+                    )
+                    if should_sample or should_save:
+                        optimizer_eval_fn()
+                        if should_sample:
+                            self._sample_full_finetune_images(
+                                accelerator,
+                                args,
+                                None,
+                                progress.global_step,
+                                vae,
+                                raw_model,
+                                forward_model,
+                                sample_parameters,
+                                trainable_dtype,
+                            )
+                        if should_save:
+                            accelerator.wait_for_everyone()
+                            ckpt_name = train_utils.get_step_ckpt_name(args.output_name, progress.global_step)
+                            self._save_full_finetune_model(
+                                accelerator,
+                                args,
+                                raw_model,
+                                forward_model,
+                                ckpt_name,
+                                metadata,
+                                minimum_metadata,
+                                progress.global_step,
+                                epoch,
+                                save_dtype,
+                            )
+                            if args.save_state:
+                                self._save_step_state(accelerator, args, progress.global_step)
+                            if accelerator.is_main_process:
+                                remove_step = train_utils.get_remove_step_no(args, progress.global_step)
+                                if remove_step is not None:
+                                    self._remove_checkpoint(
+                                        args, train_utils.get_step_ckpt_name(args.output_name, remove_step)
+                                    )
+                        optimizer_train_fn()
+
+                current_loss = loss.detach().item()
+                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                average_loss = loss_recorder.moving_average
+                progress_bar.set_postfix(avr_loss=average_loss)
+                if accelerator.trackers:
+                    logs = self.generate_step_logs(
+                        args,
+                        current_loss,
+                        average_loss,
+                        lr_scheduler,
+                        None,
+                        optimizer,
+                    )
+                    logs.update(loss_metrics)
+                    logs.update(self.extra_step_logs(args, logs))
+                    accelerator.log(logs, step=progress.global_step)
+
+                if progress.global_step >= args.max_train_steps:
+                    break
+
+            progress.epoch = epoch + 1
+            progress.next_batch = 0
+            if accelerator.trackers:
+                accelerator.log({"loss/epoch": loss_recorder.moving_average}, step=epoch + 1)
+            accelerator.wait_for_everyone()
+
+            optimizer_eval_fn()
+            if args.save_every_n_epochs is not None:
+                should_save_epoch = (
+                    (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
+                )
+                if should_save_epoch:
+                    ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
+                    self._save_full_finetune_model(
+                        accelerator,
+                        args,
+                        raw_model,
+                        forward_model,
+                        ckpt_name,
+                        metadata,
+                        minimum_metadata,
+                        progress.global_step,
+                        epoch + 1,
+                        save_dtype,
+                    )
+                    if args.save_state:
+                        self._save_epoch_state(accelerator, args, epoch + 1)
+                    if accelerator.is_main_process:
+                        remove_epoch = train_utils.get_remove_epoch_no(args, epoch + 1)
+                        if remove_epoch is not None:
+                            self._remove_checkpoint(
+                                args, train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch)
+                            )
+
+            self._sample_full_finetune_images(
+                accelerator,
+                args,
+                epoch + 1,
+                progress.global_step,
+                vae,
+                raw_model,
+                forward_model,
+                sample_parameters,
+                trainable_dtype,
+            )
+            optimizer_train_fn()
+
+        progress_bar.close()
+        optimizer_eval_fn()
+        if args.save_state or args.save_state_on_train_end:
+            self._save_final_state(accelerator, args)
+
+        accelerator.wait_for_everyone()
+        ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
+        self._save_full_finetune_model(
+            accelerator,
+            args,
+            raw_model,
+            forward_model,
+            ckpt_name,
+            metadata,
+            minimum_metadata,
+            progress.global_step,
+            num_train_epochs,
+            save_dtype,
+            force_sync_upload=True,
+        )
+        accelerator.end_training()
