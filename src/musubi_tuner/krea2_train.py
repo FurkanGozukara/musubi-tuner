@@ -10,6 +10,7 @@ from musubi_tuner.training.full_finetune import FullFineTuningTrainerMixin, add_
 
 class Krea2Trainer(FullFineTuningTrainerMixin, Krea2NetworkTrainer):
     def validate_full_finetune_model_args(self, args: argparse.Namespace) -> None:
+        self._validate_dit_variant(args)
         temporary_turbo_options = []
         if args.turbo_dit is not None:
             temporary_turbo_options.append("--turbo_dit")

@@ -63,7 +63,14 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def architecture_full_name(self) -> str:
         return ARCHITECTURE_KREA2_FULL
 
+    @staticmethod
+    def _validate_dit_variant(args):
+        dit_variant = getattr(args, "dit_variant", "raw")
+        if dit_variant not in {"raw", "turbo"}:
+            raise ValueError(f"--dit_variant must be 'raw' or 'turbo', got {dit_variant!r}")
+
     def handle_model_specific_args(self, args):
+        self._validate_dit_variant(args)
         self.dit_dtype = torch.bfloat16
         self._i2v_training = False
         self._control_training = False
@@ -170,7 +177,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         Resolution-aware mu time-shift uses the K2 RAW defaults (y1=0.5, y2=1.15). A Turbo
         primary checkpoint, or the LoRA-only temporary Turbo swap, uses fixed mu=1.15.
         """
-        model = transformer  # prepared SingleStreamDiT; keep wrapper hooks active for forward
+        model = transformer
         raw_model = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
         device = accelerator.device
         patch = raw_model.config.patch

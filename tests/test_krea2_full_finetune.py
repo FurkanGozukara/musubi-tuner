@@ -37,6 +37,12 @@ class _PreparedTransformer:
         return torch.full_like(inputs["img"], self.fill_value)
 
 
+class _SamplingTransformer(_PreparedTransformer):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(patch=2, channels=1)
+
+
 class _WrapperAwareAccelerator:
     device = torch.device("cpu")
 
@@ -75,9 +81,11 @@ def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
     monkeypatch.setattr(network_module, "clean_memory_on_device", lambda _device: None)
     monkeypatch.setattr(network_module, "tqdm", lambda values, **_kwargs: values)
 
-    prepared = _PreparedTransformer()
-    raw = SimpleNamespace(config=SimpleNamespace(patch=2, channels=1))
-    accelerator = _WrapperAwareAccelerator(prepared, raw)
+    model = _SamplingTransformer()
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        unwrap_model=lambda transformer, keep_fp32_wrapper=False: transformer,
+    )
     trainer = Krea2NetworkTrainer()
 
     pixels = trainer.do_inference(
@@ -86,7 +94,7 @@ def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
         {"krea2_vl_embed": torch.ones((2, 1, 4), dtype=torch.bfloat16)},
         _FakeVAE(),
         torch.float32,
-        prepared,
+        model,
         discrete_flow_shift=0,
         sample_steps=1,
         width=16,
@@ -98,7 +106,7 @@ def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
         cfg_scale=1.0,
     )
 
-    return observed_schedule, accelerator, prepared, pixels
+    return observed_schedule, model, pixels
 
 
 def test_dit_variant_parser_defaults_to_raw_and_accepts_turbo():
@@ -109,7 +117,7 @@ def test_dit_variant_parser_defaults_to_raw_and_accepts_turbo():
 
 
 def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
-    schedule, _, _, _ = _run_sample(monkeypatch, dit_variant="raw")
+    schedule, _, _ = _run_sample(monkeypatch, dit_variant="raw")
 
     assert schedule == {
         "seqlen": 1,
@@ -123,24 +131,24 @@ def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
 
 
 def test_turbo_primary_uses_fixed_sampling_mu(monkeypatch):
-    schedule, _, _, _ = _run_sample(monkeypatch, dit_variant="turbo")
+    schedule, _, _ = _run_sample(monkeypatch, dit_variant="turbo")
 
     assert schedule["mu"] == 1.15
 
 
 def test_lora_raw_to_turbo_sample_path_keeps_fixed_sampling_mu(monkeypatch):
-    schedule, _, _, _ = _run_sample(monkeypatch, dit_variant="raw", turbo_dit="turbo.safetensors")
+    schedule, _, _ = _run_sample(monkeypatch, dit_variant="raw", turbo_dit="turbo.safetensors")
 
     assert schedule["mu"] == 1.15
 
 
-def test_fp32_sampling_reads_raw_config_but_forwards_through_prepared_wrapper(monkeypatch):
-    _, accelerator, prepared, pixels = _run_sample(monkeypatch, dit_variant="raw")
+def test_fp32_sampling_uses_raw_model_config_and_dit_dtype(monkeypatch):
+    schedule, model, pixels = _run_sample(monkeypatch, dit_variant="raw")
 
-    assert accelerator.unwrap_calls == [(prepared, False)]
-    assert len(prepared.calls) == 1
-    assert prepared.calls[0]["img"].dtype is torch.float32
-    assert prepared.calls[0]["context"].dtype is torch.float32
+    assert schedule["mu"] is None
+    assert len(model.calls) == 1
+    assert model.calls[0]["img"].dtype is torch.float32
+    assert model.calls[0]["context"].dtype is torch.float32
     assert pixels.dtype is torch.float32
 
 
@@ -168,6 +176,30 @@ def test_call_dit_reads_raw_config_but_forwards_through_prepared_wrapper():
     assert len(prepared.calls) == 1
     assert torch.equal(output.pred, torch.full_like(latents, 3.0))
     assert torch.equal(output.target, noise - latents)
+
+
+def test_model_arg_handling_rejects_unknown_dit_variant():
+    args = SimpleNamespace(
+        dit_variant="typo",
+        fp8_base=False,
+        fp8_scaled=False,
+        turbo_dit=None,
+        turbo_dit_cache=False,
+        blocks_to_swap=0,
+        sample_prompts=None,
+    )
+
+    with pytest.raises(ValueError, match="--dit_variant"):
+        Krea2NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_full_validator_rejects_unknown_dit_variant():
+    full_train = importlib.import_module("musubi_tuner.krea2_train")
+
+    with pytest.raises(ValueError, match="--dit_variant"):
+        full_train.Krea2Trainer().validate_full_finetune_model_args(
+            SimpleNamespace(dit_variant="typo", turbo_dit=None, turbo_dit_cache=False)
+        )
 
 
 @pytest.mark.parametrize(
