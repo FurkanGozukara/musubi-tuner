@@ -888,7 +888,7 @@ class FullFineTuningTrainerMixin:
 
             progress.epoch = epoch + 1
             progress.next_batch = 0
-            if accelerator.trackers:
+            if accelerator.trackers and loss_recorder.loss_list:
                 accelerator.log({"loss/epoch": loss_recorder.moving_average}, step=epoch + 1)
             accelerator.wait_for_everyone()
 

@@ -49,12 +49,18 @@ def _run_training(
     save_at_step=None,
     interrupt_after_state_save=False,
     save_state_on_train_end=False,
+    enable_tracker=False,
     seed=123,
 ):
     trainer = ResumeTrainer()
     trainer.interrupt_after_state_save = interrupt_after_state_save
     trainer.skipped_batches = []
+    trainer.tracker_logs = []
     accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1, mixed_precision="no")
+    if enable_tracker:
+        accelerator.trackers.append(SimpleNamespace(finish=lambda: None))
+        accelerator.init_trackers = lambda *_args, **_kwargs: None
+        accelerator.log = lambda values, step=None: trainer.tracker_logs.append((values, step))
     skip_first_batches = accelerator.skip_first_batches
 
     def record_skip(dataloader, num_batches):
@@ -165,6 +171,7 @@ def test_same_max_resume_finalizes_an_exact_epoch_boundary(tmp_path, monkeypatch
         tmp_path / "boundary-resumed",
         max_train_steps=5,
         resume=interrupted_dir / "tiny-step00000005-state",
+        enable_tracker=True,
     )
 
     assert resumed.training_progress.global_step == 5
@@ -172,6 +179,7 @@ def test_same_max_resume_finalizes_an_exact_epoch_boundary(tmp_path, monkeypatch
     assert resumed.training_progress.next_batch == 0
     assert resumed.skipped_batches == []
     assert not resumed.forward_wrapper_called
+    assert resumed.tracker_logs == [({}, 5)]
     assert resumed.optimizer_mode_events == uninterrupted.optimizer_mode_events
     assert resumed.scheduler.state_dict() == uninterrupted.scheduler.state_dict()
     assert all(
