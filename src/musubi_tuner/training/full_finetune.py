@@ -42,14 +42,17 @@ class TrainingProgress:
     global_step: int = 0
     epoch: int = 0
     next_batch: int = 0
+    sampler_seed: int | None = None
 
-    def state_dict(self) -> dict[str, int]:
+    def state_dict(self) -> dict[str, int | None]:
         return asdict(self)
 
-    def load_state_dict(self, state: dict[str, int]) -> None:
+    def load_state_dict(self, state: dict[str, int | None]) -> None:
         self.global_step = int(state["global_step"])
         self.epoch = int(state["epoch"])
         self.next_batch = int(state["next_batch"])
+        sampler_seed = state.get("sampler_seed")
+        self.sampler_seed = None if sampler_seed is None else int(sampler_seed)
 
 
 def add_full_finetune_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -124,16 +127,50 @@ def save_state_all_ranks(accelerator, args, state_dir, retention_callback) -> No
         accelerator.wait_for_everyone()
 
 
-def _require_local_training_progress(args: argparse.Namespace) -> None:
-    if not args.resume or getattr(args, "resume_from_huggingface", False):
+def _require_resume_training_progress(args: argparse.Namespace) -> None:
+    if not args.resume:
         return
 
-    progress_path = os.path.join(os.path.expanduser(os.fspath(args.resume)), "custom_checkpoint_0.pkl")
-    if not os.path.isfile(progress_path):
+    if not getattr(args, "resume_from_huggingface", False):
+        progress_path = os.path.join(os.path.expanduser(os.fspath(args.resume)), "custom_checkpoint_0.pkl")
+        if os.path.isfile(progress_path):
+            return
         raise FullFineTuneResumeProgressError(
             "--resume requires a state directory containing the registered TrainingProgress checkpoint "
             f"custom_checkpoint_0.pkl; not found in {args.resume}"
         )
+
+    resume_parts = args.resume.split("/")
+    if len(resume_parts) < 3:
+        raise ValueError("--resume_from_huggingface requires --resume in repo_owner/repo_name/path format")
+    repo_id = "/".join(resume_parts[:2])
+    path_in_repo = "/".join(resume_parts[2:])
+    revision = None
+    repo_type = None
+    if ":" in path_in_repo:
+        divided = path_in_repo.split(":")
+        if len(divided) == 2:
+            path_in_repo, revision = divided
+            repo_type = "model"
+        elif len(divided) == 3:
+            path_in_repo, revision, repo_type = divided
+        else:
+            raise ValueError("--resume contains too many ':'-separated Hugging Face qualifiers")
+
+    remote_files = huggingface_utils.list_dir(
+        repo_id=repo_id,
+        subfolder=path_in_repo,
+        revision=revision,
+        token=getattr(args, "huggingface_token", None),
+        repo_type=repo_type,
+    )
+    progress_path = f"{path_in_repo.rstrip('/')}/custom_checkpoint_0.pkl".lstrip("/")
+    if any(getattr(remote_file, "rfilename", "").lstrip("/") == progress_path for remote_file in remote_files):
+        return
+    raise FullFineTuneResumeProgressError(
+        "--resume requires the registered TrainingProgress checkpoint custom_checkpoint_0.pkl; "
+        f"not found in Hugging Face path {repo_id}/{path_in_repo}"
+    )
 
 
 class FullFineTuningTrainerMixin:
@@ -486,7 +523,7 @@ class FullFineTuningTrainerMixin:
             parameter.register_post_accumulate_grad_hook(grad_hook)
 
     def train(self, args):
-        _require_local_training_progress(args)
+        _require_resume_training_progress(args)
         if not self._validate_args_and_init(args):
             return
         self.validate_full_finetune_model_args(args)
@@ -578,7 +615,7 @@ class FullFineTuningTrainerMixin:
         self.raw_model = raw_model
         self.forward_model = forward_model
 
-        progress = TrainingProgress()
+        progress = TrainingProgress(sampler_seed=args.seed)
         self.training_progress = progress
         accelerator.register_for_checkpointing(progress)
         self._patch_fused_backward(args, accelerator, optimizer, named_parameters)
@@ -593,6 +630,11 @@ class FullFineTuningTrainerMixin:
                 raise FullFineTuneResumeProgressError(
                     "--resume state is missing the registered TrainingProgress checkpoint"
                 ) from error
+            if progress.sampler_seed is None:
+                raise FullFineTuneResumeProgressError(
+                    "--resume TrainingProgress checkpoint does not contain the effective sampler seed"
+                )
+            args.seed = progress.sampler_seed
 
         self.on_train_start(args, accelerator, None, forward_model, optimizer)
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
