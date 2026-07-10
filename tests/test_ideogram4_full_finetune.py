@@ -34,9 +34,7 @@ def _write_conditional_checkpoint(
         ("layers.0.attention.qkv.weight_scale", "prequantized FP8"),
     ],
 )
-def test_quantized_conditional_header_is_rejected_before_model_construction(
-    tmp_path, monkeypatch, tensor_key, quantization_name
-):
+def test_quantized_conditional_header_is_rejected_before_model_construction(tmp_path, monkeypatch, tensor_key, quantization_name):
     full_train = _full_train_module()
     checkpoint = tmp_path / "quantized.safetensors"
     _write_conditional_checkpoint(checkpoint, tensor_key)
@@ -351,13 +349,3 @@ def test_full_metadata_preserves_native_conditional_model_type():
     assert full_train.Ideogram4Trainer().full_finetune_metadata(SimpleNamespace()) == {
         "model_type": ideogram4_utils.IDEOGRAM4_COND_MODEL_TYPE
     }
-
-
-def test_root_entrypoint_is_exact_thin_main_shim():
-    root_entrypoint = Path(__file__).parents[1] / "ideogram4_train.py"
-
-    assert root_entrypoint.read_text(encoding="utf-8") == (
-        "from musubi_tuner.ideogram4_train import main\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )

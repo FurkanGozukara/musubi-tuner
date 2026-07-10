@@ -1,6 +1,5 @@
 import argparse
 import importlib
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -151,9 +150,7 @@ def test_fp32_sampling_casts_model_inputs_but_preserves_vae_dtype(monkeypatch):
 def test_model_version_metadata_is_string_provenance_and_reload_stays_explicit():
     full_train = importlib.import_module("musubi_tuner.flux_2_train")
     selected_version = "klein-9b"
-    metadata = full_train.Flux2Trainer().full_finetune_metadata(
-        SimpleNamespace(model_version=selected_version)
-    )
+    metadata = full_train.Flux2Trainer().full_finetune_metadata(SimpleNamespace(model_version=selected_version))
 
     assert metadata == {"ss_flux_2_model_version": selected_version}
     assert all(isinstance(value, str) for value in metadata.values())
@@ -161,13 +158,3 @@ def test_model_version_metadata_is_string_provenance_and_reload_stays_explicit()
     parser = flux2_setup_parser(argparse.ArgumentParser())
     assert parser.parse_args([]).model_version == "dev"
     assert parser.parse_args(["--model_version", selected_version]).model_version == selected_version
-
-
-def test_root_entrypoint_is_exact_thin_main_shim():
-    root_entrypoint = Path(__file__).parents[1] / "flux_2_train.py"
-
-    assert root_entrypoint.read_text(encoding="utf-8") == (
-        "from musubi_tuner.flux_2_train import main\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )

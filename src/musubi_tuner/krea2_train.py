@@ -8,9 +8,21 @@ from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_pa
 from musubi_tuner.training.full_finetune import FullFineTuningTrainerMixin, add_full_finetune_args
 
 
+def krea2_full_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--dit_variant",
+        type=str,
+        choices=["raw", "turbo"],
+        default="raw",
+        help="variant of the full-finetune --dit checkpoint; Turbo uses the fixed mu=1.15 sampling schedule",
+    )
+    return parser
+
+
 class Krea2Trainer(FullFineTuningTrainerMixin, Krea2NetworkTrainer):
     def validate_full_finetune_model_args(self, args: argparse.Namespace) -> None:
-        self._validate_dit_variant(args)
+        if args.dit_variant not in {"raw", "turbo"}:
+            raise ValueError(f"--dit_variant must be 'raw' or 'turbo', got {args.dit_variant!r}")
         temporary_turbo_options = []
         if args.turbo_dit is not None:
             temporary_turbo_options.append("--turbo_dit")
@@ -22,6 +34,9 @@ class Krea2Trainer(FullFineTuningTrainerMixin, Krea2NetworkTrainer):
                 + ", ".join(temporary_turbo_options)
                 + "; pass the Turbo checkpoint as --dit together with --dit_variant turbo"
             )
+
+    def use_turbo_sampling_schedule(self, args: argparse.Namespace) -> bool:
+        return args.dit_variant == "turbo"
 
     def load_full_finetune_transformer(
         self,
@@ -51,6 +66,7 @@ class Krea2Trainer(FullFineTuningTrainerMixin, Krea2NetworkTrainer):
 def main():
     parser = setup_parser_common()
     parser = krea2_setup_parser(parser)
+    parser = krea2_full_setup_parser(parser)
     parser = add_full_finetune_args(parser)
 
     args = parser.parse_args()

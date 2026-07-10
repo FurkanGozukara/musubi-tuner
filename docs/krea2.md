@@ -131,7 +131,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 ```
 
 - Uses `krea2_train_network.py`.
-- **Requires** specifying `--dit` and `--vae` (Qwen-Image VAE). RAW is the default/recommended primary variant; if the primary checkpoint is Turbo, also pass `--dit_variant turbo` so samples use its fixed schedule.
+- **Requires** specifying `--dit` (RAW model) and `--vae` (Qwen-Image VAE).
 - **Requires** specifying `--network_module networks.lora_krea2`.
 - `--text_encoder` is only needed if you generate sample images during training (it is not needed for the training step itself, because text encoder outputs are pre-cached).
 - Krea 2 uses flow matching. `--timestep_sampling shift` with `--discrete_flow_shift` is a reasonable starting point. The value `2.5` matches the K2 inference time-shift at 1024×1024 (the schedule is resolution-aware: it ranges from about `1.6` at 256×256 to `3.2` at 1280×1280, reaching ~`2.5` at 1024×1024). For varying-resolution training, `--timestep_sampling krea2_shift` reproduces the same resolution-aware schedule per sample, so each timestep is shifted exactly as K2 shifts it at inference (default resolution range 256–1280); no fixed `--discrete_flow_shift` is needed in that case. (`--timestep_sampling flux_shift` is similar but its high end saturates at 1024px instead of 1280px, giving a slightly stronger shift above 256px.) The optimal settings are not yet established; feedback is welcome.
@@ -143,7 +143,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 LoRA学習は専用のスクリプト`krea2_train_network.py`を使用します。**RAW** DiTでの学習が引き続き推奨ワークフローです。コマンド例は英語版を参照してください。
 
 - `krea2_train_network.py`を使用します。
-- `--dit`と`--vae`（Qwen-Image VAE）を指定する必要があります。primary variantのデフォルトおよび推奨はRAWです。Turboチェックポイントをprimaryにする場合は、サンプル生成で固定スケジュールを使用するため`--dit_variant turbo`も指定してください。
+- `--dit`（RAWモデル）と`--vae`（Qwen-Image VAE）を指定する必要があります。
 - `--network_module networks.lora_krea2`を指定する必要があります。
 - `--text_encoder`は学習中にサンプル画像を生成する場合にのみ必要です（テキストエンコーダー出力は事前キャッシュされるため、学習ステップ自体には不要です）。
 - Krea 2はflow matchingを使用します。`--timestep_sampling shift`と`--discrete_flow_shift`の組み合わせが出発点として妥当です。値 `2.5` は1024×1024でのK2推論時のtime-shiftに一致します（このスケジュールは解像度依存で、256×256で約 `1.6`、1280×1280で約 `3.2`、1024×1024で約 `2.5` です）。解像度を変えて学習する場合は、`--timestep_sampling krea2_shift` を使うと同じ解像度依存スケジュールをサンプルごとに再現し、各タイムステップがK2推論時とまったく同じようにシフトされます（デフォルトの解像度レンジ256〜1280）。この場合は固定の `--discrete_flow_shift` は不要です。（`--timestep_sampling flux_shift` も類似ですが、高解像度側が1024px（K2は1280px）で飽和するため、256pxより上ではやや強いshiftになります。）最適な設定はまだ確立されていません。フィードバックをお待ちしています。
@@ -172,6 +172,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision no krea2_tra
 - Parameters and exported checkpoints are fp32 by default. To train and save in bf16, pass both `--full_bf16` and `--mixed_precision bf16`. Full fp16 parameters are not supported.
 - The exported safetensors file contains the complete DiT, not LoRA weights. It records `ss_krea2_dit_variant`, but reload remains explicit: pass the matching `--dit_variant` with the exported file.
 - `--blocks_to_swap` is available for a single training process. `--fp8_base`, `--fp8_scaled`, `--block_swap_h2d_only`, and LoRA/network arguments are not supported for full finetuning.
+- Multi-process full finetuning is limited to ordinary Accelerate DDP without block swap or fused backward. FSDP, DeepSpeed, tensor parallelism (TP), and Megatron are not supported.
 - `--text_encoder` and `--vae` remain frozen and are needed only for training-time sampling. Use `--save_state` when optimizer, scheduler, and exact training-progress state are also needed for resume.
 
 <details>
@@ -184,6 +185,7 @@ DiT全体のファインチューニングには`krea2_train.py`を使用し、p
 - デフォルトではfp32のパラメータを学習し、fp32でチェックポイントを保存します。bf16で学習および保存する場合は、`--full_bf16`と`--mixed_precision bf16`を両方指定してください。full fp16パラメータはサポートされていません。
 - 出力されるsafetensorsにはLoRAウェイトではなくDiT全体が含まれ、`ss_krea2_dit_variant`が記録されます。ただし再読み込み時のvariant選択は自動ではないため、出力ファイルと対応する`--dit_variant`を明示してください。
 - `--blocks_to_swap`は単一プロセスの学習で使用できます。`--fp8_base`、`--fp8_scaled`、`--block_swap_h2d_only`、およびLoRA/network引数は、DiT全体のファインチューニングでは使用できません。
+- マルチプロセスのフルファインチューニングは、block swapとfused backwardを使用しない通常のAccelerate DDPに限られます。FSDP、DeepSpeed、tensor parallelism（TP）、Megatronはサポートされていません。
 - `--text_encoder`と`--vae`は凍結されたままで、学習中のサンプル生成を行う場合にのみ必要です。再開に必要なオプティマイザ、スケジューラ、および正確な学習進捗も保存する場合は`--save_state`を使用してください。
 
 </details>

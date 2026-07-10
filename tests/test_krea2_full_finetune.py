@@ -1,13 +1,13 @@
 import argparse
 import importlib
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 
 
 class _FakeVAE:
@@ -61,7 +61,7 @@ class _WrapperAwareAccelerator:
         return nullcontext()
 
 
-def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
+def _run_sample(monkeypatch, *, args=None, trainer=None, turbo_dit=None):
     network_module = importlib.import_module("musubi_tuner.krea2_train_network")
     observed_schedule = {}
 
@@ -86,11 +86,12 @@ def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
         device=torch.device("cpu"),
         unwrap_model=lambda transformer, keep_fp32_wrapper=False: transformer,
     )
-    trainer = Krea2NetworkTrainer()
+    trainer = Krea2NetworkTrainer() if trainer is None else trainer
+    args = SimpleNamespace(turbo_dit=turbo_dit, mixed_precision="no") if args is None else args
 
     pixels = trainer.do_inference(
         accelerator,
-        SimpleNamespace(dit_variant=dit_variant, turbo_dit=turbo_dit, mixed_precision="no"),
+        args,
         {"krea2_vl_embed": torch.ones((2, 1, 4), dtype=torch.bfloat16)},
         _FakeVAE(),
         torch.float32,
@@ -109,15 +110,16 @@ def _run_sample(monkeypatch, *, dit_variant, turbo_dit=None):
     return observed_schedule, model, pixels
 
 
-def test_dit_variant_parser_defaults_to_raw_and_accepts_turbo():
+def test_lora_parser_does_not_expose_full_only_dit_variant():
     parser = krea2_setup_parser(argparse.ArgumentParser())
 
-    assert parser.parse_args([]).dit_variant == "raw"
-    assert parser.parse_args(["--dit_variant", "turbo"]).dit_variant == "turbo"
+    assert not hasattr(parser.parse_args([]), "dit_variant")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--dit_variant", "turbo"])
 
 
 def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
-    schedule, _, _ = _run_sample(monkeypatch, dit_variant="raw")
+    schedule, _, _ = _run_sample(monkeypatch)
 
     assert schedule == {
         "seqlen": 1,
@@ -130,20 +132,58 @@ def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
     }
 
 
-def test_turbo_primary_uses_fixed_sampling_mu(monkeypatch):
-    schedule, _, _ = _run_sample(monkeypatch, dit_variant="turbo")
+def test_lora_injected_dit_variant_does_not_change_raw_primary_schedule(monkeypatch):
+    args = SimpleNamespace(dit_variant="turbo", turbo_dit=None, mixed_precision="no")
+
+    schedule, _, _ = _run_sample(monkeypatch, args=args)
+
+    assert schedule["mu"] is None
+
+
+def test_lora_toml_injected_dit_variant_does_not_change_raw_primary_schedule(tmp_path, monkeypatch):
+    config_path = tmp_path / "lora.toml"
+    config_path.write_text('[model]\ndit_variant = "turbo"\n', encoding="utf-8")
+    parser = krea2_setup_parser(setup_parser_common())
+    monkeypatch.setattr(
+        "sys.argv",
+        ["krea2_train_network.py", "--config_file", str(config_path)],
+    )
+    args = read_config_from_file(parser.parse_args(), parser)
+
+    schedule, _, _ = _run_sample(monkeypatch, args=args)
+
+    assert args.dit_variant == "turbo"
+    assert schedule["mu"] is None
+
+
+def test_sampling_schedule_uses_explicit_trainer_policy_hook(monkeypatch):
+    class TurboScheduleTrainer(Krea2NetworkTrainer):
+        def use_turbo_sampling_schedule(self, args):
+            return True
+
+    schedule, _, _ = _run_sample(monkeypatch, trainer=TurboScheduleTrainer())
 
     assert schedule["mu"] == 1.15
 
 
+@pytest.mark.parametrize(("dit_variant", "expected_mu"), [("raw", None), ("turbo", 1.15)])
+def test_full_primary_variant_selects_matching_sampling_schedule(monkeypatch, dit_variant, expected_mu):
+    full_train = importlib.import_module("musubi_tuner.krea2_train")
+    args = SimpleNamespace(dit_variant=dit_variant, turbo_dit=None, mixed_precision="no")
+
+    schedule, _, _ = _run_sample(monkeypatch, args=args, trainer=full_train.Krea2Trainer())
+
+    assert schedule["mu"] == expected_mu
+
+
 def test_lora_raw_to_turbo_sample_path_keeps_fixed_sampling_mu(monkeypatch):
-    schedule, _, _ = _run_sample(monkeypatch, dit_variant="raw", turbo_dit="turbo.safetensors")
+    schedule, _, _ = _run_sample(monkeypatch, turbo_dit="turbo.safetensors")
 
     assert schedule["mu"] == 1.15
 
 
 def test_fp32_sampling_uses_raw_model_config_and_dit_dtype(monkeypatch):
-    schedule, model, pixels = _run_sample(monkeypatch, dit_variant="raw")
+    schedule, model, pixels = _run_sample(monkeypatch)
 
     assert schedule["mu"] is None
     assert len(model.calls) == 1
@@ -178,19 +218,12 @@ def test_call_dit_reads_raw_config_but_forwards_through_prepared_wrapper():
     assert torch.equal(output.target, noise - latents)
 
 
-def test_model_arg_handling_rejects_unknown_dit_variant():
-    args = SimpleNamespace(
-        dit_variant="typo",
-        fp8_base=False,
-        fp8_scaled=False,
-        turbo_dit=None,
-        turbo_dit_cache=False,
-        blocks_to_swap=0,
-        sample_prompts=None,
-    )
+@pytest.mark.parametrize("dit_variant", ["raw", "turbo"])
+def test_full_parser_accepts_dit_variants(dit_variant):
+    full_train = importlib.import_module("musubi_tuner.krea2_train")
+    parser = full_train.krea2_full_setup_parser(krea2_setup_parser(argparse.ArgumentParser()))
 
-    with pytest.raises(ValueError, match="--dit_variant"):
-        Krea2NetworkTrainer().handle_model_specific_args(args)
+    assert parser.parse_args(["--dit_variant", dit_variant]).dit_variant == dit_variant
 
 
 def test_full_validator_rejects_unknown_dit_variant():
@@ -200,6 +233,22 @@ def test_full_validator_rejects_unknown_dit_variant():
         full_train.Krea2Trainer().validate_full_finetune_model_args(
             SimpleNamespace(dit_variant="typo", turbo_dit=None, turbo_dit_cache=False)
         )
+
+
+def test_full_toml_injected_dit_variant_is_semantically_validated(tmp_path, monkeypatch):
+    full_train = importlib.import_module("musubi_tuner.krea2_train")
+    config_path = tmp_path / "full.toml"
+    config_path.write_text('[model]\ndit_variant = "typo"\n', encoding="utf-8")
+    parser = full_train.krea2_full_setup_parser(krea2_setup_parser(setup_parser_common()))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["krea2_train.py", "--config_file", str(config_path)],
+    )
+    args = read_config_from_file(parser.parse_args(), parser)
+
+    assert args.dit_variant == "typo"
+    with pytest.raises(ValueError, match="--dit_variant"):
+        full_train.Krea2Trainer().validate_full_finetune_model_args(args)
 
 
 @pytest.mark.parametrize(
@@ -264,13 +313,3 @@ def test_full_primary_variant_is_accepted_and_recorded_as_string_metadata(dit_va
     trainer.validate_full_finetune_model_args(args)
 
     assert trainer.full_finetune_metadata(args) == {"ss_krea2_dit_variant": dit_variant}
-
-
-def test_root_entrypoint_is_exact_thin_main_shim():
-    root_entrypoint = Path(__file__).parents[1] / "krea2_train.py"
-
-    assert root_entrypoint.read_text(encoding="utf-8") == (
-        "from musubi_tuner.krea2_train import main\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )

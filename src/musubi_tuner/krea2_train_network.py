@@ -63,14 +63,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def architecture_full_name(self) -> str:
         return ARCHITECTURE_KREA2_FULL
 
-    @staticmethod
-    def _validate_dit_variant(args):
-        dit_variant = getattr(args, "dit_variant", "raw")
-        if dit_variant not in {"raw", "turbo"}:
-            raise ValueError(f"--dit_variant must be 'raw' or 'turbo', got {dit_variant!r}")
-
     def handle_model_specific_args(self, args):
-        self._validate_dit_variant(args)
         self.dit_dtype = torch.bfloat16
         self._i2v_training = False
         self._control_training = False
@@ -100,6 +93,9 @@ class Krea2NetworkTrainer(NetworkTrainer):
             )
         if args.turbo_dit and not args.sample_prompts:
             logger.warning("--turbo_dit is set but --sample_prompts is not; Turbo is only used for sample generation.")
+
+    def use_turbo_sampling_schedule(self, args: argparse.Namespace) -> bool:
+        return bool(args.turbo_dit)
 
     def process_sample_prompts(
         self,
@@ -224,10 +220,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
         x1 = (256 // align) ** 2
         x2 = (1280 // align) ** 2
         # The distilled Turbo checkpoint was trained at a fixed mu=1.15; the RAW checkpoint
-        # uses resolution-aware mu interpolation. The primary variant selects its native
-        # schedule without changing weights; --turbo_dit remains the LoRA-only weight swap.
-        use_turbo_schedule = bool(getattr(args, "turbo_dit", None)) or getattr(args, "dit_variant", "raw") == "turbo"
-        turbo_mu = 1.15 if use_turbo_schedule else None
+        # uses resolution-aware mu interpolation. The trainer policy selects the schedule.
+        turbo_mu = 1.15 if self.use_turbo_sampling_schedule(args) else None
         ts = krea2_sampling.timesteps(img.shape[1], sample_steps, x1, x2, y1=0.5, y2=1.15, mu=turbo_mu)
 
         for tcurr, tprev in tqdm(zip(ts[:-1], ts[1:]), total=len(ts) - 1, desc="Denoising steps"):
@@ -508,13 +502,6 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         type=str,
         default=None,
         help="Qwen3-VL-4B text encoder safetensors path (only needed for sample generation during training)",
-    )
-    parser.add_argument(
-        "--dit_variant",
-        type=str,
-        choices=["raw", "turbo"],
-        default="raw",
-        help="variant of the primary --dit checkpoint; Turbo uses the fixed mu=1.15 sampling schedule",
     )
     parser.add_argument(
         "--turbo_dit",

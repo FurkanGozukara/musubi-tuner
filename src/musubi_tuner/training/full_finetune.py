@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 import toml
+from accelerate.utils import DistributedType
 from safetensors.torch import save_file
 from tqdm import tqdm
 
@@ -30,6 +31,18 @@ _LORA_INERT_DEFAULTS = {
     "scale_weight_norms": None,
     "base_weights": None,
     "base_weights_multiplier": None,
+}
+
+_REPLICA_DISTRIBUTED_TYPES = {
+    DistributedType.NO,
+    DistributedType.MULTI_CPU,
+    DistributedType.MULTI_GPU,
+    DistributedType.MULTI_NPU,
+    DistributedType.MULTI_MLU,
+    DistributedType.MULTI_SDAA,
+    DistributedType.MULTI_MUSA,
+    DistributedType.MULTI_XPU,
+    DistributedType.MULTI_HPU,
 }
 
 
@@ -69,6 +82,17 @@ def add_full_finetune_args(parser: argparse.ArgumentParser) -> argparse.Argument
 
 def resolve_trainable_dtype(args: argparse.Namespace) -> torch.dtype:
     return model_utils.str_to_dtype("bf16" if args.full_bf16 else "fp32")
+
+
+def validate_full_finetune_distributed_type(distributed_type: DistributedType) -> None:
+    if distributed_type in _REPLICA_DISTRIBUTED_TYPES:
+        return
+
+    backend = getattr(distributed_type, "value", str(distributed_type))
+    raise ValueError(
+        f"full finetuning does not support distributed backend {backend}; "
+        "use ordinary DDP replica training (for example MULTI_GPU or MULTI_CPU) instead"
+    )
 
 
 def validate_full_finetune_args(args: argparse.Namespace, num_processes: int) -> None:
@@ -136,16 +160,34 @@ def normalize_compiled_state_dict(state_dict):
     return normalized
 
 
+def _run_main_process_action_all_ranks(accelerator, operation: str, action) -> None:
+    main_error = None
+    if accelerator.is_main_process:
+        try:
+            action()
+        except Exception as error:
+            main_error = error
+
+    failure = torch.tensor(main_error is not None, dtype=torch.int32, device=accelerator.device)
+    failure_count = accelerator.reduce(failure, reduction="sum")
+    accelerator.wait_for_everyone()
+
+    if main_error is not None:
+        raise main_error
+    if failure_count.item() != 0:
+        raise RuntimeError(f"{operation} failed on the main process; stopping all ranks at this operation")
+
+
 def save_state_all_ranks(accelerator, args, state_dir, retention_callback) -> None:
     """Save one Accelerate state atomically with respect to main-rank retention."""
     del args
     accelerator.save_state(state_dir)
     accelerator.wait_for_everyone()
-    try:
-        if accelerator.is_main_process:
-            retention_callback()
-    finally:
-        accelerator.wait_for_everyone()
+    _run_main_process_action_all_ranks(
+        accelerator,
+        f"state retention for {state_dir}",
+        retention_callback,
+    )
 
 
 def _require_resume_training_progress(args: argparse.Namespace) -> None:
@@ -351,8 +393,41 @@ class FullFineTuningTrainerMixin:
         save_dtype,
         force_sync_upload=False,
     ) -> None:
-        if not accelerator.is_main_process:
-            return
+        def save_checkpoint():
+            self._save_full_finetune_model_on_main(
+                accelerator,
+                args,
+                raw_model,
+                forward_model,
+                ckpt_name,
+                metadata,
+                minimum_metadata,
+                steps,
+                epoch_no,
+                save_dtype,
+                force_sync_upload,
+            )
+
+        _run_main_process_action_all_ranks(
+            accelerator,
+            f"checkpoint export for {ckpt_name}",
+            save_checkpoint,
+        )
+
+    def _save_full_finetune_model_on_main(
+        self,
+        accelerator,
+        args,
+        raw_model,
+        forward_model,
+        ckpt_name,
+        metadata,
+        minimum_metadata,
+        steps,
+        epoch_no,
+        save_dtype,
+        force_sync_upload=False,
+    ) -> None:
 
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
@@ -573,6 +648,7 @@ class FullFineTuningTrainerMixin:
         session_id, training_started_at = self._init_session(args)
 
         accelerator = prepare_accelerator(args)
+        validate_full_finetune_distributed_type(accelerator.distributed_type)
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
         validate_full_finetune_args(args, accelerator.num_processes)
@@ -600,7 +676,9 @@ class FullFineTuningTrainerMixin:
         raw_model.requires_grad_(True)
         self.on_transformer_loaded(args, accelerator, raw_model)
         mismatched_parameters = [
-            name for name, parameter in raw_model.named_parameters() if parameter.is_floating_point() and parameter.dtype != trainable_dtype
+            name
+            for name, parameter in raw_model.named_parameters()
+            if parameter.is_floating_point() and parameter.dtype != trainable_dtype
         ]
         if mismatched_parameters:
             raise ValueError(
@@ -817,10 +895,7 @@ class FullFineTuningTrainerMixin:
                     progress_bar.update(1)
 
                     should_sample = should_sample_images(args, progress.global_step, epoch=None)
-                    should_save = (
-                        args.save_every_n_steps is not None
-                        and progress.global_step % args.save_every_n_steps == 0
-                    )
+                    should_save = args.save_every_n_steps is not None and progress.global_step % args.save_every_n_steps == 0
                     if should_sample or should_save:
                         optimizer_eval_fn()
                         if should_sample:
@@ -855,9 +930,7 @@ class FullFineTuningTrainerMixin:
                             if accelerator.is_main_process:
                                 remove_step = train_utils.get_remove_step_no(args, progress.global_step)
                                 if remove_step is not None:
-                                    self._remove_checkpoint(
-                                        args, train_utils.get_step_ckpt_name(args.output_name, remove_step)
-                                    )
+                                    self._remove_checkpoint(args, train_utils.get_step_ckpt_name(args.output_name, remove_step))
                         optimizer_train_fn()
 
                 current_loss = loss.detach().item()
@@ -894,9 +967,7 @@ class FullFineTuningTrainerMixin:
 
             optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
-                should_save_epoch = (
-                    (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
-                )
+                should_save_epoch = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if should_save_epoch:
                     ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
                     self._save_full_finetune_model(
@@ -916,9 +987,7 @@ class FullFineTuningTrainerMixin:
                     if accelerator.is_main_process:
                         remove_epoch = train_utils.get_remove_epoch_no(args, epoch + 1)
                         if remove_epoch is not None:
-                            self._remove_checkpoint(
-                                args, train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch)
-                            )
+                            self._remove_checkpoint(args, train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch))
 
             self._sample_full_finetune_images(
                 accelerator,

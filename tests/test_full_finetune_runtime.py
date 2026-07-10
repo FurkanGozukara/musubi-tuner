@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from accelerate.utils import DistributedType
 from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
@@ -90,6 +91,7 @@ class FakeAccelerator:
         self.device = torch.device("cpu")
         self.mixed_precision = "no"
         self.num_processes = 1
+        self.distributed_type = DistributedType.NO
         self.is_main_process = True
         self.is_local_main_process = True
         self.sync_gradients = True
@@ -131,6 +133,10 @@ class FakeAccelerator:
 
     def wait_for_everyone(self):
         pass
+
+    def reduce(self, tensor, reduction="sum"):
+        assert reduction == "sum"
+        return tensor
 
     def init_trackers(self, *_args, **_kwargs):
         pass
@@ -547,11 +553,54 @@ def test_attention_backend_is_validated_before_dataset_and_sampling_setup(tmp_pa
     assert not hasattr(trainer, "loaded_model")
 
 
+@pytest.mark.parametrize(
+    "distributed_type",
+    [
+        DistributedType.DEEPSPEED,
+        DistributedType.FSDP,
+        DistributedType.TP,
+        DistributedType.MEGATRON_LM,
+        DistributedType.XLA,
+    ],
+)
+def test_non_replica_backend_is_rejected_before_dataset_or_model_allocation(
+    tmp_path,
+    monkeypatch,
+    distributed_type,
+):
+    trainer = TinyFullTrainer()
+    accelerator = install_runtime_fakes(monkeypatch, trainer)
+    accelerator.distributed_type = distributed_type
+    dataset_calls = []
+
+    def fail_if_dataset_is_built(_args):
+        dataset_calls.append(True)
+        raise AssertionError("dataset allocation must not start for an unsupported distributed backend")
+
+    monkeypatch.setattr(trainer, "_build_dataset", fail_if_dataset_is_built)
+
+    with pytest.raises(ValueError) as error:
+        trainer.train(make_args(tmp_path, sample_prompts=None, blocks_to_swap=0))
+
+    assert distributed_type.value in str(error.value)
+    assert "DDP" in str(error.value)
+    assert dataset_calls == []
+    assert not hasattr(trainer, "loaded_model")
+
+
 @pytest.mark.parametrize("is_main_process", [False, True])
 def test_save_state_all_ranks_brackets_main_rank_retention(is_main_process):
     events = []
+
+    def reduce(tensor, reduction="sum"):
+        assert reduction == "sum"
+        events.append(("reduce", int(tensor.item())))
+        return tensor
+
     accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
         is_main_process=is_main_process,
+        reduce=reduce,
         save_state=lambda state_dir: events.append(("save", state_dir)),
         wait_for_everyone=lambda: events.append(("barrier", None)),
     )
@@ -561,28 +610,72 @@ def test_save_state_all_ranks_brackets_main_rank_retention(is_main_process):
     expected = [("save", "state-dir"), ("barrier", None)]
     if is_main_process:
         expected.append(("retention", None))
+    expected.append(("reduce", 0))
     expected.append(("barrier", None))
     assert events == expected
 
 
 def test_save_state_all_ranks_reaches_second_barrier_when_retention_fails():
     events = []
+    retention_error = RuntimeError("retention failed")
+
+    def reduce(tensor, reduction="sum"):
+        assert reduction == "sum"
+        events.append(("reduce", int(tensor.item())))
+        return tensor
+
     accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
         is_main_process=True,
+        reduce=reduce,
         save_state=lambda state_dir: events.append(("save", state_dir)),
         wait_for_everyone=lambda: events.append(("barrier", None)),
     )
 
     def fail_retention():
         events.append(("retention", None))
-        raise RuntimeError("retention failed")
+        raise retention_error
 
-    with pytest.raises(RuntimeError, match="retention failed"):
+    with pytest.raises(RuntimeError, match="retention failed") as caught:
         save_state_all_ranks(accelerator, SimpleNamespace(), "state-dir", fail_retention)
 
+    assert caught.value is retention_error
     assert events == [
         ("save", "state-dir"),
         ("barrier", None),
         ("retention", None),
+        ("reduce", 1),
+        ("barrier", None),
+    ]
+
+
+def test_save_state_all_ranks_propagates_main_failure_to_a_non_main_rank():
+    events = []
+
+    def reduce(tensor, reduction="sum"):
+        assert reduction == "sum"
+        events.append(("reduce", int(tensor.item())))
+        return torch.ones_like(tensor)
+
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        is_main_process=False,
+        reduce=reduce,
+        save_state=lambda state_dir: events.append(("save", state_dir)),
+        wait_for_everyone=lambda: events.append(("barrier", None)),
+    )
+
+    with pytest.raises(RuntimeError, match=r"state retention.*state-dir.*main process"):
+        save_state_all_ranks(
+            accelerator,
+            SimpleNamespace(),
+            "state-dir",
+            lambda: events.append(("retention", None)),
+        )
+
+    assert events == [
+        ("save", "state-dir"),
+        ("barrier", None),
+        ("reduce", 0),
         ("barrier", None),
     ]

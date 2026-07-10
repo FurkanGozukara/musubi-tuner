@@ -98,6 +98,33 @@ def test_state_retention_waits_for_delayed_rank_and_second_barrier(tmp_path):
         assert events[f"event-barrier_2_exit-rank{rank}"]["order"] < events[f"event-continue-rank{rank}"]["order"]
 
 
+@pytest.mark.skipif(GLOO_UNAVAILABLE, reason=GLOO_UNAVAILABLE_REASON)
+@pytest.mark.parametrize(
+    ("worker", "main_exception_type", "main_message", "operation"),
+    [
+        ("retention-error", "ValueError", "retention exploded", "state retention"),
+        ("checkpoint-error", "OSError", "checkpoint export exploded", "checkpoint export"),
+    ],
+)
+def test_main_rank_action_error_stops_both_processes_at_the_same_operation(
+    tmp_path,
+    worker,
+    main_exception_type,
+    main_message,
+    operation,
+):
+    _run_distributed_workers(worker, tmp_path)
+
+    results = [json.loads((tmp_path / f"failure-{worker}-rank{rank}.json").read_text(encoding="utf-8")) for rank in range(2)]
+    assert all(not result["continued"] for result in results)
+    assert all(result["reached_post_action_barrier"] for result in results)
+    assert results[0]["exception_type"] == main_exception_type
+    assert results[0]["exception_message"] == main_message
+    assert results[1]["exception_type"] == "RuntimeError"
+    assert operation in results[1]["exception_message"]
+    assert "main process" in results[1]["exception_message"]
+
+
 def _record_event(output_dir: Path, label: str, rank: int, order: int) -> None:
     payload = {"label": label, "rank": rank, "time_ns": time.monotonic_ns(), "order": order}
     (output_dir / f"event-{label}-rank{rank}.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -110,9 +137,10 @@ def _run_ddp_update(output_dir: Path, rank: int, init_method: str) -> None:
     trainer = TinyFullTrainer()
     full_finetune.prepare_accelerator = lambda _args: accelerator
     full_finetune.clean_memory_on_device = lambda _device: None
-    full_finetune.sai_model_spec.build_metadata = (
-        lambda *args, **kwargs: {"modelspec.architecture": "tiny", "is_lora": str(kwargs["is_lora"])}
-    )
+    full_finetune.sai_model_spec.build_metadata = lambda *args, **kwargs: {
+        "modelspec.architecture": "tiny",
+        "is_lora": str(kwargs["is_lora"]),
+    }
 
     trainer.train(
         make_args(
@@ -131,6 +159,8 @@ class _DelayedStateAccelerator:
         self.output_dir = output_dir
         self.rank = dist.get_rank()
         self.is_main_process = self.rank == 0
+        self.device = torch.device("cpu")
+        self.num_processes = 2
         self.barrier_index = 0
         self.event_order = 0
 
@@ -149,6 +179,16 @@ class _DelayedStateAccelerator:
         self.record(f"{label}_enter")
         dist.barrier()
         self.record(f"{label}_exit")
+
+    def reduce(self, tensor, reduction="sum"):
+        assert reduction == "sum"
+        self.record("reduce_enter")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        self.record("reduce_exit")
+        return tensor
+
+    def print(self, *_args, **_kwargs):
+        pass
 
 
 def _run_delayed_state(output_dir: Path, rank: int, init_method: str) -> None:
@@ -171,9 +211,69 @@ def _run_delayed_state(output_dir: Path, rank: int, init_method: str) -> None:
         dist.destroy_process_group()
 
 
+def _run_main_action_error(output_dir: Path, rank: int, init_method: str, worker: str) -> None:
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
+    try:
+        accelerator = _DelayedStateAccelerator(output_dir)
+        continued = False
+        caught = None
+        try:
+            if worker == "retention-error":
+
+                def fail_retention():
+                    raise ValueError("retention exploded")
+
+                save_state_all_ranks(
+                    accelerator,
+                    argparse.Namespace(),
+                    output_dir / "state",
+                    fail_retention,
+                )
+            else:
+                trainer = TinyFullTrainer()
+                args = make_args(output_dir, blocks_to_swap=0, compile=False, sample_prompts=None)
+                raw_model = torch.nn.Linear(1, 1)
+                full_finetune.sai_model_spec.build_metadata = lambda *args, **kwargs: {}
+
+                def fail_checkpoint_export(*_args, **_kwargs):
+                    raise OSError("checkpoint export exploded")
+
+                full_finetune.save_file = fail_checkpoint_export
+                trainer._save_full_finetune_model(
+                    accelerator,
+                    args,
+                    raw_model,
+                    raw_model,
+                    "sync-test.safetensors",
+                    {},
+                    {},
+                    1,
+                    1,
+                    torch.float32,
+                )
+            continued = True
+        except Exception as error:
+            caught = error
+
+        dist.barrier()
+        result = {
+            "continued": continued,
+            "exception_type": type(caught).__name__ if caught is not None else None,
+            "exception_message": str(caught) if caught is not None else None,
+            "reached_post_action_barrier": True,
+        }
+        (output_dir / f"failure-{worker}-rank{rank}.json").write_text(json.dumps(result), encoding="utf-8")
+    finally:
+        dist.destroy_process_group()
+
+
 def _worker_main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--distributed-worker", choices=("ddp-update", "delayed-state"), required=True)
+    parser.add_argument(
+        "--distributed-worker",
+        choices=("ddp-update", "delayed-state", "retention-error", "checkpoint-error"),
+        required=True,
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--init-method", required=True)
@@ -181,8 +281,10 @@ def _worker_main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.distributed_worker == "ddp-update":
         _run_ddp_update(args.output_dir, args.rank, args.init_method)
-    else:
+    elif args.distributed_worker == "delayed-state":
         _run_delayed_state(args.output_dir, args.rank, args.init_method)
+    else:
+        _run_main_action_error(args.output_dir, args.rank, args.init_method, args.distributed_worker)
 
 
 if __name__ == "__main__":

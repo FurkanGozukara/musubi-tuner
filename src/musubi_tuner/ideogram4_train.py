@@ -25,25 +25,16 @@ class Ideogram4Trainer(FullFineTuningTrainerMixin, Ideogram4NetworkTrainer):
             disable_numpy_memmap=args.disable_numpy_memmap,
         ) as checkpoint:
             keys = checkpoint.keys()
-            tensor_dtypes = {
-                value.get("dtype")
-                for key, value in checkpoint.header.items()
-                if key != "__metadata__"
-            }
+            tensor_dtypes = {value.get("dtype") for key, value in checkpoint.header.items() if key != "__metadata__"}
 
         if is_bnb4bit_state_dict(keys):
             raise ValueError("Ideogram 4 full finetuning does not support bnb 4-bit conditional DiT checkpoints")
-        if any(key.endswith(FP8_SCALE_SUFFIX) for key in keys) or tensor_dtypes.intersection(
-            {"F8_E4M3", "F8_E5M2"}
-        ):
+        if any(key.endswith(FP8_SCALE_SUFFIX) for key in keys) or tensor_dtypes.intersection({"F8_E4M3", "F8_E5M2"}):
             raise ValueError("Ideogram 4 full finetuning does not support prequantized FP8 conditional DiT checkpoints")
         unsupported_dtypes = tensor_dtypes.difference({"F32", "F16", "BF16"})
         if unsupported_dtypes:
             found = ", ".join(sorted(str(dtype) for dtype in unsupported_dtypes))
-            raise ValueError(
-                "Ideogram 4 full-finetune checkpoint tensor dtype must be F32, F16, or BF16; "
-                f"found {found}"
-            )
+            raise ValueError(f"Ideogram 4 full-finetune checkpoint tensor dtype must be F32, F16, or BF16; found {found}")
 
     def use_unconditional_dit_for_sampling(self, args: argparse.Namespace) -> bool:
         return bool(args.unconditional_dit)

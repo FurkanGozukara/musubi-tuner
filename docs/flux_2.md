@@ -252,6 +252,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision no flux_2_tr
 - Full finetuning uses fp32 parameters and checkpoints by default. To train and save in bf16, specify both `--full_bf16` and `--mixed_precision bf16`. Full fp16 parameters are not supported.
 - Adafactor and `--gradient_checkpointing` are recommended because full-model parameters and optimizer states require substantially more memory than LoRA training.
 - `--blocks_to_swap` is supported only for a single training process. `--block_swap_optimizer_patch_params` is intended for AdamW and Adafactor, not 8-bit or arbitrary third-party optimizers.
+- Multi-process full finetuning is limited to ordinary Accelerate DDP without block swap or fused backward. FSDP, DeepSpeed, tensor parallelism (TP), and Megatron are not supported.
 - DiT FP8 options (`--fp8_base` and `--fp8_scaled`) and `--block_swap_h2d_only` are not supported for full finetuning. `--fp8_text_encoder` remains available only for the frozen sample-prompt encoder and retains the model-version limitations described above.
 - Exported checkpoints contain the full DiT state dict, not LoRA weights. Use `--save_state` when optimizer, scheduler, and training-progress state is also required for resume.
 - Checkpoint metadata records `ss_flux_2_model_version` for provenance only. The loader does not infer the architecture from metadata. Always pass the same explicit `--model_version` when reloading or running inference. In particular, a checkpoint trained from `klein-4b` or `klein-9b` still requires `--model_version klein-4b` or `--model_version klein-9b`, respectively; the same rule applies to the base variants.
@@ -279,6 +280,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision no flux_2_tr
 - デフォルトではfp32のパラメータを学習し、fp32でチェックポイントを保存します。bf16で学習および保存する場合は、`--full_bf16`と`--mixed_precision bf16`を両方指定してください。full fp16学習はサポートされていません。
 - フルモデルのパラメータとオプティマイザ状態はLoRA学習より大きなメモリを必要とするため、Adafactorと`--gradient_checkpointing`を推奨します。
 - `--blocks_to_swap`は単一プロセスの学習でのみ使用できます。`--block_swap_optimizer_patch_params`はAdamWとAdafactor向けであり、8-bitオプティマイザや任意のサードパーティ製オプティマイザ向けではありません。
+- マルチプロセスのフルファインチューニングは、block swapとfused backwardを使用しない通常のAccelerate DDPに限られます。FSDP、DeepSpeed、tensor parallelism（TP）、Megatronはサポートされていません。
 - DiTのFP8オプション（`--fp8_base`と`--fp8_scaled`）および`--block_swap_h2d_only`は使用できません。`--fp8_text_encoder`はサンプルプロンプト用の凍結されたテキストエンコーダーにのみ使用でき、前述のモデルバージョン制限も維持されます。
 - 出力されるチェックポイントにはLoRAウェイトではなくDiT全体のstate dictが含まれます。再開に必要なオプティマイザ、スケジューラ、学習進捗も保存する場合は`--save_state`を使用してください。
 - チェックポイントの`ss_flux_2_model_version`メタデータは由来を記録するだけです。ローダーはメタデータからアーキテクチャを自動判定しないため、再読み込みや推論では必ず学習時と同じ`--model_version`を明示してください。特に、`klein-4b`または`klein-9b`から学習したチェックポイントには、それぞれ`--model_version klein-4b`または`--model_version klein-9b`が必要です。baseバリアントにも同じ規則が適用されます。

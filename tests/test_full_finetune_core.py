@@ -4,7 +4,9 @@ import sys
 
 import pytest
 import torch
+from accelerate.utils import DistributedType
 
+import musubi_tuner.training.full_finetune as full_finetune
 from musubi_tuner.training.full_finetune import (
     TrainingProgress,
     add_full_finetune_args,
@@ -12,6 +14,42 @@ from musubi_tuner.training.full_finetune import (
     resolve_trainable_dtype,
     validate_full_finetune_args,
 )
+
+
+@pytest.mark.parametrize(
+    "distributed_type",
+    [
+        DistributedType.DEEPSPEED,
+        DistributedType.FSDP,
+        DistributedType.TP,
+        DistributedType.MEGATRON_LM,
+        DistributedType.XLA,
+    ],
+)
+def test_validate_full_finetune_distributed_type_rejects_non_replica_backends(distributed_type):
+    with pytest.raises(ValueError) as error:
+        full_finetune.validate_full_finetune_distributed_type(distributed_type)
+
+    assert distributed_type.value in str(error.value)
+    assert "DDP" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "distributed_type",
+    [
+        DistributedType.NO,
+        DistributedType.MULTI_CPU,
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_NPU,
+        DistributedType.MULTI_MLU,
+        DistributedType.MULTI_SDAA,
+        DistributedType.MULTI_MUSA,
+        DistributedType.MULTI_XPU,
+        DistributedType.MULTI_HPU,
+    ],
+)
+def test_validate_full_finetune_distributed_type_accepts_replica_backends(distributed_type):
+    full_finetune.validate_full_finetune_distributed_type(distributed_type)
 
 
 def test_training_progress_round_trip():

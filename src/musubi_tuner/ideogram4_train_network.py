@@ -278,9 +278,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
     ) -> DiTOutput:
         del kwargs
         raw_model = (
-            accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-            if hasattr(accelerator, "unwrap_model")
-            else transformer
+            accelerator.unwrap_model(transformer, keep_fp32_wrapper=False) if hasattr(accelerator, "unwrap_model") else transformer
         )
         bsize, _, grid_h, grid_w = noisy_model_input.shape
         text_features = [x.to(dtype=network_dtype) for x in batch["i4_llm_features"]]

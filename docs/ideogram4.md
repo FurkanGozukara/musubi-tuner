@@ -198,6 +198,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision no ideogram4
 - Parameters and exported checkpoints are fp32 by default. To train and save in bf16, pass both `--full_bf16` and `--mixed_precision bf16`. Full fp16 parameters are not supported.
 - The exported safetensors contains the complete conditional DiT and preserves `model_type=ideogram4_cond`; it does not contain LoRA weights.
 - `--blocks_to_swap` is available for a single training process. `--fp8_base`, `--fp8_scaled`, `--block_swap_h2d_only`, and LoRA/network arguments are not supported for full finetuning.
+- Multi-process full finetuning is limited to ordinary Accelerate DDP without block swap or fused backward. FSDP, DeepSpeed, tensor parallelism (TP), and Megatron are not supported.
 - `--text_encoder` and `--vae` remain frozen and are needed only for training-time sampling.
 - When `--unconditional_dit` is supplied, it is loaded only while sampling, remains frozen, and is used automatically for asymmetric CFG. Do not pass the LoRA-only `--use_unconditional_dit_for_lora_sampling` switch; the full trainer rejects it.
 - Use `--save_state` when optimizer, scheduler, and exact training-progress state are also needed for resume.
@@ -211,6 +212,7 @@ DiT全体のファインチューニングには`ideogram4_train.py`を使用し
 - デフォルトではfp32のパラメータを学習し、fp32でチェックポイントを保存します。bf16で学習および保存する場合は、`--full_bf16`と`--mixed_precision bf16`を両方指定してください。full fp16パラメータはサポートされていません。
 - 出力されるsafetensorsにはconditional DiT全体が含まれ、`model_type=ideogram4_cond`が保持されます。LoRAウェイトは含まれません。
 - `--blocks_to_swap`は単一プロセスの学習で使用できます。`--fp8_base`、`--fp8_scaled`、`--block_swap_h2d_only`、およびLoRA/network引数は、DiT全体のファインチューニングでは使用できません。
+- マルチプロセスのフルファインチューニングは、block swapとfused backwardを使用しない通常のAccelerate DDPに限られます。FSDP、DeepSpeed、tensor parallelism（TP）、Megatronはサポートされていません。
 - `--text_encoder`と`--vae`は凍結されたままで、学習中のサンプル生成を行う場合にのみ必要です。
 - `--unconditional_dit`を指定すると、サンプル生成時だけ読み込まれ、凍結されたまま非対称CFGに自動で使用されます。LoRA専用の`--use_unconditional_dit_for_lora_sampling`は指定しないでください。full trainerではエラーになります。
 - 再開に必要なオプティマイザ、スケジューラ、および正確な学習進捗も保存する場合は`--save_state`を使用してください。

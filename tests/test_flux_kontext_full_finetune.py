@@ -1,6 +1,5 @@
 import argparse
 import importlib
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,11 +17,7 @@ class RecordingFlux(torch.nn.Module):
 
     def forward(self, **inputs):
         self.floating_input_dtypes.update(
-            {
-                name: value.dtype
-                for name, value in inputs.items()
-                if isinstance(value, torch.Tensor) and value.is_floating_point()
-            }
+            {name: value.dtype for name, value in inputs.items() if isinstance(value, torch.Tensor) and value.is_floating_point()}
         )
         return torch.zeros_like(inputs["img"])
 
@@ -130,13 +125,3 @@ def test_sampling_uses_requested_model_dtype_and_preserves_position_ids(monkeypa
         "timesteps": dit_dtype,
         "guidance": dit_dtype,
     }
-
-
-def test_root_entrypoint_is_exact_thin_main_shim():
-    root_entrypoint = Path(__file__).parents[1] / "flux_kontext_train.py"
-
-    assert root_entrypoint.read_text(encoding="utf-8") == (
-        "from musubi_tuner.flux_kontext_train import main\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )
