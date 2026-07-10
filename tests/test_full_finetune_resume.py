@@ -144,6 +144,42 @@ def test_same_max_resume_does_not_execute_an_extra_batch(tmp_path, monkeypatch):
     )
 
 
+def test_same_max_resume_finalizes_an_exact_epoch_boundary(tmp_path, monkeypatch):
+    uninterrupted = _run_training(monkeypatch, tmp_path / "boundary-uninterrupted", max_train_steps=5)
+    interrupted_dir = tmp_path / "boundary-interrupted"
+    with pytest.raises(TrainingInterrupted) as interruption:
+        _run_training(
+            monkeypatch,
+            interrupted_dir,
+            max_train_steps=5,
+            save_at_step=5,
+            interrupt_after_state_save=True,
+        )
+    interrupted = interruption.value.args[0]
+    assert interrupted.training_progress.global_step == 5
+    assert interrupted.training_progress.epoch == 0
+    assert interrupted.training_progress.next_batch == 5
+
+    resumed = _run_training(
+        monkeypatch,
+        tmp_path / "boundary-resumed",
+        max_train_steps=5,
+        resume=interrupted_dir / "tiny-step00000005-state",
+    )
+
+    assert resumed.training_progress.global_step == 5
+    assert resumed.training_progress.epoch == 1
+    assert resumed.training_progress.next_batch == 0
+    assert resumed.skipped_batches == []
+    assert not resumed.forward_wrapper_called
+    assert resumed.optimizer_mode_events == uninterrupted.optimizer_mode_events
+    assert resumed.scheduler.state_dict() == uninterrupted.scheduler.state_dict()
+    assert all(
+        torch.equal(uninterrupted.raw_model.state_dict()[key], resumed.raw_model.state_dict()[key])
+        for key in uninterrupted.raw_model.state_dict()
+    )
+
+
 def test_extending_final_mid_epoch_state_matches_uninterrupted_training(tmp_path, monkeypatch):
     uninterrupted = _run_training(monkeypatch, tmp_path / "extended-uninterrupted", max_train_steps=4)
     short_dir = tmp_path / "short-final"

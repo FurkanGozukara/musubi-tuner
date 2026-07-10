@@ -742,7 +742,7 @@ class FullFineTuningTrainerMixin:
         clean_memory_on_device(accelerator.device)
 
         for epoch in range(progress.epoch, num_train_epochs):
-            if progress.global_step >= args.max_train_steps:
+            if progress.global_step >= args.max_train_steps and progress.next_batch < len(train_dataloader):
                 break
 
             current_epoch.value = epoch + 1
@@ -754,7 +754,10 @@ class FullFineTuningTrainerMixin:
             first_batch = 0
             if resumed:
                 first_batch = progress.next_batch
-                epoch_dataloader = accelerator.skip_first_batches(train_dataloader, first_batch)
+                if first_batch >= len(train_dataloader):
+                    epoch_dataloader = ()
+                else:
+                    epoch_dataloader = accelerator.skip_first_batches(train_dataloader, first_batch)
                 resumed = False
 
             progress.epoch = epoch
