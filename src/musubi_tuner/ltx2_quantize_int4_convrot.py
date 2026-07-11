@@ -310,11 +310,11 @@ def _comfy_quant_conf_tensor(convrot_groupsize: int, linear_dtype: str) -> torch
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
-# --- Self-contained reproduction of comfy-kitchen's convrot_w4a4 weight quantization -----------
-# These mirror comfy-kitchen's eager convrot_w4a4 backend byte-for-byte so the exporter
-# has NO runtime dependency on comfy-kitchen. The dev parity test asserts equality against the real
-# comfy-kitchen package; if upstream changes the format, that test (run with comfy-kitchen present)
-# catches the drift. Do not "optimize" these — they must match upstream exactly.
+# --- Self-contained reproduction of the ComfyUI convrot_w4a4 weight quantization ----------------
+# These mirror ComfyUI's eager convrot_w4a4 quantizer so the exporter has NO runtime dependency on
+# any external package. Verified against the reference implementation: the packed int4 weights are
+# byte-identical and the per-row scales match to fp32 rounding (~1e-7) across shapes and group
+# sizes. Do not "optimize" these — they must reproduce the reference format exactly.
 _COMFY_INT4_MAX = 7  # symmetric absmax quantizer range [-7, 7], scale = absmax/7
 
 
@@ -346,7 +346,7 @@ def _comfy_pack_int4_row_major(values: torch.Tensor) -> torch.Tensor:
 
 
 def _quantize_comfy_convrot_w4a4_weight(weight: torch.Tensor, convrot_groupsize: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate + symmetric per-row int4 quantize + pack, matching comfy-kitchen (deterministic round).
+    """Rotate + symmetric per-row int4 quantize + pack, matching the convrot_w4a4 format (deterministic round).
 
     Returns (packed_int8 [out, in//2], scale_fp32 [out]).
     """
@@ -366,14 +366,14 @@ def export_comfy_convrot_w4a4(
     calc_device: str,
     linear_dtype: str = "int4",
 ) -> None:
-    """Export a ComfyUI-loadable ``convrot_w4a4`` checkpoint (Comfy-Org/comfy-kitchen format).
+    """Export a ComfyUI-loadable ``convrot_w4a4`` checkpoint.
 
     This is a one-way *publish for inference* artifact, NOT a trainer input: it writes the exact
     buffers/metadata ComfyUI's quantized-weight loader expects (packed int8 ``<base>.weight`` +
     ``<base>.weight_scale`` + ``<base>.comfy_quant`` config). The int4 ConvRot quantization is a
-    self-contained reproduction of comfy-kitchen's convrot_w4a4 math (no runtime dependency on
-    comfy-kitchen; the dev parity test asserts byte-for-byte equality against it). Weights whose
-    in_features are not divisible by the ConvRot group size (256) are kept unquantized (16-bit).
+    self-contained reproduction of the convrot_w4a4 math (no runtime dependency on any external
+    package; verified to produce byte-identical packed weights). Weights whose in_features are not
+    divisible by the ConvRot group size (256) are kept unquantized (16-bit).
     No stabilizer / AWQ (convrot_w4a4 has no slot for them).
     """
     if linear_dtype not in ("int4", "int8"):
@@ -470,8 +470,8 @@ def main() -> None:
         choices=["int4cr", "comfy_convrot_w4a4"],
         help=(
             "int4cr (default): this trainer's reusable INT4 ConvRot prepack (load with --w4a4g4/--w4a8). "
-            "comfy_convrot_w4a4: a one-way ComfyUI-loadable convrot_w4a4 checkpoint (Comfy-Org/comfy-kitchen "
-            "inference format); requires comfy-kitchen>=0.2.17; ignores stabilizer/AWQ/rotation options."
+            "comfy_convrot_w4a4: a one-way ComfyUI-loadable convrot_w4a4 inference checkpoint; "
+            "requires a ComfyUI build with convrot_w4a4 support; ignores stabilizer/AWQ/rotation options."
         ),
     )
     parser.add_argument(

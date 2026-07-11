@@ -917,6 +917,27 @@ def load_video(
     """
     bucket_reso: if given, resize the video to the bucket resolution, (width, height)
     """
+    # --- opt-in alternate decode backend (env LTX2_VIDEO_DECODE_BACKEND; default 'pyav' = no-op).
+    #     Any failure transparently falls back to the PyAV path below, so this never breaks a run. ---
+    from musubi_tuner.dataset.video_decode import get_video_decode_backend, load_video_alt
+
+    _vb = get_video_decode_backend()
+    if _vb != "pyav":
+        try:
+            from musubi_tuner.ltx_2.env import get_ltx2_env
+
+            _thr = get_ltx2_env().fps_resampling_threshold
+            _alt = load_video_alt(
+                video_path, start_frame, end_frame, bucket_selector, bucket_reso, source_fps, target_fps, _thr, backend=_vb
+            )
+            if _alt is not None:
+                return _alt
+        except Exception as e:
+            logger.warning(
+                f"video_decode backend '{_vb}' failed for {os.path.basename(video_path)} "
+                f"({type(e).__name__}: {e}); falling back to PyAV"
+            )
+
     # auto-detect source FPS from video container when not explicitly set
     if source_fps is None and target_fps is not None and os.path.isfile(video_path):
         try:
@@ -3501,7 +3522,11 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control, loss_mask = future.result()
+                    res = future.result()
+                    if res is None:  # clip decoded to 0 frames (corrupt/undecodable) -> skip, keep loop healthy
+                        futures.remove(future)
+                        continue
+                    original_frame_size, video_key, video, caption, control, loss_mask = res
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -3635,6 +3660,9 @@ class VideoDataset(BaseDataset):
                     video_key, video, caption, control, loss_mask = result
 
                 video: list[np.ndarray]
+                if not video:  # corrupt/undecodable clip -> 0 frames decoded; skip instead of crashing the whole cache job
+                    logger.warning(f"Skipping {video_key}: decoded to 0 frames (corrupt/undecodable) — excluded from cache")
+                    return None
                 frame_size = (video[0].shape[1], video[0].shape[0])
 
                 # resize if necessary

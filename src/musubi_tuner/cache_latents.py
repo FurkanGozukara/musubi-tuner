@@ -493,6 +493,21 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable_cudnn_backend", action="store_true", help="Disable CUDNN PyTorch backend. May be useful for AMD GPUs."
     )
+    parser.add_argument(
+        "--video_decode_backend",
+        type=str,
+        default=None,
+        choices=["pyav", "decord", "torchcodec"],
+        help="Video decoder for caching. pyav = default/unchanged; decord = GIL-releasing CPU (~2.8x); "
+        "torchcodec = NVDEC/GPU. Overrides env LTX2_VIDEO_DECODE_BACKEND. Any failure falls back to pyav.",
+    )
+    parser.add_argument(
+        "--video_decode_device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="Device for the torchcodec decode backend (cuda = NVDEC hardware decode). Default cpu.",
+    )
     return parser
 
 

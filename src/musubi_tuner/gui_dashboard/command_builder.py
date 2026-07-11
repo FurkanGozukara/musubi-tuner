@@ -412,6 +412,10 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--num_workers", str(c.num_workers)]
     if getattr(c, "cache_distributed", False):
         cmd.append("--cache_distributed")
+    if getattr(c, "video_decode_backend", None):
+        cmd += ["--video_decode_backend", c.video_decode_backend]
+    if getattr(c, "video_decode_device", None):
+        cmd += ["--video_decode_device", c.video_decode_device]
     if c.vae_chunk_size is not None:
         cmd += ["--vae_chunk_size", str(c.vae_chunk_size)]
     if c.vae_spatial_tile_size is not None:

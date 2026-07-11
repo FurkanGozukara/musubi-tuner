@@ -137,6 +137,9 @@ class CachingConfig(BaseModel):
     keep_cache: bool = False
     num_workers: Optional[int] = None
     cache_distributed: bool = False
+    # Video decode backend (opt-in; blank/pyav keeps the original decode path)
+    video_decode_backend: Optional[Literal["pyav", "decord", "torchcodec"]] = None
+    video_decode_device: Optional[Literal["cpu", "cuda"]] = None
     # VAE tiling
     vae_chunk_size: Optional[int] = None
     vae_spatial_tile_size: Optional[int] = None

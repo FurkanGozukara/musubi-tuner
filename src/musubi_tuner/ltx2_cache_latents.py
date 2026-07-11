@@ -1541,6 +1541,14 @@ def main() -> None:
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
 
+    # Bridge the video-decode-backend CLI flag(s) to the env vars read by dataset.video_decode.
+    # Opt-in: default None -> no override, so the env var (or pyav default) is untouched.
+    if getattr(args, "video_decode_backend", None):
+        os.environ["LTX2_VIDEO_DECODE_BACKEND"] = args.video_decode_backend
+        logger.info(f"Video decode backend set to '{args.video_decode_backend}' via CLI")
+    if getattr(args, "video_decode_device", None):
+        os.environ["LTX2_VIDEO_DECODE_DEVICE"] = args.video_decode_device
+
     if args.disable_cudnn_backend:
         logger.info("Disabling cuDNN PyTorch backend.")
         torch.backends.cudnn.enabled = False
