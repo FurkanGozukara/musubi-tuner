@@ -4156,6 +4156,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
     def compile_transformer(self, args: argparse.Namespace, transformer):
         target_blocks = model_utils.resolve_compile_block_lists(transformer, ("transformer_blocks",))
+        n_blocks = sum(len(b) for b in target_blocks)
+        logger.info("compile_transformer: %d transformer_blocks resolved for torch.compile", n_blocks)
+        if n_blocks == 0:
+            raise RuntimeError("--compile set but 0 transformer_blocks resolved; torch.compile would be a silent no-op")
         return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
 
     def _load_vae_impl(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):

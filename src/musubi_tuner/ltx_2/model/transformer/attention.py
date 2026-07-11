@@ -162,8 +162,14 @@ class PytorchCudnnAttention(AttentionCallable):
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
 
-        with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+        if torch.compiler.is_compiling():
+            # sdpa_kernel(set_priority=True) is not Dynamo-traceable; the graph break it causes inside
+            # the use_reentrant=False gradient-checkpoint region falls the whole block back to eager
+            # (silently, since fullgraph=False). Under compile call SDPA directly and let Inductor lower it.
             out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        else:
+            with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+                out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
 
