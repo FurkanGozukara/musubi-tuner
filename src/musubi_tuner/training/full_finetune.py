@@ -569,6 +569,13 @@ class FullFineTuningTrainerMixin:
         if os.path.exists(ckpt_file):
             os.remove(ckpt_file)
 
+    def _remove_checkpoint_all_ranks(self, accelerator, args, ckpt_name) -> None:
+        _run_main_process_action_all_ranks(
+            accelerator,
+            f"checkpoint retention for {ckpt_name}",
+            lambda: self._remove_checkpoint(args, ckpt_name),
+        )
+
     def _save_step_state(self, accelerator, args, global_step) -> None:
         state_name = train_utils.STEP_STATE_NAME.format(args.output_name, global_step)
         state_dir = os.path.join(args.output_dir, state_name)
@@ -927,10 +934,13 @@ class FullFineTuningTrainerMixin:
                             )
                             if args.save_state:
                                 self._save_step_state(accelerator, args, progress.global_step)
-                            if accelerator.is_main_process:
-                                remove_step = train_utils.get_remove_step_no(args, progress.global_step)
-                                if remove_step is not None:
-                                    self._remove_checkpoint(args, train_utils.get_step_ckpt_name(args.output_name, remove_step))
+                            remove_step = train_utils.get_remove_step_no(args, progress.global_step)
+                            if remove_step is not None:
+                                self._remove_checkpoint_all_ranks(
+                                    accelerator,
+                                    args,
+                                    train_utils.get_step_ckpt_name(args.output_name, remove_step),
+                                )
                         optimizer_train_fn()
 
                 current_loss = loss.detach().item()
@@ -984,10 +994,13 @@ class FullFineTuningTrainerMixin:
                     )
                     if args.save_state:
                         self._save_epoch_state(accelerator, args, epoch + 1)
-                    if accelerator.is_main_process:
-                        remove_epoch = train_utils.get_remove_epoch_no(args, epoch + 1)
-                        if remove_epoch is not None:
-                            self._remove_checkpoint(args, train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch))
+                    remove_epoch = train_utils.get_remove_epoch_no(args, epoch + 1)
+                    if remove_epoch is not None:
+                        self._remove_checkpoint_all_ranks(
+                            accelerator,
+                            args,
+                            train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch),
+                        )
 
             self._sample_full_finetune_images(
                 accelerator,

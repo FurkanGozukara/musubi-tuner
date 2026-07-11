@@ -125,6 +125,43 @@ def test_main_rank_action_error_stops_both_processes_at_the_same_operation(
     assert "main process" in results[1]["exception_message"]
 
 
+@pytest.mark.skipif(GLOO_UNAVAILABLE, reason=GLOO_UNAVAILABLE_REASON)
+def test_checkpoint_retention_delete_error_stops_both_processes_at_the_same_operation(tmp_path):
+    worker = "checkpoint-retention-error"
+    _run_distributed_workers(worker, tmp_path)
+
+    results = [json.loads((tmp_path / f"retention-{worker}-rank{rank}.json").read_text(encoding="utf-8")) for rank in range(2)]
+    assert all(not result["continued"] for result in results)
+    assert all(result["reached_post_action_barrier"] for result in results)
+    assert results[0]["exception_type"] == "OSError"
+    assert results[0]["exception_message"] == "checkpoint delete exploded"
+    assert results[1]["exception_type"] == "RuntimeError"
+    assert "checkpoint retention" in results[1]["exception_message"]
+    assert "main process" in results[1]["exception_message"]
+
+
+@pytest.mark.skipif(GLOO_UNAVAILABLE, reason=GLOO_UNAVAILABLE_REASON)
+@pytest.mark.parametrize(
+    ("worker", "expected_checkpoint"),
+    [
+        ("checkpoint-retention-step", full_finetune.train_utils.get_step_ckpt_name("tiny", 0)),
+        ("checkpoint-retention-epoch", full_finetune.train_utils.get_epoch_ckpt_name("tiny", 0)),
+    ],
+)
+def test_two_process_step_and_epoch_checkpoint_retention_deletes_once(
+    tmp_path,
+    worker,
+    expected_checkpoint,
+):
+    _run_distributed_workers(worker, tmp_path)
+
+    results = [json.loads((tmp_path / f"retention-{worker}-rank{rank}.json").read_text(encoding="utf-8")) for rank in range(2)]
+    assert all(result["continued"] for result in results)
+    assert all(result["reached_post_action_barrier"] for result in results)
+    removal_records = [json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.glob(f"remove-{worker}-*.json")]
+    assert removal_records == [{"rank": 0, "checkpoint": expected_checkpoint}]
+
+
 def _record_event(output_dir: Path, label: str, rank: int, order: int) -> None:
     payload = {"label": label, "rank": rank, "time_ns": time.monotonic_ns(), "order": order}
     (output_dir / f"event-{label}-rank{rank}.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -267,11 +304,86 @@ def _run_main_action_error(output_dir: Path, rank: int, init_method: str, worker
         dist.destroy_process_group()
 
 
+def _run_checkpoint_retention(output_dir: Path, rank: int, init_method: str, worker: str) -> None:
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
+    try:
+        accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1, mixed_precision="no")
+        assert accelerator.process_index == rank
+        accelerator.wait_for_everyone = lambda: None
+        accelerator.end_training = lambda: None
+        trainer = TinyFullTrainer()
+        full_finetune.prepare_accelerator = lambda _args: accelerator
+        full_finetune.clean_memory_on_device = lambda _device: None
+        full_finetune.sai_model_spec.build_metadata = lambda *args, **kwargs: {
+            "modelspec.architecture": "tiny",
+            "is_lora": str(kwargs["is_lora"]),
+        }
+        trainer._save_full_finetune_model = lambda *_args, **_kwargs: None
+        removal_count = 0
+
+        def remove_checkpoint(_args, ckpt_name):
+            nonlocal removal_count
+            if worker == "checkpoint-retention-error":
+                raise OSError("checkpoint delete exploded")
+            removal_count += 1
+            record_path = output_dir / f"remove-{worker}-rank{rank}-{removal_count}.json"
+            record_path.write_text(json.dumps({"rank": rank, "checkpoint": ckpt_name}), encoding="utf-8")
+
+        trainer._remove_checkpoint = remove_checkpoint
+        retention_args = {
+            "save_every_n_steps": 1,
+            "save_last_n_steps": 1,
+        }
+        if worker == "checkpoint-retention-epoch":
+            retention_args = {
+                "save_every_n_epochs": 1,
+                "save_last_n_epochs": 1,
+            }
+
+        continued = False
+        caught = None
+        try:
+            trainer.train(
+                make_args(
+                    output_dir,
+                    blocks_to_swap=0,
+                    compile=False,
+                    sample_prompts=None,
+                    max_train_steps=2,
+                    **retention_args,
+                )
+            )
+            continued = True
+        except Exception as error:
+            caught = error
+
+        if dist.is_initialized():
+            dist.barrier()
+        result = {
+            "continued": continued,
+            "exception_type": type(caught).__name__ if caught is not None else None,
+            "exception_message": str(caught) if caught is not None else None,
+            "reached_post_action_barrier": True,
+        }
+        (output_dir / f"retention-{worker}-rank{rank}.json").write_text(json.dumps(result), encoding="utf-8")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def _worker_main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--distributed-worker",
-        choices=("ddp-update", "delayed-state", "retention-error", "checkpoint-error"),
+        choices=(
+            "ddp-update",
+            "delayed-state",
+            "retention-error",
+            "checkpoint-error",
+            "checkpoint-retention-error",
+            "checkpoint-retention-step",
+            "checkpoint-retention-epoch",
+        ),
         required=True,
     )
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -283,6 +395,8 @@ def _worker_main() -> None:
         _run_ddp_update(args.output_dir, args.rank, args.init_method)
     elif args.distributed_worker == "delayed-state":
         _run_delayed_state(args.output_dir, args.rank, args.init_method)
+    elif args.distributed_worker.startswith("checkpoint-retention-"):
+        _run_checkpoint_retention(args.output_dir, args.rank, args.init_method, args.distributed_worker)
     else:
         _run_main_action_error(args.output_dir, args.rank, args.init_method, args.distributed_worker)
 

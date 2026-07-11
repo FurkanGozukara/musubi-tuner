@@ -172,7 +172,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision no krea2_tra
 - Parameters and exported checkpoints are fp32 by default. To train and save in bf16, pass both `--full_bf16` and `--mixed_precision bf16`. Full fp16 parameters are not supported.
 - The exported safetensors file contains the complete DiT, not LoRA weights. It records `ss_krea2_dit_variant`, but reload remains explicit: pass the matching `--dit_variant` with the exported file.
 - `--blocks_to_swap` is available for a single training process. `--fp8_base`, `--fp8_scaled`, `--block_swap_h2d_only`, and LoRA/network arguments are not supported for full finetuning.
-- Multi-process full finetuning is limited to ordinary Accelerate DDP without block swap or fused backward. FSDP, DeepSpeed, tensor parallelism (TP), and Megatron are not supported.
+- Multi-process full finetuning is limited to ordinary Accelerate DDP without block swap or fused backward. FSDP, DeepSpeed, tensor parallelism (TP), Megatron, and XLA are not supported.
 - `--text_encoder` and `--vae` remain frozen and are needed only for training-time sampling. Use `--save_state` when optimizer, scheduler, and exact training-progress state are also needed for resume.
 
 <details>
@@ -185,7 +185,7 @@ DiT全体のファインチューニングには`krea2_train.py`を使用し、p
 - デフォルトではfp32のパラメータを学習し、fp32でチェックポイントを保存します。bf16で学習および保存する場合は、`--full_bf16`と`--mixed_precision bf16`を両方指定してください。full fp16パラメータはサポートされていません。
 - 出力されるsafetensorsにはLoRAウェイトではなくDiT全体が含まれ、`ss_krea2_dit_variant`が記録されます。ただし再読み込み時のvariant選択は自動ではないため、出力ファイルと対応する`--dit_variant`を明示してください。
 - `--blocks_to_swap`は単一プロセスの学習で使用できます。`--fp8_base`、`--fp8_scaled`、`--block_swap_h2d_only`、およびLoRA/network引数は、DiT全体のファインチューニングでは使用できません。
-- マルチプロセスのフルファインチューニングは、block swapとfused backwardを使用しない通常のAccelerate DDPに限られます。FSDP、DeepSpeed、tensor parallelism（TP）、Megatronはサポートされていません。
+- マルチプロセスのフルファインチューニングは、block swapとfused backwardを使用しない通常のAccelerate DDPに限られます。FSDP、DeepSpeed、tensor parallelism（TP）、Megatron、XLAはサポートされていません。
 - `--text_encoder`と`--vae`は凍結されたままで、学習中のサンプル生成を行う場合にのみ必要です。再開に必要なオプティマイザ、スケジューラ、および正確な学習進捗も保存する場合は`--save_state`を使用してください。
 
 </details>

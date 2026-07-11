@@ -588,6 +588,42 @@ def test_non_replica_backend_is_rejected_before_dataset_or_model_allocation(
     assert not hasattr(trainer, "loaded_model")
 
 
+@pytest.mark.parametrize(
+    ("retention_kind", "overrides", "expected_checkpoint"),
+    [
+        (
+            "step",
+            {"max_train_steps": 2, "save_every_n_steps": 1, "save_last_n_steps": 1},
+            full_finetune.train_utils.get_step_ckpt_name("tiny", 0),
+        ),
+        (
+            "epoch",
+            {"max_train_steps": 3, "save_every_n_epochs": 1, "save_last_n_epochs": 1},
+            full_finetune.train_utils.get_epoch_ckpt_name("tiny", 0),
+        ),
+    ],
+)
+def test_training_routes_step_and_epoch_checkpoint_retention_through_all_rank_method(
+    tmp_path,
+    monkeypatch,
+    retention_kind,
+    overrides,
+    expected_checkpoint,
+):
+    trainer = TinyFullTrainer()
+    accelerator = install_runtime_fakes(monkeypatch, trainer)
+    removal_calls = []
+
+    def record_all_rank_removal(call_accelerator, _args, ckpt_name):
+        removal_calls.append((call_accelerator, ckpt_name))
+
+    monkeypatch.setattr(trainer, "_remove_checkpoint_all_ranks", record_all_rank_removal, raising=False)
+
+    trainer.train(make_args(tmp_path, sample_prompts=None, blocks_to_swap=0, **overrides))
+
+    assert removal_calls == [(accelerator, expected_checkpoint)], retention_kind
+
+
 @pytest.mark.parametrize("is_main_process", [False, True])
 def test_save_state_all_ranks_brackets_main_rank_retention(is_main_process):
     events = []
