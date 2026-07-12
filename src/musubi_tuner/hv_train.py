@@ -40,6 +40,10 @@ import musubi_tuner.hunyuan_model.vae as vae_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
+from musubi_tuner.training.compile_setup import (
+    ensure_training_compile_environment,
+    native_compile_toolchain_requested,
+)
 
 import logging
 
@@ -92,6 +96,9 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     """
     DeepSpeed is not supported in this script currently.
     """
+    if native_compile_toolchain_requested(args):
+        ensure_training_compile_environment()
+
     if args.logging_dir is None:
         logging_dir = None
     else:

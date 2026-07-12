@@ -1,11 +1,14 @@
 import argparse
 import hashlib
+import os
 from functools import lru_cache
 from io import BytesIO
 from typing import Any, Callable, Optional
 import logging
 import safetensors.torch
 import torch
+
+from musubi_tuner.training.compile_setup import ensure_training_compile_environment
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +268,16 @@ def compile_transformer(
     target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
     disable_linear: bool,
 ) -> torch.nn.Module:
+    if str(args.compile_backend).strip().casefold() == "inductor":
+        ensure_training_compile_environment()
+    fallback_on_first_error = _compile_fallback_enabled()
+    compile_state = {
+        "enabled": True,
+        "verified": set(),
+        "fallback_reason": "",
+        "reported_success": False,
+    }
+
     if disable_linear:
         logger.info("Disable linear from torch.compile for swap blocks...")
         for blocks in target_blocks:
@@ -282,14 +295,58 @@ def compile_transformer(
     if args.compile_cache_size_limit is not None:
         torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
 
-    for blocks in target_blocks:
+    for group_index, blocks in enumerate(target_blocks):
         for i, block in enumerate(blocks):
-            block = torch.compile(
+            original_block = block
+            compiled_block = torch.compile(
                 block,
                 backend=args.compile_backend,
                 mode=args.compile_mode,
                 dynamic=compile_dynamic,
                 fullgraph=args.compile_fullgraph,
             )
-            blocks[i] = block
+            if fallback_on_first_error:
+                _install_first_call_fallback(
+                    compiled_block,
+                    original_block,
+                    compile_state,
+                    label=f"{original_block.__class__.__name__}[{group_index}:{i}]",
+                )
+            blocks[i] = compiled_block
+    transformer.__dict__["_musubi_compile_state"] = compile_state
     return transformer
+
+
+def _install_first_call_fallback(compiled_block, original_block, state: dict, *, label: str) -> None:
+    compiled_forward = compiled_block.forward
+
+    def guarded_forward(*args, **kwargs):
+        if not state["enabled"]:
+            return original_block(*args, **kwargs)
+        try:
+            output = compiled_forward(*args, **kwargs)
+        except Exception as exc:
+            if label in state["verified"]:
+                raise
+            state["enabled"] = False
+            state["fallback_reason"] = f"{label}: {exc}"
+            os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"] = "0"
+            logger.warning(
+                "First compiled call failed for %s; continuing all compiled blocks in eager mode: %s",
+                label,
+                exc,
+            )
+            return original_block(*args, **kwargs)
+        state["verified"].add(label)
+        os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"] = "1"
+        if not state["reported_success"]:
+            state["reported_success"] = True
+            logger.info("First compiled transformer block executed successfully: %s", label)
+        return output
+
+    compiled_block.forward = guarded_forward
+
+
+def _compile_fallback_enabled() -> bool:
+    value = os.environ.get("MUSUBI_TORCH_COMPILE_FALLBACK", "1")
+    return value.strip().casefold() not in {"", "0", "false", "no", "off"}
