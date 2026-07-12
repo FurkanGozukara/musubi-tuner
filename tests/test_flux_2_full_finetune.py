@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from musubi_tuner.flux_2 import flux2_utils
+from musubi_tuner.flux_2 import flux2_models, flux2_utils
 from musubi_tuner.flux_2_train_network import Flux2NetworkTrainer, flux2_setup_parser
 
 
@@ -158,3 +158,49 @@ def test_model_version_metadata_is_string_provenance_and_reload_stays_explicit()
     parser = flux2_setup_parser(argparse.ArgumentParser())
     assert parser.parse_args([]).model_version == "dev"
     assert parser.parse_args(["--model_version", selected_version]).model_version == selected_version
+
+
+def test_training_timesteps_match_bf16_full_model_compute_dtype():
+    observed = {}
+
+    class FakeModel:
+        def __call__(self, **kwargs):
+            observed["timesteps"] = kwargs["timesteps"].dtype
+            return kwargs["x"]
+
+    trainer = Flux2NetworkTrainer()
+    latents = torch.zeros((1, 128, 1, 1), dtype=torch.bfloat16)
+    output = trainer.call_dit(
+        SimpleNamespace(gradient_checkpointing=False),
+        SimpleNamespace(device=torch.device("cpu")),
+        FakeModel(),
+        latents,
+        {"ctx_vec": torch.zeros((1, 2, 4), dtype=torch.bfloat16)},
+        torch.ones_like(latents),
+        torch.zeros_like(latents, dtype=torch.float32),
+        torch.tensor([500.0], dtype=torch.float32),
+        torch.bfloat16,
+    )
+
+    assert observed["timesteps"] is torch.bfloat16
+    assert output.pred.dtype is torch.bfloat16
+
+
+def test_modulation_accepts_bf16_trainable_projection():
+    modulation = flux2_models.Modulation(dim=4, double=True, disable_bias=True).to(torch.bfloat16)
+
+    image_modulation, text_modulation = modulation(torch.ones((1, 4), dtype=torch.bfloat16))
+
+    assert all(value.dtype is torch.bfloat16 for value in image_modulation)
+    assert all(value.dtype is torch.bfloat16 for value in text_modulation)
+
+
+def test_last_layer_accepts_bf16_trainable_projections():
+    layer = flux2_models.LastLayer(hidden_size=4, out_channels=2).to(torch.bfloat16)
+
+    output = layer(
+        torch.ones((1, 2, 4), dtype=torch.bfloat16),
+        torch.ones((1, 4), dtype=torch.bfloat16),
+    )
+
+    assert output.dtype is torch.bfloat16

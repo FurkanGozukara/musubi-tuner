@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -57,6 +58,19 @@ def test_training_progress_round_trip():
     restored = TrainingProgress()
     restored.load_state_dict(progress.state_dict())
     assert restored == progress
+
+
+def test_fused_optimizer_step_marks_wrapped_scheduler_optimizer_called():
+    raw_optimizer = SimpleNamespace()
+    optimizer = SimpleNamespace(optimizer=raw_optimizer)
+    scheduler_optimizer = SimpleNamespace()
+    scheduler = SimpleNamespace(scheduler=SimpleNamespace(optimizer=scheduler_optimizer))
+
+    full_finetune._mark_fused_optimizer_step_complete(optimizer, scheduler)
+
+    assert optimizer._opt_called is True
+    assert raw_optimizer._opt_called is True
+    assert scheduler_optimizer._opt_called is True
 
 
 def test_normalize_compiled_state_dict_rejects_collision():

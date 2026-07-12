@@ -322,7 +322,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
             img_input = torch.cat((img_input, ref_tokens), dim=1)
             img_input_ids = torch.cat((img_input_ids, ref_ids), dim=1)
 
-        timesteps = timesteps / 1000.0
+        timesteps = (timesteps / 1000.0).to(device=accelerator.device, dtype=network_dtype)
         model_pred = model(x=img_input, x_ids=img_input_ids, timesteps=timesteps, ctx=ctx, ctx_ids=ctx_ids, guidance=guidance_vec)
         model_pred = model_pred[:, : noisy_model_input.shape[1]]  # [B, 4096, 128]
 

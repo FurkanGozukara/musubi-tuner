@@ -343,6 +343,22 @@ def test_full_rejects_lora_only_unconditional_switch(tmp_path):
         )
 
 
+def test_full_rejects_block_swap_that_leaves_only_one_resident_block(tmp_path):
+    full_train = _full_train_module()
+    checkpoint = tmp_path / "plain.safetensors"
+    _write_conditional_checkpoint(checkpoint)
+
+    with pytest.raises(ValueError, match="at most --blocks_to_swap 32"):
+        full_train.Ideogram4Trainer().validate_full_finetune_model_args(
+            SimpleNamespace(
+                dit=str(checkpoint),
+                disable_numpy_memmap=False,
+                use_unconditional_dit_for_lora_sampling=False,
+                blocks_to_swap=33,
+            )
+        )
+
+
 def test_full_metadata_preserves_native_conditional_model_type():
     full_train = _full_train_module()
 

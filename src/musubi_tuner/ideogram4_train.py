@@ -15,6 +15,8 @@ class Ideogram4Trainer(FullFineTuningTrainerMixin, Ideogram4NetworkTrainer):
                 "--use_unconditional_dit_for_lora_sampling is LoRA-only; full finetuning uses "
                 "--unconditional_dit automatically for sampling"
             )
+        if (getattr(args, "blocks_to_swap", 0) or 0) > 32:
+            raise ValueError("Ideogram 4 full finetuning supports at most --blocks_to_swap 32 so two blocks remain resident")
 
         ideogram4_utils.validate_local_safetensors(
             args.dit,

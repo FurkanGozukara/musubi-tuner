@@ -393,7 +393,9 @@ def _unique_compiler_pairs(
 
 def _ninja_file_candidates(env: MutableMapping[str, str]) -> list[Path]:
     executable = "ninja.exe" if sys.platform == "win32" else "ninja"
-    roots: list[Path] = [Path(sys.executable).resolve().parent]
+    # Treat the supplied environment as authoritative. Importing this module from
+    # another active venv must not outrank its explicit VIRTUAL_ENV or VS install.
+    roots: list[Path] = []
     for key in ("VIRTUAL_ENV", "CONDA_PREFIX"):
         value = env.get(key) or os.environ.get(key)
         if not value:
@@ -407,18 +409,20 @@ def _ninja_file_candidates(env: MutableMapping[str, str]) -> list[Path]:
             ]
         )
 
+    candidates = [root / executable for root in roots]
     try:
         ninja_module = importlib.import_module("ninja")
     except (ImportError, OSError):
         ninja_module = None
     bin_dir = getattr(ninja_module, "BIN_DIR", "") if ninja_module is not None else ""
-    if bin_dir:
-        roots.append(Path(bin_dir))
 
-    candidates = [root / executable for root in roots]
     if sys.platform == "win32":
+        # Explicitly discovered Visual Studio roots belong to the supplied
+        # environment and therefore outrank an unrelated ambient Python venv.
         for install_root in visual_studio_install_roots(env):
             candidates.append(install_root / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.exe")
+        if bin_dir:
+            candidates.append(Path(bin_dir) / executable)
         program_files = [
             env.get("ProgramW6432"),
             env.get("ProgramFiles"),
@@ -433,6 +437,8 @@ def _ninja_file_candidates(env: MutableMapping[str, str]) -> list[Path]:
                 continue
             candidates.extend(vs_root.glob("*/*/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"))
     else:
+        if bin_dir:
+            candidates.append(Path(bin_dir) / executable)
         candidates.extend(
             [
                 Path("/usr/bin/ninja"),

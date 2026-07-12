@@ -190,6 +190,16 @@ def save_state_all_ranks(accelerator, args, state_dir, retention_callback) -> No
     )
 
 
+def _mark_fused_optimizer_step_complete(optimizer, lr_scheduler) -> None:
+    """Tell PyTorch schedulers that fused per-parameter optimizer hooks have run."""
+    candidates = [optimizer, getattr(optimizer, "optimizer", None)]
+    scheduler = getattr(lr_scheduler, "scheduler", lr_scheduler)
+    candidates.append(getattr(scheduler, "optimizer", None))
+    for candidate in candidates:
+        if candidate is not None:
+            candidate._opt_called = True
+
+
 def _require_resume_training_progress(args: argparse.Namespace) -> None:
     if not args.resume:
         return
@@ -885,6 +895,7 @@ class FullFineTuningTrainerMixin:
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                     else:
+                        _mark_fused_optimizer_step_complete(optimizer, lr_scheduler)
                         lr_scheduler.step()
 
                     self.on_post_optimizer_step(

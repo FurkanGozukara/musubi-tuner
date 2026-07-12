@@ -356,8 +356,11 @@ class Ideogram4Transformer(nn.Module):
     def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig):
         self.blocks_to_swap = blocks_to_swap
         num_blocks = len(self.layers)
-        assert self.blocks_to_swap <= num_blocks - 1, (
-            f"Cannot swap more than {num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        resident_blocks = 1 if config.h2d_only or not config.supports_backward else 2
+        max_blocks_to_swap = num_blocks - resident_blocks
+        assert self.blocks_to_swap <= max_blocks_to_swap, (
+            f"Cannot swap more than {max_blocks_to_swap} blocks with the selected offloader. "
+            f"Requested {self.blocks_to_swap} blocks to swap."
         )
         self.offloader = create_offloader(
             "ideogram4-block",

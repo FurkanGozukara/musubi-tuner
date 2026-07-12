@@ -590,6 +590,10 @@ class Flux2(nn.Module):
             vec = vec + self.guidance_in(guidance_emb)
             del guidance_emb
 
+        # Checkpoint/autocast combinations may promote the conditioning vector to fp32.
+        # Keep it aligned with the active DiT compute dtype before the modulation linears.
+        vec = vec.to(dtype=self.double_stream_modulation_img.lin.weight.dtype)
+
         double_block_mod_img = self.double_stream_modulation_img(vec)
         double_block_mod_txt = self.double_stream_modulation_txt(vec)
         single_block_mod, _ = self.single_stream_modulation(vec)
@@ -670,7 +674,9 @@ class Modulation(nn.Module):
 
     def forward(self, vec: torch.Tensor):
         org_dtype = vec.dtype
-        vec = vec.to(torch.float32)  # for numerical stability
+        # Frozen-base training keeps this projection in fp32 for numerical stability,
+        # while full-BF16 fine-tuning makes the projection itself trainable in BF16.
+        vec = vec.to(self.lin.weight.dtype)
         out = self.lin(nn.functional.silu(vec))
         if out.ndim == 2:
             out = out[:, None, :]
@@ -688,7 +694,7 @@ class LastLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
         org_dtype = x.dtype
-        vec = vec.to(torch.float32)  # for numerical stability
+        vec = vec.to(self.adaLN_modulation[1].weight.dtype)
         mod = self.adaLN_modulation(vec)
         shift, scale = mod.chunk(2, dim=-1)
         if shift.ndim == 2:
@@ -696,6 +702,7 @@ class LastLayer(nn.Module):
             scale = scale[:, None, :]
         x = x.to(torch.float32)  # for numerical stability
         x = (1 + scale) * self.norm_final(x) + shift
+        x = x.to(self.linear.weight.dtype)
         x = self.linear(x)
         return x.to(org_dtype)
 
