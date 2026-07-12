@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Union
 import torch
 import torch.nn as nn
@@ -14,6 +15,27 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.utils.device_utils import clean_memory_on_device
+
+
+def _prefetch_tensors(reader, keys):
+    """Keep two independent file reads ahead of tensor processing."""
+    if not keys:
+        return
+
+    with MemoryEfficientSafeOpen(reader.filename, disable_numpy_memmap=reader.disable_numpy_memmap) as second_reader:
+        readers = (reader, second_reader)
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="safetensors-prefetch") as executor:
+            pending = {
+                index: executor.submit(readers[index % len(readers)].get_tensor, keys[index])
+                for index in range(min(len(readers), len(keys)))
+            }
+            for index, key in enumerate(keys):
+                value = pending.pop(index).result()
+                next_index = index + len(readers)
+                if next_index < len(keys):
+                    next_reader = readers[next_index % len(readers)]
+                    pending[next_index] = executor.submit(next_reader.get_tensor, keys[next_index])
+                yield key, value
 
 
 def calculate_fp8_maxval(exp_bits=4, mantissa_bits=3, sign_bits=1):
@@ -299,9 +321,9 @@ def load_safetensors_with_fp8_optimization(
             f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
 
             keys = f.keys()
-            for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
-                value = f.get_tensor(key)
-
+            use_prefetch = weight_transform_hooks is None and calc_device is not None and torch.device(calc_device).type != "cpu"
+            tensors = _prefetch_tensors(f, keys) if use_prefetch else ((key, f.get_tensor(key)) for key in keys)
+            for key, value in tqdm(tensors, total=len(keys), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
                 # Save original device
                 original_device = value.device  # usually cpu
 
