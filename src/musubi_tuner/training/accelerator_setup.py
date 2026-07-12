@@ -11,6 +11,11 @@ from packaging.version import Version
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.utils import TorchDynamoPlugin, DynamoBackend
 
+from musubi_tuner.training.compile_setup import (
+    ensure_training_compile_environment,
+    native_compile_toolchain_requested,
+)
+
 
 def clean_memory_on_device(device: torch.device):
     r"""
@@ -50,6 +55,9 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     """
     DeepSpeed is not supported in this script currently.
     """
+    if native_compile_toolchain_requested(args):
+        ensure_training_compile_environment()
+
     if args.logging_dir is None:
         logging_dir = None
     else:
