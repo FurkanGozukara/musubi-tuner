@@ -3030,27 +3030,40 @@ def build_rl_train_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 
-    # Rollout source: offline cache replay (default) or inline online generation
-    if rl.online:
-        cmd.append("--rl_online")
+    rl_loss = getattr(rl, "rl_loss", "nft") or "nft"
+    _refl = rl_loss == "refl"
+
+    # Rollout source: refl always generates inline (differentiable backprop straight through the
+    # sampler — there is no cache to replay); the policy-gradient rules use offline cache replay
+    # (default) or inline online generation.
+    if rl.online or _refl:
+        if not _refl:
+            cmd.append("--rl_online")
         if rl.rl_prompts:
             cmd += ["--rl_prompts", rl.rl_prompts]
         cmd += _rl_reward_args(rl)
         cmd += ["--rl_group_size", str(rl.rl_group_size)]
         cmd += _rl_sample_dim_args(rl)
-        if rl.rl_dump_cache:
+        if rl.rl_dump_cache and not _refl:
             cmd += ["--rl_dump_cache", rl.rl_dump_cache]
     else:
         cmd += ["--rl_rollout_cache", rl.rl_rollout_cache]
 
     # Update rule + its hyperparameters (default nft is implicit, so emit only when switched)
-    rl_loss = getattr(rl, "rl_loss", "nft") or "nft"
     if rl_loss != "nft":
         cmd += ["--rl_loss", rl_loss]
     if rl_loss == "rwr" and rl.rwr_temperature != 1.0:
         cmd += ["--rwr_temperature", str(rl.rwr_temperature)]
     if rl_loss == "dpo" and rl.dpo_beta != 5.0:
         cmd += ["--dpo_beta", str(rl.dpo_beta)]
+    if _refl:
+        # differentiable-reward backprop: online-only; reuses --nft_kl_beta as the base-policy anchor.
+        if rl.refl_grad_steps != 1:
+            cmd += ["--refl_grad_steps", str(rl.refl_grad_steps)]
+        if rl.refl_renoise_samples != 1:
+            cmd += ["--refl_renoise_samples", str(rl.refl_renoise_samples)]
+        if rl.refl_reward_weight != 1.0:
+            cmd += ["--refl_reward_weight", str(rl.refl_reward_weight)]
     if rl_loss == "ppo":
         # ppo is trajectory-faithful DDPO: needs the SDE-sampled trajectory (Phase A
         # --rl_sde_sampler for offline; the same flag on inline generation for online).

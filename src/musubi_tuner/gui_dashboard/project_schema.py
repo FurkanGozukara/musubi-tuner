@@ -1190,13 +1190,19 @@ class RLConfig(BaseModel):
     reward_plugins: str = ""  # whitespace-separated custom-reward .py paths (--reward_plugins)
 
     # Update rule (Phase B) + its hyperparameters
-    rl_loss: Literal["nft", "rwr", "dpo", "ppo"] = "nft"
+    rl_loss: Literal["nft", "rwr", "dpo", "ppo", "refl"] = "nft"
     rwr_temperature: float = 1.0
     dpo_beta: float = 5.0
     ppo_clip_eps: float = 0.2
     # ppo is trajectory-faithful DDPO: selecting it makes Phase A sample with the SDE sampler so the
     # per-step trajectory is cached; rl_sde_eta is the per-step noise level (shared by both phases).
     rl_sde_eta: float = 1.0
+    # refl (differentiable-reward backprop): backprops a differentiable reward through the sampler
+    # instead of a policy-gradient step. Online-only (generates rollouts inline, no cache), requires a
+    # reward with kind="differentiable", and reuses nft_kl_beta as the base-policy anchor.
+    refl_grad_steps: int = 1  # final denoising steps the reward gradient flows through
+    refl_renoise_samples: int = 1  # re-noise/average count at the final step (needs refl_grad_steps == 1)
+    refl_reward_weight: float = 1.0  # scale on the maximized reward term
 
     # NFT loss coefficients (also supply the shared KL + advantage-clip for the other rules)
     nft_beta_mix: float = 1.0

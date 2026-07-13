@@ -190,8 +190,23 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "--rl_loss",
             type=str,
             default="nft",
-            choices=["nft", "rwr", "dpo", "ppo"],
-            help="RL update rule: nft (default, negative-aware) | rwr | dpo | ppo",
+            choices=["nft", "rwr", "dpo", "ppo", "refl"],
+            help="RL update rule: nft (default, negative-aware) | rwr | dpo | ppo | refl (differentiable-reward backprop)",
+        )
+    if "--refl_grad_steps" not in seen:
+        parser.add_argument(
+            "--refl_grad_steps", type=int, default=1, help="refl: final denoising steps the reward gradient flows through"
+        )
+    if "--refl_renoise_samples" not in seen:
+        parser.add_argument(
+            "--refl_renoise_samples",
+            type=int,
+            default=1,
+            help="refl: re-noise/average count at the final step (needs --refl_grad_steps 1)",
+        )
+    if "--refl_reward_weight" not in seen:
+        parser.add_argument(
+            "--refl_reward_weight", type=float, default=1.0, help="refl: scale on the maximized reward term (KL uses --nft_kl_beta)"
         )
     if "--rwr_temperature" not in seen:
         parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")

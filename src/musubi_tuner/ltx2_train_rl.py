@@ -159,6 +159,28 @@ class LTX2RLTrainer:
         net = accelerator.unwrap_model(network)
         unwrapped = accelerator.unwrap_model(transformer)
 
+        # --- refl dispatch: the differentiable-reward backend is not policy-gradient, so it
+        # runs its own online loop and returns here; everything below (EMA, rollout cache, NFT/PPO
+        # loop) is only for the policy-gradient rules and is untouched when --rl_loss != refl. ---
+        if (getattr(args, "rl_loss", "nft") or "nft").lower() == "refl":
+            from musubi_tuner.ltx2_refl import run_refl
+
+            if not getattr(args, "rl_prompts", None):
+                raise ValueError("--rl_loss refl requires --rl_prompts (it generates rollouts online each step)")
+            run_refl(
+                self._net,
+                args,
+                accelerator,
+                transformer,
+                network,
+                optimizer,
+                lr_scheduler,
+                device,
+                dit_dtype,
+                is_av=is_av,
+            )
+            return
+
         # --- EMA (`old`) ---
         # `old` is the fixed behavior policy that generated the cache: it stays FROZEN equal to the
         # warm-start snapshot for the whole Phase-B run (ema.step() is never called), which is exactly
@@ -719,8 +741,30 @@ def rl_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="nft",
         choices=list(RL_LOSS_CHOICES),
         help="RL update rule: nft (default, negative-aware) | rwr (advantage-weighted regression) | "
-        "dpo (Diffusion-DPO on each group's best/worst) | ppo (PPO-clip surrogate on the x0 Gaussian). "
-        "All share the rollout/reward/advantage machinery; only the final loss differs.",
+        "dpo (Diffusion-DPO on each group's best/worst) | ppo (PPO-clip surrogate on the x0 Gaussian) | "
+        "refl (backprop a DIFFERENTIABLE reward through the sampler, online). nft/rwr/dpo/ppo "
+        "share the rollout/reward/advantage machinery; refl uses ltx2_refl.run_refl instead.",
+    )
+    # --- differentiable-reward backend (--rl_loss refl) ---
+    parser.add_argument(
+        "--refl_grad_steps",
+        type=int,
+        default=1,
+        help="refl: number of FINAL denoising steps the reward gradient flows through. "
+        "1 (default) = the single final step; >1 requires --refl_renoise_samples 1.",
+    )
+    parser.add_argument(
+        "--refl_renoise_samples",
+        type=int,
+        default=1,
+        help="refl: re-noise the denoised latent at the final step this many times and average the "
+        "reward gradient (variance reduction). >1 requires --refl_grad_steps 1.",
+    )
+    parser.add_argument(
+        "--refl_reward_weight",
+        type=float,
+        default=1.0,
+        help="refl: scale on the maximized reward term; the base-policy KL anchor uses --nft_kl_beta.",
     )
     parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")
     parser.add_argument(

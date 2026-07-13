@@ -233,7 +233,16 @@ def compute_rl_objective(
             adv_clip_max=float(getattr(args, "nft_adv_clip_max", 5.0)),
             modality_weights=modality_weights,
         )
-    raise ValueError(f"unknown --rl_loss {name!r} (choices: nft, rwr, dpo, ppo)")
+    if name == "refl":
+        # the refl backend is not policy-gradient: it backprops a differentiable reward through the
+        # sampler and is driven by ltx2_refl.run_refl (dispatched before this loop), never here.
+        raise ValueError(
+            "--rl_loss refl is dispatched to the differentiable ReFL loop (ltx2_refl.run_refl), not "
+            "compute_rl_objective; reaching here means the refl branch was not taken in the driver."
+        )
+    raise ValueError(f"unknown --rl_loss {name!r} (choices: nft, rwr, dpo, ppo, refl)")
 
 
-RL_LOSS_CHOICES = ("nft", "rwr", "dpo", "ppo")
+# nft/rwr/dpo/ppo are policy-gradient rules dispatched through compute_rl_objective; refl is the
+# differentiable-reward backend dispatched separately (ltx2_refl.run_refl). Both are valid --rl_loss.
+RL_LOSS_CHOICES = ("nft", "rwr", "dpo", "ppo", "refl")

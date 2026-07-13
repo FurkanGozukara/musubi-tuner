@@ -36,7 +36,8 @@
 		{ value: 'nft', label: 'NFT — negative-aware (default)' },
 		{ value: 'rwr', label: 'RWR — advantage-weighted regression' },
 		{ value: 'dpo', label: 'DPO — group best vs worst' },
-		{ value: 'ppo', label: 'PPO — clipped surrogate' }
+		{ value: 'ppo', label: 'PPO — clipped surrogate' },
+		{ value: 'refl', label: 'ReFL — differentiable-reward backprop' }
 	];
 </script>
 
@@ -178,7 +179,7 @@
 				<!-- Update rule -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Update rule</div>
-					<FormSelect fieldPath="rl.rl_loss" value={rlLoss} onchange={(e) => update('rl_loss', e.target.value)} options={lossOptions} tooltip="All rules consume the same cached rollouts; only the final loss differs. NFT is the default." />
+					<FormSelect fieldPath="rl.rl_loss" value={rlLoss} onchange={(e) => update('rl_loss', e.target.value)} options={lossOptions} tooltip="nft/rwr/dpo/ppo consume the same cached rollouts; refl instead backprops a differentiable reward online (no cache). NFT is the default." />
 					{#if rlLoss === 'rwr'}
 						<div class="grid grid-cols-3 gap-2 mt-2">
 							<FormField label="RWR Temperature" type="number" fieldPath="rl.rwr_temperature" value={$projectConfig?.rl?.rwr_temperature ?? 1.0} oninput={(e) => update('rwr_temperature', Number(e.target.value))} step="0.1" min={0.01} tooltip="Softmax temperature on advantages (default 1.0). Lower = sharper weighting toward the best samples." />
@@ -192,6 +193,13 @@
 							<FormField label="PPO Clip Eps" type="number" fieldPath="rl.ppo_clip_eps" value={$projectConfig?.rl?.ppo_clip_eps ?? 0.2} oninput={(e) => update('ppo_clip_eps', Number(e.target.value))} step="0.05" min={0.01} tooltip="Importance-ratio clip epsilon (default 0.2)." />
 							<FormField label="SDE eta" type="number" fieldPath="rl.rl_sde_eta" value={$projectConfig?.rl?.rl_sde_eta ?? 1.0} oninput={(e) => update('rl_sde_eta', Number(e.target.value))} step="0.1" min={0} max={1} tooltip="Per-step SDE noise level in [0,1] (1 = fully stochastic); must match Phase A. PPO is trajectory-faithful DDPO and needs the SDE sampler enabled in Phase A so the trajectory is cached." />
 						</div>
+					{:else if rlLoss === 'refl'}
+						<div class="grid grid-cols-3 gap-2 mt-2">
+							<FormField label="Grad Steps (K)" type="number" fieldPath="rl.refl_grad_steps" value={$projectConfig?.rl?.refl_grad_steps ?? 1} oninput={(e) => update('refl_grad_steps', Number(e.target.value))} step="1" min={1} tooltip="Final denoising steps the reward gradient flows through (default 1). >1 requires Re-noise Samples = 1." />
+							<FormField label="Re-noise Samples" type="number" fieldPath="rl.refl_renoise_samples" value={$projectConfig?.rl?.refl_renoise_samples ?? 1} oninput={(e) => update('refl_renoise_samples', Number(e.target.value))} step="1" min={1} tooltip="Re-noise the denoised latent at the final step this many times and average the reward gradient (variance reduction). >1 requires Grad Steps = 1." />
+							<FormField label="Reward Weight" type="number" fieldPath="rl.refl_reward_weight" value={$projectConfig?.rl?.refl_reward_weight ?? 1.0} oninput={(e) => update('refl_reward_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Scale on the maximized reward term (default 1.0). The base-policy anchor uses KL Beta below." />
+						</div>
+						<div class="text-[11px] mt-2" style="color: var(--text-muted);">refl backprops a <strong>differentiable</strong> reward (kind=differentiable, e.g. latent_energy) through the sampler; it generates rollouts inline (online, no cache) and reuses <strong>KL Beta</strong> as the base-policy anchor. Black-box reward models (hpsv3, videoreward, …) are not differentiable — use a policy-gradient rule for those.</div>
 					{/if}
 				</div>
 

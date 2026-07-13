@@ -4234,7 +4234,7 @@ The cache is tied to the snapshot that generated it; Phase B refuses a mismatche
 You configure three independent things; everything else has defaults:
 
 1. **Reward** (`--reward_fn`) — what to optimise: the composable [reward zoo](#the-reward-zoo).
-2. **Update rule** (`--rl_loss`) — how advantages become gradients: `nft` (default), `rwr`, `dpo`, `ppo` — see [Update rules](#update-rules).
+2. **Update rule** (`--rl_loss`) — `nft` (default), `rwr`, `dpo`, `ppo` turn GRPO advantages into gradients; `refl` instead backprops a differentiable reward directly — see [Update rules](#update-rules).
 3. **The round loop** — how many generate→train rounds, at what learning rate — see [How to use](#how-to-use) and [Tips](#tips-1).
 
 The design rests on four pieces:
@@ -4342,7 +4342,7 @@ Any round's Phase-B output is an RL-LoRA you can ship. If you enabled held-out s
 ### Update rules
 <sub>[↑ contents](#table-of-contents)</sub>
 
-`nft`/`rwr`/`dpo` consume the **same** cached rollouts, the same GRPO advantages, and the same three-forward `states` dict (`fwd`/`old`/`ref`/`x0`); only the final loss differs. `ppo` (trajectory-faithful DDPO) instead reads the per-step trajectory recorded by Phase-A `--rl_sde_sampler`. Switch with `--rl_loss` (`ltx2_rl_objectives.py`):
+`nft`/`rwr`/`dpo` consume the **same** cached rollouts, the same GRPO advantages, and the same three-forward `states` dict (`fwd`/`old`/`ref`/`x0`); only the final loss differs. `ppo` (trajectory-faithful DDPO) instead reads the per-step trajectory recorded by Phase-A `--rl_sde_sampler`. `refl` is different in kind — it is not policy-gradient and uses no cache or advantages; it backprops a differentiable reward straight through the sampler (`ltx2_refl.py`). Switch with `--rl_loss`:
 
 | `--rl_loss` | What it does | Key flags |
 |---|---|---|
@@ -4350,8 +4350,9 @@ Any round's Phase-B output is an RL-LoRA you can ship. If you enabled held-out s
 | `rwr` | Advantage-weighted regression: pull each sample toward its own clean `x0`, weighted by advantage. | `--rwr_temperature` |
 | `dpo` | Diffusion-DPO on each group's best vs worst sample (preference; reward only ranks). | `--dpo_beta` |
 | `ppo` | Trajectory-faithful DDPO: exact per-step importance ratio. Needs a Phase-A `--rl_sde_sampler` cache; run with CFG off. | `--ppo_clip_eps`, `--rl_sde_eta` |
+| `refl` | Differentiable-reward backprop: maximizes the reward straight through the sampler. Online-only (generates rollouts inline, no cache); requires a `kind="differentiable"` reward. | `--refl_grad_steps`, `--refl_renoise_samples`, `--refl_reward_weight` |
 
-`nft`/`rwr`/`ppo` add a KL term to the frozen reference (`--nft_kl_beta`, default `1e-4`); `dpo` is its own anchor. Start with `nft`.
+`nft`/`rwr`/`ppo` and `refl` add a KL term to the frozen reference (`--nft_kl_beta`, default `1e-4`); `dpo` is its own anchor. Start with `nft`.
 
 ### The reward zoo
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4376,6 +4377,7 @@ Select rewards with `--reward_fn "name:weight,name2:weight2,..."` (a bare `name`
 - **Routing.** `video` rewards drive the video branch, `audio` the audio branch, `sync` both. `audio`/`sync` rewards require `--ltx2_mode av`.
 - **Composition.** Combine rewards with weights — GRPO normalises each within its group, so different raw scales mix fine. Example: `--reward_fn "hpsv3:1.0,videoreward:0.5"`. When a low-level reward (e.g. `iqa_quality`) can be satisfied by adding high-frequency noise, pair it with the `anti_noise` guardrail and a learned visual-quality reward; over-weighting `anti_noise` prefers smooth/flat video.
 - **Physics.** Use the learned `videoscore2 dims=pc` head for semantic physical commonsense (gravity, collisions, object permanence). A frame statistic cannot tell that a ball should fall down.
+- **Differentiable rewards (for `--rl_loss refl`).** A reward may additionally declare `kind="differentiable"` and implement `score_grad(samples) -> Tensor` (a grad-carrying per-sample reward, same higher-is-better convention as `score`) so `refl` can backprop it straight through the sampler. Templates in `ltx2_rewards/zoo/refl_targets.py`: `latent_energy` (latent-space, needs no decode) and `pixel_sharpness` (decoded frames). The black-box rewards in the table above have no `score_grad` and are usable only by the policy-gradient rules (`nft`/`rwr`/`dpo`/`ppo`); `refl` rejects them at launch.
 
 Reward model code is vendored (`ltx2_rewards/vendor/`), but the runtime libraries of the model-backed rewards are **not** installed with this package — each reward file lists its own `pip install` line at the top of its docstring (`iqa_quality` → `pyiqa`; `hpsv3`/`videoreward`/`videoscore2` → `qwen-vl-utils` (+`peft` for `videoreward`); `imagebind` → `ftfy regex`; `av_align`/`imagebind` have optional exact-parity extras). Checkpoints come from [`huggingface.co/zghhui/OmniNFT-Reward-Series`](https://huggingface.co/zghhui/OmniNFT-Reward-Series) where applicable; pull only the rewards your `--reward_fn` uses.
 

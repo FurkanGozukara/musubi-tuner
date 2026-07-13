@@ -2153,6 +2153,7 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
     """
     rl = config.rl
     t = config.training
+    rl_loss = getattr(rl, "rl_loss", "nft") or "nft"
     effective_phase = phase or rl.phase
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -2171,7 +2172,7 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
     # Phase A may start from either an existing LoRA or a fresh adapter. Offline Phase B is stricter:
     # it must load the exact `old` snapshot that generated the cache, or the snapshot hash invariant
     # will fail before training.
-    if effective_phase == "train_rl" and not rl.online and not _has_text(t.network_weights):
+    if effective_phase == "train_rl" and not rl.online and rl_loss != "refl" and not _has_text(t.network_weights):
         errors.append(
             _make_issue(
                 "error",
@@ -2232,6 +2233,39 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
                     page="rl",
                 )
             )
+
+    # refl (differentiable-reward backprop) is online-only and every reward must be differentiable.
+    if rl_loss == "refl":
+        if not _has_text(rl.rl_prompts):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.rl_prompts",
+                    "refl (differentiable-reward backprop) generates rollouts inline and requires a Prompts "
+                    "file (there is no rollout cache to replay).",
+                    label="Prompts",
+                    page="rl",
+                )
+            )
+        if reward_error is None and weights:
+            try:
+                from musubi_tuner.ltx2_rewards import get_reward_cls
+
+                blackbox = sorted(n for n in weights if getattr(get_reward_cls(n), "kind", "blackbox") != "differentiable")
+            except Exception:
+                blackbox = []
+            if blackbox:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "rl.reward_fn",
+                        f"refl backprops the reward, so every selected reward must be differentiable, but "
+                        f"{blackbox} is/are black-box. Use a differentiable reward (e.g. latent_energy) or "
+                        "switch to a policy-gradient rule (nft/rwr/dpo/ppo).",
+                        label="Reward Function",
+                        page="rl",
+                    )
+                )
 
     # --reward_args must be parseable key=value entries.
     for entry in _split_cli_args(rl.reward_args):

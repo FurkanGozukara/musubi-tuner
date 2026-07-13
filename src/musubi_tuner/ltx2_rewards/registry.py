@@ -39,6 +39,11 @@ class Reward(Protocol):
     def teardown(self) -> None: ...
     def score(self, samples: List[dict]) -> Tuple[List[float], dict]: ...
     def score_groups(self, groups: List[dict]) -> Tuple[List[List[float]], dict]: ...
+    # Differentiable (``kind == "differentiable"``) rewards additionally implement ``score_grad``:
+    # it returns a grad-carrying per-sample reward TENSOR (not detached floats) so the
+    # differentiable-reward optimizer (``--rl_loss refl``) can backprop it through the sampler + decode. See
+    # ``BaseReward.score_grad``.
+    def score_grad(self, samples: List[dict]) -> Tuple[Any, dict]: ...
 
 
 class BaseReward:
@@ -62,6 +67,25 @@ class BaseReward:
 
     def score(self, samples: List[dict]) -> Tuple[List[float], dict]:
         raise NotImplementedError
+
+    def score_grad(self, samples: List[dict]) -> Tuple[Any, dict]:
+        """Differentiable scoring for the ``--rl_loss refl`` backend.
+
+        Return a grad-carrying per-sample reward TENSOR ``[N]`` (higher-is-better, same
+        convention as ``score``), computed from the grad-carrying media each sample provides
+        (``sample["video"]`` for a decoded-pixel reward, ``sample["video_x0"]`` for a
+        latent-space reward). The tensor MUST stay attached to the sample's autograd graph —
+        do NOT ``.detach()`` / move to CPU / cast to Python float (that is what ``score`` does).
+
+        Only ``kind == "differentiable"`` rewards implement this. The default raises so a
+        blackbox reward can never be silently used as a (broken, zero-gradient) ReFL target.
+        """
+        raise NotImplementedError(
+            f"reward '{getattr(self, 'name', type(self).__name__)}' is blackbox (kind={self.kind!r}); "
+            "it has no differentiable score_grad() and cannot drive --rl_loss refl. Use a reward with "
+            "kind='differentiable', or optimize this reward with a policy-gradient rule "
+            "(--rl_loss nft/rwr/dpo/ppo)."
+        )
 
     def score_groups(self, groups: List[dict]) -> Tuple[List[List[float]], dict]:
         """Group-aware scoring hook.
@@ -250,3 +274,50 @@ class RewardStack:
             finally:
                 reward.teardown()
         return results
+
+    def assert_differentiable(self) -> None:
+        """Raise unless EVERY selected reward is ``kind == "differentiable"`` (ReFL requirement).
+
+        ``--rl_loss refl`` backprops the reward, so a blackbox reward in the spec would contribute
+        a zero (severed) gradient and silently do nothing. Fail loudly at setup instead.
+        """
+        bad = [name for name, r in self._rewards.items() if getattr(r, "kind", "blackbox") != "differentiable"]
+        if bad:
+            raise ValueError(
+                f"--rl_loss refl needs every reward to be differentiable, but {bad} is/are blackbox. "
+                f"Differentiable rewards register with kind='differentiable' and implement score_grad(). "
+                f"Either swap to a differentiable reward or optimize these with a policy-gradient rule "
+                f"(--rl_loss nft/rwr/dpo/ppo)."
+            )
+
+    def score_grad(self, samples: List[dict]):
+        """Weighted sum of every selected reward's differentiable ``score_grad`` -> ``(Tensor[N], info)``.
+
+        Each reward is ``setup``/``score_grad``/``teardown``-sequenced exactly like ``score_all`` (never
+        co-resident in VRAM). The returned tensor carries grad back into ``samples`` (via the media each
+        reward reads), so the ReFL loop can call ``.backward()`` on ``-reward_weight * result.mean()``.
+        Assumes ``assert_differentiable()`` already passed.
+        """
+        import torch
+
+        total = None
+        info: Dict[str, Any] = {}
+        for name, reward in self._rewards.items():
+            try:
+                reward.setup(self.device, **self.reward_args.get(name, {}))
+                scores, sub = reward.score_grad(samples)
+                if not torch.is_tensor(scores):
+                    raise TypeError(f"reward '{name}' score_grad() must return a torch.Tensor, got {type(scores).__name__}")
+                if scores.shape[0] != len(samples):
+                    raise ValueError(f"reward '{name}' score_grad returned {tuple(scores.shape)} for {len(samples)} samples")
+                w = float(self.weights.get(name, 1.0))
+                contrib = w * scores
+                total = contrib if total is None else total + contrib
+                info[name] = float(scores.detach().float().mean())
+                if sub:
+                    info.update({f"{name}.{k}": v for k, v in sub.items()})
+            finally:
+                reward.teardown()
+        if total is None:
+            raise ValueError("score_grad: no rewards selected")
+        return total, info

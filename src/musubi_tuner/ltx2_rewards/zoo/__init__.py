@@ -20,6 +20,7 @@ from . import clap  # noqa: F401  (registers "clap"; audio-text similarity)
 from . import hpsv3  # noqa: F401  (registers "hpsv3"; vendored Qwen2-VL preference)
 from . import imagebind  # noqa: F401  (registers "imagebind"; multimodal similarity)
 from . import iqa_quality  # noqa: F401  (registers "iqa_quality"; IQA-PyTorch perceptual quality/detail)
+from . import refl_targets  # noqa: F401  (registers "latent_energy" + "pixel_sharpness"; differentiable ReFL templates)
 from . import videoreward  # noqa: F401  (registers "videoreward"; VideoAlign VQ/MQ/TA)
 from . import videoscore2  # noqa: F401  (registers "videoscore2"; VQ/TA/PC physics head)
 
@@ -32,6 +33,7 @@ __all__ = [
     "hpsv3",
     "imagebind",
     "iqa_quality",
+    "refl_targets",
     "videoreward",
     "videoscore2",
 ]
