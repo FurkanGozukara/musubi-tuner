@@ -302,6 +302,17 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.activation_cpu_offloading = activation_cpu_offloading
         self.weight_cpu_offloading = weight_cpu_offloading
 
+    def _wait_for_h2d_stream_block(self) -> bool:
+        """Bind this block to its H2D ring slot before checkpoint recomputation."""
+        offloader_ref = getattr(self, "_h2d_stream_offloader_ref", None)
+        if offloader_ref is None:
+            return False
+        offloader = offloader_ref()
+        if offloader is None:
+            raise RuntimeError("The H2D block-swap offloader was released while a managed block is still active.")
+        offloader.wait_for_block(self.idx)
+        return True
+
     def get_ada_values(
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice, num_tokens: int = None
     ) -> tuple[torch.Tensor, ...]:
@@ -441,7 +452,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Key insight: During FORWARD, offloader loads block to GPU before checkpoint_wrapper runs
                 # During BACKWARD recomputation, block is on CPU (was unloaded after forward)
                 # So we detect backward by checking if block is on CPU
-                if getattr(self, "swap_weight_offload", False):
+                h2d_stream_managed = self._wait_for_h2d_stream_block()
+                if getattr(self, "swap_weight_offload", False) and not h2d_stream_managed:
                     first_param = next(self.parameters(), None)
                     block_on_cpu = first_param is not None and first_param.device.type == "cpu"
 

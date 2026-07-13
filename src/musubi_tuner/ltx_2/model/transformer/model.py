@@ -523,9 +523,11 @@ class LTXModel(torch.nn.Module):
             swap_start = max(0, self.num_blocks - self.blocks_to_swap)
             for idx, block in enumerate(self.transformer_blocks):
                 enabled = idx >= swap_start
+                setattr(block, "_h2d_stream_offloader_ref", None)
                 setattr(block, "swap_weight_offload", enabled)
                 for module in block.modules():
                     if module.__class__.__name__.endswith("Linear"):
+                        setattr(module, "_h2d_stream_managed", False)
                         setattr(module, "swap_weight_offload", enabled)
             _log_cuda_memory("after_enable_block_swap")
             return
@@ -565,12 +567,18 @@ class LTXModel(torch.nn.Module):
                 debug=swap_config.debug,
                 swap_norms=swap_norms,
             )
+            import weakref
+
+            offloader_ref = weakref.ref(self.offloader)
             managed_indices = set(getattr(self.offloader, "stream_idx", []))
             for idx, block in enumerate(self.transformer_blocks):
                 enabled = idx in managed_indices
+                setattr(block, "_h2d_stream_offloader_ref", offloader_ref if enabled else None)
                 setattr(block, "swap_weight_offload", enabled)
+                managed_module_ids = {id(module) for module in self.offloader._modules(idx)} if enabled else set()
                 for module in block.modules():
                     if module.__class__.__name__.endswith("Linear"):
+                        setattr(module, "_h2d_stream_managed", id(module) in managed_module_ids)
                         setattr(module, "swap_weight_offload", enabled)
             _log_cuda_memory("after_enable_block_swap")
             return
@@ -592,9 +600,11 @@ class LTXModel(torch.nn.Module):
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
         for idx, block in enumerate(self.transformer_blocks):
             enabled = idx >= swap_start
+            setattr(block, "_h2d_stream_offloader_ref", None)
             setattr(block, "swap_weight_offload", enabled)
             for module in block.modules():
                 if module.__class__.__name__.endswith("Linear"):
+                    setattr(module, "_h2d_stream_managed", False)
                     setattr(module, "swap_weight_offload", enabled)
         _log_cuda_memory("after_enable_block_swap")
 

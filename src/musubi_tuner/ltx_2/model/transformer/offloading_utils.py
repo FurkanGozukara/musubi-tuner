@@ -18,9 +18,6 @@ from musubi_tuner.modules.custom_offloading_utils import LoRAStreamOffloader
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
 _LOGGED_FIRST_PARAM = False
-_SKIP_AUDIO_SWAP = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
-_SKIP_CROSS_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
-_SKIP_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
 _SWAP_MASK_TOKENS = {"all", "ff", "attn", "self_attn", "cross_attn", "av_cross_attn"}
 _LOGGED_SWAP_MASK = False
 
@@ -34,12 +31,17 @@ def _swap_full_block_enabled() -> bool:
     return os.getenv("LTX2_SWAP_FULL_BLOCK", "1") == "1"
 
 
+def _swap_keep_enabled(env_name: str) -> bool:
+    """Read swap policy when an offloader is configured, not when this module is imported."""
+    return os.getenv(env_name, "0") == "1"
+
+
 def _should_skip_swap(name: str) -> bool:
-    if _SKIP_AUDIO_SWAP and "audio" in name:
+    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") and "audio" in name:
         return True
-    if _SKIP_ATTN_SWAP and "attn" in name:
+    if _swap_keep_enabled("LTX2_SWAP_KEEP_ATTN") and "attn" in name:
         return True
-    if _SKIP_CROSS_ATTN_SWAP and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
+    if _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN") and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
         return True
     return False
 
@@ -553,7 +555,7 @@ class LTX2ModelOffloader(ModelOffloader):
                     _move_non_linear_params(block, self.device, include_norms=True)
                 elif self.swap_norms:
                     # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
-                    if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") or _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN"):
                         _move_block_params_excluding_audio(
                             block,
                             cpu_device,
@@ -572,7 +574,7 @@ class LTX2ModelOffloader(ModelOffloader):
                     _move_non_linear_params(block, self.device, include_norms=False)
                 else:
                     # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
-                    if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") or _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN"):
                         _move_block_params_excluding_audio(
                             block,
                             cpu_device,
