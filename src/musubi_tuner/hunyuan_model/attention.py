@@ -3,12 +3,14 @@ import math
 import torch
 import torch.nn.functional as F
 
+from musubi_tuner.modules.attention import AUTO_FLASH_ATTENTION_MODE, resolve_automatic_flash_mode
+
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
     from flash_attn.flash_attn_interface import flash_attn_func
-except ImportError:
+except Exception:
     flash_attn = None
     flash_attn_varlen_func = None
     _flash_attn_forward = None
@@ -127,6 +129,8 @@ def attention(
     q, k, v = q_or_qkv_list if type(q_or_qkv_list) == list else (q_or_qkv_list, k, v)
     if type(q_or_qkv_list) == list:
         q_or_qkv_list.clear()
+    if mode == AUTO_FLASH_ATTENTION_MODE:
+        mode = resolve_automatic_flash_mode(q, k, v)
     split_attn = total_len is not None
     if (split_attn or cu_seqlens_q is None) and mode == "sageattn":
         mode = "sageattn_fixlen"

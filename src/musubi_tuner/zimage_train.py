@@ -15,6 +15,7 @@ from safetensors.torch import save_file
 
 from musubi_tuner import zimage_train_network
 from musubi_tuner.dataset import config_utils
+from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -173,7 +174,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
 
         logger.info(f"Loading DiT model from {args.dit}")
         if args.sdpa:
-            attn_mode = "torch"
+            attn_mode = resolve_sdpa_backend(getattr(args, "use_legacy_sdpa", False), accelerator.device)
         elif args.flash_attn:
             attn_mode = "flash"
         elif args.sage_attn:
