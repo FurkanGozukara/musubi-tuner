@@ -42,6 +42,17 @@ def test_external_flash_falls_back_when_training_probe_fails(monkeypatch):
     assert not attention.should_use_external_flash_for_sdpa()
 
 
+def test_external_flash_handles_broken_native_availability_probe(monkeypatch):
+    _mock_external_flash_ready(monkeypatch)
+    monkeypatch.setattr(
+        torch.backends.cuda,
+        "is_flash_attention_available",
+        lambda: (_ for _ in ()).throw(RuntimeError("backend probe failed")),
+    )
+
+    assert attention.should_use_external_flash_for_sdpa()
+
+
 def test_krea2_routes_sdpa_to_external_flash_when_needed(monkeypatch):
     monkeypatch.setattr(krea2_train_network, "should_use_external_flash_for_sdpa", lambda: True)
     args = SimpleNamespace(
@@ -59,3 +70,22 @@ def test_krea2_routes_sdpa_to_external_flash_when_needed(monkeypatch):
 
     assert not args.sdpa
     assert args.flash_attn
+
+
+def test_krea2_keeps_sdpa_when_external_flash_probe_fails(monkeypatch):
+    monkeypatch.setattr(krea2_train_network, "should_use_external_flash_for_sdpa", lambda: False)
+    args = SimpleNamespace(
+        fp8_base=True,
+        fp8_scaled=True,
+        sdpa=True,
+        flash_attn=False,
+        turbo_dit_cache=False,
+        turbo_dit=None,
+        blocks_to_swap=0,
+        sample_prompts=None,
+    )
+
+    krea2_train_network.Krea2NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.sdpa
+    assert not args.flash_attn

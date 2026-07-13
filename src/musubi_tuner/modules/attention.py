@@ -5,16 +5,19 @@ from dataclasses import dataclass
 import torch
 from typing import Optional, Union
 
+_flash_attn_import_error: Optional[Exception] = None
+
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
     from flash_attn.flash_attn_interface import flash_attn_func
-except ImportError:
+except Exception as exc:
     flash_attn = None
     flash_attn_varlen_func = None
     _flash_attn_forward = None
     flash_attn_func = None
+    _flash_attn_import_error = exc
 
 try:
     from sageattention import sageattn_varlen, sageattn
@@ -32,6 +35,8 @@ _external_flash_training_probe: dict[int, bool] = {}
 
 
 def _external_flash_supports_training(device: Optional[Union[str, torch.device]] = None) -> bool:
+    if flash_attn_func is None or flash_attn_varlen_func is None:
+        return False
     try:
         parsed_device = torch.device("cuda" if device is None else device)
         if parsed_device.type != "cuda":
@@ -45,11 +50,27 @@ def _external_flash_supports_training(device: Optional[Union[str, torch.device]]
     supported = False
     try:
         probe_device = torch.device("cuda", device_index)
-        q = torch.zeros((1, 16, 2, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
-        k = torch.zeros((1, 16, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
-        v = torch.zeros((1, 16, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
-        output = flash_attn_func(q, k, v, dropout_p=0.0)
-        output.sum().backward()
+        q = torch.zeros((2, 16, 2, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        k = torch.zeros((2, 16, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        v = torch.zeros((2, 16, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        fixed_output = flash_attn_func(q, k, v, dropout_p=0.0)
+
+        variable_tokens = 24
+        q_varlen = torch.zeros((variable_tokens, 2, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        k_varlen = torch.zeros((variable_tokens, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        v_varlen = torch.zeros((variable_tokens, 1, 128), dtype=torch.bfloat16, device=probe_device, requires_grad=True)
+        cu_seqlens = torch.tensor([0, 8, variable_tokens], dtype=torch.int32, device=probe_device)
+        varlen_output = flash_attn_varlen_func(
+            q_varlen,
+            k_varlen,
+            v_varlen,
+            cu_seqlens,
+            cu_seqlens,
+            16,
+            16,
+            0.0,
+        )
+        (fixed_output.sum() + varlen_output.sum()).backward()
         torch.cuda.synchronize(probe_device)
         supported = True
     except Exception:
@@ -74,12 +95,15 @@ def should_use_external_flash_for_sdpa(device: Optional[Union[str, torch.device]
         return False
 
     native_flash_available = getattr(torch.backends.cuda, "is_flash_attention_available", None)
-    if native_flash_available is not None and native_flash_available():
-        return False
+    try:
+        if native_flash_available is not None and native_flash_available():
+            return False
+    except Exception:
+        pass
 
     try:
         major, _minor = torch.cuda.get_device_capability(device)
-    except (AssertionError, RuntimeError, ValueError):
+    except (AssertionError, RuntimeError, TypeError, ValueError):
         return False
     return major >= 8 and _external_flash_supports_training(device)
 
