@@ -4596,6 +4596,9 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 > [!WARNING]
 > The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
 
+> [!NOTE]
+> **Block swap with full fine-tuning.** `--blocks_to_swap N` works for full-parameter runs but is far slower than for LoRA. The faster H2D-only path is unavailable here — combining `--block_swap_h2d_only` with `--blocks_to_swap` raises an error — because with trainable base weights each swapped block must be written back Device→Host every step, making the transfer bidirectional and PCIe-bound instead of Host→Device-only. Measured on one H100 at 1280x720x121, `blocks_to_swap=40` ran roughly 3x slower per step than `blocks_to_swap=0`. Prefer `blocks_to_swap=0` when the model fits (video-only peaks ~55-66 GB), and use int8-weight training or QAPOLLO / Q-GaLore rather than block swap to fit full fine-tuning on smaller cards.
+
 #### Using Full-Finetune Checkpoints for Inference
 
 `ltx2_train.py` saves a transformer-only checkpoint with internal key naming (`model.<...>`) and without the `config` safetensors metadata. The LTX-2 loaders (generation, caching, LoRA training) expect a self-contained bundle in the base-checkpoint layout (`model.diffusion_model.<...>` plus VAE / vocoder / audio VAE / text-projection weights and the `config` metadata), so the trainer output cannot be passed to `--ltx2_checkpoint` directly. Merge it into a copy of the base bundle first:
