@@ -391,7 +391,11 @@ class LTX2H2DModelOffloader(LoRAStreamOffloader):
                 continue
             if not hasattr(module, "weight") or module.weight is None:
                 continue
-            if _should_skip_swap(name) or not _module_matches_swap_mask(name, self._swap_mask):
+            # A requested full ("all") H2D swap must not retain the audio half of the AV
+            # transformer: the shared skip-audio default is a throughput knob for
+            # partial/classic swap, and applying it to a full H2D swap leaves ~5GB resident
+            # on a 40-block INT8 run. An explicit non-"all" mask still selects a partial set.
+            if self._swap_mask != {"all"} and (_should_skip_swap(name) or not _module_matches_swap_mask(name, self._swap_mask)):
                 continue
             mods.append(module)
         return mods

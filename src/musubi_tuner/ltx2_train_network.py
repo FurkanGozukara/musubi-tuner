@@ -2835,6 +2835,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             payload["shifted_logit_shift"] = shifted_logit_shifts.detach().to(dtype=torch.float32)
         return payload
 
+    @staticmethod
+    def _resident_block_indices(base_model: torch.nn.Module, num_blocks: int, blocks_to_swap: int) -> set[int]:
+        """Indices of blocks that stay GPU-resident (never streamed).
+
+        H2D-only block swap streams evenly-spaced indices (``offloader.stream_idx``), not a
+        contiguous tail, so the classic ``idx < num_blocks - blocks_to_swap`` split wrongly
+        treats interleaved streamed blocks as resident. Prefer the offloader's actual streamed
+        set when present; fall back to the tail split for classic/aggressive swap.
+        """
+        offloader = getattr(base_model, "offloader", None)
+        stream_idx = getattr(offloader, "stream_idx", None)
+        if stream_idx is not None:
+            streamed = {int(idx) for idx in stream_idx}
+            return {idx for idx in range(num_blocks) if idx not in streamed}
+
+        swap_start = max(0, num_blocks - blocks_to_swap)
+        return set(range(swap_start))
+
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
             return
@@ -2859,8 +2877,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 ensure_fp8_modules_on_device(block, mp_plan.block_devices[idx])
             return
 
-        target_device = next(model.parameters()).device
         blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
+        # Use the offloader's compute device, not the first parameter's: under H2D swap the
+        # first parameter may be a CPU master, which would otherwise push resident blocks to CPU.
+        offloader = getattr(base_model, "offloader", None)
+        target_device = torch.device(getattr(offloader, "device", next(model.parameters()).device))
 
         if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
             # Process non-block components (patchify, adaln, caption_projection, etc.)
@@ -2869,11 +2890,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     continue  # Skip transformer blocks - they are managed by block swap
                 ensure_fp8_modules_on_device(child, target_device)
 
-            # Only process non-swapped blocks (those that should always be on GPU)
+            # Only process resident (never-streamed) blocks; streamed blocks are managed by
+            # the offloader ring. H2D streams evenly-spaced indices, so use the offloader set.
             num_blocks = len(base_model.transformer_blocks)
-            swap_start = max(0, num_blocks - blocks_to_swap)
+            resident_indices = self._resident_block_indices(base_model, num_blocks, blocks_to_swap)
             for idx, block in enumerate(base_model.transformer_blocks):
-                if idx < swap_start:
+                if idx in resident_indices:
                     # This block should be on GPU - ensure FP8 modules are on device
                     ensure_fp8_modules_on_device(block, target_device)
                 # Skip swapped blocks - they are managed by the block swap mechanism
@@ -2921,7 +2943,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 _sync_nf4_buffers(block, mp_plan.block_devices[idx])
             return
 
-        target_device = next(model.parameters()).device
+        offloader = getattr(base_model, "offloader", None)
+        target_device = torch.device(getattr(offloader, "device", next(model.parameters()).device))
 
         if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
             for name, child in base_model.named_children():
@@ -2929,9 +2952,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     continue
                 _sync_nf4_buffers(child, target_device)
             num_blocks = len(base_model.transformer_blocks)
-            swap_start = max(0, num_blocks - blocks_to_swap)
+            resident_indices = self._resident_block_indices(base_model, num_blocks, blocks_to_swap)
             for idx, block in enumerate(base_model.transformer_blocks):
-                if idx < swap_start:
+                if idx in resident_indices:
                     _sync_nf4_buffers(block, target_device)
         else:
             _sync_nf4_buffers(model, target_device)
