@@ -105,6 +105,25 @@ class BlockSwapConfig:
                 "backward 用に保存された重みの version が進むため。gradient checkpointing は再計算時に読み直すので回避できます）。"
             )
 
+        # H2D-only rebinds each streamed block's Linear weights to views into a small reused GPU ring
+        # buffer. Any path that moves a whole *managed* block CPU-ward rewrites those views in place and
+        # detaches them from the ring (a raw ``weight.data = weight.data.to("cpu")`` on a ring view), which
+        # corrupts the ring and crashes with an opaque device/version mismatch. These offload paths route
+        # around the ring entirely, so they are mutually exclusive with H2D-only swap during training.
+        if h2d_only and supports_backward:
+            for flag_attr, flag_name in (
+                ("blockwise_checkpointing", "--blockwise_checkpointing"),
+                ("gradient_checkpointing_cpu_offload", "--gradient_checkpointing_cpu_offload"),
+                ("sample_with_offloading", "--sample_with_offloading"),
+            ):
+                if getattr(args, flag_attr, False):
+                    raise ValueError(
+                        f"{flag_name} is incompatible with --block_swap_h2d_only: it moves whole streamed"
+                        " blocks to CPU, which rewrites the H2D ring's GPU weight views and corrupts the ring."
+                        " H2D-only block swap already streams frozen weights off the GPU, so disable"
+                        f" {flag_name} (or drop --block_swap_h2d_only)."
+                    )
+
         ring_size = getattr(args, "block_swap_ring_size", 2)
         if ring_size < 1:
             raise ValueError("--block_swap_ring_size must be >= 1")
