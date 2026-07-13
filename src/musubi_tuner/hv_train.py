@@ -39,6 +39,14 @@ import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae
 import musubi_tuner.hunyuan_model.vae as vae_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    get_adaptive_learning_rates,
+    is_automagic_optimizer_type,
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    prepare_automagic_optimizer,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
 from musubi_tuner.training.compile_setup import (
@@ -381,7 +389,16 @@ class FineTuningTrainer:
         optimizer = None
         optimizer_class = None
 
-        if optimizer_type.endswith("8bit".lower()):
+        if is_automagic_optimizer_type(optimizer_type):
+            optimizer_class, optimizer, optimizer_kwargs = prepare_automagic_optimizer(
+                optimizer_type,
+                trainable_params,
+                lr,
+                optimizer_kwargs,
+                args,
+            )
+
+        elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
             except ImportError:
@@ -462,9 +479,9 @@ class FineTuningTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        return args.optimizer_type.lower().endswith("schedulefree".lower()) or is_automagic_optimizer_type(args.optimizer_type)
 
-    def get_dummy_scheduler(optimizer: torch.optim.Optimizer) -> Any:
+    def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
         # this isn't be wrapped by accelerator because of this class is not a subclass of torch.optim.lr_scheduler._LRScheduler
@@ -476,7 +493,7 @@ class FineTuningTrainer:
                 pass
 
             def get_last_lr(self):
-                return [group["lr"] for group in self.optimizer.param_groups]
+                return get_adaptive_learning_rates(self.optimizer)
 
         return DummyScheduler(optimizer)
 
@@ -738,6 +755,7 @@ class FineTuningTrainer:
         return noisy_model_input, timesteps
 
     def train(self, args):
+        args.full_finetune = True
         if args.seed is None:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
@@ -1102,6 +1120,7 @@ class FineTuningTrainer:
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
+                        materialize_stochastic_gradients(optimizer)
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -1112,6 +1131,9 @@ class FineTuningTrainer:
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(transformer).parameters()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        if blocks_to_swap > 0 and should_patch_block_swap_gradients(optimizer):
+                            move_optimizer_gradients_to_parameters(optimizer)
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -1391,7 +1413,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(

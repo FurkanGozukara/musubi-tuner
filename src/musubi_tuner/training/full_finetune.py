@@ -15,6 +15,11 @@ from tqdm import tqdm
 from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, prepare_accelerator
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
@@ -658,6 +663,7 @@ class FullFineTuningTrainerMixin:
             parameter.register_post_accumulate_grad_hook(grad_hook)
 
     def train(self, args):
+        args.full_finetune = True
         _require_resume_training_progress(args)
         if not self._validate_args_and_init(args):
             return
@@ -885,13 +891,15 @@ class FullFineTuningTrainerMixin:
                     accelerator.backward(loss)
 
                     if not args.fused_backward_pass:
+                        if accelerator.sync_gradients:
+                            materialize_stochastic_gradients(optimizer)
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             accelerator.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
-                        if has_block_swap and args.block_swap_optimizer_patch_params:
-                            for parameter_group in optimizer.param_groups:
-                                for parameter in parameter_group["params"]:
-                                    if parameter.grad is not None and parameter.device != parameter.grad.device:
-                                        parameter.grad = parameter.grad.to(parameter.device, non_blocking=True)
+                        patch_block_swap_gradients = should_patch_block_swap_gradients(
+                            optimizer, args.block_swap_optimizer_patch_params
+                        )
+                        if has_block_swap and patch_block_swap_gradients:
+                            move_optimizer_gradients_to_parameters(optimizer)
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
@@ -914,7 +922,7 @@ class FullFineTuningTrainerMixin:
                     progress_bar.update(1)
 
                     should_sample = should_sample_images(args, progress.global_step, epoch=None)
-                    should_save = args.save_every_n_steps is not None and progress.global_step % args.save_every_n_steps == 0
+                    should_save = bool(args.save_every_n_steps) and progress.global_step % args.save_every_n_steps == 0
                     if should_sample or should_save:
                         optimizer_eval_fn()
                         if should_sample:
@@ -988,7 +996,7 @@ class FullFineTuningTrainerMixin:
             accelerator.wait_for_everyone()
 
             optimizer_eval_fn()
-            if args.save_every_n_epochs is not None:
+            if args.save_every_n_epochs:
                 should_save_epoch = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if should_save_epoch:
                     ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)

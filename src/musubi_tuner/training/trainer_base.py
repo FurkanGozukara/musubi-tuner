@@ -43,6 +43,14 @@ from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    get_adaptive_learning_rates,
+    is_automagic_optimizer_type,
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    prepare_automagic_optimizer,
+    should_patch_block_swap_gradients,
+)
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
@@ -178,7 +186,16 @@ class NetworkTrainer:
         optimizer = None
         optimizer_class = None
 
-        if optimizer_type.endswith("8bit".lower()):
+        if is_automagic_optimizer_type(optimizer_type):
+            optimizer_class, optimizer, optimizer_kwargs = prepare_automagic_optimizer(
+                optimizer_type,
+                trainable_params,
+                lr,
+                optimizer_kwargs,
+                args,
+            )
+
+        elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
             except ImportError:
@@ -259,7 +276,7 @@ class NetworkTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        return args.optimizer_type.lower().endswith("schedulefree".lower()) or is_automagic_optimizer_type(args.optimizer_type)
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -273,7 +290,7 @@ class NetworkTrainer:
                 pass
 
             def get_last_lr(self):
-                return [group["lr"] for group in self.optimizer.param_groups]
+                return get_adaptive_learning_rates(self.optimizer)
 
         return DummyScheduler(optimizer)
 
@@ -2056,6 +2073,7 @@ class NetworkTrainer:
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
+                        materialize_stochastic_gradients(optimizer)
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -2066,6 +2084,9 @@ class NetworkTrainer:
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        if self.blocks_to_swap and should_patch_block_swap_gradients(optimizer):
+                            move_optimizer_gradients_to_parameters(optimizer)
 
                     optimizer.step()
                     lr_scheduler.step()

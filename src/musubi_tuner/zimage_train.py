@@ -19,6 +19,11 @@ from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.zimage import zimage_model
 from musubi_tuner.hv_train_network import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
@@ -79,6 +84,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
     # endregion model specific
 
     def train(self, args):
+        args.full_finetune = True
         if torch.cuda.is_available():
             if args.cuda_allow_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -543,18 +549,16 @@ class ZImageTrainer(ZImageNetworkTrainer):
                     accelerator.backward(loss)
 
                     if not args.fused_backward_pass:
+                        if accelerator.sync_gradients:
+                            materialize_stochastic_gradients(optimizer)
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             params_to_clip = transformer.parameters()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        if blocks_to_swap > 0 and args.block_swap_optimizer_patch_params:
-                            # Move grad to same device of parameter: workaround for optimizer step, working with AdamW and Adafactor for now.
-                            # AdamW8bit and other optimizers does not work with this patch because of their specific implementation.
-                            unwrapped_optimizer = accelerator.unwrap_model(optimizer)
-                            for group in unwrapped_optimizer.param_groups:
-                                for param in group["params"]:
-                                    if param.grad is not None and param.device != param.grad.device:
-                                        param.grad = param.grad.to(param.device, non_blocking=True)
+                        if blocks_to_swap > 0 and should_patch_block_swap_gradients(
+                            optimizer, args.block_swap_optimizer_patch_params
+                        ):
+                            move_optimizer_gradients_to_parameters(optimizer)
 
                         optimizer.step()
                         lr_scheduler.step()

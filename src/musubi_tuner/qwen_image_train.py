@@ -19,6 +19,11 @@ from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
 from musubi_tuner.hv_train_network import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
@@ -143,6 +148,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
     # endregion model specific
 
     def train(self, args):
+        args.full_finetune = True
         if torch.cuda.is_available():
             if args.cuda_allow_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -632,9 +638,14 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     accelerator.backward(loss)
 
                     if not args.fused_backward_pass:
+                        if accelerator.sync_gradients:
+                            materialize_stochastic_gradients(optimizer)
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             params_to_clip = transformer.parameters()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        if blocks_to_swap > 0 and should_patch_block_swap_gradients(optimizer):
+                            move_optimizer_gradients_to_parameters(optimizer)
 
                         optimizer.step()
                         lr_scheduler.step()

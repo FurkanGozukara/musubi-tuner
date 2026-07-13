@@ -29,6 +29,11 @@ from musubi_tuner.hv_train_network import (
     should_sample_images,
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.optimizers.factory import (
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
@@ -105,6 +110,7 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
         return frozen_params, frozen_numel
 
     def train(self, args):
+        args.full_finetune = True
         if torch.cuda.is_available():
             if args.cuda_allow_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -508,15 +514,15 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
                     accelerator.backward(loss)
 
                     if not args.fused_backward_pass:
+                        if accelerator.sync_gradients:
+                            materialize_stochastic_gradients(optimizer)
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
 
-                        if blocks_to_swap > 0 and args.block_swap_optimizer_patch_params:
-                            unwrapped_optimizer = accelerator.unwrap_model(optimizer)
-                            for group in unwrapped_optimizer.param_groups:
-                                for param in group["params"]:
-                                    if param.grad is not None and param.device != param.grad.device:
-                                        param.grad = param.grad.to(param.device, non_blocking=True)
+                        if blocks_to_swap > 0 and should_patch_block_swap_gradients(
+                            optimizer, args.block_swap_optimizer_patch_params
+                        ):
+                            move_optimizer_gradients_to_parameters(optimizer)
 
                         optimizer.step()
                         lr_scheduler.step()

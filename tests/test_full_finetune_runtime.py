@@ -436,6 +436,24 @@ def test_full_model_lifecycle_uses_prepared_forward_and_exports_only_transformer
     assert trainer.optimizer_mode_events[:4] == ["train", "eval", "sample", "train"]
 
 
+def test_zero_checkpoint_intervals_disable_periodic_saves(tmp_path, monkeypatch):
+    trainer = TinyFullTrainer()
+    install_runtime_fakes(monkeypatch, trainer)
+
+    trainer.train(
+        make_args(
+            tmp_path,
+            max_train_steps=1,
+            save_every_n_steps=0,
+            save_every_n_epochs=0,
+            sample_prompts=None,
+            blocks_to_swap=0,
+        )
+    )
+
+    assert trainer.saved_state_dict.keys() == {"linear.weight", "linear.bias"}
+
+
 def test_resume_is_rejected_before_accelerator_or_model_loading(tmp_path, monkeypatch):
     trainer = TinyFullTrainer()
 
