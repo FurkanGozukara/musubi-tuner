@@ -54,6 +54,14 @@ def _add_attention_args(parser: argparse.ArgumentParser) -> None:
         help="use sdpa for CrossAttention (requires PyTorch 2.0) / CrossAttentionにsdpaを使う（PyTorch 2.0が必要）",
     )
     parser.add_argument(
+        "--use_legacy_sdpa",
+        action="store_true",
+        help=(
+            "keep PyTorch SDPA even when a verified external FlashAttention backend can replace a slower fallback; "
+            "only applies with --sdpa"
+        ),
+    )
+    parser.add_argument(
         "--flash_attn",
         action="store_true",
         help="use FlashAttention for CrossAttention, requires FlashAttention / CrossAttentionにFlashAttentionを使う、FlashAttentionが必要",

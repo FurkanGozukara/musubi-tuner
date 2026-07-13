@@ -2,18 +2,20 @@
 from typing import Optional
 import torch
 
+from musubi_tuner.modules.attention import AUTO_FLASH_ATTENTION_MODE, resolve_automatic_flash_mode
+
 try:
     import flash_attn_interface
 
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except Exception:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
 
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except Exception:
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
@@ -87,6 +89,12 @@ def flash_attention(
         assert k_lens is None or (
             min(k_lens) == max(k_lens) and k_lens[0] == lk
         ), f"k_lens is not supported except for flash attention 3 or sage attention. k_lens={k_lens}, lk={lk}."
+
+    if attn_mode == AUTO_FLASH_ATTENTION_MODE:
+        q = half(q)
+        k = half(k)
+        v = half(v)
+        attn_mode = resolve_automatic_flash_mode(q, k, v)
 
     # SDPA
     if attn_mode == "torch" or attn_mode == "sdpa":

@@ -32,6 +32,7 @@ from diffusers.optimization import (
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 
 from musubi_tuner.dataset import config_utils
+from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
@@ -796,7 +797,7 @@ class FineTuningTrainer:
 
         logger.info(f"Loading DiT model from {args.dit}")
         if args.sdpa:
-            attn_mode = "torch"
+            attn_mode = resolve_sdpa_backend(getattr(args, "use_legacy_sdpa", False), accelerator.device)
         elif args.flash_attn:
             attn_mode = "flash"
         elif args.sage_attn:
@@ -1236,6 +1237,14 @@ def setup_parser() -> argparse.ArgumentParser:
         "--sdpa",
         action="store_true",
         help="use sdpa for CrossAttention (requires PyTorch 2.0) / CrossAttentionにsdpaを使う（PyTorch 2.0が必要）",
+    )
+    parser.add_argument(
+        "--use_legacy_sdpa",
+        action="store_true",
+        help=(
+            "keep PyTorch SDPA even when a verified external FlashAttention backend can replace a slower fallback; "
+            "only applies with --sdpa"
+        ),
     )
     parser.add_argument(
         "--flash_attn",

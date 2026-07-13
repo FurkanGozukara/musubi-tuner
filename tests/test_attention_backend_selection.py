@@ -1,9 +1,10 @@
-from types import SimpleNamespace
+from pathlib import Path
 
 import torch
 
 from musubi_tuner.modules import attention
-from musubi_tuner import krea2_train_network
+from musubi_tuner import hv_train
+from musubi_tuner.training.parser_common import setup_parser_common
 
 
 def _mock_external_flash_ready(monkeypatch, *, native_available=False, capability=(12, 0)):
@@ -53,39 +54,90 @@ def test_external_flash_handles_broken_native_availability_probe(monkeypatch):
     assert attention.should_use_external_flash_for_sdpa()
 
 
-def test_krea2_routes_sdpa_to_external_flash_when_needed(monkeypatch):
-    monkeypatch.setattr(krea2_train_network, "should_use_external_flash_for_sdpa", lambda: True)
-    args = SimpleNamespace(
-        fp8_base=True,
-        fp8_scaled=True,
-        sdpa=True,
-        flash_attn=False,
-        turbo_dit_cache=False,
-        turbo_dit=None,
-        blocks_to_swap=0,
-        sample_prompts=None,
+def test_sdpa_resolver_routes_to_verified_external_flash(monkeypatch):
+    monkeypatch.setattr(attention, "should_use_external_flash_for_sdpa", lambda device=None: True)
+
+    assert attention.resolve_sdpa_backend() == attention.AUTO_FLASH_ATTENTION_MODE
+
+
+def test_sdpa_resolver_falls_back_to_torch(monkeypatch):
+    monkeypatch.setattr(attention, "should_use_external_flash_for_sdpa", lambda device=None: False)
+
+    assert attention.resolve_sdpa_backend() == "torch"
+
+
+def test_legacy_sdpa_bypasses_external_probe(monkeypatch):
+    def unexpected_probe(device=None):
+        raise AssertionError("legacy SDPA must not probe the external backend")
+
+    monkeypatch.setattr(attention, "should_use_external_flash_for_sdpa", unexpected_probe)
+
+    assert attention.resolve_sdpa_backend(use_legacy_sdpa=True) == "torch"
+
+
+def test_automatic_flash_runtime_falls_back_for_unsupported_tensors(monkeypatch):
+    def unexpected_flash(*args, **kwargs):
+        raise AssertionError("unsupported tensors must not reach external FlashAttention")
+
+    monkeypatch.setattr(attention, "flash_attn_func", unexpected_flash)
+    query = torch.randn(1, 4, 1, 8, dtype=torch.float32)
+    params = attention.AttentionParams.create_attention_params(attention.AUTO_FLASH_ATTENTION_MODE, False)
+
+    output = attention.attention(query, query.clone(), query.clone(), params)
+
+    assert output.shape == (1, 4, 8)
+    assert output.dtype == torch.float32
+
+
+def test_automatic_flash_runtime_fallback_preserves_attention_mask():
+    query = torch.randn(1, 4, 1, 8, dtype=torch.float32)
+    text_mask = torch.tensor([[1, 0]], dtype=torch.int64)
+    automatic = attention.AttentionParams.create_attention_params_from_mask(
+        attention.AUTO_FLASH_ATTENTION_MODE, False, 2, text_mask
     )
+    legacy = attention.AttentionParams.create_attention_params_from_mask("torch", False, 2, text_mask)
 
-    krea2_train_network.Krea2NetworkTrainer().handle_model_specific_args(args)
+    automatic_output = attention.attention(query, query.clone(), query.clone(), automatic)
+    legacy_output = attention.attention(query, query.clone(), query.clone(), legacy)
 
-    assert not args.sdpa
-    assert args.flash_attn
+    torch.testing.assert_close(automatic_output, legacy_output)
 
 
-def test_krea2_keeps_sdpa_when_external_flash_probe_fails(monkeypatch):
-    monkeypatch.setattr(krea2_train_network, "should_use_external_flash_for_sdpa", lambda: False)
-    args = SimpleNamespace(
-        fp8_base=True,
-        fp8_scaled=True,
-        sdpa=True,
-        flash_attn=False,
-        turbo_dit_cache=False,
-        turbo_dit=None,
-        blocks_to_swap=0,
-        sample_prompts=None,
-    )
+def test_automatic_flash_runtime_routes_compatible_tensors(monkeypatch):
+    monkeypatch.setattr(attention, "external_flash_supports_inputs", lambda q, k, v: True)
+    monkeypatch.setattr(attention, "flash_attn_func", lambda q, k, v, dropout_p: q + k + v)
+    query = torch.ones(1, 4, 1, 8, dtype=torch.bfloat16)
+    params = attention.AttentionParams.create_attention_params(attention.AUTO_FLASH_ATTENTION_MODE, False)
 
-    krea2_train_network.Krea2NetworkTrainer().handle_model_specific_args(args)
+    output = attention.attention(query, query.clone(), query.clone(), params)
+
+    torch.testing.assert_close(output, torch.full((1, 4, 8), 3, dtype=torch.bfloat16))
+
+
+def test_common_parser_accepts_legacy_sdpa_flag():
+    args = setup_parser_common().parse_args(["--sdpa", "--use_legacy_sdpa"])
 
     assert args.sdpa
-    assert not args.flash_attn
+    assert args.use_legacy_sdpa
+
+
+def test_hunyuan_parser_accepts_legacy_sdpa_flag():
+    args = hv_train.setup_parser().parse_args(["--sdpa", "--use_legacy_sdpa"])
+
+    assert args.sdpa
+    assert args.use_legacy_sdpa
+
+
+def test_every_training_selector_delegates_sdpa_resolution():
+    source_root = Path(__file__).resolve().parents[1] / "src" / "musubi_tuner"
+    selector_files = [
+        source_root / "training" / "trainer_base.py",
+        source_root / "training" / "full_finetune.py",
+        source_root / "qwen_image_train.py",
+        source_root / "zimage_train.py",
+        source_root / "hv_train.py",
+    ]
+
+    for path in selector_files:
+        source = path.read_text(encoding="utf-8")
+        assert "resolve_sdpa_backend(getattr(args, \"use_legacy_sdpa\", False)" in source, path.name

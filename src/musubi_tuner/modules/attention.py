@@ -1,9 +1,13 @@
 # Unified attention function supporting various implementations
 
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import torch
 from typing import Optional, Union
+
+
+logger = logging.getLogger(__name__)
 
 _flash_attn_import_error: Optional[Exception] = None
 
@@ -32,6 +36,8 @@ except ImportError:
 
 
 _external_flash_training_probe: dict[int, bool] = {}
+_automatic_flash_runtime_fallbacks: set[str] = set()
+AUTO_FLASH_ATTENTION_MODE = "flash_auto"
 
 
 def _external_flash_supports_training(device: Optional[Union[str, torch.device]] = None) -> bool:
@@ -106,6 +112,53 @@ def should_use_external_flash_for_sdpa(device: Optional[Union[str, torch.device]
     except (AssertionError, RuntimeError, TypeError, ValueError):
         return False
     return major >= 8 and _external_flash_supports_training(device)
+
+
+def resolve_sdpa_backend(
+    use_legacy_sdpa: bool = False,
+    device: Optional[Union[str, torch.device]] = None,
+) -> str:
+    """Resolve an SDPA request to the fastest verified compatible backend.
+
+    PyTorch's native fused SDPA remains the first choice. When it is unavailable,
+    the external FlashAttention package is selected only after a CUDA forward and
+    backward probe succeeds. Any import, capability, or probe failure keeps the
+    original PyTorch SDPA path.
+    """
+    if use_legacy_sdpa:
+        logger.info("Using legacy PyTorch SDPA because --use_legacy_sdpa is enabled.")
+        return "torch"
+    if should_use_external_flash_for_sdpa(device):
+        logger.info(
+            "PyTorch native FlashAttention is unavailable; using the verified external FlashAttention backend for SDPA."
+        )
+        return AUTO_FLASH_ATTENTION_MODE
+    logger.info("Using PyTorch SDPA; no compatible external replacement was selected.")
+    return "torch"
+
+
+def external_flash_supports_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Return whether a QKV triplet satisfies external FlashAttention's runtime contract."""
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        return False
+    if q.dtype not in {torch.float16, torch.bfloat16} or k.dtype != q.dtype or v.dtype != q.dtype:
+        return False
+    head_dim = q.shape[-1]
+    if head_dim <= 0 or head_dim > 256 or head_dim % 8 != 0:
+        return False
+    return q.shape[-2] % k.shape[-2] == 0 and k.shape[-2] == v.shape[-2]
+
+
+def resolve_automatic_flash_mode(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> str:
+    """Resolve the internal automatic mode for the actual model tensors."""
+    if external_flash_supports_inputs(q, k, v):
+        return "flash"
+
+    reason = f"device={q.device.type}, qkv_dtypes={q.dtype}/{k.dtype}/{v.dtype}, head_dim={q.shape[-1]}"
+    if reason not in _automatic_flash_runtime_fallbacks:
+        logger.info("Automatic external FlashAttention is incompatible with these tensors (%s); using PyTorch SDPA.", reason)
+        _automatic_flash_runtime_fallbacks.add(reason)
+    return "torch"
 
 
 @dataclass
@@ -194,6 +247,12 @@ def attention(
         assert k is not None and v is not None, "k and v must be provided if qkv_or_q is a tensor"
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
+    elif attn_params.attn_mode == AUTO_FLASH_ATTENTION_MODE:
+        runtime_mode = resolve_automatic_flash_mode(q, k, v)
+        attention_mask = attn_params.attention_mask
+        if runtime_mode == "torch" and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :].to(torch.bool)
+        attn_params = replace(attn_params, attn_mode=runtime_mode, attention_mask=attention_mask)
 
     # GQA: q may carry more heads than k/v (e.g. Krea 2 = 48 query / 12 kv heads). flash and
     # sageattn group heads natively inside the kernel (verified), so they ignore this. For the

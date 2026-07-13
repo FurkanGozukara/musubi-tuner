@@ -39,6 +39,7 @@ from diffusers.optimization import (
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 
 from musubi_tuner.dataset import config_utils
+from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -1499,7 +1500,7 @@ class NetworkTrainer:
 
         logger.info(f"Loading DiT model from {args.dit}")
         if args.sdpa:
-            attn_mode = "torch"
+            attn_mode = resolve_sdpa_backend(getattr(args, "use_legacy_sdpa", False), accelerator.device)
         elif args.flash_attn:
             attn_mode = "flash"
         elif args.sage_attn:

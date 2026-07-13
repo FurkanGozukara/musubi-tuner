@@ -807,11 +807,11 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         attn_mask = total_len = None
-        if self.split_attn or self.attn_mode == "torch":
+        if self.split_attn or self.attn_mode in {"torch", "flash_auto"}:
             # calculate text length and total length
             text_len = text_mask.sum(dim=1)  #  (bs, )
             total_len = img_seq_len + text_len  # (bs, )
-        if self.attn_mode == "torch" and not self.split_attn:
+        if self.attn_mode in {"torch", "flash_auto"} and not self.split_attn:
             # initialize attention mask: bool tensor for sdpa, (b, 1, n, n)
             bs = img.shape[0]
             attn_mask = torch.zeros((bs, 1, max_seqlen_q, max_seqlen_q), dtype=torch.bool, device=text_mask.device)

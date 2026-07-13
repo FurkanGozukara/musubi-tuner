@@ -12,6 +12,7 @@ from accelerate.utils import DistributedType
 from safetensors.torch import save_file
 from tqdm import tqdm
 
+from musubi_tuner.modules.attention import resolve_sdpa_backend
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, prepare_accelerator
@@ -298,9 +299,9 @@ class FullFineTuningTrainerMixin:
         )
 
     @staticmethod
-    def _attention_mode(args: argparse.Namespace) -> str:
+    def _attention_mode(args: argparse.Namespace, device: torch.device | None = None) -> str:
         if args.sdpa:
-            return "torch"
+            return resolve_sdpa_backend(getattr(args, "use_legacy_sdpa", False), device)
         if args.flash_attn:
             return "flash"
         if args.sage_attn:
@@ -670,7 +671,7 @@ class FullFineTuningTrainerMixin:
             args.mixed_precision = accelerator.mixed_precision
         validate_full_finetune_args(args, accelerator.num_processes)
         trainable_dtype = resolve_trainable_dtype(args)
-        attn_mode = self._attention_mode(args)
+        attn_mode = self._attention_mode(args, accelerator.device)
 
         train_dataset_group, collator, current_epoch = self._build_dataset(args)
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
