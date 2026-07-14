@@ -523,7 +523,13 @@ class WanNetworkTrainer(NetworkTrainer):
 
     def compile_transformer(self, args, transformer):
         transformer: WanModel = transformer
-        return model_utils.compile_transformer(args, transformer, [transformer.blocks], disable_linear=self.blocks_to_swap > 0)
+        return model_utils.compile_transformer(
+            args,
+            transformer,
+            [transformer.blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[transformer.offloader if self.blocks_to_swap > 0 else None],
+        )
 
     def scale_shift_latents(self, latents):
         return latents
@@ -587,11 +593,19 @@ class WanNetworkTrainer(NetworkTrainer):
             def patch_fn(state_dict):
                 if not args.compile:
                     return state_dict
+                compiled_blocks = {
+                    index for index, block in enumerate(model.blocks) if hasattr(block, "_orig_mod")
+                }
                 for key in list(state_dict.keys()):
                     if key.startswith("blocks.") and "._orig_mod." not in key:
                         tokens = key.split(".")
-                        new_key = ".".join(tokens[:2] + ["_orig_mod"] + tokens[2:])
-                        state_dict[new_key] = state_dict.pop(key)
+                        try:
+                            block_index = int(tokens[1])
+                        except (IndexError, ValueError):
+                            block_index = -1
+                        if block_index in compiled_blocks:
+                            new_key = ".".join(tokens[:2] + ["_orig_mod"] + tokens[2:])
+                            state_dict[new_key] = state_dict.pop(key)
                 return state_dict
 
             if self.blocks_to_swap == 0:

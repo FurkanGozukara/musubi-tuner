@@ -363,7 +363,11 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         # Disable linear compilation when block swapping is enabled
         # because torch.compile doesn't work well with dynamic module movement
         return model_utils.compile_transformer(
-            args, transformer, [transformer.double_blocks], disable_linear=self.blocks_to_swap > 0
+            args,
+            transformer,
+            [transformer.double_blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[transformer.offloader_double if self.blocks_to_swap > 0 else None],
         )
 
     def scale_shift_latents(self, latents):

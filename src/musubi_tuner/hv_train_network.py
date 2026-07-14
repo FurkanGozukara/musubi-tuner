@@ -393,7 +393,15 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
     def compile_transformer(self, args, transformer):
         transformer: HYVideoDiffusionTransformer = transformer
         return model_utils.compile_transformer(
-            args, transformer, [transformer.double_blocks, transformer.single_blocks], disable_linear=self.blocks_to_swap > 0
+            args,
+            transformer,
+            [transformer.double_blocks, transformer.single_blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=(
+                [transformer.offloader_double, transformer.offloader_single]
+                if self.blocks_to_swap > 0
+                else [None, None]
+            ),
         )
 
     def scale_shift_latents(self, latents):

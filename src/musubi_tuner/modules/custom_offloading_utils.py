@@ -191,6 +191,18 @@ class Offloader:
         # Pinned buffer for cuda offloading with pinned memory. We need only one pinned buffer per layer transfer
         self.pinned_buffer = None
 
+    def compile_safe_block_indices(self) -> list[int]:
+        """Return blocks whose Linear weights never move during training or sampling."""
+        blocks_to_swap = int(self.blocks_to_swap or 0)
+        if blocks_to_swap <= 0:
+            return list(range(self.num_blocks))
+
+        # Forward-only sampling becomes cyclic at this boundary, so even a
+        # training-resident middle block is not safe to compile there.
+        if blocks_to_swap >= self.num_blocks // 2:
+            return []
+        return list(range(blocks_to_swap, self.num_blocks - blocks_to_swap))
+
     def swap_weight_devices_cuda(self, device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
         assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
@@ -909,6 +921,10 @@ class LoRAStreamOffloader:
     def set_forward_only(self, forward_only: bool):
         self.copier.sync()
         self.forward_only = forward_only
+
+    def compile_safe_block_indices(self) -> list[int]:
+        """Return the permanently GPU-resident complement of streamed blocks."""
+        return [index for index, is_stream in enumerate(self.is_stream) if not is_stream]
 
     def __del__(self):
         if getattr(self, "supports_backward", False):

@@ -252,7 +252,13 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         )
 
     def compile_transformer(self, args, transformer):
-        return model_utils.compile_transformer(args, transformer, [transformer.layers], disable_linear=self.blocks_to_swap > 0)
+        return model_utils.compile_transformer(
+            args,
+            transformer,
+            [transformer.layers],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[transformer.offloader if self.blocks_to_swap > 0 else None],
+        )
 
     def scale_shift_latents(self, latents):
         # Transform raw VAE latents into the model's normalized token-grid space

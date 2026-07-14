@@ -1,3 +1,4 @@
+import ast
 import os
 import subprocess
 import tempfile
@@ -43,6 +44,7 @@ from musubi_tuner.training.compile_setup import (
     compile_requested,
     native_compile_toolchain_requested,
 )
+from musubi_tuner.modules.custom_offloading_utils import LoRAStreamOffloader, Offloader
 from musubi_tuner.utils import model_utils
 
 
@@ -660,6 +662,14 @@ class CompiledBlockFallbackTests(unittest.TestCase):
         def forward(self, _value):
             raise RuntimeError("synthetic cold compile failure")
 
+    class PassingCompiledBlock(torch.nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            self._orig_mod = original
+
+        def forward(self, value):
+            return self._orig_mod(value)
+
     def test_first_call_failure_falls_back_without_changing_state_dict_shape(self):
         transformer = self.Transformer()
         original = transformer.blocks[0]
@@ -691,6 +701,175 @@ class CompiledBlockFallbackTests(unittest.TestCase):
         torch.testing.assert_close(output, original(value))
         self.assertFalse(compiled._musubi_compile_state["enabled"])
         self.assertIn("blocks.0._orig_mod.weight", compiled.state_dict())
+
+    def test_fallback_disabled_still_records_verified_compiled_blocks(self):
+        transformer = self.Transformer()
+        args = SimpleNamespace(
+            compile_dynamic="auto",
+            compile_backend="inductor",
+            compile_mode="default",
+            compile_fullgraph=False,
+            compile_cache_size_limit=None,
+        )
+
+        with (
+            patch("musubi_tuner.utils.model_utils.ensure_training_compile_environment"),
+            patch(
+                "musubi_tuner.utils.model_utils.torch.compile",
+                side_effect=lambda block, **_kwargs: self.PassingCompiledBlock(block),
+            ),
+            patch.dict(os.environ, {"MUSUBI_TORCH_COMPILE_FALLBACK": "0"}, clear=False),
+        ):
+            compiled = model_utils.compile_transformer(
+                args,
+                transformer,
+                [transformer.blocks],
+                disable_linear=False,
+            )
+            compiled.blocks[0](torch.ones(1, 2))
+
+        self.assertEqual(1, len(compiled._musubi_compile_state["verified"]))
+        self.assertTrue(compiled._musubi_compile_state["enabled"])
+
+
+class ResidentBlockCompileTests(unittest.TestCase):
+    class Transformer(torch.nn.Module):
+        def __init__(self, count=3):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False), torch.nn.ReLU()) for _ in range(count)]
+            )
+
+    class CompiledBlock(torch.nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            self._orig_mod = original
+
+        def forward(self, value):
+            return self._orig_mod(value)
+
+    @staticmethod
+    def args():
+        return SimpleNamespace(
+            compile_dynamic="auto",
+            compile_backend="inductor",
+            compile_mode="default",
+            compile_fullgraph=False,
+            compile_cache_size_limit=None,
+            compile_resident_blocks_only=True,
+        )
+
+    def test_classic_offloader_is_conservative_at_cyclic_sampling_boundary(self):
+        offloader = object.__new__(Offloader)
+        offloader.num_blocks = 5
+        offloader.blocks_to_swap = 1
+        self.assertEqual([1, 2, 3], offloader.compile_safe_block_indices())
+        offloader.blocks_to_swap = 2
+        self.assertEqual([], offloader.compile_safe_block_indices())
+
+    def test_stream_offloader_returns_non_streaming_complement(self):
+        offloader = object.__new__(LoRAStreamOffloader)
+        offloader.is_stream = [True, False, True, False]
+        self.assertEqual([1, 3], offloader.compile_safe_block_indices())
+
+    def test_only_resident_blocks_are_wrapped_and_linears_stay_compile_eligible(self):
+        transformer = self.Transformer()
+        originals = list(transformer.blocks)
+        offloader = SimpleNamespace(compile_safe_block_indices=lambda: [1])
+
+        with (
+            patch("musubi_tuner.utils.model_utils.ensure_training_compile_environment"),
+            patch(
+                "musubi_tuner.utils.model_utils.torch.compile",
+                side_effect=lambda block, **_kwargs: self.CompiledBlock(block),
+            ) as compile_mock,
+        ):
+            compiled = model_utils.compile_transformer(
+                self.args(),
+                transformer,
+                [transformer.blocks],
+                disable_linear=True,
+                offloaders=[offloader],
+            )
+            compiled.blocks[1](torch.ones(1, 2))
+
+        self.assertIs(originals[0], compiled.blocks[0])
+        self.assertIs(originals[2], compiled.blocks[2])
+        self.assertIsInstance(compiled.blocks[1], self.CompiledBlock)
+        self.assertEqual(1, compile_mock.call_count)
+        self.assertEqual([1], compiled._musubi_compile_state["plans"][0]["compile_indices"])
+        self.assertEqual([0, 2], compiled._musubi_compile_state["plans"][0]["eager_indices"])
+        self.assertEqual(1, compiled._musubi_compile_state["plans"][0]["compile_eligible_linears"])
+        self.assertEqual(1, len(compiled._musubi_compile_state["verified"]))
+        self.assertTrue(all(not hasattr(block[0], "_eager_forward") for block in originals))
+
+    def test_zero_safe_blocks_leaves_transformer_eager(self):
+        transformer = self.Transformer()
+        originals = list(transformer.blocks)
+        offloader = SimpleNamespace(compile_safe_block_indices=lambda: [])
+        with (
+            patch("musubi_tuner.utils.model_utils.ensure_training_compile_environment"),
+            patch("musubi_tuner.utils.model_utils.torch.compile") as compile_mock,
+        ):
+            compiled = model_utils.compile_transformer(
+                self.args(),
+                transformer,
+                [transformer.blocks],
+                disable_linear=True,
+                offloaders=[offloader],
+            )
+
+        self.assertEqual(originals, list(compiled.blocks))
+        compile_mock.assert_not_called()
+        self.assertFalse(compiled._musubi_compile_state["enabled"])
+        self.assertEqual(0, compiled._musubi_compile_state["expected_compiled_blocks"])
+
+    def test_missing_selector_falls_back_to_established_compile_policy(self):
+        transformer = self.Transformer()
+        with (
+            patch("musubi_tuner.utils.model_utils.ensure_training_compile_environment"),
+            patch(
+                "musubi_tuner.utils.model_utils.torch.compile",
+                side_effect=lambda block, **_kwargs: self.CompiledBlock(block),
+            ) as compile_mock,
+        ):
+            compiled = model_utils.compile_transformer(
+                self.args(),
+                transformer,
+                [transformer.blocks],
+                disable_linear=True,
+                offloaders=None,
+            )
+
+        self.assertEqual(3, compile_mock.call_count)
+        self.assertEqual(
+            "all_blocks_fallback_missing_residency_selector",
+            compiled._musubi_compile_state["policy"],
+        )
+        self.assertIn("no residency selector", compiled._musubi_compile_state["policy_fallback_reason"])
+        self.assertTrue(all(hasattr(block._orig_mod[0], "_eager_forward") for block in compiled.blocks))
+
+    def test_every_training_compile_call_site_supplies_residency_selectors(self):
+        source_root = Path(__file__).parents[1] / "src" / "musubi_tuner"
+        missing = []
+        call_count = 0
+        for path in sorted(source_root.glob("*_train_network.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "compile_transformer"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "model_utils"
+                ):
+                    continue
+                call_count += 1
+                if not any(keyword.arg == "offloaders" for keyword in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+
+        self.assertGreater(call_count, 0)
+        self.assertEqual([], missing)
 
 
 if __name__ == "__main__":

@@ -356,7 +356,13 @@ class HiDreamO1NetworkTrainer(NetworkTrainer):
                 "frequently and is likely to run slower than no compile. Pass --compile_dynamic true."
             )
 
-        return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
+        return model_utils.compile_transformer(
+            args,
+            transformer,
+            target_blocks,
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[transformer.model.language_model.offloader if self.blocks_to_swap > 0 else None],
+        )
 
     def scale_shift_latents(self, latents):
         return latents

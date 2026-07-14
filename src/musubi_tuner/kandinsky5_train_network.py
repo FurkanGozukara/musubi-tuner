@@ -712,6 +712,11 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
             transformer,
             [transformer.text_transformer_blocks, transformer.visual_transformer_blocks],
             disable_linear=self.blocks_to_swap > 0,
+            offloaders=(
+                [transformer.offloader_text, transformer.offloader_visual]
+                if self.blocks_to_swap > 0
+                else [None, None]
+            ),
         )
 
     def scale_shift_latents(self, latents):

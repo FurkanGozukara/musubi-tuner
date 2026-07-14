@@ -251,7 +251,11 @@ class ZImageNetworkTrainer(NetworkTrainer):
         model: zimage_model.ZImageTransformer2DModel = transformer
         # Compile blocks
         return model_utils.compile_transformer(
-            args, model, [model.noise_refiner, model.context_refiner, model.layers], disable_linear=self.blocks_to_swap > 0
+            args,
+            model,
+            [model.noise_refiner, model.context_refiner, model.layers],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[None, None, getattr(model, "offloader", None)],
         )
 
     def scale_shift_latents(self, latents):

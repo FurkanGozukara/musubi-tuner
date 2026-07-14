@@ -1,8 +1,11 @@
 import argparse
+import atexit
 import hashlib
+import json
 import os
 from functools import lru_cache
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Optional
 import logging
 import safetensors.torch
@@ -11,6 +14,8 @@ import torch
 from musubi_tuner.training.compile_setup import ensure_training_compile_environment
 
 logger = logging.getLogger(__name__)
+
+_COMPILE_DIAGNOSTIC_STATES: dict[Path, list[dict[str, Any]]] = {}
 
 
 def model_hash(filename):
@@ -267,18 +272,76 @@ def compile_transformer(
     transformer: torch.nn.Module,
     target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
     disable_linear: bool,
+    offloaders: Optional[list[Any]] = None,
 ) -> torch.nn.Module:
     if str(args.compile_backend).strip().casefold() == "inductor":
         ensure_training_compile_environment()
     fallback_on_first_error = _compile_fallback_enabled()
+    resident_only_requested = bool(getattr(args, "compile_resident_blocks_only", False))
+    resident_only = resident_only_requested and disable_linear
     compile_state = {
         "enabled": True,
         "verified": set(),
         "fallback_reason": "",
         "reported_success": False,
+        "policy": "resident_only" if resident_only else "all_blocks",
+        "plans": [],
     }
 
-    if disable_linear:
+    if resident_only:
+        selector_error = None
+        if offloaders is None or len(offloaders) != len(target_blocks):
+            selector_error = "no residency selector was supplied for every block group"
+        elif any(
+            offloader is not None and not callable(getattr(offloader, "compile_safe_block_indices", None))
+            for offloader in offloaders
+        ):
+            selector_error = "an offloader does not expose compile_safe_block_indices()"
+
+        if selector_error is None:
+            try:
+                for group_index, (blocks, offloader) in enumerate(zip(target_blocks, offloaders)):
+                    compile_indices = (
+                        list(range(len(blocks)))
+                        if offloader is None
+                        else sorted(set(offloader.compile_safe_block_indices()))
+                    )
+                    if any(index < 0 or index >= len(blocks) for index in compile_indices):
+                        raise ValueError(
+                            f"Invalid resident compile index in block group {group_index}: {compile_indices}"
+                        )
+                    compile_set = set(compile_indices)
+                    eager_indices = [index for index in range(len(blocks)) if index not in compile_set]
+                    compile_state["plans"].append(
+                        _compile_group_plan(blocks, compile_indices, eager_indices, disabled_linear_indices=[])
+                    )
+            except Exception as exc:
+                selector_error = f"the residency selector failed: {type(exc).__name__}: {exc}"
+
+        if selector_error is not None:
+            resident_only = False
+            compile_state["plans"].clear()
+            compile_state["policy"] = "all_blocks_fallback_missing_residency_selector"
+            compile_state["policy_fallback_reason"] = selector_error
+            logger.warning(
+                "Resident-only compile is unavailable because %s; using the established all-block compile policy "
+                "with moving Linear modules kept eager.",
+                selector_error,
+            )
+
+    if not resident_only:
+        for blocks in target_blocks:
+            all_indices = list(range(len(blocks)))
+            compile_state["plans"].append(
+                _compile_group_plan(
+                    blocks,
+                    all_indices,
+                    [],
+                    disabled_linear_indices=all_indices if disable_linear else [],
+                )
+            )
+
+    if disable_linear and not resident_only:
         logger.info("Disable linear from torch.compile for swap blocks...")
         for blocks in target_blocks:
             for block in blocks:
@@ -296,7 +359,9 @@ def compile_transformer(
         torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
 
     for group_index, blocks in enumerate(target_blocks):
-        for i, block in enumerate(blocks):
+        compile_indices = compile_state["plans"][group_index]["compile_indices"]
+        for i in compile_indices:
+            block = blocks[i]
             original_block = block
             compiled_block = torch.compile(
                 block,
@@ -305,19 +370,141 @@ def compile_transformer(
                 dynamic=compile_dynamic,
                 fullgraph=args.compile_fullgraph,
             )
-            if fallback_on_first_error:
-                _install_first_call_fallback(
-                    compiled_block,
-                    original_block,
-                    compile_state,
-                    label=f"{original_block.__class__.__name__}[{group_index}:{i}]",
-                )
+            _install_first_call_fallback(
+                compiled_block,
+                original_block,
+                compile_state,
+                label=f"{original_block.__class__.__name__}[{group_index}:{i}]",
+                fallback_enabled=fallback_on_first_error,
+            )
             blocks[i] = compiled_block
+    compile_state["expected_compiled_blocks"] = sum(len(plan["compile_indices"]) for plan in compile_state["plans"])
+    compile_state["enabled"] = compile_state["expected_compiled_blocks"] > 0
+    if not compile_state["enabled"]:
+        os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"] = "0"
+        logger.info("Resident-only compile selected no safe blocks; transformer remains eager.")
+    else:
+        logger.info(
+            "Compile block plan: %s compiled, %s eager; %s Linear modules compile-eligible, %s eager-disabled",
+            compile_state["expected_compiled_blocks"],
+            sum(len(plan["eager_indices"]) for plan in compile_state["plans"]),
+            sum(plan["compile_eligible_linears"] for plan in compile_state["plans"]),
+            sum(plan["eager_linears"] for plan in compile_state["plans"]),
+        )
     transformer.__dict__["_musubi_compile_state"] = compile_state
+    diagnostics_path = os.environ.get("MUSUBI_COMPILE_DIAGNOSTICS_PATH")
+    if diagnostics_path:
+        _register_compile_diagnostics(Path(diagnostics_path), compile_state)
     return transformer
 
 
-def _install_first_call_fallback(compiled_block, original_block, state: dict, *, label: str) -> None:
+def _linear_count(module: torch.nn.Module) -> int:
+    return sum(1 for item in module.modules() if item.__class__.__name__.endswith("Linear"))
+
+
+def _compile_group_plan(
+    blocks: torch.nn.ModuleList | list[torch.nn.Module],
+    compile_indices: list[int],
+    eager_indices: list[int],
+    disabled_linear_indices: list[int],
+) -> dict[str, Any]:
+    compile_set = set(compile_indices)
+    disabled_set = set(disabled_linear_indices)
+    linear_counts = [_linear_count(block) for block in blocks]
+    compile_eligible = sum(
+        count for index, count in enumerate(linear_counts) if index in compile_set and index not in disabled_set
+    )
+    eager_linears = sum(linear_counts) - compile_eligible
+    return {
+        "total_blocks": len(blocks),
+        "compile_indices": compile_indices,
+        "eager_indices": eager_indices,
+        "linear_modules": sum(linear_counts),
+        "compile_eligible_linears": compile_eligible,
+        "eager_linears": eager_linears,
+    }
+
+
+def _register_compile_diagnostics(path: Path, compile_state: dict[str, Any]) -> None:
+    states = _COMPILE_DIAGNOSTIC_STATES.setdefault(path.resolve(), [])
+    states.append(compile_state)
+    if len(states) == 1:
+        atexit.register(_write_compile_diagnostics, path.resolve())
+
+
+def _write_compile_diagnostics(path: Path) -> None:
+    try:
+        from torch._dynamo import guard_failures
+        from torch._dynamo.utils import counters
+
+        counter_payload = {
+            str(category): {str(key): int(value) for key, value in counter.items()}
+            for category, counter in counters.items()
+        }
+        failures = []
+        for code, reasons in guard_failures.items():
+            failures.append(
+                {
+                    "function": getattr(code, "co_name", "unknown"),
+                    "file": getattr(code, "co_filename", "unknown"),
+                    "line": getattr(code, "co_firstlineno", None),
+                    "reasons": [str(reason) for reason in reasons],
+                }
+            )
+
+        inductor_metrics = {}
+        try:
+            from torch._inductor import metrics
+
+            for name in (
+                "generated_kernel_count",
+                "generated_cpp_vec_kernel_count",
+                "ir_nodes_pre_fusion",
+                "cpp_outer_loop_fused_inner_counts",
+                "num_bytes_accessed",
+                "nodes_num_elem",
+            ):
+                value = getattr(metrics, name, None)
+                if isinstance(value, (bool, int, float, str)) or value is None:
+                    inductor_metrics[name] = value
+        except Exception as exc:
+            inductor_metrics["error"] = f"{type(exc).__name__}: {exc}"
+
+        states = []
+        for state in _COMPILE_DIAGNOSTIC_STATES.get(path, []):
+            states.append(
+                {
+                    **{key: value for key, value in state.items() if key != "verified"},
+                    "verified": sorted(state["verified"]),
+                    "verified_count": len(state["verified"]),
+                }
+            )
+        payload = {
+            "schema_version": 1,
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "compile_states": states,
+            "counter_scope": "process",
+            "counters": counter_payload,
+            "guard_failure_scope": "process",
+            "guard_failure_count": sum(len(item["reasons"]) for item in failures),
+            "guard_failures": failures,
+            "inductor_metrics": inductor_metrics,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Could not write compile diagnostics to %s: %s", path, exc)
+
+
+def _install_first_call_fallback(
+    compiled_block,
+    original_block,
+    state: dict,
+    *,
+    label: str,
+    fallback_enabled: bool,
+) -> None:
     compiled_forward = compiled_block.forward
 
     def guarded_forward(*args, **kwargs):
@@ -327,6 +514,9 @@ def _install_first_call_fallback(compiled_block, original_block, state: dict, *,
             output = compiled_forward(*args, **kwargs)
         except Exception as exc:
             if label in state["verified"]:
+                raise
+            if not fallback_enabled:
+                state["fallback_reason"] = f"{label}: {exc}"
                 raise
             state["enabled"] = False
             state["fallback_reason"] = f"{label}: {exc}"

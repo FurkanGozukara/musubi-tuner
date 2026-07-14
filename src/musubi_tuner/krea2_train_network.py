@@ -411,7 +411,13 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # Compile the per-block SingleStreamBlocks (the heavy, repeated compute). The forward
         # already pads the combined sequence to a multiple of 256 to keep kernel shapes stable.
         # When block swap is on, exclude the swap blocks' Linears from compile (cf. zimage/qwen_image).
-        return model_utils.compile_transformer(args, model, [model.blocks], disable_linear=self.blocks_to_swap > 0)
+        return model_utils.compile_transformer(
+            args,
+            model,
+            [model.blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[model.offloader if self.blocks_to_swap > 0 else None],
+        )
 
     def scale_shift_latents(self, latents):
         # K2 latents are already normalized by the Qwen-Image VAE caching ((raw-mean)/std).

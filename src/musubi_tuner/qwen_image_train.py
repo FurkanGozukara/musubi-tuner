@@ -433,6 +433,8 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
             # "ss_fp8_llm": bool(args.fp8_llm), # remove this because this is only for HuanyuanVideo TODO set architecure dependent metadata
             "ss_full_fp16": bool(args.full_fp16),
             "ss_full_bf16": bool(args.full_bf16),
+            "ss_training_type": "full-finetune",
+            "ss_full_finetune": True,
             "ss_weighting_scheme": args.weighting_scheme,
             "ss_logit_mean": args.logit_mean,
             "ss_logit_std": args.logit_std,
@@ -561,7 +563,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     unwrapped_model._modules["_orig_mod"] = unwrapped_model
 
             # if model is compiled, get original model state dict
-            if "transformer_blocks.0._orig_mod.attn.add_k_proj.bias" in state_dict:
+            if any("._orig_mod." in key for key in state_dict):
                 logger.info("detected compiled model, getting original model state dict for saving")
                 state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 

@@ -516,6 +516,11 @@ class FramePackNetworkTrainer(NetworkTrainer):
             transformer,
             [transformer.transformer_blocks, transformer.single_transformer_blocks],
             disable_linear=self.blocks_to_swap > 0,
+            offloaders=(
+                [transformer.offloader_double, transformer.offloader_single]
+                if self.blocks_to_swap > 0
+                else [None, None]
+            ),
         )
 
     def scale_shift_latents(self, latents):

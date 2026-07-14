@@ -129,6 +129,14 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
     )
     parser.add_argument(
+        "--compile_resident_blocks_only",
+        action="store_true",
+        help=(
+            "With block swapping, compile only blocks whose Linear weights stay permanently on the GPU. "
+            "Moving blocks remain eager."
+        ),
+    )
+    parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
         help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",

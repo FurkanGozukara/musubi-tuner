@@ -419,7 +419,11 @@ class QwenImageNetworkTrainer(NetworkTrainer):
     def compile_transformer(self, args, transformer):
         transformer: qwen_image_model.QwenImageTransformer2DModel = transformer
         return model_utils.compile_transformer(
-            args, transformer, [transformer.transformer_blocks], disable_linear=self.blocks_to_swap > 0
+            args,
+            transformer,
+            [transformer.transformer_blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[transformer.offloader if self.blocks_to_swap > 0 else None],
         )
 
     def scale_shift_latents(self, latents):

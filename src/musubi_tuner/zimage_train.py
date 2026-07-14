@@ -352,6 +352,8 @@ class ZImageTrainer(ZImageNetworkTrainer):
             "ss_fp8_base": bool(args.fp8_base),
             "ss_full_fp16": bool(args.full_fp16),
             "ss_full_bf16": bool(args.full_bf16),
+            "ss_training_type": "full-finetune",
+            "ss_full_finetune": True,
             "ss_weighting_scheme": args.weighting_scheme,
             "ss_logit_mean": args.logit_mean,
             "ss_logit_std": args.logit_std,
