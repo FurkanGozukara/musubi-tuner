@@ -173,3 +173,8 @@ def validate_ltx2_fsdp_setup(args: argparse.Namespace, accelerator) -> None:
 
     if bool(getattr(args, "self_flow", False)):
         raise RuntimeError("--ltx2_fsdp is mutually exclusive with Self-Flow.")
+    if str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower() == "uncertainty":
+        raise RuntimeError(
+            "--ltx2_fsdp is mutually exclusive with uncertainty loss balancing because its optimizer-only "
+            "parameters are not part of the FSDP shard mapping. Use standard DDP for distributed uncertainty balancing."
+        )

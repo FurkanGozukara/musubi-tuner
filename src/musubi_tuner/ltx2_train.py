@@ -19,7 +19,7 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from musubi_tuner.dataset.accumulation_group_sampler import build_accumulation_group_sampler
 from musubi_tuner.dataset.audio_quota_sampler import (
@@ -52,11 +52,19 @@ from musubi_tuner.training.weight_noise import apply_weight_noise_to_optimizer, 
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients
 from musubi_tuner.audio_loss_balance import (
+    UncertaintyLogVars,
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
     compute_uncertainty_weighted_loss,
     update_audio_presence_ema,
     update_loss_ema,
+)
+from musubi_tuner.training.step_control import (
+    AccumulationSkipGuard,
+    combine_full_ft_loss_weight,
+    distributed_any,
+    optimizer_step_succeeded,
+    synchronize_parameter_gradients,
 )
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
@@ -3457,6 +3465,11 @@ def main() -> None:
     accelerator = prepare_accelerator(args)
     if args.mixed_precision is None:
         args.mixed_precision = accelerator.mixed_precision
+    if bool(getattr(args, "fused_backward_pass", False)) and str(args.mixed_precision).lower() == "fp16":
+        raise ValueError(
+            "--fused_backward_pass cannot be combined with FP16 mixed precision: per-parameter fused steps bypass "
+            "GradScaler's overflow decision. Use BF16 or disable --fused_backward_pass."
+        )
     ltx2_model_parallel = is_ltx2_model_parallel_enabled(args)
     ltx2_remote_stage = is_ltx2_remote_stage_enabled(args)
     ltx2_fsdp = is_ltx2_fsdp_enabled(args)
@@ -4271,6 +4284,28 @@ def main() -> None:
                     len(shadow_params),
                 )
 
+    audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+    uncertainty_state: Optional[UncertaintyLogVars] = None
+    uncertainty_log_var_video = uncertainty_log_var_audio = None
+    if audio_loss_balance_mode == "uncertainty":
+        uncertainty_state = UncertaintyLogVars().to(device=accelerator.device)
+        uncertainty_log_var_video = uncertainty_state.log_var_video
+        uncertainty_log_var_audio = uncertainty_state.log_var_audio
+        uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
+        params_to_optimize.append(
+            {
+                "params": list(uncertainty_state.parameters()),
+                "lr": uncertainty_lr,
+                "weight_decay": 0.0,
+                "group_name": "uncertainty",
+            }
+        )
+        param_names.append(["uncertainty.log_var_video", "uncertainty.log_var_audio"])
+        logger.info(
+            "Uncertainty weighting enabled: optimizer and checkpoint state include 2 log-variance parameters, lr=%g",
+            uncertainty_lr,
+        )
+
     logger.info(
         "Full-FT parameter groups: trainable=%d frozen=%d groups=%d scales=%s",
         ft_group_stats["trainable_param_count"],
@@ -4510,6 +4545,32 @@ def main() -> None:
         except Exception as exc:
             logger.warning("validation_extra_configs[%s]: failed to load %s: %s", _cat, _path, exc)
 
+    if uncertainty_state is not None:
+        uncertainty_state_filename = "uncertainty_log_vars.safetensors"
+
+        def save_uncertainty_state_hook(models, weights, output_dir):
+            if not accelerator.is_main_process:
+                return
+            save_file(
+                {name: value.detach().cpu() for name, value in uncertainty_state.state_dict().items()},
+                os.path.join(output_dir, uncertainty_state_filename),
+            )
+
+        def load_uncertainty_state_hook(models, input_dir):
+            state_path = os.path.join(input_dir, uncertainty_state_filename)
+            if not os.path.exists(state_path):
+                logger.warning("No uncertainty loss state found in %s; initializing log-variances to zero.", input_dir)
+                return
+            uncertainty_state.load_state_dict(load_file(state_path))
+            logger.info(
+                "Loaded uncertainty log-variances: video=%.4f audio=%.4f",
+                float(uncertainty_state.log_var_video.detach().item()),
+                float(uncertainty_state.log_var_audio.detach().item()),
+            )
+
+        accelerator.register_save_state_pre_hook(save_uncertainty_state_hook)
+        accelerator.register_load_state_pre_hook(load_uncertainty_state_hook)
+
     if getattr(args, "autoresume", False) and not args.resume:
         latest = trainer._find_latest_state_dir(args)
         if latest:
@@ -4597,11 +4658,10 @@ def main() -> None:
         from musubi_tuner.optimizers.badam import BlockOptimizer
 
         if isinstance(base_optimizer, BlockOptimizer) and bool(getattr(args, "badam_use_gradient_release", False)):
-            hooks_step_enabled = args.max_grad_norm == 0.0
+            hooks_step_enabled = args.max_grad_norm == 0.0 and uncertainty_state is None
             if not hooks_step_enabled:
                 logger.info(
-                    "BAdam gradient-release: per-param clipping at max_grad_norm=%.6f.",
-                    float(args.max_grad_norm),
+                    "BAdam gradient-release hooks deferred to the sync point for global clipping or uncertainty synchronization."
                 )
             fused_step_state = {
                 "defer_step": False,
@@ -4700,12 +4760,10 @@ def main() -> None:
                         f"got {base_optimizer.__class__.__name__}"
                     )
 
-            hooks_step_enabled = args.max_grad_norm == 0.0
+            hooks_step_enabled = args.max_grad_norm == 0.0 and uncertainty_state is None
             if not hooks_step_enabled:
                 logger.info(
-                    "Fused hooks are disabled because max_grad_norm=%.6f. "
-                    "Using sync-point fused stepping to preserve global gradient clipping correctness.",
-                    float(args.max_grad_norm),
+                    "Fused hooks are deferred to the sync point to preserve global clipping or uncertainty synchronization."
                 )
             fused_step_state = {
                 "defer_step": False,
@@ -5304,6 +5362,8 @@ def main() -> None:
             return {}
 
         accelerator.print(f"\nRunning validation at step {step}...")
+        trainer_was_training = bool(getattr(trainer, "training", False))
+        trainer.training = False
         transformer.eval()
 
         # Apply EMA weights for validation if available
@@ -5417,6 +5477,7 @@ def main() -> None:
                         dtype=trainer.dit_dtype,
                         loss_type=_val_loss_type,
                         huber_delta=_val_huber_delta,
+                        per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                     )
                     val_video_losses.append(video_loss.item())
 
@@ -5432,6 +5493,7 @@ def main() -> None:
                             dtype=trainer.dit_dtype,
                             loss_type=_val_loss_type,
                             huber_delta=_val_huber_delta,
+                            per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                         )
                         val_audio_losses.append(audio_loss.item())
                         video_weight = float(out.get("video_loss_weight", 1.0))
@@ -5701,6 +5763,7 @@ def main() -> None:
         # Restore original weights if EMA was applied
         if original_params is not None:
             ema_model.restore(accelerator.unwrap_model(transformer), original_params)
+            original_params = None
         if force_self_flow_capture and self_flow_network is not None:
             self_flow_network.training = bool(self_flow_network_was_training)
 
@@ -5734,7 +5797,11 @@ def main() -> None:
                 if not tok:
                     continue
                 try:
-                    mt_list.append(float(tok))
+                    fixed_t = float(tok)
+                    if not math.isfinite(fixed_t) or not 0.0 <= fixed_t <= 1000.0:
+                        logger.warning("validation_timesteps: skipping out-of-range timestep %r (expected 0..1000)", tok)
+                        continue
+                    mt_list.append(fixed_t)
                 except ValueError:
                     logger.warning("validation_timesteps: skipping non-numeric token %r", tok)
 
@@ -5762,16 +5829,17 @@ def main() -> None:
                         latents_tensor = trainer.scale_shift_latents(latents_tensor)
                         noise = torch.randn_like(latents_tensor)
                         bsz = int(noise.shape[0])
-                        override_t = [float(fixed_t)] * bsz
+                        override_sigma = [float(fixed_t) / 1000.0] * bsz
                         try:
                             noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
                                 args,
                                 noise,
                                 latents_tensor,
-                                override_t,
+                                override_sigma,
                                 noise_scheduler,
                                 accelerator.device,
                                 trainer.dit_dtype,
+                                timesteps_are_sigmas=True,
                             )
                         except Exception as exc:
                             logger.warning("val/t%s: get_noisy failed: %s", fixed_t, exc)
@@ -5810,6 +5878,7 @@ def main() -> None:
                                 dtype=trainer.dit_dtype,
                                 loss_type=_val_lt,
                                 huber_delta=_val_hd,
+                                per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                             )
                             mt_video_losses.append(v_loss.item())
                             a_pred = model_pred.get("audio_pred")
@@ -5824,6 +5893,7 @@ def main() -> None:
                                     dtype=trainer.dit_dtype,
                                     loss_type=_val_lt,
                                     huber_delta=_val_hd,
+                                    per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                                 )
                                 mt_audio_losses.append(a_loss.item())
                                 v_w = float(model_pred.get("video_loss_weight", 1.0))
@@ -5942,6 +6012,7 @@ def main() -> None:
                                 dtype=trainer.dit_dtype,
                                 loss_type=_val_lt,
                                 huber_delta=_val_hd,
+                                per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                             )
                             c_video.append(v_loss.item())
                             a_pred = model_pred.get("audio_pred")
@@ -5956,6 +6027,7 @@ def main() -> None:
                                     dtype=trainer.dit_dtype,
                                     loss_type=_val_lt,
                                     huber_delta=_val_hd,
+                                    per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                                 )
                                 c_audio.append(a_loss.item())
                                 v_w = float(model_pred.get("video_loss_weight", 1.0))
@@ -6006,6 +6078,7 @@ def main() -> None:
             accelerator.print(f"Validation metrics: {val_metrics}")
             accelerator.log(val_metrics, step=step)
 
+        trainer.training = trainer_was_training
         return val_metrics
 
     def should_validate(step: int, epoch: int, is_epoch_end: bool) -> bool:
@@ -6030,6 +6103,8 @@ def main() -> None:
     def run_sampling_safely(sample_epoch, sample_step: int) -> None:
         """Run sampling preview without allowing failures to interrupt training."""
         optimizer_eval_fn()
+        trainer_was_training = bool(getattr(trainer, "training", False))
+        trainer.training = False
         cpu_rng_state = torch.get_rng_state()
         cuda_rng_state = None
         try:
@@ -6081,6 +6156,7 @@ def main() -> None:
                     torch.cuda.set_rng_state(cuda_rng_state)
                 except Exception:
                     pass
+            trainer.training = trainer_was_training
             optimizer_train_fn()
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -6266,7 +6342,6 @@ def main() -> None:
         accelerator,
     )
 
-    audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
     audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
     audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
     audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
@@ -6282,25 +6357,6 @@ def main() -> None:
     audio_presence_ema = min(max(audio_loss_balance_ema_init, 1e-6), 1.0)
     audio_loss_ema = max(audio_loss_balance_ema_init, 1e-6)
     video_loss_ema = max(audio_loss_balance_ema_init, 1e-6)
-
-    uncertainty_log_var_video = uncertainty_log_var_audio = None
-    if audio_loss_balance_mode == "uncertainty":
-        device_for_uncert = accelerator.device if accelerator is not None else torch.device("cpu")
-        uncertainty_log_var_video = torch.nn.Parameter(torch.zeros(1, device=device_for_uncert))
-        uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1, device=device_for_uncert))
-        uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
-        try:
-            optimizer.add_param_group({"params": [uncertainty_log_var_video, uncertainty_log_var_audio], "lr": uncertainty_lr})
-            trainer._refresh_prodigy_plus_late_param_group_state(optimizer)
-            logger.info(
-                "Uncertainty weighting enabled: 2 learnable log-variance params added to optimizer, lr=%g",
-                uncertainty_lr,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to add uncertainty params to optimizer (%s); uncertainty mode will not learn variances.",
-                e,
-            )
 
     if audio_loss_balance_mode == "ogm_ge":
         logger.info("OGM-GE audio/video balancing enabled: alpha=%.4f", ogm_ge_alpha)
@@ -6325,6 +6381,8 @@ def main() -> None:
         _run_noise_scale_probe_ft(trainer, args, accelerator, transformer, noise_scheduler, train_dataloader)
         return
 
+    trainer.training = True
+    accumulation_skip_guard = AccumulationSkipGuard()
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1
         if train_audio_sampler is not None:
@@ -6353,6 +6411,11 @@ def main() -> None:
                 continue
 
             with accelerator.accumulate(transformer):
+                if accumulation_skip_guard.should_drop_current_microbatch(sync_gradients=accelerator.sync_gradients):
+                    optimizer.zero_grad(set_to_none=True)
+                    if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
+                        zero_grad_ltx2_remote_stage(transformer)
+                    continue
                 motion_micro_step += 1
                 batch = _normalize_ltx2_batch_for_call_dit(batch)
                 latents = batch["latents"]
@@ -6394,17 +6457,20 @@ def main() -> None:
                 )
 
                 dict_output = isinstance(model_pred, dict)
+                local_skip = bool(dict_output and model_pred.get("_skip_step"))
+                if distributed_any(accelerator, local_skip, device=accelerator.device):
+                    skip_reason = (
+                        model_pred.get("skip_reason", "peer_rank_requested_skip") if local_skip else "peer_rank_requested_skip"
+                    )
+                    logger.warning("Discarding accumulation window due to skipped microbatch (%s).", skip_reason)
+                    optimizer.zero_grad(set_to_none=True)
+                    if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
+                        zero_grad_ltx2_remote_stage(transformer)
+                    accumulation_skip_guard.mark_bad_microbatch(sync_gradients=accelerator.sync_gradients)
+                    continue
+
                 if dict_output:
                     out = model_pred
-                    if out.get("_skip_step"):
-                        logger.warning(
-                            "Skipping step due to non-finite tensor (%s).",
-                            out.get("skip_reason", "unknown"),
-                        )
-                        optimizer.zero_grad(set_to_none=True)
-                        if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
-                            zero_grad_ltx2_remote_stage(transformer)
-                        continue
 
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = float(getattr(args, "huber_delta", 1.0))
@@ -6425,7 +6491,11 @@ def main() -> None:
                         per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                     )
                     # Base weights: dataset config × CLI override.
-                    video_weight = float(out.get("video_loss_weight", 1.0)) * cli_video_loss_weight
+                    video_weight = combine_full_ft_loss_weight(
+                        float(out.get("video_loss_weight", 1.0)),
+                        batch.get("video_loss_weight"),
+                        cli_video_loss_weight,
+                    )
 
                     audio_pred = out.get("audio_pred")
                     audio_target = out.get("audio_target")
@@ -6447,7 +6517,11 @@ def main() -> None:
                             ),
                             per_sample=bool(getattr(args, "ltx2_per_sample_loss", False)),
                         )
-                        audio_weight = float(out.get("audio_loss_weight", 1.0)) * cli_audio_loss_weight
+                        audio_weight = combine_full_ft_loss_weight(
+                            float(out.get("audio_loss_weight", 1.0)),
+                            batch.get("audio_loss_weight"),
+                            cli_audio_loss_weight,
+                        )
 
                     # Uncertainty mode replaces the manual sum with Kendall et al. weighting.
                     if (
@@ -6852,27 +6926,34 @@ def main() -> None:
                     pending_attn_recorder = None
                 did_optimizer_step = False
                 if not args.fused_backward_pass:
+                    if accelerator.sync_gradients and uncertainty_state is not None:
+                        synchronize_parameter_gradients(accelerator, uncertainty_state.parameters())
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                        params_to_clip = list(transformer.parameters())
+                        if text_encoder is not None:
+                            params_to_clip.extend(param for param in text_encoder.parameters() if param.requires_grad)
+                        if uncertainty_state is not None:
+                            params_to_clip.extend(uncertainty_state.parameters())
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            params_to_clip.extend(trainer._self_flow.get_trainable_params())
                         _clip_grad_norm_ltx2(
-                            transformer.parameters(),
+                            params_to_clip,
                             accelerator,
                             args.max_grad_norm,
                             ltx2_model_parallel=ltx2_model_parallel,
                             optimizer=optimizer,
                         )
                     optimizer.step()
-                    if (
-                        accelerator.sync_gradients
-                        and ltx2_remote_stage
-                        and bool(getattr(args, "ltx2_remote_stage_trainable", False))
-                    ):
+                    did_optimizer_step = optimizer_step_succeeded(accelerator)
+                    if did_optimizer_step and ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
                         optimizer_step_ltx2_remote_stage(transformer)
-                    did_optimizer_step = bool(accelerator.sync_gradients)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                 else:
                     did_fused_step = False
                     if accelerator.sync_gradients:
+                        if uncertainty_state is not None:
+                            synchronize_parameter_gradients(accelerator, uncertainty_state.parameters())
                         if fused_step_state is not None:
                             fused_step_state["defer_step"] = False
                         hook_stepped = bool(fused_step_state is not None and fused_step_state.get("hook_stepped", False))
@@ -6907,7 +6988,10 @@ def main() -> None:
                     except Exception as e:
                         logger.warning("Self-Flow teacher update failed at step=%s: %s", global_step, e)
 
-            if accelerator.sync_gradients:
+            if accelerator.sync_gradients and not did_optimizer_step and accelerator.optimizer_step_was_skipped:
+                logger.warning("Optimizer update skipped after mixed-precision gradient overflow; global step is unchanged.")
+
+            if did_optimizer_step:
                 progress_bar.update(1)
                 global_step += 1
                 last_resume_epoch = epoch + 1

@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.audio_loss_balance import (
+    UncertaintyLogVars,
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
     compute_uncertainty_weighted_loss,
@@ -68,6 +69,12 @@ from musubi_tuner.training.runtime_utils import (
 )
 from musubi_tuner.training.network_ema import NetworkEMAModel
 from musubi_tuner.training.sampling_prompts import should_sample_images
+from musubi_tuner.training.step_control import (
+    AccumulationSkipGuard,
+    distributed_any,
+    optimizer_step_succeeded,
+    synchronize_parameter_gradients,
+)
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 from musubi_tuner.training.weight_noise import apply_weight_noise_to_optimizer, validate_weight_noise_args
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
@@ -166,11 +173,13 @@ def train(self, args):
         )
 
     # Uncertainty weighting: learnable log-variance scalars (Kendall et al., CVPR 2018)
+    uncertainty_state = None
     uncertainty_log_var_video = None
     uncertainty_log_var_audio = None
     if audio_loss_balance_mode == "uncertainty":
-        uncertainty_log_var_video = torch.nn.Parameter(torch.zeros(1))
-        uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1))
+        uncertainty_state = UncertaintyLogVars()
+        uncertainty_log_var_video = uncertainty_state.log_var_video
+        uncertainty_log_var_audio = uncertainty_state.log_var_audio
         logger.info("Uncertainty weighting enabled: learnable log-variance scalars initialized to 0.0")
 
     # G2D-style modality freezing
@@ -544,13 +553,14 @@ def train(self, args):
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(args, trainable_params)
 
     # Add uncertainty weighting log-variance params to optimizer
-    if uncertainty_log_var_video is not None:
+    if uncertainty_state is not None:
         uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
-        uncertainty_log_var_video = uncertainty_log_var_video.to(device=accelerator.device)
-        uncertainty_log_var_audio = uncertainty_log_var_audio.to(device=accelerator.device)
+        uncertainty_state.to(device=accelerator.device)
+        uncertainty_log_var_video = uncertainty_state.log_var_video
+        uncertainty_log_var_audio = uncertainty_state.log_var_audio
         optimizer.add_param_group(
             {
-                "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
+                "params": list(uncertainty_state.parameters()),
                 "lr": uncertainty_lr,
                 "weight_decay": 0.0,
                 "group_name": "uncertainty",
@@ -859,7 +869,10 @@ def train(self, args):
                     from safetensors.torch import save_file
 
                     save_file(
-                        {"log_var_video": uncertainty_log_var_video.data, "log_var_audio": uncertainty_log_var_audio.data},
+                        {
+                            "log_var_video": uncertainty_log_var_video.detach().cpu(),
+                            "log_var_audio": uncertainty_log_var_audio.detach().cpu(),
+                        },
                         os.path.join(output_dir, "uncertainty_log_vars.safetensors"),
                     )
                 except Exception as e:
@@ -1924,6 +1937,7 @@ def train(self, args):
     # pre_train_hook and CREPA param group already called before resume (above)
 
     set_trainer_train_mode()  # Set training mode
+    accumulation_skip_guard = AccumulationSkipGuard()
 
     for epoch in range(epoch_to_start, num_train_epochs):
         accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -1986,8 +2000,12 @@ def train(self, args):
                 self.set_current_batch_latents_info(None)
                 latents_tensor = latents
             latents_shape = tuple(latents_tensor.shape)
+            did_optimizer_step = False
 
             with accelerator.accumulate(training_model):
+                if accumulation_skip_guard.should_drop_current_microbatch(sync_gradients=accelerator.sync_gradients):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 accelerator.unwrap_model(network).on_step_start(
                     global_step=global_step,
                     max_train_steps=args.max_train_steps,
@@ -2090,6 +2108,15 @@ def train(self, args):
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER call_dit (forward pass)", logger)
                 dict_output = isinstance(model_pred, dict)
+                local_skip = bool(dict_output and model_pred.get("_skip_step"))
+                if distributed_any(accelerator, local_skip, device=accelerator.device):
+                    skip_reason = (
+                        model_pred.get("skip_reason", "peer_rank_requested_skip") if local_skip else "peer_rank_requested_skip"
+                    )
+                    logger.warning("Discarding accumulation window due to skipped microbatch (%s).", skip_reason)
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulation_skip_guard.mark_bad_microbatch(sync_gradients=accelerator.sync_gradients)
+                    continue
                 video_loss_value = None  # For tracking in wandb/tensorboard
                 audio_loss_value = None  # For tracking in wandb/tensorboard
                 audio_weight_effective_value = None
@@ -2502,11 +2529,16 @@ def train(self, args):
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
 
+                    if uncertainty_state is not None:
+                        synchronize_parameter_gradients(accelerator, uncertainty_state.parameters())
+
                     params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
                     if hasattr(self, "_crepa") and self._crepa is not None:
                         params_to_clip.extend(self._crepa.get_trainable_params())
                     if hasattr(self, "_self_flow") and self._self_flow is not None:
                         params_to_clip.extend(self._self_flow.get_trainable_params())
+                    if uncertainty_state is not None:
+                        params_to_clip.extend(uncertainty_state.parameters())
 
                     if len(accelerator.trackers) > 0 or gui_metrics is not None:
                         total_grad_sq = torch.zeros(1, device=accelerator.device)
@@ -2544,8 +2576,9 @@ def train(self, args):
                 if _is_first_step:
                     _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                 optimizer.step()
+                did_optimizer_step = optimizer_step_succeeded(accelerator)
                 if (
-                    accelerator.sync_gradients
+                    did_optimizer_step
                     and bool(getattr(args, "ltx2_remote_stage", False))
                     and bool(getattr(args, "ltx2_remote_stage_trainable", False))
                 ):
@@ -2558,9 +2591,9 @@ def train(self, args):
                         raise
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
-                if accelerator.sync_gradients:
+                if did_optimizer_step:
                     apply_weight_noise_to_optimizer(optimizer, args, global_step=global_step)
-                if accelerator.sync_gradients and hasattr(self, "_self_flow") and self._self_flow is not None:
+                if did_optimizer_step and hasattr(self, "_self_flow") and self._self_flow is not None:
                     try:
                         # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
                         _sf_net = getattr(self, "_self_flow_network", None) or (
@@ -2588,7 +2621,11 @@ def train(self, args):
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER zero_grad (end of first step)", logger)
 
-            if args.scale_weight_norms:
+            if accelerator.sync_gradients and not did_optimizer_step and accelerator.optimizer_step_was_skipped:
+                logger.warning("Optimizer update skipped after mixed-precision gradient overflow; global step is unchanged.")
+                continue
+
+            if args.scale_weight_norms and did_optimizer_step:
                 keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                     args.scale_weight_norms, accelerator.device
                 )
@@ -2597,7 +2634,7 @@ def train(self, args):
                 keys_scaled, mean_norm, maximum_norm = None, None, None
 
             # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
+            if did_optimizer_step:
                 if global_step == 0:
                     progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                 progress_bar.update(1)

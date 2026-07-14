@@ -3,6 +3,15 @@ from __future__ import annotations
 import torch
 
 
+class UncertaintyLogVars(torch.nn.Module):
+    """Checkpointable leaf parameters for uncertainty-based loss balancing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.log_var_video = torch.nn.Parameter(torch.zeros(1))
+        self.log_var_audio = torch.nn.Parameter(torch.zeros(1))
+
+
 def update_audio_presence_ema(audio_presence_ema: float, balance_beta: float, has_audio_loss: bool) -> float:
     """Update EMA for audio-batch frequency."""
     audio_presence = 1.0 if has_audio_loss else 0.0
@@ -50,10 +59,7 @@ def compute_uncertainty_weighted_loss(
     """
     precision_v = torch.exp(-log_var_video)
     precision_a = torch.exp(-log_var_audio)
-    loss = (
-        0.5 * precision_v * video_loss + 0.5 * log_var_video
-        + 0.5 * precision_a * audio_loss + 0.5 * log_var_audio
-    )
+    loss = 0.5 * precision_v * video_loss + 0.5 * log_var_video + 0.5 * precision_a * audio_loss + 0.5 * log_var_audio
     return loss
 
 
@@ -70,4 +76,3 @@ def compute_ema_magnitude_audio_weight(
     dynamic_scale = target_audio_loss / max(float(audio_loss_ema), 1e-12)
     weight = float(base_audio_weight) * dynamic_scale
     return min(max(weight, float(balance_min)), float(balance_max))
-

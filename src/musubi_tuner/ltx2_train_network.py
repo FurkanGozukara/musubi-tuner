@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.training.trainer_base import NetworkTrainer
+from musubi_tuner.training.step_control import distributed_any
 from musubi_tuner.audio_supervision import (
     AudioSupervisionState,
     format_audio_supervision_alert,
@@ -3183,6 +3184,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         noise_scheduler,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        timesteps_are_sigmas: bool = False,
     ):
         # For non-video latents, use parent implementation
         if latents.dim() != 5:
@@ -3199,13 +3202,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
         seq_len = int(frames * height * width)
         timestep_uniforms: Optional[torch.Tensor] = None
+        provided_sigmas: Optional[torch.Tensor] = None
         if timesteps is not None:
             timestep_uniforms = torch.as_tensor(timesteps, device=device, dtype=torch.float32).view(-1)
             if timestep_uniforms.numel() == 1 and batch_size > 1:
                 timestep_uniforms = timestep_uniforms.expand(batch_size)
             if timestep_uniforms.numel() != batch_size:
                 raise ValueError(f"timesteps must contain {batch_size} values for LTX-2 sampling, got {timestep_uniforms.numel()}")
-            timestep_uniforms = timestep_uniforms.clamp(0.0, 1.0)
+            if timesteps_are_sigmas:
+                if not torch.isfinite(timestep_uniforms).all():
+                    raise ValueError("Fixed LTX-2 sigmas must be finite")
+                if torch.any(timestep_uniforms < 0.0) or torch.any(timestep_uniforms > 1.0):
+                    raise ValueError("Fixed LTX-2 sigmas must be in [0, 1]")
+                provided_sigmas = timestep_uniforms
+                timestep_uniforms = None
+            else:
+                timestep_uniforms = timestep_uniforms.clamp(0.0, 1.0)
+        elif timesteps_are_sigmas:
+            raise ValueError("timesteps_are_sigmas=True requires explicit timesteps")
         audio_seq_lens = None
         if self._ltx_mode == "audio":
             audio_seq_lens = self._resolve_audio_only_sequence_lengths(batch_size, device)
@@ -3302,6 +3316,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             return sampled
 
         def _sample_sigmas(*, use_provided: bool = True) -> torch.Tensor:
+            if use_provided and provided_sigmas is not None:
+                return provided_sigmas
             if bool(getattr(args, "preserve_distribution_shape", False)) and (min_timestep is not None or max_timestep is not None):
                 max_loops = 1000
                 available_sigmas: List[torch.Tensor] = []
@@ -6176,12 +6192,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                             "Provide cached audio latents to train audio generation."
                         )
                         self._warned_missing_audio = True
-            if audio_latents is None and directional_live and frozen_modality == "audio":
+            a2v_missing_audio = audio_latents is None and directional_live and frozen_modality == "audio"
+            if (
+                directional_live
+                and frozen_modality == "audio"
+                and distributed_any(
+                    accelerator,
+                    a2v_missing_audio,
+                    device=accelerator.device,
+                )
+            ):
                 # a2v conditions the video on CLEAN audio; a batch with no audio latents has nothing to
-                # condition on, so training the video here would invert the directional intent. Skip the
-                # step rather than corrupt it (the missing-audio warning above already fired once).
+                # condition on. All ranks must skip together because another rank may have a valid local
+                # audio batch and otherwise enter distributed forward/backward collectives alone.
                 return (
-                    {"_skip_step": True, "skip_reason": "a2v_missing_audio"},
+                    {
+                        "_skip_step": True,
+                        "skip_reason": "a2v_missing_audio" if a2v_missing_audio else "a2v_missing_audio_on_peer_rank",
+                    },
                     torch.tensor(0.0, device=accelerator.device),
                 )
             if audio_latents is not None:
@@ -6403,8 +6431,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     raise ValueError(message)
                 logger.warning("%s Running in warning mode; training will continue.", message)
 
-        if skip_nonfinite and nonfinite_flag["hit"]:
-            return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(0.0, device=accelerator.device)
+        if skip_nonfinite and distributed_any(accelerator, nonfinite_flag["hit"], device=accelerator.device):
+            reason = nonfinite_flag["tag"] if nonfinite_flag["hit"] else "nonfinite_input_on_peer_rank"
+            return {"_skip_step": True, "skip_reason": reason}, torch.tensor(0.0, device=accelerator.device)
 
         caption_channels = getattr(transformer, "caption_channels", None)
         if caption_channels is None:
@@ -7149,8 +7178,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         _log_stats("video_pred", video_pred)
         _log_stats("audio_pred", audio_pred)
 
-        if skip_nonfinite and nonfinite_flag["hit"]:
-            return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(0.0, device=accelerator.device)
+        if skip_nonfinite and distributed_any(accelerator, nonfinite_flag["hit"], device=accelerator.device):
+            reason = nonfinite_flag["tag"] if nonfinite_flag["hit"] else "nonfinite_output_on_peer_rank"
+            return {"_skip_step": True, "skip_reason": reason}, torch.tensor(0.0, device=accelerator.device)
 
         video_target = noise - latents
         _check_finite("video_target", video_target)
@@ -7291,6 +7321,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             elif frozen_modality == "audio":
                 out["audio_loss_weight"] = 0.0
         # --- end directional training (loss-weight) ---
+
+        if skip_nonfinite and distributed_any(accelerator, nonfinite_flag["hit"], device=accelerator.device):
+            reason = nonfinite_flag["tag"] if nonfinite_flag["hit"] else "nonfinite_target_on_peer_rank"
+            return {"_skip_step": True, "skip_reason": reason}, torch.tensor(0.0, device=accelerator.device)
 
         return out, torch.tensor(0.0, device=accelerator.device)
 
