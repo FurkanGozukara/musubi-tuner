@@ -42,7 +42,7 @@ from musubi_tuner.ltx_2.utils import to_denoised
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.training.accelerator_setup import prepare_accelerator
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
-from musubi_tuner.training.trainer_base import NetworkTrainer
+from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.utils import model_utils
 
 

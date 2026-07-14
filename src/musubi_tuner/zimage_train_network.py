@@ -12,7 +12,7 @@ from musubi_tuner.training.accelerator_setup import clean_memory_on_device
 from musubi_tuner.training.outputs import DiTOutput
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import load_prompts
-from musubi_tuner.training.trainer_base import NetworkTrainer
+from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.utils import model_utils
 
 import logging

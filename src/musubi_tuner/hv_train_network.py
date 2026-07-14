@@ -14,7 +14,7 @@ import musubi_tuner.hunyuan_model.vae as vae_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.training import metadata as _metadata
 from musubi_tuner.training import outputs as _outputs
-from musubi_tuner.training.trainer_base import NetworkTrainer as BaseNetworkTrainer
+from musubi_tuner.training.trainer_ext import NetworkTrainer as BaseNetworkTrainer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO, ARCHITECTURE_HUNYUAN_VIDEO_FULL
 from musubi_tuner.hv_generate_video import resize_image_to_bucket, encode_to_latents
 

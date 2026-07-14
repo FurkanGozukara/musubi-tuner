@@ -14,7 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from musubi_tuner.training.trainer_base import NetworkTrainer
+from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.training.step_control import distributed_any
 from musubi_tuner.audio_supervision import (
     AudioSupervisionState,

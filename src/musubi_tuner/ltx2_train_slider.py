@@ -41,7 +41,7 @@ from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, prepare_accelerator
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import should_sample_images
-from musubi_tuner.training.trainer_base import NetworkTrainer
+from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.utils import model_utils, train_utils
 
 
@@ -665,9 +665,7 @@ class LTX2SliderTrainer:
             anc_sum = 0.0
             anc_count = 0
             for tgt in targets:
-                d, a = self._run_one_text_target(
-                    transformer, network, accelerator, args, dit_dtype, tgt, loss_scale
-                )
+                d, a = self._run_one_text_target(transformer, network, accelerator, args, dit_dtype, tgt, loss_scale)
                 dir_sum += d
                 if a is not None:
                     anc_sum += a
@@ -677,9 +675,7 @@ class LTX2SliderTrainer:
             return direction_avg, anchor_avg
 
         target = random.choice(targets)
-        return self._run_one_text_target(
-            transformer, network, accelerator, args, dit_dtype, target, 1.0
-        )
+        return self._run_one_text_target(transformer, network, accelerator, args, dit_dtype, target, 1.0)
 
     def _run_one_text_target(
         self,
@@ -794,10 +790,7 @@ class LTX2SliderTrainer:
             """
             if n_anchors == 0:
                 return None
-            losses = [
-                _anchor_mse(pred_chunks[i + 1], anchor_targets[i])
-                for i in range(n_anchors)
-            ]
+            losses = [_anchor_mse(pred_chunks[i + 1], anchor_targets[i]) for i in range(n_anchors)]
             anchor = sum(losses) / n_anchors
 
             # Running-median cap (self-calibrating, no model-specific constant).
@@ -1574,7 +1567,9 @@ class LTX2SliderTrainer:
         if getattr(args, "resume", None):
             if not train_utils.is_complete_state_dir(args.resume):
                 if getattr(args, "_autoresume_selected", False):
-                    logger.warning("autoresume: selected state directory is missing or incomplete, starting from scratch: %s", args.resume)
+                    logger.warning(
+                        "autoresume: selected state directory is missing or incomplete, starting from scratch: %s", args.resume
+                    )
                     args.resume = None
                 else:
                     raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
@@ -1636,9 +1631,7 @@ class LTX2SliderTrainer:
 
             best_step = 0
             best_path = None
-            step_pattern = _re.compile(
-                _re.escape(args.output_name) + r"-step(\d+)\.safetensors$"
-            )
+            step_pattern = _re.compile(_re.escape(args.output_name) + r"-step(\d+)\.safetensors$")
             for entry in os.listdir(args.output_dir):
                 m = step_pattern.match(entry)
                 if m:
@@ -1984,9 +1977,7 @@ class LTX2SliderTrainer:
                     # The slider has its own loop, so this must be applied here;
                     # the network method self-guards for non-LoRA networks.
                     if getattr(args, "scale_weight_norms", None):
-                        accelerator.unwrap_model(network).apply_max_norm_regularization(
-                            args.scale_weight_norms, accelerator.device
-                        )
+                        accelerator.unwrap_model(network).apply_max_norm_regularization(args.scale_weight_norms, accelerator.device)
 
             if not accelerator.sync_gradients:
                 continue
