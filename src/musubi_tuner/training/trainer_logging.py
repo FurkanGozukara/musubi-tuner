@@ -4,6 +4,21 @@ from __future__ import annotations
 
 import argparse
 
+import torch
+
+
+def collect_grad_metrics(self, params) -> dict:
+    """Collect total, mean per-parameter, and maximum pre-clip gradient metrics."""
+    grads = [param.grad.detach() for param in params if param.grad is not None]
+    if not grads:
+        return {}
+    per_norm = torch.stack([grad.norm() for grad in grads])
+    return {
+        "grad/norm": per_norm.norm().item(),
+        "grad/mean_norm": per_norm.mean().item(),
+        "grad/max": torch.stack([grad.abs().max() for grad in grads]).max().item(),
+    }
+
 
 def generate_step_logs(
     self,

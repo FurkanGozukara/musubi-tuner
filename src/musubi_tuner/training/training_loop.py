@@ -2454,6 +2454,7 @@ def train(self, args):
 
                 if _is_first_step:
                     _log_vram("FIRST_ITER: BEFORE backward", logger)
+                grad_metrics = {}
                 accelerator.backward(loss)
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER backward", logger)
@@ -2539,6 +2540,9 @@ def train(self, args):
                         params_to_clip.extend(self._self_flow.get_trainable_params())
                     if uncertainty_state is not None:
                         params_to_clip.extend(uncertainty_state.parameters())
+
+                    if args.log_grad_metrics and len(accelerator.trackers) > 0:
+                        grad_metrics = self.collect_grad_metrics(network.parameters())
 
                     if len(accelerator.trackers) > 0 or gui_metrics is not None:
                         total_grad_sq = torch.zeros(1, device=accelerator.device)
@@ -2836,6 +2840,7 @@ def train(self, args):
                         logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
                 if grad_norm_total_value is not None:
                     logs["grad_norm/total"] = grad_norm_total_value
+                logs.update(grad_metrics)
                 if uncertainty_log_var_video is not None:
                     lv_v = uncertainty_log_var_video.detach().item()
                     lv_a = uncertainty_log_var_audio.detach().item()

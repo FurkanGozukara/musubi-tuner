@@ -327,6 +327,13 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="log CUDA memory stats every N optimizer steps (alloc/reserved/max).",
     )
+    parser.add_argument(
+        "--log_grad_metrics",
+        action="store_true",
+        help="log gradient norm metrics (grad/norm, grad/mean_norm, grad/max, pre-clipping) to the tracker."
+        " Adds a small per-step GPU sync overhead"
+        " / 勾配ノルムのメトリクス（grad/norm, grad/mean_norm, grad/max、クリッピング前）をトラッカーに出力する。ステップごとにわずかなGPU同期のオーバーヘッドが発生する",
+    )
 
 
 def _add_ddp_args(parser: argparse.ArgumentParser) -> None:
