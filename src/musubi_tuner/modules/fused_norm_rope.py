@@ -1,4 +1,4 @@
-"""Optional fused qk-norm + RoPE CUDA kernel (speed-roadmap K2).
+"""Optional fused qk-norm + RoPE CUDA kernel.
 
 Wraps a fused RMSNorm + RoPE CUDA kernel as the forward of a
 :class:`torch.autograd.Function`. Both RoPE conventions are covered: the interleaved
@@ -364,6 +364,12 @@ def try_qk_norm_rope(
     Returns ``None`` whenever the kernel is unavailable or the tensors are not
     eligible, so the eager path stays intact and byte-identical.
     """
+    # PyBind extension calls cannot be captured by Dynamo in a full graph and
+    # introduce a graph break otherwise. Let the existing eager tensor path be
+    # compiled instead; the fused CUDA path remains active outside torch.compile.
+    if torch.compiler.is_compiling():
+        return None
+
     kind = _rope_kind(rope_type)
     if kind == "":
         return None
