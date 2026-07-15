@@ -208,6 +208,7 @@ class CachingConfig(BaseModel):
 class TrainingConfig(BaseModel):
     # Model
     ltx2_checkpoint: str = ""
+    vae: str = ""
     gemma_root: str = ""
     gemma_safetensors: str = ""
     config_file: str = ""
@@ -215,6 +216,7 @@ class TrainingConfig(BaseModel):
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     ltx_version: Literal["2.0", "2.3"] = "2.3"
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
+    debug_dataset: bool = False
     fp8_base: bool = False
     fp8_scaled: bool = False
     fp8_keep_blocks: str = ""
@@ -256,6 +258,15 @@ class TrainingConfig(BaseModel):
     int4_convrot_groupsize: str = "auto"
     int4_convrot_no_mse_clip: bool = False
     int4_convrot_quality_report: str = ""
+    int4_convrot_awq_calibration: bool = False
+    int4_convrot_awq_scales: str = ""
+    int4_convrot_awq_alpha: float = 0.25
+    int4_convrot_activation_calibration_report: str = ""
+    int4_convrot_activation_calibration_batches: int = 1
+    int4_convrot_activation_calibration_regex: str = ""
+    int4_convrot_activation_calibration_max_rows: int = 128
+    int4_convrot_activation_calibration_max_layers: int = 0
+    int4_convrot_activation_calibration_only: bool = False
     int8_fused_quant: bool = False
     awq_calibration: bool = False
     awq_alpha: float = 0.25
@@ -807,6 +818,17 @@ class TrainingConfig(BaseModel):
     # Directional training mode (requires --ltx2_mode av). "joint" = normal joint AV (default);
     # "a2v" freezes audio and generates video; "v2a" freezes video and generates audio (foley).
     ltx2_train_direction: str = "joint"
+
+    # Advanced output, diagnostics, and EMA. These are common CLI flags and are
+    # persisted here so both LoRA and full-finetune dashboard flows can expose them.
+    save_precision: Optional[Literal["float", "fp32", "fp16", "bf16"]] = None
+    log_grad_metrics: bool = False
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    ema_update_after_step: int = 100
+    ema_update_every: int = 1
+    save_ema_only: bool = False
+    ema_cpu_offload: bool = False
     accelerate_extra_args: str = ""
     extra_args: str = ""
 
@@ -857,6 +879,7 @@ class FullFinetuneConfig(TrainingConfig):
     int8_weights_sparse_ratio: float = 0.0
     int8_weights_convrot: str = ""
     int8_weights_w8a8: bool = False
+    int8_weights_prequant: str = ""
 
     # Q-GaLore full fine-tune.
     qgalore_full_ft: bool = False
@@ -906,13 +929,7 @@ class FullFinetuneConfig(TrainingConfig):
     freeze_audio_params: bool = False
     audio_param_lr_scale: float = 1.0
 
-    # EMA and validation.
-    use_ema: bool = False
-    ema_decay: float = 0.9999
-    ema_update_after_step: int = 100
-    ema_update_every: int = 1
-    save_ema_only: bool = False
-    ema_cpu_offload: bool = False
+    # Validation (EMA fields are inherited from TrainingConfig).
     validation_dataset_config: str = ""
     validation_extra_configs: str = ""
     num_validation_batches: Optional[int] = None

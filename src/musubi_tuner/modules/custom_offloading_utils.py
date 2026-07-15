@@ -97,13 +97,14 @@ class BlockSwapConfig:
         # not point at the offloader. Fail early with an actionable message instead. (Inference / forward-only
         # has no backward, so it is unaffected.)
         if h2d_only and supports_backward and not getattr(args, "gradient_checkpointing", False):
-            raise ValueError(
+            message = (
                 "--block_swap_h2d_only requires --gradient_checkpointing for training. H2D-only block swap streams"
                 " frozen weights through a reused GPU ring buffer, which advances the autograd version of weights"
                 " saved for backward; gradient checkpointing re-reads them at recompute time and avoids this."
                 " / --block_swap_h2d_only は学習時に --gradient_checkpointing が必須です（リングバッファの上書きで"
                 "backward 用に保存された重みの version が進むため。gradient checkpointing は再計算時に読み直すので回避できます）。"
             )
+            raise ValueError(message)
 
         # H2D-only rebinds each streamed block's Linear weights to views into a small reused GPU ring
         # buffer. Any path that moves a whole *managed* block CPU-ward rewrites those views in place and
@@ -117,12 +118,13 @@ class BlockSwapConfig:
                 ("sample_with_offloading", "--sample_with_offloading"),
             ):
                 if getattr(args, flag_attr, False):
-                    raise ValueError(
+                    message = (
                         f"{flag_name} is incompatible with --block_swap_h2d_only: it moves whole streamed"
                         " blocks to CPU, which rewrites the H2D ring's GPU weight views and corrupts the ring."
                         " H2D-only block swap already streams frozen weights off the GPU, so disable"
                         f" {flag_name} (or drop --block_swap_h2d_only)."
                     )
+                    raise ValueError(message)
 
         ring_size = getattr(args, "block_swap_ring_size", 2)
         if ring_size < 1:

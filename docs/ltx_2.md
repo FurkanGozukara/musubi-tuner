@@ -334,6 +334,7 @@ other non-IC image workflows can continue using `control_directory`.
 | `loss_mask_use_alpha` | bool | false | Image datasets only: use target image alpha as the mask when no mask directory is set |
 | `loss_mask_invert` | bool | false | Invert image/video masks before caching |
 
+
 ### Audio Dataset Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -1195,7 +1196,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
 | `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | `transformers>=5.0` renamed Gemma3 rotary embedding buffers (`rotary_emb.inv_freq` → `rotary_emb.full_attention_inv_freq` / `sliding_attention_inv_freq`). The derivable-buffer suffix check expects `.inv_freq` and does not match the new `_inv_freq` suffix. The safetensors file is correct — rotary buffers are non-persistent and computed from config at init time. | `pip install transformers==4.57.6` (pinned in `pyproject.toml`), or reinstall all deps with `pip install -e .` |
-| Audio quality degrades after training video/image LoRA on an AV checkpoint | Default `t2v` preset creates LoRA weights for audio and cross-modal attention layers. With no audio training data, those weights are initialized but receive no meaningful gradient signal — applying the LoRA overwrites audio layers with near-zero deltas that disrupt the base model's audio representations. | Use a `video_*` preset (`--lora_target_preset video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict LoRA to video-branch modules only. Audio layers remain frozen and unmodified. See [LoRA Targets](#lora-targets). |
+| Audio quality degrades after video-only training performed in `--ltx2_mode av` | AV mode loads audio and cross-modal modules, so the broad default `t2v` preset can attach LoRA adapters to them. This does **not** apply to `--ltx2_mode v`/`video`: video mode loads a video-only transformer, and the resulting LoRA contains no audio or AV cross-modal adapters. | For an entirely audio-free dataset, use `--ltx2_mode v`; the base AV checkpoint's audio layers remain untouched when the resulting LoRA is applied. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict training to the video branch. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
 
@@ -1588,6 +1589,8 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 |----------|-------------|
 | `--blocks_to_swap X` | Offload X transformer blocks to CPU (up to one less than the model's block count; e.g. 47 for the 48-block 22B checkpoint). Higher = more VRAM saved, more CPU↔GPU overhead |
 | `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
+| `--block_swap_h2d_only` | Stream frozen LoRA base blocks Host→Device only; requires `--blocks_to_swap X` and `--gradient_checkpointing` |
+| `--block_swap_ring_size N` | H2D-only GPU ring size. `2` (default) overlaps prefetch and compute; `1` minimizes VRAM but cannot overlap them |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
 | `--blockwise_checkpointing` | Checkpoint transformer blocks individually and reload block state around backward. Lowest peak VRAM, but heavy CPU↔GPU traffic and recompute. |
@@ -1605,7 +1608,13 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU). Masked cross-attention uses the FA3 variable-length path (no fallback to slower SDPA). |
 
-**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** Fuses the per-attention query/key RMSNorm and rotary embedding into a single CUDA kernel, covering both the interleaved and split RoPE layouts (LTX-2.3 uses split). Opt in by setting the environment variable `LTX2_FUSED_NORM_ROPE=1`; leaving it unset keeps the exact eager path. The kernel is JIT-compiled on first use and requires a CUDA GPU with a working nvcc/MSVC or nvcc/gcc toolchain; if it cannot be built the trainer prints a one-time warning and uses the eager path. It applies to bf16 activations; other cases fall back automatically. The fused forward runs the norm and rotation in one pass, and gradients come from a closed-form backward that matches the eager path within bf16 rounding, so training results are unchanged.
+**H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
+for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
+and `--gradient_checkpointing`; it is not valid for full fine-tuning and is
+incompatible with checkpoint/activation CPU-offload modes. Invalid combinations
+are warned about or rejected. See the [Block Swap guide](./block_swap.md).
+
+**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** Fuses the per-attention query/key RMSNorm and rotary embedding into a single CUDA kernel, covering both the interleaved and split RoPE layouts (LTX-2.3 uses split). Opt in by setting the environment variable `LTX2_FUSED_NORM_ROPE=1`; leaving it unset keeps the exact eager path. The kernel is JIT-compiled on first use and requires a CUDA GPU with a working nvcc/MSVC or nvcc/gcc toolchain; if it cannot be built the trainer prints a one-time warning and uses the eager path. It applies to bf16 activations; other cases fall back automatically. The fused forward runs the norm and rotation in one pass, and gradients come from a closed-form backward that matches the eager path within bf16 rounding, so training results are unchanged. Under `torch.compile`, the trainer automatically uses the compilable unfused path.
 
 ### Blockwise Checkpointing
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -2476,6 +2485,8 @@ See also the [timestep bucketing documentation](./advanced_config.md) for advanc
 <sub>[↑ contents](#table-of-contents)</sub>
 
 Use `--lora_target_preset` to control which layers LoRA targets. For custom layer patterns and `--network_args` format, see the [LoRA documentation](./advanced_config.md#lora):
+
+Preset scopes describe the modules they can match when those modules exist. In `--ltx2_mode v`/`video`, the trainer constructs a video-only transformer, so even the broad `t2v` preset cannot create audio or AV cross-modal adapters. Applying a video-mode LoRA to an AV checkpoint therefore leaves the checkpoint's audio layers untouched.
 
 | Preset | Layers | Modality scope | Use Case |
 |--------|--------|----------------|----------|

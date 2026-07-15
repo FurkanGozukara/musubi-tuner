@@ -1115,6 +1115,19 @@ def main() -> None:
     _main()
 
 
+def warn_if_h2d_only_ignored(args: argparse.Namespace) -> bool:
+    """Warn when LTX H2D-only block swap was requested without swapped blocks."""
+    if not bool(getattr(args, "block_swap_h2d_only", False)):
+        return False
+    if int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
+        return False
+    logger.warning(
+        "--block_swap_h2d_only has no effect because --blocks_to_swap is not greater than zero. "
+        "Set --blocks_to_swap N (N > 0), or remove --block_swap_h2d_only."
+    )
+    return True
+
+
 class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     """Trainer for LTX-2 models with LoRA support"""
 
@@ -1187,6 +1200,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_delta_loss_config = None
 
     def train(self, args: argparse.Namespace):
+        warn_if_h2d_only_ignored(args)
         if getattr(args, "debug_dataset", False):
             self._debug_dataset_and_exit(args)
             return

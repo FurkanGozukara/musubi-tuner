@@ -472,6 +472,7 @@
 		<FormGroup title="Model">
 			<div class="space-y-2 pt-2">
 				<CheckpointInput fieldPath="full_finetune.ltx2_checkpoint" label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(value) => update('ltx2_checkpoint', value)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('full_finetune.ltx2_checkpoint')} error={fieldError('full_finetune.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
+				<PathInput fieldPath="full_finetune.vae" value={t.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to use the VAE bundled with the LTX checkpoint." />
 				<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} scanning={scanningLtx} scanMessage={ltxScanMessage} scanTone={ltxScanTone} onscan={scanLtx} oncancel={stopLtxScan} onusefound={(path) => update('ltx2_checkpoint', path)} />
 				<CheckpointInput fieldPath="full_finetune.gemma_root" label="Gemma Root" value={t.gemma_root || ''} onchange={(value) => update('gemma_root', value)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('full_finetune.gemma_root')} error={fieldError('full_finetune.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
 				<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} scanning={scanningGemma} scanMessage={gemmaScanMessage} scanTone={gemmaScanTone} onscan={scanGemma} oncancel={stopGemmaScan} onusefound={(path) => { update('gemma_root', path); update('gemma_safetensors', ''); }} />
@@ -536,6 +537,7 @@
 				</div>
 				<div class="grid grid-cols-3 gap-2">
 					<FormField fieldPath="full_finetune.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile backend" />
+					<FormField fieldPath="full_finetune.inductor_config" value={t.inductor_config || ''} oninput={(e) => update('inductor_config', e.target.value)} placeholder="triton.cudagraphs=true ..." disabled={!t.compile || t.compile_backend !== 'inductor'} tooltip="Space- or comma-separated TorchInductor key=value overrides." />
 					<FormField fieldPath="full_finetune.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile mode" />
 					<FormSelect fieldPath="full_finetune.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Value for --compile_dynamic." />
 				</div>
@@ -618,6 +620,10 @@
 					<FormField type="number" fieldPath="full_finetune.noise_scale_probe_rounds" value={t.noise_scale_probe_rounds ?? 5} oninput={(e) => update('noise_scale_probe_rounds', Number(e.target.value))} min={1} tooltip="Rounds to median-average the B_simple estimate over (only used when the probe is on)." />
 					<FormField type="number" fieldPath="full_finetune.noise_scale_probe_param_frac" value={t.noise_scale_probe_param_frac ?? 1.0} oninput={(e) => update('noise_scale_probe_param_frac', Number(e.target.value))} min={0} max={1} step="0.01" tooltip="Fraction of parameter tensors to measure the gradient over; the rest are frozen so the dense gradient co-resides with the weights on a single GPU. 0.25-0.5 is typical. Unbiased subset." />
 				</div>
+				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+					<FormToggle label="Log Gradient Metrics" fieldPath="full_finetune.log_grad_metrics" checked={t.log_grad_metrics ?? false} onchange={(e) => update('log_grad_metrics', e.target.checked)} tooltip="Log pre-clipping gradient norm metrics each step." />
+					<FormToggle label="Debug Dataset" fieldPath="full_finetune.debug_dataset" checked={t.debug_dataset ?? false} onchange={(e) => update('debug_dataset', e.target.checked)} tooltip="Run the trainer's dataset debug path." />
+				</div>
 			</div>
 		</FormGroup>
 
@@ -633,6 +639,7 @@
 					<FormToggle fieldPath="full_finetune.mem_eff_save" checked={t.mem_eff_save ?? true} onchange={(e) => update('mem_eff_save', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.flash_attn" checked={t.flash_attn ?? true} onchange={(e) => update('flash_attn', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.sdpa" checked={t.sdpa ?? false} onchange={(e) => update('sdpa', e.target.checked)} />
+					<FormToggle label="cuDNN Attention" fieldPath="full_finetune.cudnn_attn" checked={t.cudnn_attn ?? false} onchange={(e) => update('cudnn_attn', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.xformers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
@@ -709,6 +716,7 @@
 				<div class="grid grid-cols-2 gap-2">
 					<FormField fieldPath="full_finetune.fp8_gemm_targets" value={t.fp8_gemm_targets || 'video'} oninput={(e) => update('fp8_gemm_targets', e.target.value)} placeholder="video" tooltip="Which LTX-2 Linear layers to run in FP8 (video/audio/attn/ff/blocks/all)." />
 					<FormSelect fieldPath="full_finetune.fp8_gemm_grad_dtype" value={t.fp8_gemm_grad_dtype || 'e4m3'} options={['e4m3', 'e5m2']} onchange={(e) => update('fp8_gemm_grad_dtype', e.target.value)} tooltip="FP8 format for gradients. e4m3 = more accurate; e5m2 = wider range." />
+					<FormSelect fieldPath="full_finetune.fp8_gemm_scaling" value={t.fp8_gemm_scaling || 'tensor'} options={['tensor', 'rowwise']} onchange={(e) => update('fp8_gemm_scaling', e.target.value)} tooltip="Scaling granularity for FP8 GEMMs." />
 					<FormField type="number" fieldPath="full_finetune.fp8_gemm_min_numel" value={t.fp8_gemm_min_numel ?? 16384} oninput={(e) => update('fp8_gemm_min_numel', Number(e.target.value))} min={0} tooltip="Skip Linear layers with fewer than this many weight elements." />
 				</div>
 			</div>
@@ -727,6 +735,7 @@
 					<FormField type="number" fieldPath="full_finetune.int8_weights_outlier_quantile" value={t.int8_weights_outlier_quantile ?? 1.0} oninput={(e) => update('int8_weights_outlier_quantile', Number(e.target.value))} min={0} max={1} step="0.001" tooltip="Set the int8 scale from a per-row/group quantile of |w| (default 1.0 = absmax). 0.999 clips the top 0.1% to give the bulk a tighter grid." />
 					<FormField type="number" fieldPath="full_finetune.int8_weights_sparse_ratio" value={t.int8_weights_sparse_ratio ?? 0.0} oninput={(e) => update('int8_weights_sparse_ratio', Number(e.target.value))} min={0} max={1} step="0.001" tooltip="Keep the top fraction of |w| as an exact fp32 side-vector, excluded from the int8 grid so outliers don't coarsen the bulk weights. Default 0.0 = off; try 0.01. Alternative to outlier quantile." />
 					<FormField fieldPath="full_finetune.int8_weights_convrot" value={t.int8_weights_convrot || ''} oninput={(e) => update('int8_weights_convrot', e.target.value)} placeholder="off" tooltip="Rotate the int8 weight grid with a group-wise Hadamard (ConvRot) before quantization for tighter reconstruction; the GEMM stays bf16. Empty = off, 'auto', or a group size (16/64/256)." />
+					<PathInput fieldPath="full_finetune.int8_weights_prequant" value={t.int8_weights_prequant || ''} oninput={(e) => update('int8_weights_prequant', e.target.value)} showFiles tooltip="Pre-quantized INT8 sidecar. Its grid settings must match the options above." />
 				</div>
 			</div>
 		</FormGroup>
@@ -796,6 +805,7 @@
 
 		<FormGroup title="Saving">
 			<div class="space-y-2 pt-2">
+				<FormSelect label="Save Precision" fieldPath="full_finetune.save_precision" value={t.save_precision || ''} options={[{value:'',label:'Trainer default'}, 'float', 'fp32', 'fp16', 'bf16']} onchange={(e) => update('save_precision', e.target.value || null)} tooltip="Precision used when saving weights." />
 				<div class="grid grid-cols-2 gap-2">
 					<PathInput fieldPath="full_finetune.output_dir" value={t.output_dir || ''} oninput={(e) => update('output_dir', e.target.value)} />
 					<FormField fieldPath="full_finetune.output_name" value={t.output_name || 'ltx2_full_ft'} oninput={(e) => update('output_name', e.target.value)} />
@@ -812,6 +822,21 @@
 					<FormSelect fieldPath="full_finetune.save_state_mode" value={t.save_state_mode || 'full'} options={saveStateModeOptions} onchange={(e) => update('save_state_mode', e.target.value)} disabled={!(t.save_state || t.save_state_on_train_end)} tooltip="Full can resume optimizer state. Minimal skips optimizer, scheduler, and dataloader state." />
 					<FormToggle fieldPath="full_finetune.save_merged_checkpoint" checked={t.save_merged_checkpoint ?? false} onchange={(e) => update('save_merged_checkpoint', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.no_final_save" checked={t.no_final_save ?? false} onchange={(e) => update('no_final_save', e.target.checked)} />
+				</div>
+			</div>
+		</FormGroup>
+
+		<FormGroup title="EMA">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-3 gap-2">
+					<FormField type="number" fieldPath="full_finetune.ema_decay" value={t.ema_decay ?? 0.9999} oninput={(e) => update('ema_decay', Number(e.target.value))} min={0} max={1} step="0.0001" disabled={!t.use_ema} />
+					<FormField type="number" fieldPath="full_finetune.ema_update_after_step" value={t.ema_update_after_step ?? 100} oninput={(e) => update('ema_update_after_step', Number(e.target.value))} min={0} disabled={!t.use_ema} />
+					<FormField type="number" fieldPath="full_finetune.ema_update_every" value={t.ema_update_every ?? 1} oninput={(e) => update('ema_update_every', Number(e.target.value))} min={1} disabled={!t.use_ema} />
+				</div>
+				<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+					<FormToggle fieldPath="full_finetune.use_ema" checked={t.use_ema ?? false} onchange={(e) => update('use_ema', e.target.checked)} />
+					<FormToggle fieldPath="full_finetune.save_ema_only" checked={t.save_ema_only ?? false} onchange={(e) => update('save_ema_only', e.target.checked)} disabled={!t.use_ema} />
+					<FormToggle fieldPath="full_finetune.ema_cpu_offload" checked={t.ema_cpu_offload ?? false} onchange={(e) => update('ema_cpu_offload', e.target.checked)} disabled={!t.use_ema} />
 				</div>
 			</div>
 		</FormGroup>

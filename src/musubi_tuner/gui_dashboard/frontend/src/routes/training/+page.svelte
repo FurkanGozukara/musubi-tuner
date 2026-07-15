@@ -464,6 +464,9 @@
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
 						<CheckpointInput fieldPath="training.ltx2_checkpoint" label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
+						{#if $advancedMode}
+							<PathInput fieldPath="training.vae" value={t.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to use the VAE bundled with the LTX checkpoint." />
+						{/if}
 						<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} scanning={scanningLtx} scanMessage={ltxScanMessage} scanTone={ltxScanTone} onscan={scanLtx} oncancel={stopLtxScan} onusefound={(path) => update('ltx2_checkpoint', path)} />
 						<CheckpointInput fieldPath="training.gemma_root" label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
 						<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} scanning={scanningGemma} scanMessage={gemmaScanMessage} scanTone={gemmaScanTone} onscan={scanGemma} oncancel={stopGemmaScan} onusefound={(path) => { update('gemma_root', path); update('gemma_safetensors', ''); }} />
@@ -515,6 +518,7 @@
 							</div>
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.flash3" checked={t.flash3 ?? false} onchange={(e) => update('flash3', e.target.checked)} tooltip="FlashAttention 3 backend" />
+								<FormToggle label="cuDNN Attention" fieldPath="training.cudnn_attn" checked={t.cudnn_attn ?? false} onchange={(e) => update('cudnn_attn', e.target.checked)} tooltip="PyTorch cuDNN SDPA attention backend." />
 								<FormToggle fieldPath="training.sage_attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle fieldPath="training.xformers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
 								<FormToggle fieldPath="training.gemma_bnb_4bit_disable_double_quant" checked={t.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => update('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization (4-bit)" />
@@ -653,7 +657,14 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.int8_base" checked={t.int8_base ?? false} onchange={(e) => update('int8_base', e.target.checked)} tooltip="Train a LoRA over a pre-quantized Optimum-Quanto int8 checkpoint (needs Triton). Mutually exclusive with FP8/NF4." />
 								<FormToggle fieldPath="training.int8_base_dynamic" checked={t.int8_base_dynamic ?? false} onchange={(e) => update('int8_base_dynamic', e.target.checked)} tooltip="Quantize a standard (bf16) checkpoint to int8 on the fly at load time (no pre-quantized file needed)." />
+								<FormToggle label="INT8 ConvRot Base" fieldPath="training.int8_convrot_base" checked={t.int8_convrot_base ?? false} onchange={(e) => update('int8_convrot_base', e.target.checked)} tooltip="Load a pre-quantized INT8 ConvRot checkpoint." />
+								<FormToggle label="INT8 ConvRot Dynamic" fieldPath="training.int8_convrot_dynamic" checked={t.int8_convrot_dynamic ?? false} onchange={(e) => update('int8_convrot_dynamic', e.target.checked)} tooltip="Quantize a standard checkpoint to INT8 ConvRot at load time." />
 								<FormToggle fieldPath="training.int8_fused_quant" checked={t.int8_fused_quant ?? false} onchange={(e) => update('int8_fused_quant', e.target.checked)} tooltip="Also fuse the int8 activation/gradient quantization (faster int8 on Ampere; needs Triton)." />
+								<FormToggle label="INT8 ConvRot No MSE Clip" fieldPath="training.int8_convrot_no_mse_clip" checked={t.int8_convrot_no_mse_clip ?? false} onchange={(e) => update('int8_convrot_no_mse_clip', e.target.checked)} disabled={!(t.int8_convrot_base || t.int8_convrot_dynamic)} tooltip="Use absmax instead of MSE-optimal clipping." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormField label="INT8 ConvRot Groupsize" fieldPath="training.int8_convrot_groupsize" value={t.int8_convrot_groupsize || 'auto'} oninput={(e) => update('int8_convrot_groupsize', e.target.value || 'auto')} disabled={!(t.int8_convrot_base || t.int8_convrot_dynamic)} placeholder="auto" tooltip="Group size or comma-separated fallback list." />
+								<FormField label="INT8 ConvRot Quality Report" fieldPath="training.int8_convrot_quality_report" value={t.int8_convrot_quality_report || ''} oninput={(e) => update('int8_convrot_quality_report', e.target.value)} disabled={!t.int8_convrot_dynamic} placeholder="Optional JSON path" />
 							</div>
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle label="W4A4G4" fieldPath="training.w4a4g4" checked={t.w4a4g4 ?? false} onchange={(e) => update('w4a4g4', e.target.checked)} tooltip="Fully 4-bit (W4A4G4) LoRA training over a frozen 4-bit base; the container is selected below. Mutually exclusive with W4A8, W4A4G8 and FP8/NF4/INT8 base modes." />
@@ -679,6 +690,23 @@
 							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormSelect fieldPath="training.quantize_device" value={t.quantize_device || ''} options={[{value:'',label:'Auto'},{value:'cuda',label:'CUDA'},{value:'cpu',label:'CPU'}]} onchange={(e) => update('quantize_device', e.target.value || null)} tooltip="Device for quantization math" />
+							</div>
+							<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+								<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+									<FormToggle label="INT4 AWQ Calibration" fieldPath="training.int4_convrot_awq_calibration" checked={t.int4_convrot_awq_calibration ?? false} onchange={(e) => update('int4_convrot_awq_calibration', e.target.checked)} tooltip="Compute reusable AWQ-style input-channel scales before INT4 ConvRot quantization." />
+									<FormToggle label="Activation Calibration Only" fieldPath="training.int4_convrot_activation_calibration_only" checked={t.int4_convrot_activation_calibration_only ?? false} onchange={(e) => update('int4_convrot_activation_calibration_only', e.target.checked)} disabled={!t.int4_convrot_activation_calibration_report} tooltip="Write the activation report and exit before optimizer updates." />
+								</div>
+								<div class="grid grid-cols-3 gap-2">
+									<PathInput fieldPath="training.int4_convrot_awq_scales" value={t.int4_convrot_awq_scales || ''} oninput={(e) => update('int4_convrot_awq_scales', e.target.value)} showFiles tooltip="AWQ scales input, or output path while calibration is enabled." />
+									<FormField type="number" label="INT4 AWQ Alpha" fieldPath="training.int4_convrot_awq_alpha" value={t.int4_convrot_awq_alpha ?? 0.25} oninput={(e) => update('int4_convrot_awq_alpha', Number(e.target.value))} min={0} max={1} step="0.05" />
+									<PathInput fieldPath="training.int4_convrot_activation_calibration_report" value={t.int4_convrot_activation_calibration_report || ''} oninput={(e) => update('int4_convrot_activation_calibration_report', e.target.value)} tooltip="Activation-aware INT4 diagnostics JSON output path." />
+								</div>
+								<div class="grid grid-cols-4 gap-2">
+									<FormField type="number" label="Calibration Batches" fieldPath="training.int4_convrot_activation_calibration_batches" value={t.int4_convrot_activation_calibration_batches ?? 1} oninput={(e) => update('int4_convrot_activation_calibration_batches', Number(e.target.value))} min={1} />
+									<FormField label="Module Regex" fieldPath="training.int4_convrot_activation_calibration_regex" value={t.int4_convrot_activation_calibration_regex || ''} oninput={(e) => update('int4_convrot_activation_calibration_regex', e.target.value)} placeholder="Optional regex" />
+									<FormField type="number" label="Max Rows" fieldPath="training.int4_convrot_activation_calibration_max_rows" value={t.int4_convrot_activation_calibration_max_rows ?? 128} oninput={(e) => update('int4_convrot_activation_calibration_max_rows', Number(e.target.value))} min={0} />
+									<FormField type="number" label="Max Layers" fieldPath="training.int4_convrot_activation_calibration_max_layers" value={t.int4_convrot_activation_calibration_max_layers ?? 0} oninput={(e) => update('int4_convrot_activation_calibration_max_layers', Number(e.target.value))} min={0} tooltip="0 means all matched layers." />
+								</div>
 							</div>
 						</div>
 					</FormGroup>
@@ -981,6 +1009,7 @@
 							<FormField fieldPath="training.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile mode (default, reduce-overhead, max-autotune)" />
 							<FormSelect fieldPath="training.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Value for --compile_dynamic." />
 						</div>
+						<FormField fieldPath="training.inductor_config" value={t.inductor_config || ''} oninput={(e) => update('inductor_config', e.target.value)} placeholder="triton.cudagraphs=true ..." disabled={!t.compile || t.compile_backend !== 'inductor'} tooltip="Space- or comma-separated TorchInductor key=value overrides." />
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.cuda_memory_fraction" value={t.cuda_memory_fraction ?? ''} oninput={(e) => update('cuda_memory_fraction', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.05" min={0} max={1} tooltip="Limit CUDA memory fraction" />
 							<FormField type="number" fieldPath="training.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="torch.compile cache size limit" />
@@ -1122,7 +1151,29 @@
 							<FormField type="number" fieldPath="training.video_loss_weight" value={t.video_loss_weight ?? 1.0} oninput={(e) => update('video_loss_weight', Number(e.target.value))} step="0.1" tooltip="Video loss multiplier" />
 							<FormField type="number" fieldPath="training.audio_loss_weight" value={t.audio_loss_weight ?? 1.0} oninput={(e) => update('audio_loss_weight', Number(e.target.value))} step="0.1" tooltip="Audio loss multiplier" />
 						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField type="number" label="IC Reference Probability" fieldPath="training.ic_lora_ref_probability" value={t.ic_lora_ref_probability ?? 1.0} oninput={(e) => update('ic_lora_ref_probability', Number(e.target.value))} min={0} max={1} step="0.05" tooltip="Probability that an eligible sample uses its IC-LoRA reference when no conditioning recipe owns this setting." />
+							<FormField type="number" label="Reference Temporal Scale" fieldPath="training.reference_temporal_scale" value={t.reference_temporal_scale ?? 1} oninput={(e) => update('reference_temporal_scale', Number(e.target.value))} min={1} tooltip="Temporal scale applied to cached reference latents." />
+						</div>
 						<FormToggle fieldPath="training.preserve_audio_timing" checked={t.preserve_audio_timing ?? false} onchange={(e) => update('preserve_audio_timing', e.target.checked)} tooltip="Preserve original audio duration by skipping audio time-stretching and duration alignment." />
+					</div>
+				</FormGroup>
+
+				<FormGroup title="Diagnostics, Saving & EMA">
+					<div class="space-y-2 pt-2">
+						<div class="grid grid-cols-3 gap-2">
+							<FormSelect label="Save Precision" fieldPath="training.save_precision" value={t.save_precision || ''} options={[{value:'',label:'Trainer default'}, 'float', 'fp32', 'fp16', 'bf16']} onchange={(e) => update('save_precision', e.target.value || null)} tooltip="Precision used when saving network weights." />
+							<FormField type="number" label="EMA Decay" fieldPath="training.ema_decay" value={t.ema_decay ?? 0.9999} oninput={(e) => update('ema_decay', Number(e.target.value))} min={0} max={1} step="0.0001" disabled={!t.use_ema} />
+							<FormField type="number" label="EMA Start Step" fieldPath="training.ema_update_after_step" value={t.ema_update_after_step ?? 100} oninput={(e) => update('ema_update_after_step', Number(e.target.value))} min={0} disabled={!t.use_ema} />
+							<FormField type="number" label="EMA Update Every" fieldPath="training.ema_update_every" value={t.ema_update_every ?? 1} oninput={(e) => update('ema_update_every', Number(e.target.value))} min={1} disabled={!t.use_ema} />
+						</div>
+						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+							<FormToggle label="EMA" fieldPath="training.use_ema" checked={t.use_ema ?? false} onchange={(e) => update('use_ema', e.target.checked)} tooltip="Maintain EMA adapter weights for validation and saving." />
+							<FormToggle label="Save EMA Only" fieldPath="training.save_ema_only" checked={t.save_ema_only ?? false} onchange={(e) => update('save_ema_only', e.target.checked)} disabled={!t.use_ema} />
+							<FormToggle label="EMA CPU Offload" fieldPath="training.ema_cpu_offload" checked={t.ema_cpu_offload ?? false} onchange={(e) => update('ema_cpu_offload', e.target.checked)} disabled={!t.use_ema} />
+							<FormToggle label="Log Gradient Metrics" fieldPath="training.log_grad_metrics" checked={t.log_grad_metrics ?? false} onchange={(e) => update('log_grad_metrics', e.target.checked)} tooltip="Log pre-clipping gradient norm metrics; adds a small synchronization cost." />
+							<FormToggle label="Debug Dataset" fieldPath="training.debug_dataset" checked={t.debug_dataset ?? false} onchange={(e) => update('debug_dataset', e.target.checked)} tooltip="Run the trainer's dataset debug path." />
+						</div>
 					</div>
 				</FormGroup>
 

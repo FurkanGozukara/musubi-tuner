@@ -68,7 +68,7 @@ from musubi_tuner.training.step_control import (
 )
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
-from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
+from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser, warn_if_h2d_only_ignored
 from musubi_tuner.ltx2_model_parallel import (
     add_ltx2_model_parallel_args,
     clip_grad_norm_model_parallel,
@@ -3749,6 +3749,7 @@ def main() -> None:
 
     # model
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
+    warn_if_h2d_only_ignored(args)
     if blocks_to_swap > 0 and bool(getattr(args, "block_swap_h2d_only", False)):
         raise ValueError(
             "--block_swap_h2d_only is only supported for LTX-2/2.3 LoRA-style frozen-base training. "

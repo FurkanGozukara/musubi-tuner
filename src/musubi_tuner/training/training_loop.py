@@ -394,8 +394,6 @@ def train(self, args):
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, "
                 f"use pinned memory: {use_pinned_memory}"
             )
-            if getattr(args, "block_swap_h2d_only", False):
-                logger.warning("--block_swap_h2d_only is not supported by this transformer's block swap implementation.")
             transformer.enable_block_swap(
                 blocks_to_swap,
                 accelerator.device,

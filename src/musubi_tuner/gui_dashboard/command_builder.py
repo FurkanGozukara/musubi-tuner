@@ -378,6 +378,50 @@ def _append_h2d_block_swap_args(cmd: list[str], settings) -> None:
         cmd += ["--block_swap_ring_size", str(ring_size)]
 
 
+def _append_advanced_cli_args(cmd: list[str], settings) -> None:
+    """Append persisted advanced flags shared by LoRA and full-FT commands."""
+    if getattr(settings, "debug_dataset", False):
+        cmd.append("--debug_dataset")
+    if getattr(settings, "save_precision", None):
+        cmd += ["--save_precision", str(settings.save_precision)]
+    if getattr(settings, "log_grad_metrics", False):
+        cmd.append("--log_grad_metrics")
+
+    if getattr(settings, "int4_convrot_awq_calibration", False):
+        cmd.append("--int4_convrot_awq_calibration")
+    if getattr(settings, "int4_convrot_awq_scales", ""):
+        cmd += ["--int4_convrot_awq_scales", str(settings.int4_convrot_awq_scales)]
+    if float(getattr(settings, "int4_convrot_awq_alpha", 0.25)) != 0.25:
+        cmd += ["--int4_convrot_awq_alpha", str(settings.int4_convrot_awq_alpha)]
+    if getattr(settings, "int4_convrot_activation_calibration_report", ""):
+        cmd += [
+            "--int4_convrot_activation_calibration_report",
+            str(settings.int4_convrot_activation_calibration_report),
+        ]
+    if int(getattr(settings, "int4_convrot_activation_calibration_batches", 1)) != 1:
+        cmd += [
+            "--int4_convrot_activation_calibration_batches",
+            str(settings.int4_convrot_activation_calibration_batches),
+        ]
+    if getattr(settings, "int4_convrot_activation_calibration_regex", ""):
+        cmd += [
+            "--int4_convrot_activation_calibration_regex",
+            str(settings.int4_convrot_activation_calibration_regex),
+        ]
+    if int(getattr(settings, "int4_convrot_activation_calibration_max_rows", 128)) != 128:
+        cmd += [
+            "--int4_convrot_activation_calibration_max_rows",
+            str(settings.int4_convrot_activation_calibration_max_rows),
+        ]
+    if int(getattr(settings, "int4_convrot_activation_calibration_max_layers", 0)) != 0:
+        cmd += [
+            "--int4_convrot_activation_calibration_max_layers",
+            str(settings.int4_convrot_activation_calibration_max_layers),
+        ]
+    if getattr(settings, "int4_convrot_activation_calibration_only", False):
+        cmd.append("--int4_convrot_activation_calibration_only")
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
@@ -1019,6 +1063,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
 
     # Model
     cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
+    if t.vae:
+        cmd += ["--vae", t.vae]
     if gemma_root:
         cmd += ["--gemma_root", gemma_root]
     if gemma_safetensors:
@@ -1943,6 +1989,20 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     _append_dataloader_args(cmd, t)
     _append_ltx2_conditioning(cmd, t, config)
 
+    if t.use_ema:
+        cmd.append("--use_ema")
+        if t.ema_decay != 0.9999:
+            cmd += ["--ema_decay", str(t.ema_decay)]
+        if t.ema_update_after_step != 100:
+            cmd += ["--ema_update_after_step", str(t.ema_update_after_step)]
+        if t.ema_update_every != 1:
+            cmd += ["--ema_update_every", str(t.ema_update_every)]
+        if t.save_ema_only:
+            cmd.append("--save_ema_only")
+        if t.ema_cpu_offload:
+            cmd.append("--ema_cpu_offload")
+    _append_advanced_cli_args(cmd, t)
+
     cmd += _split_cli_args(t.extra_args)
     return cmd
 
@@ -1971,6 +2031,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
 
     # Model
     cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
+    if t.vae:
+        cmd += ["--vae", t.vae]
     if gemma_root:
         cmd += ["--gemma_root", gemma_root]
     if gemma_safetensors:
@@ -2182,6 +2244,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--int8_weights_convrot", str(t.int8_weights_convrot)]
         if getattr(t, "int8_weights_w8a8", False):
             cmd.append("--int8_weights_w8a8")
+        if getattr(t, "int8_weights_prequant", ""):
+            cmd += ["--int8_weights_prequant", str(t.int8_weights_prequant)]
 
     if getattr(t, "preserve_audio_timing", False):
         cmd.append("--preserve_audio_timing")
@@ -2460,6 +2524,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--noise_scale_probe_rounds", str(t.noise_scale_probe_rounds)]
         if t.noise_scale_probe_param_frac != 1.0:
             cmd += ["--noise_scale_probe_param_frac", str(t.noise_scale_probe_param_frac)]
+
+    _append_advanced_cli_args(cmd, t)
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
