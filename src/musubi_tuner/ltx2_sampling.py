@@ -2426,7 +2426,7 @@ class LTX2SamplingMixin:
                         logger.warning("Sampling: failed to log image to TensorBoard: %s", exc)
             else:
                 video_path = os.path.join(save_dir, save_path) + ".mp4"
-                save_videos_grid(video, video_path)
+                save_videos_grid(video, video_path, fps=int(round(sample_parameter.get("frame_rate", 24))))
                 if wandb_tracker is not None and wandb is not None:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
                 if tb_writer is not None:
