@@ -917,8 +917,8 @@ def load_video(
     """
     bucket_reso: if given, resize the video to the bucket resolution, (width, height)
     """
-    # --- opt-in alternate decode backend (env LTX2_VIDEO_DECODE_BACKEND; default 'pyav' = no-op).
-    #     Any failure transparently falls back to the PyAV path below, so this never breaks a run. ---
+    # Opt-in alternate decode backend (env LTX2_VIDEO_DECODE_BACKEND; default 'pyav' = no-op).
+    # An alternate-backend exception is logged and retried through the PyAV path below.
     from musubi_tuner.dataset.video_decode import get_video_decode_backend, load_video_alt
 
     _vb = get_video_decode_backend()

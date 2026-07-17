@@ -49,7 +49,6 @@ at::Tensor rms_norm_split_rope(
     int n = cos_freqs.size(1);
     int d = h / n;
 
-    
     // Require a contiguous innermost (d/2) dim for the vectorized int4 freq load,
     // but keep the outer (b, n, s) strides: apply_split_rotary_emb hands us a
     // swapaxes view (logical [b, n, s, d/2], physical [b, s, n, d/2]) whose inner
@@ -69,7 +68,7 @@ at::Tensor rms_norm_split_rope(
     } else {
         out = torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     }
-    
+
     // Setup CUDA
     at::cuda::CUDAGuard device_guard{(char)x.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();

@@ -1,22 +1,17 @@
-"""Differentiable (``kind == "differentiable"``) reward templates for the ``--rl_loss refl`` backend.
+"""Differentiable rewards registered for the ``--rl_loss refl`` backend.
 
 Unlike the black-box zoo rewards (which return detached Python floats scored on decoded media), a
 differentiable reward implements ``score_grad(samples) -> (Tensor[N], info)`` returning a grad-carrying
-per-sample reward tensor. The refl backend backprops ``-reward_weight * reward.mean()`` straight
-through the sampler's last denoising step (and, for a pixel reward, the VAE decode) into the LoRA.
+per-sample reward tensor. The refl backend backprops through one final denoising step into the LoRA.
 
 Two templates:
 
-* ``latent_energy`` — **latent-space**, ``needs=frozenset()`` (NO VAE decode). Scores a high-pass
-  energy proxy on the grad-carrying denoised latent ``sample["video_x0"]``. This is the reward to
-  copy for any target computable directly from the latent, and it makes the whole ReFL loop testable
-  without a decoder. Higher = more latent high-frequency detail (an anti-blur / anti-collapse proxy).
-* ``pixel_sharpness`` — **pixel-space**, ``needs={"video"}``. Differentiable Laplacian energy over the
-  grad-carrying decoded frames ``sample["video"]``. This is the pattern a real perceptual reward
-  (e.g. a face-embedding distance) follows; it requires the ReFL loop to decode the latent in-graph.
+* ``latent_energy`` is the runnable latent-space example and needs no VAE decode.
+* ``pixel_sharpness`` defines the pixel-space reward interface, but the ReFL driver currently rejects
+  it because in-graph LTX-2 video decoding has not been implemented or validated there.
 
-Both also implement the plain ``score`` (detached) so they double as ordinary eval metrics / blackbox
-rewards. Copy either, rename the class + ``@register_reward`` name, and swap in your target.
+Both also implement detached ``score`` methods. A custom ReFL reward is currently runnable only when
+its ``needs`` set does not request decoded video or audio.
 """
 
 from __future__ import annotations
@@ -87,7 +82,7 @@ class LatentEnergyReward(BaseReward):
 
 @register_reward("pixel_sharpness")
 class PixelSharpnessReward(BaseReward):
-    """Decoded-pixel Laplacian sharpness — differentiable ReFL template (requires in-graph decode)."""
+    """Pixel-space interface example; unavailable in ReFL until in-graph decode is implemented."""
 
     kind = "differentiable"
     route = "video"

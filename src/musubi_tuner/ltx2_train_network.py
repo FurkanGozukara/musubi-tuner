@@ -3480,8 +3480,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
-        # --- W4A4G4 / W4A8: resolve the INT4 ConvRot mode flags --------------------------
-        # --w4a4g4 (W4A4G4) and --w4a8 are the two peer activation-precision flags;
+        # --- W4A4G4 / W4A4G8 / W4A8: resolve the INT4 ConvRot mode flags -----------------
+        # The three peer flags select activation/gradient precision;
         # --w4a4g4_container selects the frozen-base format (int4 / nvfp4). The checkpoint type is
         # auto-detected (converter-produced prepack -> base load path; plain bf16/fp16 -> on-the-fly
         # dynamic path) and the expert gates are resolved once here, before model load / first gate
@@ -3503,7 +3503,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if sum((_w4a4g4, _w4a8, _w4a4g8)) > 1:
             raise ValueError("--w4a4g4, --w4a8 and --w4a4g8 are mutually exclusive; pick one INT4 ConvRot activation/gradient mode")
         if _container != "auto" and not (_w4a4g4 or _w4a8 or _w4a4g8):
-            raise ValueError("--w4a4g4_container requires --w4a4g4 (--w4a8/--w4a4g8 are int4-only)")
+            raise ValueError("--w4a4g4_container requires --w4a4g4, --w4a4g8 or --w4a8")
         if (_w4a8 or _w4a4g8) and _container == "nvfp4":
             _int4only_flag = "--w4a8" if _w4a8 else "--w4a4g8"
             raise ValueError(
@@ -3621,7 +3621,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # NOTE: nvfp4_training_base is intentionally NOT in this dict — it is an internal attr set by
         # the nvfp4 container above, so listing it would double-count against the --w4a4g4 entry and
         # raise a false "mutually exclusive" error. Real nvfp4-vs-other conflicts are caught by the
-        # --w4a4g4/--w4a8 conflict loop above.
+        # --w4a4g4/--w4a4g8/--w4a8 conflict loop above.
         _quantized_base_flags = {
             "--int8_base": _int8_base,
             "--int8_base_dynamic": _int8_dynamic,

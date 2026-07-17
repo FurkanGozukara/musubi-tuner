@@ -974,13 +974,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--w4a4g4",
         action="store_true",
         help=(
-            "W4A4G4 training: the one-stop INT4 ConvRot mode with fully 4-bit activations/gradients "
-            "(W4A4), a native INT4 tensor-core backend, and fused CUDA + triple-branch LoRA paths, "
-            "all implied by this one flag. "
+            "Experimental W4A4G4 INT4 ConvRot LoRA training with 4-bit activations and gradients. "
+            "For the int4 container this selects the CUTLASS backend and requests the fused CUDA and "
+            "eligible plain-LoRA paths; CUTLASS headers and a working CUDA extension toolchain are required. "
             "Auto-detects the checkpoint passed as --ltx2_checkpoint: a converter-produced int4cr "
             "checkpoint loads its packed INT4 directly, a plain bf16/fp16 checkpoint is quantized on "
-            "the fly. Requires LoRA training. The four LTX2_INT4_CONVROT_* env vars remain expert "
-            "overrides (env wins). Mutually exclusive with --w4a8 and other quantized-base modes."
+            "the fly. Requires LoRA training. The LTX2_INT4_CONVROT_* env vars remain expert "
+            "overrides (env wins). Mutually exclusive with --w4a8, --w4a4g8 and other quantized-base modes."
         ),
     )
     parser.add_argument(
@@ -990,8 +990,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "W4A8 INT4 ConvRot training: 4-bit weights with 8-bit activations. "
             "Same checkpoint auto-detect as --w4a4g4 (converter-produced int4cr "
             "loads directly; bf16/fp16 is quantized on the fly). Uses the default backend routing "
-            "and no implied fusion gates. Requires LoRA training. Mutually exclusive with --w4a4g4 "
-            "and other quantized-base modes."
+            "and no implied fusion gates. Requires LoRA training. Mutually exclusive with --w4a4g4, "
+            "--w4a4g8 and other quantized-base modes."
         ),
     )
     parser.add_argument(
@@ -1012,7 +1012,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=None,
         help=(
-            "Rank of the frozen low-rank SVD stabilizer split off each weight when --w4a4g4 quantizes "
+            "Rank of the frozen low-rank SVD stabilizer split off each weight when --w4a4g4/--w4a4g8 quantizes "
             "a bf16/fp16 checkpoint on the fly. The effective default depends on --w4a4g4_container: int4 -> 0 "
             "(the ConvRot rotation already tames outliers), nvfp4 -> 32 (no rotation, so a stabilizer is used). "
             "Pass an explicit value to override either. Ignored when a pre-quantized checkpoint is passed "
@@ -1028,10 +1028,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Frozen-backbone container (numeric format) for --w4a4g4. "
             "'auto' (default) detects it from --ltx2_checkpoint: a converter-produced int4cr checkpoint -> int4, "
             "a converter-produced NVFP4 checkpoint -> nvfp4, a plain bf16/fp16 checkpoint -> int4. "
-            "'int4' uses the INT4 tensor-core backend with ConvRot Hadamard rotation (runs on INT4-capable GPUs). "
-            "'nvfp4' uses NVFP4 E2M1 with no rotation (Blackwell scaled-MMA fast path, "
-            "compute capability >= 10.0, emulated on other GPUs). Both run the same triple-branch W4A4G4 training. "
-            "Only meaningful with --w4a4g4; --w4a8 is int4-only."
+            "'int4' uses ConvRot Hadamard rotation; W4A4 modes select the CUTLASS extension and require its headers. "
+            "'nvfp4' uses NVFP4 E2M1 with no rotation. Auto may select the experimental, hardware-unvalidated "
+            "Triton scaled-MMA path on compute capability >= 10.0; other devices use functional emulation. "
+            "Only meaningful with a W4 mode; --w4a8 and --w4a4g8 are int4-only."
         ),
     )
     parser.add_argument(
@@ -1148,7 +1148,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="e4m3",
         choices=["e4m3", "e5m2"],
-        help="FP8 format for gradients. e4m3 (default) is more accurate; e5m2 has wider range (safer against gradient spikes).",
+        help="FP8 format for gradients. e4m3 (default) has more mantissa bits; e5m2 has a wider exponent range.",
     )
     parser.add_argument(
         "--fp8_gemm_min_numel",
@@ -1160,16 +1160,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--fp8_gemm_compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Region-compile the FP8 GEMM (torch.compile) to fuse the per-tensor scaling. "
-        "On by default; ~halves the FP8 GEMM step time with no quality change. Use --no-fp8_gemm_compile to disable.",
+        help="Request torch.compile for the FP8 GEMM region (enabled by default). Compilation failure is logged and "
+        "uses the eager FP8 implementation. Use --no-fp8_gemm_compile to disable.",
     )
     parser.add_argument(
         "--fp8_gemm_scaling",
         type=str,
         default="tensor",
         choices=["tensor", "rowwise"],
-        help="FP8 scaling granularity for --fp8_gemm: tensor (per-tensor dynamic scale) or rowwise "
-        "(per-row dynamic scales via torch._scaled_mm rowwise support; better numerics on Hopper, requires torch>=2.5).",
+        help="FP8 scaling granularity for --fp8_gemm: tensor uses one dynamic scale per tensor; rowwise passes "
+        "per-row/per-column scales to private torch._scaled_mm support, which depends on the installed PyTorch build.",
     )
     parser.add_argument(
         "--int8_weights",

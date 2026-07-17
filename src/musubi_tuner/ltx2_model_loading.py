@@ -925,8 +925,8 @@ def load_comfy_int4_convrot_state_dict(
                     if bool(cfg.get("convrot", True)):
                         convrot += 1
                     else:
-                        # No-rotation layer: mark it so the runtime skips the online
-                        # Hadamard rotation. Rotated layers add no buffer and stay byte-identical.
+                        # No-rotation layer: mark it so the runtime skips the online Hadamard
+                        # rotation. Absence of this buffer retains the established rotated default.
                         sd[base + ".int4_rotation"] = torch.tensor(0, dtype=torch.int32)
                     continue
                 if (
@@ -937,7 +937,7 @@ def load_comfy_int4_convrot_state_dict(
                 ):
                     raise ValueError(
                         f"{key} looks like a scaled FP8 weight, not an INT4 ConvRot weight. "
-                        "Pass a bf16/fp16 checkpoint (--w4a4g4/--w4a8 auto-detect the on-the-fly dynamic path), "
+                        "Pass a bf16/fp16 checkpoint (--w4a4g4/--w4a4g8/--w4a8 auto-detect the on-the-fly dynamic path), "
                         "or a converter-produced INT4 ConvRot checkpoint with .int4_shape/.comfy_quant metadata."
                     )
                 if value.is_floating_point() and non_quant_dtype is not None:

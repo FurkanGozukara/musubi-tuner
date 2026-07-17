@@ -498,15 +498,16 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["pyav", "decord", "torchcodec"],
-        help="Video decoder for caching. pyav = default/unchanged; decord = GIL-releasing CPU (~2.8x); "
-        "torchcodec = NVDEC/GPU. Overrides env LTX2_VIDEO_DECODE_BACKEND. Any failure falls back to pyav.",
+        help="Video decoder for caching. pyav keeps the default path; decord and torchcodec batch-decode selected "
+        "frames and require their optional dependencies. Overrides LTX2_VIDEO_DECODE_BACKEND. An alternate-backend "
+        "decode error is logged before retrying with pyav.",
     )
     parser.add_argument(
         "--video_decode_device",
         type=str,
         default=None,
         choices=["cpu", "cuda"],
-        help="Device for the torchcodec decode backend (cuda = NVDEC hardware decode). Default cpu.",
+        help="Device passed to torchcodec's VideoDecoder. CUDA support depends on the installed torchcodec/FFmpeg build. Default cpu.",
     )
     return parser
 

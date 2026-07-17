@@ -54,9 +54,8 @@ try:
 
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    # cuDNN attention first, with fallback for masked / unsupported shapes. cuDNN is the
-    # fastest SDPA backend on Hopper and the only fast one on Windows (Windows torch wheels
-    # ship no flash backend).
+    # Ask PyTorch to try cuDNN first, then its flash, efficient, and math SDPA backends.
+    # Actual availability and selection are shape-, build-, and hardware-dependent.
     _CUDNN_SDPA_ORDER = [
         SDPBackend.CUDNN_ATTENTION,
         SDPBackend.FLASH_ATTENTION,
@@ -98,7 +97,7 @@ _warned_cudnn_unavailable = False
 
 def _cudnn_attention_callable_explicit() -> "AttentionCallable":
     """Return the cuDNN-prioritized SDPA callable for the explicit --cudnn_attn path.
-    Falls back to plain SDPA (never crashes) when sdpa_kernel priority is unavailable."""
+    Falls back to plain SDPA when sdpa_kernel priority is unavailable."""
     global _cudnn_explicit_logged, _warned_cudnn_unavailable
     if SDPBackend is None or not _SDPA_HAS_SET_PRIORITY:
         if not _warned_cudnn_unavailable:
@@ -144,10 +143,11 @@ class PytorchAttention(AttentionCallable):
 
 
 class PytorchCudnnAttention(AttentionCallable):
-    """SDPA with the cuDNN attention backend prioritized (flash/efficient/math fallback for
-    masked or unsupported paths). Opt-in via LTX2_SDPA_CUDNN=1. Numerically equivalent to
-    PytorchAttention (cos ~1.0); faster on Hopper and on Windows, where no flash SDPA
-    backend exists."""
+    """SDPA with cuDNN prioritized and other PyTorch SDPA backends retained as fallbacks.
+
+    The priority context is used outside ``torch.compile``. During compilation this calls ordinary
+    SDPA because the priority context is not Dynamo-traceable; PyTorch then selects the backend.
+    """
 
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None

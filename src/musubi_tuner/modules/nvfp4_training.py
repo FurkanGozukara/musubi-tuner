@@ -414,8 +414,8 @@ def quantize_nvfp4_training_tensor(
 ) -> tuple[dict[str, torch.Tensor], NVFP4LayerQuality | None]:
     """Quantize one weight to the converter's NVFP4 state-dict entries (suffix -> tensor).
 
-    Shared by ``ltx2_quantize_nvfp4`` and the on-the-fly load path so both produce byte-identical
-    buffers for the same weight, ``stabilizer_rank``, ``calc_device`` and RNG state. Returns the
+    Shared by ``ltx2_quantize_nvfp4`` and the on-the-fly load path. Matching inputs, options,
+    device behavior, and RNG state traverse the same quantization routine. Returns the
     per-layer entries keyed by suffix (``.weight`` for the packed residual) plus optional quality.
     """
     stabilizer = None
@@ -995,10 +995,10 @@ def load_safetensors_dynamic_nvfp4_training(
 ) -> dict[str, torch.Tensor]:
     """Stream a bf16/fp16 checkpoint and quantize targeted Linear weights to packed NVFP4.
 
-    Produces exactly the state-dict entries the offline ``ltx2_quantize_nvfp4`` converter would
+    Produces the same state-dict schema as the offline ``ltx2_quantize_nvfp4`` converter
     (packed E2M1 residual + tile/tensor scales + shape + optional stabilizer), keyed in the
-    original checkpoint namespace, so register/monkey-patch/runtime are identical to loading a
-    pre-quantized checkpoint. Weights are processed one tensor at a time (no full bf16 model in
+    original checkpoint namespace. Matching tensor values also require matching inputs, options,
+    device behavior, and RNG state. Weights are processed one tensor at a time (no full bf16 model in
     memory); FP8 source weights are dequantized with their ``.weight_scale`` first.
     """
     from tqdm import tqdm

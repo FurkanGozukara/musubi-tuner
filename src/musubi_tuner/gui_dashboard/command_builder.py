@@ -3123,7 +3123,7 @@ def build_rl_train_cmd(config: ProjectConfig) -> list[str]:
     if rl_loss == "dpo" and rl.dpo_beta != 5.0:
         cmd += ["--dpo_beta", str(rl.dpo_beta)]
     if _refl:
-        # differentiable-reward backprop: online-only; reuses --nft_kl_beta as the base-policy anchor.
+        # Differentiable-reward backprop: online-only; --nft_kl_beta weights reference-x0 MSE.
         if rl.refl_grad_steps != 1:
             cmd += ["--refl_grad_steps", str(rl.refl_grad_steps)]
         if rl.refl_renoise_samples != 1:

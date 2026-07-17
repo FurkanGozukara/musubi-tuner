@@ -111,7 +111,7 @@ def load_video_alt(
     fps_threshold: float,
     backend: Optional[str] = None,
 ) -> Optional[list[np.ndarray]]:
-    """Opt-in fast decode -> list of HWC RGB uint8 frames resized to bucket.
+    """Opt-in alternate decode -> list of HWC RGB uint8 frames resized to bucket.
 
     Returns None to signal the caller to use the PyAV path (backend disabled, or a non-file path).
     Raises on decode error so the caller can catch and fall back to PyAV.

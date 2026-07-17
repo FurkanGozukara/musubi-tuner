@@ -1,32 +1,14 @@
-"""Differentiable-reward optimization for LTX-2 RL (``--rl_loss refl``).
+"""Online, differentiable-reward training for the LTX-2 video path.
 
-The fifth ``--rl_loss`` backend, and the only one that is NOT policy-gradient. nft/rwr/dpo/ppo treat
-the reward as a black-box scalar (score rollouts, estimate an advantage, do a policy-gradient step).
-This backend instead assumes the reward is DIFFERENTIABLE and backprops it directly:
+This backend performs one differentiable denoising step from a re-noised, detached rollout latent,
+then maximizes a ``kind == "differentiable"`` reward. ``--refl_renoise_samples`` repeats that
+single-step estimate with fresh noise and averages the losses. Only latent-space rewards are runnable:
+the in-graph video decoder deliberately raises until its decode contract has been implemented and
+validated.
 
-    maximize  E[ reward( decode( denoise(z) ) ) ]
-
-i.e. the reward gradient flows through the denoiser (and, for a pixel reward, the decoder) into the
-LoRA. This is the generic mechanism; it is reward-agnostic — any reward that implements the
-registry's ``score_grad`` (``kind == "differentiable"``) can drive it (latent detail, aesthetic,
-face/subject similarity, style, ...). It is NOT tied to a specific paper's recipe; the differentiable
-reward and the truncation depth below are the only knobs.
-
-Two generic knobs control the cost/variance of the reward gradient:
-
-  * ``--refl_grad_steps N`` (default 1): how many of the FINAL denoising steps carry the gradient.
-    The reward-relevant detail is decided at low sigma, so the gradient is truncated to the last N
-    steps for cost. N=1 backprops the single final step.
-  * ``--refl_renoise_samples M`` (default 1): re-noise the denoised latent to the final step M times
-    and average the reward gradient (variance reduction). M>1 requires ``--refl_grad_steps 1``.
-
-Regularization is generic too: a base-policy KL anchor (``--nft_kl_beta``, reused) keeps the policy
-near the frozen base and is the main guard against reward-hacking; ``--refl_reward_weight`` scales the
-reward term against it.
-
-Non-differentiable rewards (VLM judges: hpsv3, videoreward, videoscore2) cannot be backpropped and
-stay on the policy-gradient rules — the registry's ``kind`` field partitions the reward space between
-this backend and nft/rwr/dpo/ppo. Only reached when ``--rl_loss refl``; every other path is unchanged.
+The optional reference term is mean-squared error between the policy and LoRA-disabled denoised
+latents. Its coefficient reuses the historically named ``--nft_kl_beta`` flag; it is not a measured
+KL divergence. Non-differentiable rewards remain available only to the policy-gradient update rules.
 """
 
 from __future__ import annotations
@@ -46,60 +28,51 @@ def compute_refl_loss(
     ref_x0: Optional[torch.Tensor],
     *,
     reward_weight: float,
-    kl_beta: float,
+    anchor_beta: float,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Reward-maximization loss with a base-policy KL anchor (reward-agnostic).
+    """Reward-maximization loss with an optional reference-x0 MSE term.
 
     Args:
         reward:   ``[K]`` grad-carrying per-sample reward (higher-is-better) from a differentiable reward.
         fwd_x0:   ``[K, ...]`` grad-carrying denoised latent from the policy (LoRA-on) forward.
         ref_x0:   ``[K, ...]`` DETACHED denoised latent from the frozen base (LoRA-off) forward, or None.
         reward_weight: scale on the (maximized) reward term.
-        kl_beta:  scale on the ``E||fwd_x0 - ref_x0||^2`` anchor keeping the policy near the base.
+        anchor_beta: scale on ``E||fwd_x0 - ref_x0||^2``.
 
-    Returns ``(loss, info)`` — ``loss`` is minimized: ``-reward_weight * mean(reward) + kl_beta * KL``.
+    Returns ``(loss, info)``. The minimized value is the negative mean reward plus the weighted MSE.
     """
     reward_term = -float(reward_weight) * reward.float().mean()
-    if ref_x0 is not None and float(kl_beta) != 0.0:
+    if ref_x0 is not None and float(anchor_beta) != 0.0:
         reduce = tuple(range(1, fwd_x0.dim()))
-        kl = ((fwd_x0.float() - ref_x0.float()) ** 2).mean(dim=reduce).mean()
+        anchor_mse = ((fwd_x0.float() - ref_x0.float()) ** 2).mean(dim=reduce).mean()
     else:
-        kl = torch.zeros((), device=fwd_x0.device, dtype=torch.float32)
-    loss = reward_term + float(kl_beta) * kl
+        anchor_mse = torch.zeros((), device=fwd_x0.device, dtype=torch.float32)
+    loss = reward_term + float(anchor_beta) * anchor_mse
     info = {
         "policy": reward_term.detach(),
-        "kl": kl.detach(),
+        "anchor_mse": anchor_mse.detach(),
         "reward": reward.detach().float().mean(),
     }
     return loss, info
 
 
 def _final_step_sigmas(sigmas: torch.Tensor, grad_steps: int) -> torch.Tensor:
-    """The ``grad_steps`` smallest (final) positive sigmas of a rollout's schedule, clamped.
-
-    The gradient is truncated to the last few denoising steps (small sigma = near-clean = where the
-    reward-relevant detail is decided); grad_steps=1 (default) uses the single final step.
-    """
+    """Return the requested smallest positive sigmas, clamped away from zero."""
     s = sigmas.reshape(-1).clamp_min(1e-4)
     k = max(1, min(int(grad_steps), s.numel()))
     return torch.topk(s, k, largest=False).values  # k smallest
 
 
 def decode_latent_for_reward(net_trainer, vae, latent: torch.Tensor):
-    """Decode a denoised latent ``[K,C,F,H,W]`` to grad-carrying pixels ``[K,C,T,H,W]`` in [0,1].
+    """Placeholder for a differentiable latent-to-pixel decode.
 
-    Pixel-space rewards (``needs`` contains "video") backprop through this. The exact
-    de-normalization + tiled-decode contract must match the sampler's own decode; that has not yet
-    been validated on-GPU, so this raises rather than risk silently-wrong gradients. Latent-space
-    differentiable rewards (``needs=frozenset()``, e.g. ``latent_energy``) do NOT hit this path and
-    are fully functional today.
+    Pixel-space ReFL rewards are unavailable because this function is not implemented. Latent-space
+    differentiable rewards (``needs=frozenset()``, such as ``latent_energy``) do not call it.
     """
     raise NotImplementedError(
-        "pixel-space differentiable rewards (needs={'video'}) require an in-graph VAE decode whose "
-        "de-normalization/tiling must be validated bit-for-bit against the sampler decode on-GPU "
-        "(workbox). It is intentionally not shipped unverified. For now use a latent-space "
-        "differentiable reward (e.g. latent_energy, needs=frozenset()), or optimize the pixel reward "
-        "with a policy-gradient rule (--rl_loss nft/rwr/dpo/ppo). See LTX2_REFL_SPEC for the decode plan."
+        "pixel-space differentiable rewards (needs={'video'}) are unavailable because an in-graph "
+        "LTX-2 VAE decode is not implemented. Use a latent-space differentiable reward such as "
+        "latent_energy, or use nft/rwr/dpo/ppo with a separately scored pixel-space reward."
     )
 
 
@@ -137,11 +110,9 @@ def run_refl(
     grad_steps = int(getattr(args, "refl_grad_steps", 1) or 1)
     renoise_samples = int(getattr(args, "refl_renoise_samples", 1) or 1)
     reward_weight = float(getattr(args, "refl_reward_weight", 1.0))
-    kl_beta = float(getattr(args, "nft_kl_beta", 1e-4))
-    if renoise_samples > 1 and grad_steps != 1:
-        # Re-noise averaging is the single-final-step variant. Backprop through >1 real trajectory
-        # steps is a separate strategy (not implemented here); refuse the ambiguous combo loudly.
-        raise ValueError("--refl_renoise_samples > 1 requires --refl_grad_steps 1 (re-noise is the single-final-step variant)")
+    anchor_beta = float(getattr(args, "nft_kl_beta", 1e-4))
+    if grad_steps != 1:
+        raise ValueError("--refl_grad_steps currently supports only 1; multi-step differentiable denoising is not implemented")
 
     frame_rate = float(getattr(args, "frame_rate", 24.0))
     num_steps = int(getattr(args, "sample_steps", 20) or 20)
@@ -197,11 +168,11 @@ def run_refl(
         tb_writer = SummaryWriter(os.path.join(args.logging_dir, args.output_name or "ltx2_refl"))
 
     logger.info(
-        "ReFL (differentiable reward): grad_steps=%d renoise=%d reward_weight=%.4g kl_beta=%.4g reward=%s pixels=%s",
+        "ReFL (differentiable reward): grad_steps=%d renoise=%d reward_weight=%.4g anchor_beta=%.4g reward=%s pixels=%s",
         grad_steps,
         renoise_samples,
         reward_weight,
-        kl_beta,
+        anchor_beta,
         args.reward_fn,
         needs_pixels,
     )
@@ -248,7 +219,7 @@ def run_refl(
 
         # 2) re-noise to a final-step sigma, one grad forward, decode/score the reward, KL, backward.
         acc_loss = None
-        acc_info = {"policy": 0.0, "kl": 0.0, "reward": 0.0}
+        acc_info = {"policy": 0.0, "anchor_mse": 0.0, "reward": 0.0}
         for it in range(renoise_samples):
             sigma = final_sigmas[it % final_sigmas.numel()].expand(k)  # [K]
             sigma_b = sigma.view(k, *([1] * (x0.dim() - 1)))
@@ -256,7 +227,7 @@ def run_refl(
             noise = torch.randn_like(x0)
             xt = (1.0 - sigma_b) * x0 + sigma_b * noise  # rectified-flow noising to the final step
 
-            # frozen-base (LoRA-off) reference for the KL anchor
+            # Frozen-base (LoRA-off) reference for the reference-x0 MSE term.
             if blocks_to_swap > 0:
                 unwrapped.switch_block_swap_for_inference()
             with torch.no_grad():
@@ -280,7 +251,13 @@ def run_refl(
                     media[j]["video"] = pixels[j]
 
             reward, r_info = reward_stack.score_grad(media)  # [K] grad
-            loss, info = compute_refl_loss(reward, fwd_x0, ref_x0, reward_weight=reward_weight, kl_beta=kl_beta)
+            loss, info = compute_refl_loss(
+                reward,
+                fwd_x0,
+                ref_x0,
+                reward_weight=reward_weight,
+                anchor_beta=anchor_beta,
+            )
             acc_loss = loss if acc_loss is None else acc_loss + loss
             for key in acc_info:
                 acc_info[key] += float(info[key])

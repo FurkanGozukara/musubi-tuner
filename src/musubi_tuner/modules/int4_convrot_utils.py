@@ -40,14 +40,14 @@ _CUTLASS_INT4_TRANSPOSE_CACHE_BYTES = 0
 _INT_MM_MIN_CUDA_CAPABILITY = (7, 5)
 
 # W4A4G4 / W4A8 mode-flag gate overrides (set by configure_int4cr_training_defaults for
-# --w4a4g4 / --w4a8). Both stay None unless a mode flag runs the setter, so every gate reads
-# its environment variable exactly as before and the entire int4cr path is byte-identical
-# unless a mode flag is passed. An explicitly-set env var always wins over these overrides.
+# --w4a4g4 / --w4a8). Both stay None unless a mode flag runs the setter, so the existing
+# environment/default resolution remains active when no mode flag is passed. An explicitly-set
+# environment variable always wins over these overrides.
 _INT4CR_ACT_BITS_OVERRIDE: int | None = None
 _INT4CR_BACKEND_OVERRIDE: str | None = None
 # Backward gradient-quant bit-width, decoupled from forward activation bits so --w4a4g8 can run
 # an a4 forward with a g8 backward. Stays None unless a mode flag sets it; when None the getter
-# falls back to the activation bits, so w4a4g4 (g4) and w4a8 (g8) stay byte-identical.
+# falls back to the activation bits.
 _INT4CR_GRAD_BITS_OVERRIDE: int | None = None
 
 
@@ -528,7 +528,7 @@ def _module_int4_rotate(module: nn.Module) -> bool:
     """Whether this layer uses the online ConvRot Hadamard rotation.
 
     Legacy checkpoints (and all rotated exports) carry no ``int4_rotation`` buffer, so
-    the default is the rotated path -- keeping every existing checkpoint byte-identical.
+    absence of the buffer selects the established rotated path.
     No-rotation exports register ``int4_rotation`` = 0.
     """
 
@@ -1041,10 +1041,9 @@ def _grad_input_w4a8_fallback(
 # ``torch._int_mm`` bridge, so the activation-side elementwise passes -- online
 # ConvRot rotation, per-token int8 quantization, and the int32->compute-dtype
 # rescale -- are the only memory-bound overhead left around the matmul. They are
-# byte-for-byte the same shape as the INT8 ConvRot path, so we reuse its proven
-# fused Triton kernels verbatim. Opt-in via ``LTX2_INT4_CONVROT_FUSE``; when it is
-# off (default), unavailable, or the kernel fails, every other code path is left
-# byte-identical to the eager implementation.
+# the same tensor shapes as the INT8 ConvRot path, so this path reuses those fused
+# Triton kernels. It is opt-in via ``LTX2_INT4_CONVROT_FUSE``; when it is off
+# (default), unavailable, or the kernel fails, dispatch uses the eager implementation.
 # ---------------------------------------------------------------------------
 
 _INT4_FUSE: bool | None = None
@@ -1055,7 +1054,7 @@ _INT4_FUSED_GROUP_SIZES = (4, 16, 64, 256)
 # Distinct from the Triton W4A8 fusion above: it folds the ConvRot rotation into the
 # activation-quantize kernel and the int32->bf16 dequant into the CUTLASS int4 GEMM's
 # epilogue (an Sm80 Epilogue Visitor Tree), so the int32 accumulator never hits global
-# memory. Off (unset) leaves every existing path byte-identical.
+# memory. Off (unset) leaves this fusion branch disabled.
 _INT4_FUSE_CUDA: bool | None = None
 _INT4_CUDA_FUSED_BROKEN = False
 _CUTLASS_INT4_FUSED = "unset"
@@ -1065,8 +1064,7 @@ _CUTLASS_INT4_FUSED = "unset"
 # the trainable-LoRA and frozen-stabilizer *down* projections into a single GEMM that
 # reads the activation once, and accumulates both *up* projections onto the int4 backbone
 # output in one pass. The rotation is folded once into the frozen stabilizer down weight
-# so all three branches share the raw activation. Off (unset) leaves the wrapped LoRA
-# forward byte-identical to the eager down/up path.
+# so all three branches share the raw activation. Off (unset) retains the eager down/up path.
 _INT4_FUSE_LORA: bool | None = None
 
 
@@ -1106,15 +1104,14 @@ def configure_int4cr_training_defaults(
     implies (a non-None argument), an explicitly-set environment variable WINS (expert
     override, warned once when it contradicts the implied value); an unset variable takes the
     implied default. Gates the mode does not imply (None argument) are left completely
-    untouched, so their environment variables behave exactly as today. When no mode flag is
-    passed the setter is never called and the whole int4cr path is byte-identical.
+    untouched. When no mode flag is passed the setter is not called.
 
     ``--w4a4g4`` -> act_bits=4, backend="cutlass", fuse_cuda=True, fuse_lora=True.
     ``--w4a4g8`` -> act_bits=4, grad_bits=8 (a4 forward, int8 grad backward) + the w4a4g4 backend/fusion.
     ``--w4a8``   -> act_bits=8 only (legacy default backend routing / no implied fusion).
 
-    ``grad_bits`` is left None by --w4a4g4 / --w4a8 (the getter falls back to ``act_bits``, keeping
-    both byte-identical); only --w4a4g8 passes it to decouple the backward gradient bit-width.
+    ``grad_bits`` is left None by --w4a4g4 / --w4a8 (the getter falls back to ``act_bits``);
+    only --w4a4g8 passes it to decouple the backward gradient bit-width.
     """
     global _INT4CR_ACT_BITS_OVERRIDE, _INT4CR_BACKEND_OVERRIDE, _INT4CR_GRAD_BITS_OVERRIDE
     global _INT4_FUSE_CUDA, _INT4_FUSE_LORA
@@ -1900,7 +1897,8 @@ def _fused_stab_down_raw(
     activation ``x`` the fused product ``x @ S`` equals the eager
     ``rotate_activation_padded(x) @ stab_l2.t()`` (or ``pad(x) @ stab_l2.t()`` when
     ``rotate`` is False). The rotation is orthogonal and frozen, so folding it into the
-    frozen stabilizer factor is exact up to float rounding and costs nothing at runtime.
+    frozen stabilizer factor is algebraically equivalent before floating-point rounding and is
+    precomputed once per patched module.
     """
     l2 = stab_l2.to(device=device, dtype=torch.float32)  # [r_stab, padded]
     if not rotate:
@@ -1921,9 +1919,9 @@ def _fused_int4_convrot_lora_forward(self, x: torch.Tensor) -> torch.Tensor:
     a single down GEMM ``x @ [S | A]`` reads the activation once for both the frozen
     stabilizer and the trainable LoRA down projections, and a single up GEMM
     ``d @ [L1^T | s*B]`` produces both up projections in one pass. Standard autograd ops
-    are used (not a custom Function) so the fused path is autocast-correct: under the
-    trainer's bf16 autocast the GEMMs run in bf16 exactly like the eager LoRA/stabilizer,
-    and gradients flow only to the LoRA down/up parameters (S and L1 are frozen).
+    are used (not a custom Function), so the surrounding autocast context selects their
+    dtypes. The fused operation order can differ numerically from the eager path. Gradients
+    flow only to the LoRA down/up parameters (S and L1 are frozen).
     """
     if not self.enabled:
         return self.org_forward(x)
@@ -2000,7 +1998,7 @@ def _fused_lora_eligible(lora_module) -> tuple[bool, str]:
 def apply_int4_convrot_fused_lora(network) -> int:
     """Route eligible int4cr-backed LoRA modules through the fused triple-branch forward.
 
-    No-op (returns 0, every module byte-identical) unless ``LTX2_INT4_CONVROT_FUSE_LORA``
+    No-op (returns 0 without rebinding module forwards) unless ``LTX2_INT4_CONVROT_FUSE_LORA``
     is enabled. Precomputes the rotation-folded stabilizer down weight once per module and
     binds a fused ``forward``; ineligible modules keep their existing forward. The LoRA
     down/up tensors remain the module's own parameters, so the optimizer and checkpoint

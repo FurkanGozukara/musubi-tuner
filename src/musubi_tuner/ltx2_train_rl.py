@@ -725,7 +725,10 @@ def rl_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--nft_beta_mix", type=float, default=1.0, help="NFT pos/neg mix coefficient (config.beta)")
     parser.add_argument(
-        "--nft_kl_beta", type=float, default=1e-4, help="KL coefficient (config.train.beta) — distinct from beta_mix"
+        "--nft_kl_beta",
+        type=float,
+        default=1e-4,
+        help=("Reference-prediction MSE coefficient for nft/rwr/ppo/refl (historical flag name; this term is not a KL divergence)"),
     )
     parser.add_argument("--nft_adv_clip_max", type=float, default=5.0)
     parser.add_argument(
@@ -750,8 +753,8 @@ def rl_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--refl_grad_steps",
         type=int,
         default=1,
-        help="refl: number of FINAL denoising steps the reward gradient flows through. "
-        "1 (default) = the single final step; >1 requires --refl_renoise_samples 1.",
+        choices=[1],
+        help="refl: differentiable denoising steps; currently only the single final step is implemented.",
     )
     parser.add_argument(
         "--refl_renoise_samples",
@@ -764,7 +767,7 @@ def rl_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--refl_reward_weight",
         type=float,
         default=1.0,
-        help="refl: scale on the maximized reward term; the base-policy KL anchor uses --nft_kl_beta.",
+        help="refl: scale on the maximized reward term; reference-x0 MSE uses --nft_kl_beta.",
     )
     parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")
     parser.add_argument(

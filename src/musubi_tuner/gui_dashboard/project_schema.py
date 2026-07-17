@@ -1216,12 +1216,13 @@ class RLConfig(BaseModel):
     rl_sde_eta: float = 1.0
     # refl (differentiable-reward backprop): backprops a differentiable reward through the sampler
     # instead of a policy-gradient step. Online-only (generates rollouts inline, no cache), requires a
-    # reward with kind="differentiable", and reuses nft_kl_beta as the base-policy anchor.
-    refl_grad_steps: int = 1  # final denoising steps the reward gradient flows through
-    refl_renoise_samples: int = 1  # re-noise/average count at the final step (needs refl_grad_steps == 1)
+    # reward with kind="differentiable". nft_kl_beta weights its reference-x0 MSE term.
+    refl_grad_steps: int = 1  # only the single final denoising step is implemented
+    refl_renoise_samples: int = 1  # independent re-noise estimates averaged at that step
     refl_reward_weight: float = 1.0  # scale on the maximized reward term
 
-    # NFT loss coefficients (also supply the shared KL + advantage-clip for the other rules)
+    # NFT loss coefficients. nft_kl_beta is a historical field name: it weights the shared
+    # reference-prediction MSE for nft/rwr/ppo/refl, not a KL divergence.
     nft_beta_mix: float = 1.0
     nft_kl_beta: float = 1e-4
     nft_adv_clip_max: float = 5.0

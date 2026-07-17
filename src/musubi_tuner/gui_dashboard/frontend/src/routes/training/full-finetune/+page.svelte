@@ -711,7 +711,7 @@
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 					<FormToggle fieldPath="full_finetune.fp8_gemm" checked={t.fp8_gemm ?? false} onchange={(e) => update('fp8_gemm', e.target.checked)} tooltip="Replace attention/FFN Linear layers with FP8 GEMMs. Mutually exclusive with LoRA / qgalore_full_ft / fp8_scaled." />
-					<FormToggle fieldPath="full_finetune.fp8_gemm_compile" checked={t.fp8_gemm_compile ?? true} onchange={(e) => update('fp8_gemm_compile', e.target.checked)} tooltip="Region-compile the FP8 GEMM to fuse per-tensor scaling (~halves step time)." />
+					<FormToggle fieldPath="full_finetune.fp8_gemm_compile" checked={t.fp8_gemm_compile ?? true} onchange={(e) => update('fp8_gemm_compile', e.target.checked)} tooltip="Request torch.compile for the FP8 GEMM region. A compile failure is logged and uses eager FP8 execution." />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField fieldPath="full_finetune.fp8_gemm_targets" value={t.fp8_gemm_targets || 'video'} oninput={(e) => update('fp8_gemm_targets', e.target.value)} placeholder="video" tooltip="Which LTX-2 Linear layers to run in FP8 (video/audio/attn/ff/blocks/all)." />

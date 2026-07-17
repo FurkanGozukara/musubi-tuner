@@ -195,11 +195,11 @@
 						</div>
 					{:else if rlLoss === 'refl'}
 						<div class="grid grid-cols-3 gap-2 mt-2">
-							<FormField label="Grad Steps (K)" type="number" fieldPath="rl.refl_grad_steps" value={$projectConfig?.rl?.refl_grad_steps ?? 1} oninput={(e) => update('refl_grad_steps', Number(e.target.value))} step="1" min={1} tooltip="Final denoising steps the reward gradient flows through (default 1). >1 requires Re-noise Samples = 1." />
+							<FormField label="Grad Steps (K)" type="number" fieldPath="rl.refl_grad_steps" value={$projectConfig?.rl?.refl_grad_steps ?? 1} oninput={(e) => update('refl_grad_steps', Number(e.target.value))} step="1" min={1} max={1} tooltip="Only one final differentiable denoising step is currently implemented." />
 							<FormField label="Re-noise Samples" type="number" fieldPath="rl.refl_renoise_samples" value={$projectConfig?.rl?.refl_renoise_samples ?? 1} oninput={(e) => update('refl_renoise_samples', Number(e.target.value))} step="1" min={1} tooltip="Re-noise the denoised latent at the final step this many times and average the reward gradient (variance reduction). >1 requires Grad Steps = 1." />
-							<FormField label="Reward Weight" type="number" fieldPath="rl.refl_reward_weight" value={$projectConfig?.rl?.refl_reward_weight ?? 1.0} oninput={(e) => update('refl_reward_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Scale on the maximized reward term (default 1.0). The base-policy anchor uses KL Beta below." />
+							<FormField label="Reward Weight" type="number" fieldPath="rl.refl_reward_weight" value={$projectConfig?.rl?.refl_reward_weight ?? 1.0} oninput={(e) => update('refl_reward_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Scale on the maximized reward term (default 1.0). The reference-prediction MSE term uses Reference MSE Beta below." />
 						</div>
-						<div class="text-[11px] mt-2" style="color: var(--text-muted);">refl backprops a <strong>differentiable</strong> reward (kind=differentiable, e.g. latent_energy) through the sampler; it generates rollouts inline (online, no cache) and reuses <strong>KL Beta</strong> as the base-policy anchor. Black-box reward models (hpsv3, videoreward, …) are not differentiable — use a policy-gradient rule for those.</div>
+						<div class="text-[11px] mt-2" style="color: var(--text-muted);">refl backprops a <strong>differentiable</strong> latent-space reward (currently latent_energy) through one final denoising step. It runs online without a cache. <strong>Reference MSE Beta</strong> weights the squared difference from the LoRA-disabled reference prediction. Pixel/audio rewards and black-box models are not supported by refl.</div>
 					{/if}
 				</div>
 
@@ -208,7 +208,7 @@
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Loss coefficients</div>
 					<div class="grid grid-cols-3 gap-2">
 						<FormField label="NFT Beta Mix" type="number" fieldPath="rl.nft_beta_mix" value={$projectConfig?.rl?.nft_beta_mix ?? 1.0} oninput={(e) => update('nft_beta_mix', Number(e.target.value))} step="0.1" min={0.01} disabled={rlLoss !== 'nft'} tooltip="NFT positive/negative target mix (default 1.0). Used by the NFT rule only." />
-						<FormField label="KL Beta" type="number" fieldPath="rl.nft_kl_beta" value={$projectConfig?.rl?.nft_kl_beta ?? 0.0001} oninput={(e) => update('nft_kl_beta', Number(e.target.value))} step="0.0001" min={0} disabled={rlLoss === 'dpo'} tooltip="KL-to-reference coefficient (default 1e-4). Anchors the policy to the frozen base. DPO uses its own preference anchor." />
+						<FormField label="Reference MSE Beta" type="number" fieldPath="rl.nft_kl_beta" value={$projectConfig?.rl?.nft_kl_beta ?? 0.0001} oninput={(e) => update('nft_kl_beta', Number(e.target.value))} step="0.0001" min={0} disabled={rlLoss === 'dpo'} tooltip="Coefficient on the mean-squared difference from the frozen reference prediction (default 1e-4). The config/CLI field retains its historical nft_kl_beta name. DPO does not use this term." />
 						<FormField label="Advantage Clip Max" type="number" fieldPath="rl.nft_adv_clip_max" value={$projectConfig?.rl?.nft_adv_clip_max ?? 5.0} oninput={(e) => update('nft_adv_clip_max', Number(e.target.value))} step="0.5" min={0.01} tooltip="Clip on the group-relative advantage magnitude (default 5.0)." />
 					</div>
 				</div>

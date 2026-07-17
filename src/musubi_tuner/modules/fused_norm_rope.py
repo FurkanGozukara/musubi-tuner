@@ -6,14 +6,13 @@ Wraps a fused RMSNorm + RoPE CUDA kernel as the forward of a
 LTX-2.3 22B model. The backward is a closed-form analytical gradient (elementwise
 math plus one reduction per row, no forward recompute): the rotation is inverted by
 its transpose, the affine grad is a row reduction, and the RMSNorm grad uses the
-standard mean-free formula. It runs in fp32 and matches the eager autograd path
-within bf16 rounding noise. Under gradient checkpointing the forward runs twice per
-step, so the fusion still pays off.
+standard mean-free formula. The extension is built with CUDA fast math and has no
+documented numerical- or training-equivalence guarantee relative to eager execution.
 
 Opt-in via ``LTX2_FUSED_NORM_ROPE=1`` (default OFF). When the flag is unset the
-module is never touched and the eager path is byte-identical. When the flag is set
-but the CUDA extension cannot be built (no toolchain, wrong platform), the module
-degrades to a one-time warning and the caller falls back to eager.
+caller retains the existing eager path. When the flag is set but tensors are ineligible,
+the process is compiling, or the CUDA extension cannot be built, the caller falls back
+to eager (with a one-time warning for extension-load failure).
 """
 
 from __future__ import annotations
@@ -362,7 +361,7 @@ def try_qk_norm_rope(
     Handles both the interleaved and split (LTX-2.3) RoPE conventions, dispatched on
     ``rope_type``. Callers should gate on :func:`is_enabled` and a non-None ``pe``.
     Returns ``None`` whenever the kernel is unavailable or the tensors are not
-    eligible, so the eager path stays intact and byte-identical.
+    eligible, so the caller uses its existing eager implementation.
     """
     # PyBind extension calls cannot be captured by Dynamo in a full graph and
     # introduce a graph break otherwise. Let the existing eager tensor path be

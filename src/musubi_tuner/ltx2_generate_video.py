@@ -414,8 +414,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cudnn_attn",
         action="store_true",
-        help="Use cuDNN-prioritized SDPA (same as --attn_mode cudnn); fastest SDPA backend on Hopper and on Windows,"
-        " falls back per-shape to flash/efficient/math",
+        help="Use cuDNN-prioritized SDPA (same as --attn_mode cudnn). Outside torch.compile, PyTorch may fall "
+        "back per shape to flash/efficient/math; under torch.compile the normal SDPA call is used.",
     )
     parser.add_argument("--sdpa", action="store_true", help="Use SDPA (same as --attn_mode sdpa)")
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")

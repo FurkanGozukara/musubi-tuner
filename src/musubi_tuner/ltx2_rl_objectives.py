@@ -18,7 +18,8 @@ Objectives
 - ``nft``  : negative-aware fine-tuning (the default; lives in ``ltx2_nft_loss.py``). Reinforces
              good samples toward their own x0 AND pushes away from bad ones.
 - ``rwr``  : advantage-weighted regression — NFT's positive branch only. Softmax(adv/T) weights the
-             regression of each sample's prediction toward its own clean x0 (+ a KL term). Good
+             regression of each sample's prediction toward its own clean x0 (+ a frozen-reference
+             prediction MSE term). Good
              samples are pulled in; bad ones are merely down-weighted (not pushed away).
 - ``dpo``  : Diffusion-DPO over the best/worst sample of each group (ranked by advantage). The policy
              should denoise the *winner* better than the frozen ``ref`` does, relative to the *loser*
@@ -243,6 +244,6 @@ def compute_rl_objective(
     raise ValueError(f"unknown --rl_loss {name!r} (choices: nft, rwr, dpo, ppo, refl)")
 
 
-# nft/rwr/dpo/ppo are policy-gradient rules dispatched through compute_rl_objective; refl is the
-# differentiable-reward backend dispatched separately (ltx2_refl.run_refl). Both are valid --rl_loss.
+# nft/rwr/dpo/ppo are offline update rules dispatched through compute_rl_objective; refl is the
+# differentiable-reward backend dispatched separately (ltx2_refl.run_refl). All are valid --rl_loss.
 RL_LOSS_CHOICES = ("nft", "rwr", "dpo", "ppo", "refl")

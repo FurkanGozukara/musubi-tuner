@@ -23,13 +23,15 @@ def combine_full_ft_loss_weight(
 
 def distributed_any(accelerator, local_flag: bool, *, device: torch.device | None = None) -> bool:
     """Return the rank-wide logical OR of a local boolean flag."""
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return bool(local_flag)
+
     flag = torch.tensor(
         1 if local_flag else 0,
         device=device if device is not None else accelerator.device,
         dtype=torch.int32,
     )
-    if int(getattr(accelerator, "num_processes", 1)) > 1:
-        flag = accelerator.reduce(flag, reduction="sum")
+    flag = accelerator.reduce(flag, reduction="sum")
     return bool(flag.item() > 0)
 
 

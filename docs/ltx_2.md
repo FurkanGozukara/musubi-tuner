@@ -221,9 +221,9 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
 
-Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper. It can create or refresh the local virtual environment, install the dashboard extras, build the dashboard frontend, and write launchers for the dashboard and setup tool.
+Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper; that section documents the script's current operations and options.
 
-Unless otherwise noted, command examples in this LTX-2 guide were tested on Windows 11. They should also work on Linux, but you may need small shell/path adjustments.
+Command examples assume the repository root and an activated project environment. Ellipses and parenthesized phrases are placeholders for the remaining required arguments.
 
 For a Windows-focused community setup example for this fork (tested environment and install helpers), see [Discussion #19: Windows OS installation/usage helpers](https://github.com/AkaneTendo25/musubi-tuner/discussions/19).
 
@@ -512,8 +512,8 @@ python ltx2_cache_latents.py ^
 - `--ltx2_audio_dtype`: Data type for audio VAE encoding (default: `float16`).
 - `--audio_video_latent_dtype`: Optional override for audio-only video latent dtype (defaults to `--ltx2_audio_dtype`).
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
-- `--video_decode_backend pyav|decord|torchcodec`: Opt-in decode backend. The stock `pyav` (default) decodes under the GIL, so caching barely uses the CPU and leaves the GPU idle; `decord` (CPU) and `torchcodec` (GPU/NVDEC with `--video_decode_device cuda`) batch-decode so caching can saturate the machine. When caching is GIL-bound and decode-dominated this cuts wall-time several-fold — up to roughly **~8×** vs the single-process PyAV path (backend/hardware dependent). Strictly opt-in — it falls back to PyAV on any error and produces byte-identical latents. `decord` pins one thread per reader (`LTX2_DECORD_NUM_THREADS`, default `1`), so drive parallelism from dataloader workers / process shards and keep `shards × workers ≤ physical cores`; `torchcodec` needs a wheel matching your torch version and FFmpeg libraries present. Equivalent env vars: `LTX2_VIDEO_DECODE_BACKEND`, `LTX2_VIDEO_DECODE_DEVICE`.
-- `--video_decode_device cpu|cuda`: Decode device for the `torchcodec` backend (`cuda` = NVDEC hardware decode). Ignored by other backends.
+- `--video_decode_backend pyav|decord|torchcodec`: Opt-in decode backend. Omitting the flag keeps the `pyav` path. The `decord` and `torchcodec` adapters batch-decode the selected source-frame indices and require their optional runtime dependencies. If an alternate-backend decode raises, the loader logs a warning and retries that item with PyAV; a subsequent PyAV error still fails normally. Different decoder/codec implementations can produce different decoded pixels and therefore different caches, so keep one backend fixed when cache reproducibility matters. The CLI overrides `LTX2_VIDEO_DECODE_BACKEND` when supplied. Decord receives `LTX2_DECORD_NUM_THREADS` (default `1`) for each reader.
+- `--video_decode_device cpu|cuda`: Device passed to TorchCodec's `VideoDecoder` (default `cpu`); ignored by other backends. CUDA support depends on the installed TorchCodec wheel, FFmpeg libraries, and hardware. The CLI overrides `LTX2_VIDEO_DECODE_DEVICE` when supplied.
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 - `--precache_sample_latents`: Cache I2V / V2V / reference-audio conditioning latents for sample prompts, then continue with normal latent caching. Requires `--sample_prompts`.
 - `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
@@ -533,10 +533,10 @@ python ltx2_cache_latents.py ^
 ### Latent Cache Preview and Verification
 <sub>[↑ contents](#table-of-contents)</sub>
 
-`ltx2_cache_preview.py` checks cached LTX-2 latent files and writes `summary.json` with tensor keys, shapes, dtypes, metadata, and NaN/Inf results. Add `--checkpoint` only when decoded MP4/PNG/WAV previews are needed.
+`src/musubi_tuner/ltx2_cache_preview.py` checks cached LTX-2 latent files and writes `summary.json` with tensor keys, shapes, dtypes, metadata, and NaN/Inf results. Add `--checkpoint` only when decoded MP4/PNG/WAV previews are needed.
 
 ```bash
-python ltx2_cache_preview.py ^
+python src/musubi_tuner/ltx2_cache_preview.py ^
   --input /path/to/cache_dir ^
   --output /path/to/cache_preview ^
   --stats
@@ -737,8 +737,8 @@ Optional torch.compile and DataLoader flags:
 |---|---|
 | `--compile` | Enables block-level `torch.compile` for the LTX-2 transformer. |
 | `--compile_mode MODE` | `torch.compile` mode, e.g. `default` or `max-autotune-no-cudagraphs`. |
-| `--compile_cache_size_limit N` | Sets the Dynamo cache size limit (raise it for multi-bucket datasets to avoid recompiles). |
-| `--inductor_config KEY=VALUE ...` | Sets arbitrary `torch._inductor.config` / `torch._dynamo.config` attributes; dotted keys allowed (e.g. `coordinate_descent_tuning=true triton.enable_persistent_tma_matmul=true`). Values parse as bool/int/float/none/string; unknown keys are skipped with a warning. Applied only with `--compile`. Use `triton.enable_persistent_tma_matmul=true` to opt into TMA GEMM kernels on Hopper. |
+| `--compile_cache_size_limit N` | Sets `torch._dynamo.config.cache_size_limit`, the maximum number of cached variants before Dynamo's cache-limit behavior applies. It does not prevent recompilation for new shapes. |
+| `--inductor_config KEY=VALUE ...` | With `--compile`, sets existing `torch._inductor.config` / `torch._dynamo.config` attributes; dotted keys are accepted. Values parse as bool/int/float/none/string and unknown keys are skipped with a warning. The available keys and their effect belong to the installed PyTorch build; for example, `triton.enable_persistent_tma_matmul` is forwarded only when that attribute exists. |
 | `--compile_dynamic false` | Avoids dynamic-shape compile paths when the training shape is fixed. |
 | `--compile_auto_cache_size_limit` | Raises the Dynamo cache limit based on the number of compiled blocks. |
 | `--compile_fallback_to_eager` | Restores eager blocks and continues if compile setup fails. |
@@ -819,7 +819,7 @@ For IC-LoRA / V2V training, also precache the conditioning image latents during 
 <sub>[↑ contents](#table-of-contents)</sub>
 
 > [!NOTE]
-> This feature is disabled by default. Two-stage inference generates on a reduced spatial and/or temporal grid, then upsamples and refines. It is intended for larger final outputs; at `512x512`, spatial two-stage stage 1 is only `256x256`, so compare against the single-stage baseline before using it.
+> This feature is disabled by default. Two-stage inference reduces the spatial axis when a spatial upsampler is supplied and reduces the temporal axis when a temporal upsampler is supplied, then upsamples and refines. For example, a spatial stage at final size `512x512` uses `256x256` in stage 1. Compare outputs with the single-stage path for the intended checkpoint and settings.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -1196,7 +1196,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
 | `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | `transformers>=5.0` renamed Gemma3 rotary embedding buffers (`rotary_emb.inv_freq` → `rotary_emb.full_attention_inv_freq` / `sliding_attention_inv_freq`). The derivable-buffer suffix check expects `.inv_freq` and does not match the new `_inv_freq` suffix. The safetensors file is correct — rotary buffers are non-persistent and computed from config at init time. | `pip install transformers==4.57.6` (pinned in `pyproject.toml`), or reinstall all deps with `pip install -e .` |
-| Audio quality degrades after video-only training performed in `--ltx2_mode av` | AV mode loads audio and cross-modal modules, so the broad default `t2v` preset can attach LoRA adapters to them. This does **not** apply to `--ltx2_mode v`/`video`: video mode loads a video-only transformer, and the resulting LoRA contains no audio or AV cross-modal adapters. | For an entirely audio-free dataset, use `--ltx2_mode v`; the base AV checkpoint's audio layers remain untouched when the resulting LoRA is applied. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict training to the video branch. See [LoRA Targets](#lora-targets). |
+| A nominally video-only LoRA contains audio or AV cross-modal adapter keys | `--ltx2_mode av` constructs the audio/cross-modal modules, and a broad target preset can select them. In `--ltx2_mode v`/`video`, those modules are not constructed. | Use `--ltx2_mode v` when no audio path is needed. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict adapter targets to the video branch. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
 
@@ -1559,6 +1559,8 @@ For additional training and inference speedups, see the [torch.compile Support](
 #### Quantization Options
 <sub>[↑ contents](#table-of-contents)</sub>
 
+The following table restores the historical measurements documented for this branch. The repository does not include the raw output artifact used to produce them, so treat the values as reported reference data, not as a reproduced benchmark or capacity guarantee.
+
 | Method | Base-weight VRAM (19B) | Weight Error (MAE) | SNR | Cosine Similarity |
 |--------|------------------|--------------------|-----|-------------------|
 | BF16 (baseline) | ~38 GB | 0.0011 | 55.6 dB | 0.999999 |
@@ -1567,9 +1569,9 @@ For additional training and inference speedups, see the [torch.compile Support](
 | `--nf4_base --loftq_init` | ~10 GB | 0.0654 (60x BF16) | 21.5 dB | 0.996437 |
 | INT4 ConvRot weights (MSE-clipped g256) | ~10 GB | 0.0037 | 18.9 dB | 0.993353 |
 
-*Approximate values measured with representative LTX-2 transformer shapes, except the INT4 ConvRot row, which is from a full LTX-2.3 transformer-block quality report. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). The VRAM column is base-weight storage (parameters × bytes-per-weight), not measured training peak — actual peak also includes activations, gradients, optimizer state, and the LoRA.*
+The reported values used representative LTX-2 transformer shapes, except the INT4 ConvRot row, which was reported from a full LTX-2.3 transformer-block quality report. MAE is the mean absolute error between original and reconstructed weights. The LoftQ row includes the rank-32, two-iteration LoRA correction. The VRAM column describes base-weight storage, not peak training memory.
 
-NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot weights are accurate enough for clean weight-only samples, but W4A4 activation quantization can visibly degrade video samples. The default INT4 ConvRot runtime is W4A8: weights stay packed INT4, while forward activations and backward grad-output use row-wise INT8. The base model is frozen during LoRA training, so weight quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
+All quantized-base paths are opt-in; a run that omits their flags retains the normal base-loading path. Peak training memory also includes activations, temporary quantization buffers, adapter parameters, gradients, optimizer state, and optional sampling models. This repository does not guarantee output or training equivalence between a quantized path and bf16/fp16. Use the generated reconstruction report where available and compare task-specific samples before selecting a format. INT4 ConvRot is disabled unless one of the W4 mode flags is selected. In `--w4a8` mode, weights stay packed INT4 while forward activations and backward grad-output use row-wise INT8. LoftQ initializes LoRA weights from a quantization residual via SVD.
 
 - `--fp8_base`: keep base model weights in FP8 path (~19 GB base weights).
 - `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
@@ -1579,7 +1581,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 - `--nf4_base`: NF4 4-bit quantization (~10 GB base weights). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--int8_base`: load a pre-quantized Optimum-Quanto `qint8` checkpoint and train a LoRA over the frozen int8 base. See [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto) below.
 - `--int8_convrot_dynamic`: quantize a standard checkpoint to INT8 ConvRot at load time. See [INT8 ConvRot Base](#int8-convrot-base) below.
-- `--w4a4g4` / `--w4a8`: INT4 ConvRot path (weights stored as packed signed INT4). `--w4a8` quantizes activations to INT8; `--w4a4g4` is the fully 4-bit FourTune pipeline. Both auto-detect a pre-quantized vs bf16 checkpoint. See [W4A4G4 Training](#w4a4g4-training) below.
+- `--w4a4g4` / `--w4a4g8` / `--w4a8`: local INT4 ConvRot modes (weights stored as packed signed INT4). `--w4a8` uses INT8 activations and grad-output, `--w4a4g8` uses INT4 activations with INT8 grad-output, and `--w4a4g4` uses INT4 for activations and grad-output. All three auto-detect a pre-quantized versus bf16/fp16 checkpoint. See [W4A4G4 Training](#w4a4g4-training) below.
 - `--quantize_device cpu|cuda|gpu`: Device for startup quantization in NF4/FP8 and dynamic INT8/INT4 ConvRot paths (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves the quantized result to GPU; this avoids load-time GPU high-water marks at the cost of more host RAM and startup time. `cuda` loads and quantizes directly on GPU. For NF4/FP8 it overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE`.
 
 #### Other Memory Options
@@ -1590,7 +1592,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 | `--blocks_to_swap X` | Offload X transformer blocks to CPU (up to one less than the model's block count; e.g. 47 for the 48-block 22B checkpoint). Higher = more VRAM saved, more CPU↔GPU overhead |
 | `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
 | `--block_swap_h2d_only` | Stream frozen LoRA base blocks Host→Device only; requires `--blocks_to_swap X` and `--gradient_checkpointing` |
-| `--block_swap_ring_size N` | H2D-only GPU ring size. `2` (default) overlaps prefetch and compute; `1` minimizes VRAM but cannot overlap them |
+| `--block_swap_ring_size N` | H2D-only GPU ring size. `2` (default) uses double buffering; `1` allocates one streaming buffer and cannot overlap prefetch with compute |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
 | `--blockwise_checkpointing` | Checkpoint transformer blocks individually and reload block state around backward. Lowest peak VRAM, but heavy CPU↔GPU traffic and recompute. |
@@ -1603,10 +1605,10 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). INT4 ConvRot 
 | `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
 | `--ddp_find_unused_parameters` | Enable DDP unused-parameter detection for branchy LoRA targets (off by default) |
 | `--gemma_bnb_use_local_rank` | For Gemma 8-bit/4-bit loading, pin the quantized model to this process's `LOCAL_RANK` GPU (off by default) |
-| `--sdpa` | Use PyTorch scaled dot-product attention (recommended default) |
-| `--cudnn_attn` | Use the cuDNN attention backend (SDPA with cuDNN prioritized, per-shape fallback to flash/efficient/math). Mask-safe. Fast on Hopper, and the fastest backend on Windows where no flash build is available. Requires no extra package. |
+| `--sdpa` | Use PyTorch scaled dot-product attention. |
+| `--cudnn_attn` | Outside `torch.compile`, call PyTorch SDPA with backend priority cuDNN → flash → efficient → math. If the installed PyTorch lacks priority support, warn and use plain SDPA. Under `torch.compile`, use plain SDPA because the priority context is not traceable. Masks are passed to SDPA; the backend PyTorch ultimately selects is build/shape/hardware-dependent. |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
-| `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU). Masked cross-attention uses the FA3 variable-length path (no fallback to slower SDPA). |
+| `--flash3` | Use the separately installed FlashAttention 3 interface. A reducible key-padding mask uses its variable-length function when present; if that function is absent, or the mask is query-specific, the code warns once and falls back to PyTorch SDPA. Package and hardware requirements depend on the installed FlashAttention build. |
 
 **H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
 for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
@@ -1614,14 +1616,14 @@ and `--gradient_checkpointing`; it is not valid for full fine-tuning and is
 incompatible with checkpoint/activation CPU-offload modes. Invalid combinations
 are warned about or rejected. See the [Block Swap guide](./block_swap.md).
 
-**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** Fuses the per-attention query/key RMSNorm and rotary embedding into a single CUDA kernel, covering both the interleaved and split RoPE layouts (LTX-2.3 uses split). Opt in by setting the environment variable `LTX2_FUSED_NORM_ROPE=1`; leaving it unset keeps the exact eager path. The kernel is JIT-compiled on first use and requires a CUDA GPU with a working nvcc/MSVC or nvcc/gcc toolchain; if it cannot be built the trainer prints a one-time warning and uses the eager path. It applies to bf16 activations; other cases fall back automatically. The fused forward runs the norm and rotation in one pass, and gradients come from a closed-form backward that matches the eager path within bf16 rounding, so training results are unchanged. Under `torch.compile`, the trainer automatically uses the compilable unfused path.
+**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** This separately implemented CUDA path combines query/key RMSNorm and rotary embedding for eligible bf16 tensors and supports the interleaved and split layouts. It JIT-builds with CUDA fast math and requires a working CUDA extension toolchain. Ineligible tensors, extension-load failure, and `torch.compile` use the eager tensor path (extension-load failure emits a one-time warning). No numerical-parity or unchanged-training-result guarantee is made for the fused kernel; validate it against the eager path on the target build before relying on it.
 
 ### Blockwise Checkpointing
 <sub>[↑ contents](#table-of-contents)</sub>
 
 `--blockwise_checkpointing` checkpoints transformer blocks individually and reloads block state during backward. This shifts more state through CPU memory and increases recomputation cost.
 
-Peak VRAM is dataset- and bucket-dependent. On the 832x480x49 video dataset it is typically around 4-6 GiB when using `--blocks_to_swap 47`. The tradeoff is speed: expect roughly `15-30+ s/step` at that setting depending on GPU, PCIe bandwidth, CPU/RAM speed, resolution, frame count, attention backend, and LoRA target/rank. Smaller `--blocks_to_swap` values reduce CPU pressure, raise VRAM, and usually improve step time.
+Peak memory and step time are dataset-, bucket-, system-, and configuration-dependent. Increasing `--blocks_to_swap` moves more block state through host memory and generally trades device residency for transfer/recompute work; benchmark the exact target configuration.
 `--blocks_to_checkpoint -1` applies blockwise checkpointing to all transformer blocks.
 
 ### Aggressive VRAM Optimization (8-16GB GPUs)
@@ -1765,7 +1767,7 @@ Weights are dequantized to the compute dtype and run through a standard `F.linea
 `--int8_base` loads a checkpoint that was quantized to int8 with [Optimum-Quanto](https://github.com/huggingface/optimum-quanto) (`qint8` weight-only) and trains a LoRA over the frozen int8 base. The int8 Linear layers run int8×int8 matmuls (`torch._int_mm`); layers the checkpoint left in bf16 (and the LoRA) run in bf16.
 
 ```bat
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\model_qint8.safetensors ^
   --int8_base ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1789,7 +1791,7 @@ Performance is hardware- and shape-dependent. Benchmark the target configuration
 `--int8_convrot_dynamic` quantizes eligible LTX-2 transformer block Linear weights to INT8 ConvRot while loading a standard bf16/fp16 checkpoint. ConvRot rotates weights offline with a group-wise Hadamard matrix, then rotates activations online before the dynamic int8 matmul. The base is frozen, so this path is for LoRA training.
 
 ```bat
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
   --int8_convrot_dynamic ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1804,7 +1806,7 @@ python ltx2_quantize_int8_convrot.py ^
   --input_model path\to\ltx-2.3-22b-dev.safetensors ^
   --output_model path\to\ltx-2.3-22b-dev-int8-convrot.safetensors
 
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev-int8-convrot.safetensors ^
   --int8_convrot_base ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1838,30 +1840,30 @@ Notes:
 ### W4A4G4 Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
-W4A4G4 training runs a LoRA over a frozen 4-bit base, following the FourTune fully-4-bit post-training pipeline (arXiv 2607.05711). The frozen 4-bit base, a frozen low-rank stabilizer, and the trainable LoRA form the paper's triple-branch decomposition; the forward and backward passes run 4-bit GEMMs with weights, activations, and gradients all quantized to 4 bits.
+W4A4G4 training is an experimental LoRA path over a frozen 4-bit base. Its frozen quantized residual, optional frozen low-rank stabilizer, and trainable LoRA are structurally inspired by the triple-branch decomposition in [FourTune (arXiv 2607.05711)](https://arxiv.org/abs/2607.05711). Local containers, ConvRot handling, backend dispatch, and fallbacks are repository-specific; this documentation does not claim reproduction or result equivalence to the paper. In W4A4G4 mode, weights, forward activations, and backward grad-output are quantized to 4 bits, but the actual matrix multiply may be a native extension or a floating-point fallback depending on the selected path.
 
 `--w4a4g4_container` selects the numeric format ("container") of the frozen base:
 
-- `int4` (default) — INT4 integer weights run through the INT4 tensor-core backend with ConvRot Hadamard rotation. This is the container that runs on INT4-capable GPUs.
-- `nvfp4` — NVFP4 (E2M1 float) weights with no rotation, the FourTune-native format. The fast path uses Blackwell scaled-MMA kernels (compute capability `>= 10.0`); other GPUs use an emulated backend.
+- `int4` — packed signed-INT4 weights with ConvRot Hadamard rotation. `auto` resolves a plain bf16/fp16 checkpoint to this container. W4A4G4/W4A4G8 selects the local CUTLASS backend and therefore requires CUTLASS headers (`LTX2_CUTLASS_INCLUDE_DIR`) plus a working CUDA extension toolchain.
+- `nvfp4` — packed NVFP4 E2M1 weights with no rotation. The emulated provider dequantizes for floating-point matrix multiplication. The optional Triton `tl.dot_scaled` provider is gated to compute capability `>= 10.0` but has not been validated on Blackwell hardware in this repository.
 
-Both containers run the same triple-branch training. They differ only in the base's numeric format and, for `int4`, the added ConvRot rotation — integer 4-bit uses that rotation to tame outliers, while NVFP4's per-block float scales do not need it. `--w4a4g4_container auto` (the default) picks the container from `--ltx2_checkpoint`: a converter-produced int4cr checkpoint → `int4`, a converter-produced NVFP4 checkpoint → `nvfp4`, a plain bf16/fp16 checkpoint → `int4`. An explicit `int4`/`nvfp4` that contradicts a pre-quantized checkpoint's format is rejected.
+Both containers expose the three-branch model, but they differ in numeric format, scaling, rotation, backend dispatch, and default stabilizer rank. `--w4a4g4_container auto` (the default) picks the container from `--ltx2_checkpoint`: a converter-produced int4cr checkpoint → `int4`, a converter-produced NVFP4 checkpoint → `nvfp4`, a plain bf16/fp16 checkpoint → `int4`. An explicit `int4`/`nvfp4` that contradicts a detected pre-quantized checkpoint format is rejected.
 
 Within the `int4` container, three peer mode flags select the activation/gradient precision:
 
-- `--w4a4g4`: fully 4-bit activations and gradients (W4A4G4). This single flag implies the whole fast path — 4-bit activation/gradient quantization, the native INT4 tensor-core (`cutlass`) backend, the fused CUDA activation/epilogue path, and the fused triple-branch LoRA path.
+- `--w4a4g4`: 4-bit activations and gradients. For the int4 container this selects `cutlass` and enables the two fusion gates. The selected CUTLASS backend must build successfully; individual fusion helpers can still leave ineligible modules on their unfused implementations.
 - `--w4a8`: 4-bit weights with 8-bit activations (int4 container only). Weights stay packed INT4 while forward activations and backward grad-output are quantized to row-wise INT8; the default backend routing is used and no fusion is implied.
-- `--w4a4g8`: 4-bit weights and activations (the `--w4a4g4` forward) with 8-bit gradients (the `--w4a8` backward grad path). The middle step between `--w4a4g4` and `--w4a8`: it keeps the 4-bit forward but quantizes the backward grad-output to row-wise INT8 for higher gradient precision than a 4-bit gradient. It uses the same backend, fusion, and stabilizer defaults as `--w4a4g4`. int4 container only.
+- `--w4a4g8`: 4-bit weights/activations with row-wise INT8 grad-output. It uses the same backend, fusion gates, and stabilizer defaults as `--w4a4g4`; int4 container only.
 
-Both flags share one nf4-style checkpoint workflow. Point `--ltx2_checkpoint` at either a plain bf16/fp16 checkpoint (quantized on the fly at load, one tensor at a time) or a converter output (the packed weights are loaded directly). The checkpoint type is detected automatically from its metadata/keys, so the same command works for both; the converter is a pay-once optimization that produces exactly the buffers the on-the-fly path would. The `nvfp4` container has no W4A8 mode; use `--w4a4g4 --w4a4g4_container nvfp4`.
+All three mode flags accept either a plain bf16/fp16 checkpoint (quantized during load) or a matching converter output (packed weights loaded directly). Metadata/keys select the loader. Converter and on-the-fly paths share quantization code, but a nonzero SVD stabilizer uses randomized low-rank decomposition; matching tensors require the same input, options, device behavior, and RNG state. The `nvfp4` container has no W4A8 or W4A4G8 mode; use `--w4a4g4 --w4a4g4_container nvfp4`.
 
 > [!WARNING]
-> INT4 ConvRot LoRA training is experimental. `--w4a8` stores the frozen base weights as packed INT4 and quantizes forward activations and backward grad-output to row-wise INT8. The 4-bit base-weight representation can introduce domain-dependent output changes versus NF4/FP8/bf16 baselines, including reduced fine detail, softer texture, or changed texture statistics. `--w4a4g4` additionally quantizes activations and gradients to 4 bits. Validate with short runs and sample videos before committing long training jobs.
+> INT4 ConvRot LoRA training is experimental and changes numerical execution relative to bf16/fp16. `--w4a8` uses packed INT4 base weights plus row-wise INT8 activations/grad-output; `--w4a4g8` changes activations to 4 bits; `--w4a4g4` changes both activations and grad-output to 4 bits. This repository does not guarantee a particular quality delta. Validate loss, gradients, checkpoint loading, and representative samples on the target system.
 
 On-the-fly from a bf16 checkpoint:
 
 ```bat
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
   --w4a4g4 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1876,7 +1878,7 @@ python ltx2_quantize_int4_convrot.py ^
   --input_model path\to\ltx-2.3-22b-dev.safetensors ^
   --output_model path\to\ltx-2.3-22b-dev-int4-convrot.safetensors
 
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev-int4-convrot.safetensors ^
   --w4a4g4 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1884,7 +1886,7 @@ python src/musubi_tuner/ltx2_train_network.py ^
 ```
 
 Options:
-- `--w4a4g4`: fully 4-bit (W4A4G4) LoRA training following the FourTune pipeline. In the `int4` container it implies 4-bit activations/gradients, the `cutlass` INT4 tensor-core backend, and the fused CUDA + fused triple-branch LoRA paths.
+- `--w4a4g4`: experimental W4A4G4 LoRA mode. In the `int4` container it selects 4-bit activation/grad-output quantization, the `cutlass` backend, and both fusion gates; see the prerequisites and fallback limits above.
 - `--w4a4g4_container`: `auto` (default), `int4`, or `nvfp4` — the numeric format of the frozen base (see above). `auto` detects it from the checkpoint (int4cr → `int4`, NVFP4 → `nvfp4`, plain bf16/fp16 → `int4`).
 - `--w4a8`: 4-bit weights with 8-bit activations (int4 container only); default backend routing, no implied fusion.
 - `--w4a4g8`: 4-bit weights/activations with 8-bit gradients (int4 container only); the `--w4a4g4` forward with the `--w4a8` backward grad path, and the same backend/fusion/stabilizer defaults as `--w4a4g4`.
@@ -1908,16 +1910,16 @@ Notes:
 - `--w4a4g4`, `--w4a8`, and `--w4a4g8` are mutually exclusive with each other and with `--int8_base`, `--int8_base_dynamic`, `--int8_convrot_base`, `--int8_convrot_dynamic`, `--fp8_base`, `--fp8_scaled`, and `--nf4_base`.
 - The `LTX2_INT4_CONVROT_*` environment variables below remain expert overrides. When set explicitly they win over the value implied by `--w4a4g4`/`--w4a8`/`--w4a4g8`, and a one-line warning records the override.
 - Targets LTX-2 transformer block attention/FFN Linear weights and leaves norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors unquantized.
-- `LTX2_INT4_CONVROT_BACKEND=auto` uses the torch tensor-core bridge when available. Optional backend values are `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, and `scalar`; the native CUTLASS path requires headers from `LTX2_CUTLASS_INCLUDE_DIR`. The torch bridge is the recommended default for LoRA training.
+- `LTX2_INT4_CONVROT_BACKEND=auto` uses the torch bridge when its requirements are met. Optional values are `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, and `scalar`; `cutlass` requires headers from `LTX2_CUTLASS_INCLUDE_DIR` and a successful extension build.
 - `LTX2_INT4_CONVROT_ACT_BITS`: `8` selects W4A8 (the `--w4a8` default; forward activations and backward grad-output are row-wise INT8), `4` selects the fully 4-bit W4A4 activation path (the `--w4a4g4` default). Setting it explicitly overrides the mode flag (for example `LTX2_INT4_CONVROT_ACT_BITS=8` with `--w4a4g4` runs the W4A8 activation path).
 - `LTX2_INT4_CONVROT_GRAD_BITS`: bit-width used to quantize the backward grad-output, decoupled from the forward activation bits. `4` selects a 4-bit gradient, `8` selects a row-wise INT8 gradient (the `--w4a4g8` default). When unset it follows the activation bits, so `--w4a4g4` uses a 4-bit gradient and `--w4a8` an 8-bit gradient. Set it explicitly to override the mode flag (for example `LTX2_INT4_CONVROT_GRAD_BITS=8` with `--w4a4g4` is the same as `--w4a4g8`).
 - `LTX2_INT4_CONVROT_BACKEND`: tensor-core backend routing. `--w4a4g4` implies `cutlass`; `--w4a8` uses `auto`. Set explicitly to override (values: `auto`, `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, `scalar`).
 - `LTX2_INT4_CONVROT_FUSE_CUDA` / `LTX2_INT4_CONVROT_FUSE_LORA`: the fused native-CUTLASS W4A4 activation/epilogue path and the fused triple-branch LoRA path. `--w4a4g4` implies both `1`; `--w4a8` implies neither (they are W4A4-only, so the fused LoRA path stays on the eager down/up path under W4A8 even if enabled). Set either explicitly to override.
-- `LTX2_INT4_CONVROT_FUSE=1` enables fused Triton kernels for the `W4A8` path: the online ConvRot rotation and per-token INT8 quantization fold into one kernel, and the int32→compute-dtype rescale and backward inverse rotation into another, cutting memory traffic around the INT8-bridge matmul. It requires Triton and a CUDA device, is off by default, and applies to `W4A8` only. When unset the eager path is byte-identical; with it enabled, fused reductions run in a different order so outputs match within the training noise floor rather than bitwise.
+- `LTX2_INT4_CONVROT_FUSE=1` requests fused Triton kernels for the W4A8 rotation/quantization and rescale/inverse-rotation helpers. It requires Triton and CUDA, is off by default, and applies only to W4A8. The fused and eager implementations can differ numerically; no tolerance or training-equivalence guarantee is made here.
 - No Blackwell performance claim is made for the native INT4 kernels.
-- ConvRot's paper reports W4A4 as the intended advantage of the method, but also notes quality sensitivity for fully 4-bit diffusion transformers. Use the quality report and sample checks before committing a long run.
+- Reconstruction reports measure weight or observed activation/backend error; they do not establish generation quality or convergence.
 - For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--w4a4g4`/`--w4a8`/`--w4a4g8` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
-- INT4 ConvRot AWQ scales multiply weight columns before ConvRot packing and divide activations by the same per-channel scales at runtime. This preserves the Linear semantics while changing which input channels receive more effective quantization resolution.
+- INT4 ConvRot AWQ scales multiply weight columns before packing and divide activations by the reciprocal factors at runtime. Before rounding this rescaling is algebraically cancelling; INT4 quantization still changes the layer output.
 - AWQ scale files are tied to the base checkpoint, target layer set, group-size policy, and model mode. They are not tied to the LoRA dataset identity.
 - For layer ranking, use both reports: `--int4_convrot_quality_report` estimates static packed-weight reconstruction error, while `--int4_convrot_activation_calibration_report` measures runtime activation/backend error on the observed training activation distribution.
 - Activation calibration performs extra reference matmuls during the measured forward pass. Keep the batch count small, and use `--int4_convrot_activation_calibration_regex` or `--int4_convrot_activation_calibration_max_layers` when memory is tight.
@@ -1942,12 +1944,12 @@ Use `--ema_cpu_offload` when VRAM is tight; for LoRA this stores only the adapte
 
 #### ComfyUI inference export (convrot_w4a4)
 
-`ltx2_quantize_int4_convrot.py --export_format comfy_convrot_w4a4` writes a checkpoint in the ComfyUI `convrot_w4a4` inference format (Comfy-Org/comfy-kitchen) instead of this trainer's int4cr prepack. It is a one-way *publish for inference* artifact: it is **not** loadable by `--w4a4g4`/`--w4a8` (those want the int4cr prepack), and this trainer does not read it back.
+`ltx2_quantize_int4_convrot.py --export_format comfy_convrot_w4a4` writes the `convrot_w4a4` layout used by [Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) instead of this trainer's int4cr prepack. It is a one-way inference export: it is **not** loadable by this trainer's W4 modes, and this trainer does not read it back.
 
-The int4 ConvRot quantization is a self-contained reproduction of comfy-kitchen's `convrot_w4a4` math (power-of-4 regular Hadamard rotation, symmetric per-row `absmax/7` int4, signed-nibble packing) — there is no runtime dependency on comfy-kitchen. For each quantized transformer-block Linear it writes `<base>.weight` (packed int8), `<base>.weight_scale`, and `<base>.comfy_quant` (the config ComfyUI's loader reads).
+The exporter implements a power-of-4 regular Hadamard rotation, symmetric per-row `absmax/7` INT4 quantization, signed-nibble packing, and JSON metadata without a runtime comfy-kitchen dependency. For each selected transformer-block Linear it writes `<base>.weight` (packed int8 storage), `<base>.weight_scale`, and `<base>.comfy_quant`. Consumer compatibility depends on a ComfyUI/comfy-kitchen version that supports this layout; no cross-version byte-equivalence claim is made.
 
 ```bat
-python src/musubi_tuner/ltx2_quantize_int4_convrot.py ^
+python ltx2_quantize_int4_convrot.py ^
   --input_model path\to\ltx-2.3-22b-dev.safetensors ^
   --output_model path\to\ltx-2.3-22b-dev-convrot_w4a4.safetensors ^
   --export_format comfy_convrot_w4a4
@@ -1960,17 +1962,17 @@ Options and constraints:
 
 #### NVFP4 container
 
-The `nvfp4` container (`--w4a4g4 --w4a4g4_container nvfp4`) stores the frozen transformer-block Linear weights in NVFP4 (E2M1) and runs the FourTune W4A4G4 path with no rotation: the frozen base contributes `Q(X) @ Q(R)` in the forward and `Q(G) @ Q(R)^T` in the backward, an optional low-rank stabilizer branch is added in bf16, and the trainable LoRA adapter is the third branch. Only the LoRA adapter receives gradients; the packed base and stabilizer are frozen.
+The `nvfp4` container (`--w4a4g4 --w4a4g4_container nvfp4`) stores selected frozen transformer-block Linear weights in packed NVFP4 E2M1 with no rotation. The frozen residual uses quantized inputs/grad-output, an optional bf16 low-rank stabilizer is added, and the trainable LoRA is the third branch. Only the LoRA adapter receives parameter gradients; the packed base and stabilizer are frozen.
 
 The container works with either input, detected automatically from the checkpoint:
 
 - a **bf16/fp16 checkpoint** — quantized to NVFP4 on the fly at load, one tensor at a time. `--w4a4g4_stabilizer_rank` sets the stabilizer rank (default `32` for this container; `0` disables it).
-- a **converter output** from `ltx2_quantize_nvfp4.py` — the packed NVFP4 is loaded directly. The converter is a pay-once optimization: it produces the same buffers the on-the-fly path would, so training is identical while the quantization cost is paid once instead of every run.
+- a **converter output** from `src/musubi_tuner/ltx2_quantize_nvfp4.py` — the packed NVFP4 state is loaded directly. Converter and on-the-fly loading share quantization routines. With a nonzero stabilizer rank, matching output also requires the same input, options, device behavior, and RNG state used by the randomized low-rank decomposition.
 
 On the fly (single command):
 
 ```bat
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev.safetensors ^
   --w4a4g4 --w4a4g4_container nvfp4 --w4a4g4_stabilizer_rank 32 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1985,7 +1987,7 @@ python src/musubi_tuner/ltx2_quantize_nvfp4.py ^
   --output_model path\to\ltx-2.3-22b-dev-nvfp4t.safetensors ^
   --stabilizer_rank 32
 
-python src/musubi_tuner/ltx2_train_network.py ^
+python ltx2_train_network.py ^
   --ltx2_checkpoint path\to\ltx-2.3-22b-dev-nvfp4t.safetensors ^
   --w4a4g4 --w4a4g4_container nvfp4 ^
   --network_module networks.lora_ltx2 --network_dim 32 ^
@@ -1994,10 +1996,10 @@ python src/musubi_tuner/ltx2_train_network.py ^
 
 Notes:
 - A converter output stores packed E2M1 nibbles, a per-`16x16`-tile fp8 scale, a per-tensor fp32 scale, `.nvfp4_shape` metadata, and optional stabilizer factors, and is loaded directly.
-- `ltx2_quantize_nvfp4.py --stabilizer_rank N`: split a rank-`N` SVD component off each weight before NVFP4 quantization and store it as two bfloat16 factors (`.nvfp4_stab_l1`/`.nvfp4_stab_l2`); the residual is what gets NVFP4-quantized. `0` disables it. The factors load automatically when present. `--output_model` defaults to `<input>.nvfp4t.safetensors`; `--quality_report PATH` writes per-layer reconstruction metrics (defaults to `<output>.quality.json`; `--no_quality_report` skips it).
+- `python src/musubi_tuner/ltx2_quantize_nvfp4.py --stabilizer_rank N`: split a rank-`N` randomized low-rank component off each weight before NVFP4 quantization and store it as two bfloat16 factors (`.nvfp4_stab_l1`/`.nvfp4_stab_l2`); the residual is quantized. `0` disables it. The factors load automatically when present. `--output_model` defaults to `<input>.nvfp4t.safetensors`; `--quality_report PATH` writes per-layer reconstruction metrics (defaults to `<output>.quality.json`; `--no_quality_report` skips it).
 - Targets the same layer set as the INT4 ConvRot converter (transformer-block attention/FFN Linear weights); norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors stay in bf16.
 - Weight scales are shared across each `16x16` tile so the transposed weight layout used in the backward pass reuses the same scale tiles without requantization. Activations and grad-outputs are quantized dynamically per NVFP4 `1x16` micro-block.
-- `LTX2_NVFP4_BACKEND=auto` (default) uses the Blackwell scaled-MMA (Triton `tl.dot_scaled`) fast path on compute capability `>= 10.0` and falls back to the emulated backend otherwise. `LTX2_NVFP4_BACKEND=emulate` forces the emulated backend on any CUDA GPU or CPU; it dequantizes the base and round-trips activations and gradients through the same NVFP4 quantization as the fast path, so results are comparable while running without Blackwell hardware. `LTX2_NVFP4_BACKEND=triton` requires a Blackwell GPU and errors otherwise.
+- `LTX2_NVFP4_BACKEND=auto` (default) selects the Triton `tl.dot_scaled` provider when it is importable and compute capability is `>= 10.0`; otherwise it selects `emulate`. The Triton provider has not been run on Blackwell hardware in this repository, so `auto` on such hardware is experimental and can fall back to emulation after a runtime failure. `emulate` round-trips activations/grad-output through the same quantizer, dequantizes the base, and performs a floating-point matrix multiply; it is a functional implementation, not a performance or bitwise substitute for scaled MMA. Explicit `triton` rejects unsupported hardware/builds instead of silently selecting emulation.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -2563,7 +2565,7 @@ The output is a JSON report written to `--estimation_output` or, if omitted, `<o
 
 Text connectors are stacked 1D transformer blocks (the layer count comes from the checkpoint config key `connector_num_layers`) between Gemma and the denoising transformer. They transform text embeddings before they reach the denoising model. `--train_connectors` includes these modules in LoRA training alongside the main transformer.
 
-**Usage:** Cache with `--cache_before_connector`, train with `--train_connectors`. The same `--lora_target_preset` patterns apply to both transformer and connector layers. Connector and transformer LoRA weights are saved in one file. At inference and in ComfyUI (after `convert_lora_to_comfy.py`), connector weights are auto-detected and applied.
+**Usage:** Cache with `--cache_before_connector`, train with `--train_connectors`. The same `--lora_target_preset` patterns apply to both transformer and connector layers. Connector and transformer LoRA weights are saved in one file. For standalone ComfyUI conversion, use `python -m musubi_tuner.ltx2_convert_lora_to_comfy`; connector weights in the converted file are detected by the supported loading path.
 
 **Notes:** Keeps the frozen connector weights resident in VRAM (size scales with the checkpoint's connector layer/head config). Not compatible with LyCORIS. Connectors have `attn1` and `ff` only (no `attn2`).
 
@@ -4224,19 +4226,19 @@ Additional notes:
 
 A LoRA trained the supervised way needs examples of the target result. RL post-training needs only a **score**. The model generates candidate videos, each one gets a number from a reward function, and training pushes the model toward what scores higher. It applies to properties you can *measure* but cannot *collect a dataset of*: human preference, physical plausibility, audio-video sync, prompt adherence — any metric you can compute on a generated sample (see [Writing a custom reward](#writing-a-custom-reward)). The output is an ordinary LoRA file — this document calls it an **RL-LoRA**: a LoRA whose weights come from reward scores rather than from a supervised dataset. The name describes how the weights were obtained, not the file format; it loads anywhere a regular LTX-2 LoRA does.
 
-The learning loop: sample `K` rollouts per prompt with the current policy → score each with the reward → compare scores **within each prompt group**: samples above their group's mean get reinforced, samples below get pushed away (group-relative **GRPO** advantages, `(reward − group_mean) / (group_std + 1e-4)`) → update the LoRA, anchored to a frozen reference by a KL term so the policy cannot drift arbitrarily far.
+The offline loop samples `K` rollouts per prompt, scores them, computes group-relative advantages as `(reward - group_mean) / (group_std + 1e-4)`, and applies the selected objective. For `nft`, `rwr`, and `ppo`, `--nft_kl_beta` weights a mean-squared difference between policy and frozen-reference predictions. The flag and `kl` log key are historical names; this implementation does not calculate a KL divergence for that term.
 
-The starting LoRA is either fresh (no `--network_weights`; round 0 samples the bare base model) or an existing LoRA to refine. Either way RL reweights toward the better samples the current policy already produces — it **sharpens existing capability, it does not add new**. Two consequences: a group whose `K` samples score equally gives no signal (zero-variance groups are flagged and skipped — raise `K` or prompt diversity if many do), and the KL term keeps the policy near the base model (runaway KL = drift/collapse).
+The starting point is either a fresh LoRA (omit `--network_weights`) or an existing LoRA. A group whose `K` samples receives equal scores has zero normalized advantage and is skipped. The effect of training depends on the reward, generated samples, objective, and optimization settings; no capability or quality outcome is guaranteed.
 
 **This implementation runs the loop as offline rollouts** — two separate processes instead of one:
 
 - **Phase A** (`ltx2_cache_rollouts.py`) — data collection and scoring. It generates `K` rollouts per prompt with the current LoRA, runs the selected rewards, and writes a disk cache plus the `old` snapshot LoRA that generated it. It does **not** update weights.
 - **Phase B** (`ltx2_train_rl.py`) — optimisation. It replays that exact cache, checks that the warm-start LoRA matches the cache's `old` snapshot, and applies the update rule (`--rl_loss`). In the offline path it does **not** call reward models again; it trains from the scores stored by Phase A.
 
-The generator, the reward models, and the training step therefore never share the GPU — one heavy model holds it at a time — which is what makes RL post-training fit consumer-level GPUs. An online (single-process) loop instead has to co-host all three at once: the generator's inference memory, every reward model, and the training step's gradients and optimizer state — pushing the requirement far past consumer cards. The decoupling also provides:
+In the offline workflow, rollout generation/scoring and Phase-B training run as separate processes, so their peak allocations are not simultaneous. This does not guarantee that either phase fits a particular GPU; memory depends on the model, precision, reward implementation, media decode, sampling settings, and training configuration. The separate phases also allow:
 
 - the two phases can run on different GPUs, different machines, or different days;
-- one cache serves many experiments — switch between the `nft`/`rwr`/`dpo` update rules or their hyperparameters and retrain without regenerating anything (`ppo` instead needs a cache recorded with Phase-A `--rl_sde_sampler`); generation dominates the wall-clock, the training step is cheap;
+- one compatible cache can be replayed for `nft`/`rwr`/`dpo` objective changes; `ppo` requires a cache recorded with Phase-A `--rl_sde_sampler`;
 - rollouts and their scores sit on disk, so you can inspect what the reward is actually rewarding before spending any training compute;
 - an interrupted run loses at most one round — every round's cache and LoRA are ordinary files.
 
@@ -4267,7 +4269,7 @@ Algorithm papers are listed under [References](#references).
 **3. Phase A — generate + score rollouts, write the cache:**
 
 ```bash
-python ltx2_cache_rollouts.py ^
+python src/musubi_tuner/ltx2_cache_rollouts.py ^
   --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
   --gemma_root /path/to/gemma ^
   --fp8_base --fp8_scaled --blocks_to_swap 10 ^
@@ -4288,7 +4290,7 @@ python ltx2_cache_rollouts.py ^
 **4. Phase B — replay the cache, update the LoRA:**
 
 ```bash
-accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_rl.py ^
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/musubi_tuner/ltx2_train_rl.py ^
   --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
   --gemma_root /path/to/gemma ^
   --fp8_base --fp8_scaled --blocks_to_swap 10 --gradient_checkpointing ^
@@ -4302,25 +4304,25 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --seed 42
 ```
 
-The result, `output/my_lora_rl_r0.safetensors`, is an ordinary LoRA file — usable as-is, or as the warm start for the next round. With `--logging_dir`, the per-step loss/policy/KL scalars are written to TensorBoard.
+The result, `output/my_lora_rl_r0.safetensors`, is a LoRA checkpoint and can be used as the next round's warm start. With `--logging_dir`, per-step loss/policy and historically named `kl` scalars are written to TensorBoard; for `nft`, `rwr`, and `ppo`, that scalar is the reference-prediction MSE described above.
 
 Swap the update rule with `--rl_loss rwr|dpo` — nothing else changes; the same cache is reused. **`--rl_loss ppo`** (trajectory-faithful DDPO) instead needs a cache built with Phase-A `--rl_sde_sampler` (records the per-step trajectory):
 
 ```bash
 # Phase A — add --rl_sde_sampler so the per-step SDE trajectory is cached (CFG stays off):
-python ltx2_cache_rollouts.py ... --reward_fn "hpsv3:1.0" ^
+python src/musubi_tuner/ltx2_cache_rollouts.py ... --reward_fn "hpsv3:1.0" ^
   --rl_sde_sampler --rl_sde_eta 1.0 ^
   --rl_rollout_cache output/rollouts_ppo_r0 --rl_save_old_lora output/old_ppo_r0.safetensors
 
 # Phase B — trajectory-faithful PPO on that cache:
-accelerate launch ... ltx2_train_rl.py ... --network_weights output/old_ppo_r0.safetensors ^
+accelerate launch ... src/musubi_tuner/ltx2_train_rl.py ... --network_weights output/old_ppo_r0.safetensors ^
   --rl_rollout_cache output/rollouts_ppo_r0 --rl_loss ppo --rl_sde_eta 1.0 --ppo_clip_eps 0.2
 ```
 
 **5. The round loop.** RL proceeds in rounds: *generate → train → warm-start the next round from the new LoRA*. `ltx2_rl_rounds.py` runs the whole loop from one command — pass it the union of the Phase A and Phase B arguments (each flag is forwarded to the phase that owns it) plus `--rl_rounds`:
 
 ```bash
-python ltx2_rl_rounds.py <the Phase A and Phase B arguments from above> ^
+python src/musubi_tuner/ltx2_rl_rounds.py <the Phase A and Phase B arguments from above> ^
   --rl_rounds 10 ^
   --output_dir output --output_name my_lora_rl ^
   --rl_heldout_prompts heldout_prompts.txt   # optional evaluation/model selection
@@ -4361,9 +4363,9 @@ Any round's Phase-B output is an RL-LoRA you can ship. If you enabled held-out s
 | `rwr` | Advantage-weighted regression: pull each sample toward its own clean `x0`, weighted by advantage. | `--rwr_temperature` |
 | `dpo` | Diffusion-DPO on each group's best vs worst sample (preference; reward only ranks). | `--dpo_beta` |
 | `ppo` | Trajectory-faithful DDPO: exact per-step importance ratio. Needs a Phase-A `--rl_sde_sampler` cache; run with CFG off. | `--ppo_clip_eps`, `--rl_sde_eta` |
-| `refl` | Differentiable-reward backprop: maximizes the reward straight through the sampler. Online-only (generates rollouts inline, no cache); requires a `kind="differentiable"` reward. | `--refl_grad_steps`, `--refl_renoise_samples`, `--refl_reward_weight` |
+| `refl` | Online video-only differentiable-reward update. It performs one differentiable final denoising step from a re-noised detached rollout latent. | `--refl_renoise_samples`, `--refl_reward_weight`, `--nft_kl_beta` (reference-x0 MSE coefficient) |
 
-`nft`/`rwr`/`ppo` and `refl` add a KL term to the frozen reference (`--nft_kl_beta`, default `1e-4`); `dpo` is its own anchor. Start with `nft`.
+`nft`/`rwr`/`ppo` and `refl` use `--nft_kl_beta` (default `1e-4`) for a frozen-reference MSE term; `dpo` does not use it. For `refl`, `--refl_grad_steps` accepts only `1`; values greater than one are rejected because multi-step differentiable denoising is not implemented. `--refl_renoise_samples M` averages `M` independent one-step estimates. ReFL rejects AV mode and every reward that requests decoded pixels/audio. The only runnable built-in differentiable reward is currently `latent_energy`; `pixel_sharpness` is an interface example whose required in-graph video decoder intentionally raises `NotImplementedError`.
 
 ### The reward zoo
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4388,7 +4390,7 @@ Select rewards with `--reward_fn "name:weight,name2:weight2,..."` (a bare `name`
 - **Routing.** `video` rewards drive the video branch, `audio` the audio branch, `sync` both. `audio`/`sync` rewards require `--ltx2_mode av`.
 - **Composition.** Combine rewards with weights — GRPO normalises each within its group, so different raw scales mix fine. Example: `--reward_fn "hpsv3:1.0,videoreward:0.5"`. When a low-level reward (e.g. `iqa_quality`) can be satisfied by adding high-frequency noise, pair it with the `anti_noise` guardrail and a learned visual-quality reward; over-weighting `anti_noise` prefers smooth/flat video.
 - **Physics.** Use the learned `videoscore2 dims=pc` head for semantic physical commonsense (gravity, collisions, object permanence). A frame statistic cannot tell that a ball should fall down.
-- **Differentiable rewards (for `--rl_loss refl`).** A reward may additionally declare `kind="differentiable"` and implement `score_grad(samples) -> Tensor` (a grad-carrying per-sample reward, same higher-is-better convention as `score`) so `refl` can backprop it straight through the sampler. Templates in `ltx2_rewards/zoo/refl_targets.py`: `latent_energy` (latent-space, needs no decode) and `pixel_sharpness` (decoded frames). The black-box rewards in the table above have no `score_grad` and are usable only by the policy-gradient rules (`nft`/`rwr`/`dpo`/`ppo`); `refl` rejects them at launch.
+- **Differentiable rewards (for `--rl_loss refl`).** A reward declares `kind="differentiable"` and implements `score_grad(samples) -> (Tensor[N], info)`, returning one grad-carrying higher-is-better value per sample. `latent_energy` is the runnable latent-space example. `pixel_sharpness` is registered as a pixel-space interface example, but ReFL rejects its decode path as described above. The black-box rewards in the table do not implement `score_grad` and ReFL rejects them during setup.
 
 Reward model code is vendored (`ltx2_rewards/vendor/`), but the runtime libraries of the model-backed rewards are **not** installed with this package — each reward file lists its own `pip install` line at the top of its docstring (`iqa_quality` → `pyiqa`; `hpsv3`/`videoreward`/`videoscore2` → `qwen-vl-utils` (+`peft` for `videoreward`); `imagebind` → `ftfy regex`; `av_align`/`imagebind` have optional exact-parity extras). Checkpoints come from [`huggingface.co/zghhui/OmniNFT-Reward-Series`](https://huggingface.co/zghhui/OmniNFT-Reward-Series) where applicable; pull only the rewards your `--reward_fn` uses.
 
@@ -4401,7 +4403,7 @@ Reward model code is vendored (`ltx2_rewards/vendor/`), but the runtime librarie
 - **Judge by held-out when possible, not by the train reward.** For serious runs, score a fixed-seed **held-out** prompt set between rounds — the train-side reward can climb while the policy degenerates.
 - **Keep the peak round, not the last one.** Learned rewards can climb for a stretch and then collapse — every round's LoRA is saved, so pick the one at the held-out peak.
 - **Check for hacking.** A composite can be gamed. Pair a low-level objective with a guardrail (e.g. `anti_noise`) and a learned visual-quality reward, score the final RL-LoRA on rewards it was **not** trained on, and look at the samples.
-- **Watch:** `ROUND_REWARD` should trend up across rounds; the `policy` term should fall within a round; `kl` should stay small and finite (rising KL means the policy is drifting from the reference).
+- **Watch:** record `ROUND_REWARD`, the objective-specific `policy` term, and the historically named `kl` scalar. The latter is reference-prediction MSE, not KL divergence. Trends are diagnostics, not guaranteed acceptance criteria; compare held-out scores and generated samples.
 
 ### Writing a custom reward
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4485,7 +4487,7 @@ class SaturationReward(BaseReward):
 Use it as a drop-in file:
 
 ```bash
-python ltx2_rl_rounds.py ... ^
+python src/musubi_tuner/ltx2_rl_rounds.py ... ^
   --reward_plugins path/to/saturation.py ^
   --reward_fn "saturation:1.0" ^
   --reward_args num_frames=5
@@ -4608,7 +4610,7 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 > The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
 
 > [!NOTE]
-> **Block swap with full fine-tuning.** `--blocks_to_swap N` works for full-parameter runs but is far slower than for LoRA. The faster H2D-only path is unavailable here — combining `--block_swap_h2d_only` with `--blocks_to_swap` raises an error — because with trainable base weights each swapped block must be written back Device→Host every step, making the transfer bidirectional and PCIe-bound instead of Host→Device-only. Measured on one H100 at 1280x720x121, `blocks_to_swap=40` ran roughly 3x slower per step than `blocks_to_swap=0`. Prefer `blocks_to_swap=0` when the model fits (video-only peaks ~55-66 GB), and use int8-weight training or QAPOLLO / Q-GaLore rather than block swap to fit full fine-tuning on smaller cards.
+> **Block swap with full fine-tuning.** `--blocks_to_swap N` is accepted for full-parameter runs. `--block_swap_h2d_only` is not: combining it with full fine-tuning raises an error because trainable base blocks cannot use the frozen-weight Host→Device-only schedule. Standard block swap therefore transfers trainable block state in both directions. Its peak memory and step time depend on the model, bucket, host/device interconnect, ring settings, and optimizer; benchmark the intended configuration rather than treating the LoRA measurements or historical benchmark tables below as a capacity guarantee.
 
 #### Using Full-Finetune Checkpoints for Inference
 
@@ -5068,7 +5070,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
-**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`, expect roughly bf16-minus-~10 GB peak VRAM and a small step-time overhead (~1.05x) with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). The compiled GEMM roughly halves the FP8 GEMM-op time; measure end-to-end on your hardware. Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`, `--fp8_gemm_scaling {tensor,rowwise}`. `--fp8_gemm_scaling tensor` (default) uses one dynamic scale per tensor; `rowwise` uses per-row dynamic scales via `torch._scaled_mm` rowwise support for better numerics on Hopper (requires torch ≥ 2.5). Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
+**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces eligible attention/FFN `Linear` layers with FP8 forward/backward calls to the private `torch._scaled_mm` API while retaining bf16 master weights. The runtime gate requires CUDA compute capability ≥ 8.9. `--fp8_gemm_compile` defaults on and requests regional compilation; if compilation raises, the wrapper logs a warning and continues with the eager FP8 wrapper. `--fp8_gemm_scaling tensor` (default) uses one dynamic scale per input tensor; `rowwise` passes per-row/per-column scale tensors to the installed build's private `torch._scaled_mm` implementation. Support for that private rowwise form is build-dependent. Other flags are `--fp8_gemm_targets`, `--fp8_gemm_grad_dtype {e4m3,e5m2}`, and `--fp8_gemm_min_numel`. The path is mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, and `--ltx2_model_parallel`. No fixed memory, speed, numerical-stability, or output-quality claim is made; measure and validate the exact target build and workload.
 
 > [!CAUTION]
 > **Experimental.** Validate loss, long-run stability, and final sample quality on your own runs (and monitor gradient norms) before relying on it for production.
@@ -5101,7 +5103,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [QLoRA (arXiv 2305.14314)](https://arxiv.org/abs/2305.14314) — Introduces NF4 quantization used by the `--nf4_base` implementation
 - [LoftQ (arXiv 2310.08659)](https://arxiv.org/abs/2310.08659) — Quantization-aware LoRA initialization used by `--loftq_init`
 - [AWQ (arXiv 2306.00978)](https://arxiv.org/abs/2306.00978) — Activation-aware quantization background for `--awq_calibration`
-- [FourTune: Towards Fully 4-Bit Efficient Post-Training for Diffusion Models (arXiv 2607.05711)](https://arxiv.org/abs/2607.05711) — Fully 4-bit (W4A4G4) post-training pipeline followed by `--w4a4g4`
+- [FourTune: Towards Fully 4-Bit Efficient Post-Training for Diffusion Models (arXiv 2607.05711)](https://arxiv.org/abs/2607.05711) — Research background for the local `--w4a4g4` design; the local path is not claimed to reproduce the paper
 - [DINOv2 (arXiv 2304.07193)](https://arxiv.org/abs/2304.07193) — External visual features used by CREPA dino mode
 - [CREPA (arXiv 2506.09229)](https://arxiv.org/abs/2506.09229) — Cross-frame Representation Alignment; basis for CREPA dino mode (`--crepa` with `--crepa_args mode=dino`, DINOv2 teacher from neighboring frames)
 - [Latent Temporal Discrepancy (arXiv 2601.20504)](https://arxiv.org/abs/2601.20504) — Motion-prior loss weighting basis for `--latent_temporal_weighting`

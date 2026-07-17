@@ -12,11 +12,12 @@ group-relative advantage:
     pos_pt = ((pos - x0)^2 / wp).mean(-1) ; neg_pt = ((neg - x0)^2 / wn).mean(-1)
     policy_pt = r*pos_pt + (1-r)*neg_pt
     policy_m  = (policy_pt*attn_w).sum(1)/attn_w.sum(1) / beta_mix * adv_clip_max
-    kl_m      = ((fwd - ref)^2).mean(-1).mean(1)
-    loss = policy.mean() + kl_beta * kl.mean()
+    reference_mse_m = ((fwd - ref)^2).mean(-1).mean(1)
+    loss = policy.mean() + kl_beta * reference_mse.mean()
 
-CRITICAL: ``beta_mix`` (the pos/neg mix, default 1.0) and ``kl_beta`` (the KL coefficient,
-default 1e-4) are DIFFERENT scalars. Tensors are the token layout ``[B, T, C]``;
+CRITICAL: ``beta_mix`` (the pos/neg mix, default 1.0) and ``kl_beta`` (the historically named
+reference-prediction MSE coefficient, default 1e-4) are DIFFERENT scalars. No KL divergence is
+calculated. Tensors are the token layout ``[B, T, C]``;
 the RL loop flattens the latent to tokens before calling this. ``wp``/``wn`` are computed in
 float64 (chunked per modality by construction).
 """
@@ -38,7 +39,7 @@ def compute_nft_loss(
     adv_clip_max: float = 5.0,
     modality_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Compute the NFT policy+KL loss.
+    """Compute the NFT policy loss plus the reference-prediction MSE term.
 
     ``modality_states[m]`` holds tensors ``fwd``, ``old``, ``ref``, ``x0`` of shape ``[B, T, C]``
     (``fwd`` carries grad; the rest are detached), ``adv`` of shape ``[B, T]`` (per-token advantage),
@@ -57,8 +58,8 @@ def compute_nft_loss(
     modality_policy: Dict[str, torch.Tensor] = {}
     modality_kl: Dict[str, torch.Tensor] = {}
 
-    # Promote bf16/fp16 state tensors to fp32 for the squared-error + KL math; the RL loop passes
-    # bf16, which truncates the tiny kl_beta(1e-4)-scaled KL signal. Tensors that
+    # Promote bf16/fp16 state tensors to fp32 for the squared-error math; the RL loop passes
+    # bf16, which truncates the small kl_beta(1e-4)-scaled reference-MSE signal. Tensors that
     # are already fp32+ are left untouched (do NOT downcast fp64). ``.float()`` is differentiable so a
     # grad-carrying tensor keeps its graph (autograd casts the gradient back on backward).
     def _calc(t):

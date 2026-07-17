@@ -138,7 +138,7 @@
 				style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
 			>
 				<option value="cpu">CPU</option>
-				<option value="cuda">CUDA (faster)</option>
+				<option value="cuda">CUDA</option>
 			</select>
 		</label>
 	</div>
@@ -162,7 +162,7 @@
 	<div class="flex flex-wrap items-center gap-4">
 		<label class="flex items-center gap-2 text-[12px]" style="color: var(--text-secondary);">
 			<input type="checkbox" bind:checked={mseClip} disabled={active} />
-			MSE-optimal scale clipping
+			MSE-selected scale clipping
 		</label>
 		<label class="flex items-center gap-2 text-[12px]" style="color: var(--text-secondary);">
 			<input type="checkbox" bind:checked={qualityReport} disabled={active} />

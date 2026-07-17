@@ -2296,7 +2296,15 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
     if rl.nft_beta_mix <= 0.0:
         errors.append(_make_issue("error", "rl.nft_beta_mix", "NFT Beta Mix must be > 0.", label="NFT Beta Mix", page="rl"))
     if rl.nft_kl_beta < 0.0:
-        errors.append(_make_issue("error", "rl.nft_kl_beta", "NFT KL Beta must be >= 0.", label="NFT KL Beta", page="rl"))
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.nft_kl_beta",
+                "Reference MSE Beta must be >= 0.",
+                label="Reference MSE Beta",
+                page="rl",
+            )
+        )
     if rl.nft_adv_clip_max <= 0.0:
         errors.append(
             _make_issue(

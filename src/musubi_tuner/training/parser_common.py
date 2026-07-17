@@ -85,8 +85,8 @@ def _add_attention_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cudnn_attn",
         action="store_true",
-        help="use cuDNN-prioritized SDPA attention; fastest SDPA backend on Hopper and on Windows,"
-        " falls back per-shape to flash/efficient/math (LTX-2 only)",
+        help="use cuDNN-prioritized SDPA attention; outside torch.compile PyTorch may fall back per shape to "
+        "flash/efficient/math, while compiled LTX-2 blocks use ordinary SDPA (LTX-2 only)",
     )
     parser.add_argument(
         "--split_attn",

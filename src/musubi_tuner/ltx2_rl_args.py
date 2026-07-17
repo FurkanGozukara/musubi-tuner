@@ -165,7 +165,9 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "--nft_kl_beta",
             type=float,
             default=DEFAULT_NFT_KL_BETA,
-            help="KL coefficient (config.train.beta) — distinct from beta_mix",
+            help=(
+                "Reference-prediction MSE coefficient for nft/rwr/ppo/refl (historical flag name; this term is not a KL divergence)"
+            ),
         )
     if "--nft_adv_clip_max" not in seen:
         parser.add_argument("--nft_adv_clip_max", type=float, default=DEFAULT_NFT_ADV_CLIP_MAX)
@@ -195,7 +197,11 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         )
     if "--refl_grad_steps" not in seen:
         parser.add_argument(
-            "--refl_grad_steps", type=int, default=1, help="refl: final denoising steps the reward gradient flows through"
+            "--refl_grad_steps",
+            type=int,
+            default=1,
+            choices=[1],
+            help="refl: differentiable denoising steps (currently only the single final step is implemented)",
         )
     if "--refl_renoise_samples" not in seen:
         parser.add_argument(
@@ -206,7 +212,10 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         )
     if "--refl_reward_weight" not in seen:
         parser.add_argument(
-            "--refl_reward_weight", type=float, default=1.0, help="refl: scale on the maximized reward term (KL uses --nft_kl_beta)"
+            "--refl_reward_weight",
+            type=float,
+            default=1.0,
+            help="refl: scale on the maximized reward term (reference-x0 MSE uses --nft_kl_beta)",
         )
     if "--rwr_temperature" not in seen:
         parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")
