@@ -373,22 +373,58 @@ class MultiModalTransformerArgsPreprocessor:
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | tuple, torch.Tensor | tuple]:
         """Prepare cross attention timestep embeddings."""
         scale_shift_timestep = scale_shift_timestep * timestep_scale_multiplier
         gate_timestep = gate_timestep * timestep_scale_multiplier
 
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            scale_shift_timestep.flatten(),
-            hidden_dtype=hidden_dtype,
+        compact_enabled = os.getenv("LTX2_COMPACT_AV_CROSS_ADALN", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
-        scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
-        gate_noise_timestep, _ = self.cross_gate_adaln(
-            gate_timestep.flatten() * av_ca_factor,
-            hidden_dtype=hidden_dtype,
+        if not compact_enabled:
+            scale_shift_timestep, _ = self.cross_scale_shift_adaln(
+                scale_shift_timestep.flatten(),
+                hidden_dtype=hidden_dtype,
+            )
+            scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
+            gate_noise_timestep, _ = self.cross_gate_adaln(
+                gate_timestep.flatten() * av_ca_factor,
+                hidden_dtype=hidden_dtype,
+            )
+            gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
+            return scale_shift_timestep, gate_noise_timestep
+
+        min_tokens = max(1, int(os.getenv("LTX2_COMPACT_AV_CROSS_ADALN_MIN_TOKENS", "256")))
+        compact_video = self.simple_preprocessor.inner_dim >= 4096
+
+        def project_timestep(adaln, values: torch.Tensor, *, allow_compact: bool):
+            flat_values = values.flatten()
+            if flat_values.numel() % batch_size != 0:
+                raise ValueError(f"Cross-AdaLN timestep count {flat_values.numel()} is not divisible by batch size {batch_size}.")
+            num_tokens = flat_values.numel() // batch_size
+            if allow_compact and num_tokens >= min_tokens:
+                unique_values, inverse_indices = torch.unique(flat_values, return_inverse=True)
+                if unique_values.numel() < flat_values.numel():
+                    projected, _ = adaln(unique_values, hidden_dtype=hidden_dtype)
+                    return projected, inverse_indices, batch_size, num_tokens
+
+            projected, _ = adaln(flat_values, hidden_dtype=hidden_dtype)
+            return projected.view(batch_size, num_tokens, projected.shape[-1])
+
+        scale_shift_timestep = project_timestep(
+            self.cross_scale_shift_adaln,
+            scale_shift_timestep,
+            allow_compact=compact_video,
         )
-        gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
+        gate_noise_timestep = project_timestep(
+            self.cross_gate_adaln,
+            gate_timestep * av_ca_factor,
+            allow_compact=compact_video,
+        )
 
         return scale_shift_timestep, gate_noise_timestep
