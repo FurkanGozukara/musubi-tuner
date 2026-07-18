@@ -24,6 +24,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     save_text_encoder_output_cache_ltx2_gemma,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.utils.safetensors_utils import atomic_torch_save
 
@@ -33,6 +34,10 @@ logging.basicConfig(level=logging.INFO)
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
+
+
+def _checkpoint_model_loader(args: argparse.Namespace) -> SafetensorsModelStateDictLoader:
+    return SafetensorsModelStateDictLoader(cpu_staging=bool(getattr(args, "cpu_staged_checkpoint_loading", False)))
 
 
 def _all_declared_datasets_are_audio(user_config: dict) -> bool:
@@ -355,6 +360,8 @@ def main() -> None:
         args.ltx_mode = short_map[args.ltx_mode]
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+    if getattr(args, "cpu_staged_checkpoint_loading", False):
+        logger.info("CPU-staged LTX checkpoint loading is enabled")
 
     # Opt-in multi-process cache sharding (default off → single process, no change).
     device, _shard = cache_latents.resolve_distributed_cache_shard(args, device)
@@ -448,6 +455,7 @@ def main() -> None:
         model_path=str(text_encoder_checkpoint),
         model_class_configurator=configurator,
         model_sd_ops=key_ops,
+        model_loader=_checkpoint_model_loader(args),
         module_ops=module_ops_from_gemma_root(
             args.gemma_root,
             gemma_safetensors=gemma_safetensors,
@@ -554,6 +562,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
+    )
+    parser.add_argument(
+        "--cpu_staged_checkpoint_loading",
+        action="store_true",
+        help="Load LTX checkpoint tensors through CPU before moving them to the selected device. "
+        "Useful as a compatibility workaround for direct CUDA safetensors loading errors.",
     )
     parser.add_argument(
         "--ltx2_text_encoder_checkpoint",

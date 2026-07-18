@@ -13,6 +13,15 @@ class SafetensorsStateDictLoader(StateDictLoader):
     configuration metadata, use SafetensorsModelStateDictLoader instead.
     """
 
+    def __init__(self, *, cpu_staging: bool = False):
+        """Create a weight loader.
+
+        When ``cpu_staging`` is enabled, tensors are opened on CPU and then
+        copied synchronously to the requested device. This avoids relying on
+        safetensors' direct device-backed storage path.
+        """
+        self.cpu_staging = cpu_staging
+
     def metadata(self, path: str) -> dict:
         raise NotImplementedError("Not implemented")
 
@@ -24,15 +33,20 @@ class SafetensorsStateDictLoader(StateDictLoader):
         size = 0
         dtype = set()
         device = device or torch.device("cpu")
+        open_device = torch.device("cpu") if self.cpu_staging else device
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            with safetensors.safe_open(shard_path, framework="pt", device=str(device)) as f:
+            with safetensors.safe_open(shard_path, framework="pt", device=str(open_device)) as f:
                 safetensor_keys = f.keys()
                 for name in safetensor_keys:
                     expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
                     if expected_name is None:
                         continue
-                    value = f.get_tensor(name).to(device=device, non_blocking=True, copy=False)
+                    value = f.get_tensor(name).to(
+                        device=device,
+                        non_blocking=not self.cpu_staging,
+                        copy=False,
+                    )
                     key_value_pairs = ((expected_name, value),)
                     if sd_ops is not None:
                         key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
@@ -51,8 +65,10 @@ class SafetensorsModelStateDictLoader(StateDictLoader):
     from the safetensors file metadata via the metadata() method.
     """
 
-    def __init__(self, weight_loader: SafetensorsStateDictLoader | None = None):
-        self.weight_loader = weight_loader if weight_loader is not None else SafetensorsStateDictLoader()
+    def __init__(self, weight_loader: SafetensorsStateDictLoader | None = None, *, cpu_staging: bool = False):
+        if weight_loader is not None and cpu_staging:
+            raise ValueError("cpu_staging cannot be combined with a custom weight_loader")
+        self.weight_loader = weight_loader if weight_loader is not None else SafetensorsStateDictLoader(cpu_staging=cpu_staging)
 
     def metadata(self, path: str) -> dict:
         with safetensors.safe_open(path, framework="pt") as f:

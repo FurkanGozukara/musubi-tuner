@@ -37,6 +37,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
 from musubi_tuner.ltx_2.env import get_ltx2_env
+from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
 from musubi_tuner.model_defaults import default_ltx2_checkpoint_path
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, atomic_torch_save, save_file_atomic
@@ -50,6 +51,10 @@ LTX2_VIDEO_SPATIAL_DOWNSAMPLE_FACTOR = 32
 LTX2_AUDIO_ONLY_PROXY_LATENT_FRAMES = 1
 LTX2_AUDIO_ONLY_PROXY_LATENT_HEIGHT = 1
 LTX2_AUDIO_ONLY_PROXY_LATENT_WIDTH = 1
+
+
+def _checkpoint_model_loader(args: argparse.Namespace) -> SafetensorsModelStateDictLoader:
+    return SafetensorsModelStateDictLoader(cpu_staging=bool(getattr(args, "cpu_staged_checkpoint_loading", False)))
 
 
 def _amp_context(device: torch.device, dtype: torch.dtype):
@@ -1304,6 +1309,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             model_path=str(vae_checkpoint),
             model_class_configurator=VideoEncoderConfigurator,
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=_checkpoint_model_loader(args),
         ).build(device=device, dtype=vae_dtype)
         vae_encoder.eval()
 
@@ -1326,6 +1332,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             model_path=str(args.ltx2_checkpoint),
             model_class_configurator=AudioEncoderConfigurator,
             model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=_checkpoint_model_loader(args),
         ).build(device=device, dtype=audio_dtype)
         audio_encoder.eval()
 
@@ -1586,6 +1593,9 @@ def main() -> None:
     audio_only = ltx_mode == "audio"
     audio_video = ltx_mode == "av"
 
+    if getattr(args, "cpu_staged_checkpoint_loading", False):
+        logger.info("CPU-staged LTX checkpoint loading is enabled")
+
     # Auto-detect audio-only mode if all datasets are AudioDataset
     audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
     non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
@@ -1608,6 +1618,7 @@ def main() -> None:
             model_path=str(args.vae),
             model_class_configurator=VideoEncoderConfigurator,
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=_checkpoint_model_loader(args),
         ).build(device=device, dtype=vae_dtype)
         vae.eval()
         if args.vae_chunk_size is not None:
@@ -1774,6 +1785,7 @@ def main() -> None:
             model_path=str(args.ltx2_checkpoint),
             model_class_configurator=AudioEncoderConfigurator,
             model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=_checkpoint_model_loader(args),
         ).build(device=device, dtype=audio_dtype)
         encoder.eval()
 
@@ -1887,6 +1899,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
+    )
+    parser.add_argument(
+        "--cpu_staged_checkpoint_loading",
+        action="store_true",
+        help="Load LTX checkpoint tensors through CPU before moving them to the selected device. "
+        "Useful as a compatibility workaround for direct CUDA safetensors loading errors.",
     )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
     parser.add_argument(
