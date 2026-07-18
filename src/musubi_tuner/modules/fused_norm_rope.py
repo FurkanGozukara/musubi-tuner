@@ -13,6 +13,8 @@ Opt-in via ``LTX2_FUSED_NORM_ROPE=1`` (default OFF). When the flag is unset the
 caller retains the existing eager path. When the flag is set but tensors are ineligible,
 the process is compiling, or the CUDA extension cannot be built, the caller falls back
 to eager (with a one-time warning for extension-load failure).
+Set ``LTX2_FUSED_NORM_ROPE_BACKWARD=1`` to enable the split-RoPE CUDA backward
+when the norm weights are frozen.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ _EXTENSION = None
 _LOAD_ERROR: Exception | None = None
 _WARNED_UNAVAILABLE = False
 _LOGGED_ENGAGED = False
+_LOGGED_BACKWARD_ENGAGED = False
 
 _MAX_FUSED_DIM = 32768
 
@@ -91,6 +94,10 @@ def is_enabled() -> bool:
     return os.getenv("LTX2_FUSED_NORM_ROPE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def is_backward_enabled() -> bool:
+    return os.getenv("LTX2_FUSED_NORM_ROPE_BACKWARD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _warn_unavailable_once() -> None:
     global _WARNED_UNAVAILABLE
     if not _WARNED_UNAVAILABLE:
@@ -107,6 +114,13 @@ def _log_engaged_once(kind: str) -> None:
     if not _LOGGED_ENGAGED:
         _LOGGED_ENGAGED = True
         logger.info("LTX2_FUSED_NORM_ROPE=1: using fused qk-norm + %s RoPE kernel", kind)
+
+
+def _log_backward_engaged_once() -> None:
+    global _LOGGED_BACKWARD_ENGAGED
+    if not _LOGGED_BACKWARD_ENGAGED:
+        _LOGGED_BACKWARD_ENGAGED = True
+        logger.info("LTX2_FUSED_NORM_ROPE_BACKWARD=1: using fused split-RoPE backward")
 
 
 def _eager_ref(
@@ -265,6 +279,51 @@ class _FusedNormSplitRopeFn(torch.autograd.Function):
         return gx, gw, None, None, None
 
 
+class _FusedQKNormSplitRopeFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, q_weight, k_weight, q_cos, q_sin, k_cos, k_sin, eps):
+        ext = _load_extension()
+        q_weight_k = q_weight.to(torch.bfloat16).contiguous()
+        k_weight_k = k_weight.to(torch.bfloat16).contiguous()
+        q_cos_k, q_sin_k = q_cos.to(torch.bfloat16), q_sin.to(torch.bfloat16)
+        k_cos_k, k_sin_k = k_cos.to(torch.bfloat16), k_sin.to(torch.bfloat16)
+        q_out, q_inv_rms = ext.rms_norm_split_rope_with_inv_rms(q.contiguous(), q_sin_k, q_cos_k, q_weight_k, False, eps)
+        k_out, k_inv_rms = ext.rms_norm_split_rope_with_inv_rms(k.contiguous(), k_sin_k, k_cos_k, k_weight_k, False, eps)
+        ctx.save_for_backward(
+            q,
+            k,
+            q_weight_k,
+            k_weight_k,
+            q_cos_k,
+            q_sin_k,
+            k_cos_k,
+            k_sin_k,
+            q_inv_rms,
+            k_inv_rms,
+        )
+        return q_out, k_out
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k):
+        ext = _load_extension()
+        q, k, q_weight, k_weight, q_cos, q_sin, k_cos, k_sin, q_inv_rms, k_inv_rms = ctx.saved_tensors
+        grad_x_q, grad_x_k = ext.rms_norm_split_rope_backward_pair(
+            grad_q.contiguous(),
+            q,
+            q_sin,
+            q_cos,
+            q_weight,
+            q_inv_rms,
+            grad_k.contiguous(),
+            k,
+            k_sin,
+            k_cos,
+            k_weight,
+            k_inv_rms,
+        )
+        return grad_x_q, grad_x_k, None, None, None, None, None, None, None
+
+
 def fused_norm_rope(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -285,6 +344,20 @@ def fused_norm_split_rope(
 ) -> torch.Tensor:
     """Fused RMSNorm(+affine) then split (half-split) RoPE on ``x`` (bf16 in, bf16 out)."""
     return _FusedNormSplitRopeFn.apply(x, weight, cos, sin, eps)
+
+
+def fused_qk_norm_split_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    q_cos: torch.Tensor,
+    q_sin: torch.Tensor,
+    k_cos: torch.Tensor,
+    k_sin: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _FusedQKNormSplitRopeFn.apply(q, k, q_weight, k_weight, q_cos, q_sin, k_cos, k_sin, eps)
 
 
 def _is_eligible(x: object) -> bool:
@@ -387,6 +460,15 @@ def try_qk_norm_rope(
             _warn_unavailable_once()
             return None
         _log_engaged_once("split")
+        if (
+            is_backward_enabled()
+            and q.requires_grad
+            and k.requires_grad
+            and not q_weight.requires_grad
+            and not k_weight.requires_grad
+        ):
+            _log_backward_engaged_once()
+            return fused_qk_norm_split_rope(q, k, q_weight, k_weight, cos_q, sin_q, cos_k, sin_k, eps)
         q_out = fused_norm_split_rope(q, q_weight, cos_q, sin_q, eps)
         k_out = fused_norm_split_rope(k, k_weight, cos_k, sin_k, eps)
         return q_out, k_out
