@@ -1,3 +1,9 @@
+import os
+import threading
+import weakref
+from functools import wraps
+from typing import Callable, TypeVar
+
 import torch
 
 _LOGGED_MISMATCH = False
@@ -6,6 +12,136 @@ _BLOCK_SWAP_ACTIVE = False
 # Track which block index is currently being processed by swap logic
 # Only disable auto-moves for THIS block (others need auto-load for gradient checkpointing)
 _CURRENT_SWAP_BLOCK_IDX = -1
+_FP8_PLACEMENT_SCOPE_ENABLED: bool | None = None
+_PLACEMENT_SCOPE_STATE = threading.local()
+
+_Forward = TypeVar("_Forward", bound=Callable)
+_PlacementScope = tuple[tuple[str, int | None], frozenset[int], bool, bool]
+_PendingScope = tuple[weakref.ReferenceType[torch.nn.Module], _PlacementScope]
+
+
+def fp8_placement_scope_enabled() -> bool:
+    enabled = _FP8_PLACEMENT_SCOPE_ENABLED
+    if enabled is None:
+        enabled = os.getenv("LTX2_FP8_PLACEMENT_SCOPE", "0") == "1"
+    return enabled and not torch.compiler.is_compiling()
+
+
+def _device_key(device: torch.device) -> tuple[str, int | None]:
+    device = torch.device(device)
+    index = device.index
+    if device.type == "cuda" and index is None and torch.cuda.is_available():
+        index = torch.cuda.current_device()
+    return device.type, index
+
+
+def _scope_stack() -> list[_PlacementScope]:
+    stack = getattr(_PLACEMENT_SCOPE_STATE, "stack", None)
+    if stack is None:
+        stack = []
+        _PLACEMENT_SCOPE_STATE.stack = stack
+    return stack
+
+
+def _pending_scopes() -> dict[int, _PendingScope]:
+    pending = getattr(_PLACEMENT_SCOPE_STATE, "pending", None)
+    if pending is None:
+        pending = {}
+        _PLACEMENT_SCOPE_STATE.pending = pending
+    return pending
+
+
+def _scope_covers(
+    scope: _PlacementScope,
+    module: torch.nn.Module,
+    target_device: torch.device,
+    only_lora: bool,
+    skip_trainable: bool,
+) -> bool:
+    device_key, module_ids, scope_only_lora, scope_skip_trainable = scope
+    if device_key != _device_key(target_device) or id(module) not in module_ids:
+        return False
+    if scope_only_lora and not only_lora:
+        return False
+    return not (device_key[0] == "cpu" and scope_skip_trainable and not skip_trainable)
+
+
+def prepare_fp8_placement_scope(
+    module: torch.nn.Module,
+    target_device: torch.device,
+    verified_module_ids: frozenset[int] | None,
+    *,
+    only_lora: bool = False,
+    skip_trainable: bool = True,
+) -> None:
+    if not fp8_placement_scope_enabled() or not verified_module_ids or id(module) not in verified_module_ids:
+        return
+    _pending_scopes()[id(module)] = (
+        weakref.ref(module),
+        (_device_key(target_device), verified_module_ids, only_lora, skip_trainable),
+    )
+
+
+def _take_prepared_scope(module: torch.nn.Module):
+    record = _pending_scopes().pop(id(module), None)
+    if record is None or record[0]() is not module:
+        return None
+    return record[1]
+
+
+def _find_tensor_device(values) -> torch.device | None:
+    stack = list(values)
+    seen: set[int] = set()
+    while stack:
+        value = stack.pop()
+        if isinstance(value, torch.Tensor):
+            return value.device
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+        else:
+            for name in ("x", "latent"):
+                tensor = getattr(value, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    return tensor.device
+    return None
+
+
+def fp8_placement_scoped_forward(*, prepared_only: bool = False):
+    def decorate(forward: _Forward) -> _Forward:
+        @wraps(forward)
+        def wrapped(module: torch.nn.Module, *args, **kwargs):
+            if not fp8_placement_scope_enabled():
+                return forward(module, *args, **kwargs)
+
+            active = _scope_stack()
+            if active and id(module) in active[-1][1]:
+                return forward(module, *args, **kwargs)
+
+            scope = _take_prepared_scope(module)
+            if scope is None and not prepared_only:
+                target_device = _find_tensor_device((args, kwargs))
+                if target_device is not None:
+                    verified = ensure_fp8_modules_on_device(module, target_device)
+                    if verified:
+                        scope = (_device_key(target_device), verified, False, True)
+            if scope is None:
+                return forward(module, *args, **kwargs)
+
+            active.append(scope)
+            try:
+                return forward(module, *args, **kwargs)
+            finally:
+                active.pop()
+
+        return wrapped
+
+    return decorate
 
 
 def set_block_swap_active(active: bool) -> None:
@@ -34,7 +170,7 @@ def _is_norm_module(module: torch.nn.Module) -> bool:
 
 def ensure_fp8_modules_on_device(
     module: torch.nn.Module, target_device: torch.device, only_lora: bool = False, skip_trainable: bool = True
-) -> None:
+) -> frozenset[int] | None:
     """Move FP8 module components to target device.
 
     Args:
@@ -49,10 +185,20 @@ def ensure_fp8_modules_on_device(
     """
     global _LOGGED_MISMATCH
 
+    if fp8_placement_scope_enabled():
+        active = _scope_stack()
+        if active and _scope_covers(active[-1], module, target_device, only_lora, skip_trainable):
+            return active[-1][1]
+        verified_module_ids: set[int] | None = set()
+    else:
+        verified_module_ids = None
+
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
     should_skip_trainable = skip_trainable and target_device.type == "cpu"
 
     for submodule in module.modules():
+        if verified_module_ids is not None:
+            verified_module_ids.add(id(submodule))
         if only_lora:
             allow_weight_move = False
             allow_norm_move = False
@@ -206,6 +352,8 @@ def ensure_fp8_modules_on_device(
                     lora_up_weight = getattr(lora_up, "weight", None)
                     if isinstance(lora_up_weight, torch.Tensor) and lora_up_weight.device != target_device:
                         lora_up.to(target_device)
+
+    return frozenset(verified_module_ids) if verified_module_ids is not None else None
 
 
 def move_fp8_scale_weights(module: torch.nn.Module, target_device: torch.device) -> None:

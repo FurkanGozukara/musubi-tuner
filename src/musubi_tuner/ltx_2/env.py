@@ -241,7 +241,38 @@ def get_ltx2_env() -> LTX2Env:
     return DEFAULT_ENV
 
 
+def _apply_performance_cli(args) -> None:
+    flags = (
+        ("ltx2_fused_norm_rope", "LTX2_FUSED_NORM_ROPE"),
+        ("ltx2_fused_norm_rope_backward", "LTX2_FUSED_NORM_ROPE_BACKWARD"),
+        ("ltx2_compact_av_cross_adaln", "LTX2_COMPACT_AV_CROSS_ADALN"),
+        ("ltx2_fp8_placement_scope", "LTX2_FP8_PLACEMENT_SCOPE"),
+        ("ltx2_attn_auto_dispatch", "LTX2_ATTN_AUTO_DISPATCH"),
+        ("ltx2_prompt_kv_checkpoint", "LTX2_PROMPT_KV_CHECKPOINT"),
+        ("ltx2_padded_prompt_trim", "LTX2_PADDED_PROMPT_TRIM"),
+        ("ltx2_partial_gradient_checkpointing", "LTX2_PARTIAL_GRADIENT_CHECKPOINTING"),
+    )
+    for attribute, environment_key in flags:
+        value = getattr(args, attribute, None)
+        if value is not None:
+            _set_env_bool(environment_key, bool(value))
+
+    values = (
+        ("ltx2_compact_av_cross_adaln_min_tokens", "LTX2_COMPACT_AV_CROSS_ADALN_MIN_TOKENS", 1),
+        ("ltx2_prompt_kv_checkpoint_max_mb", "LTX2_PROMPT_KV_CHECKPOINT_MAX_MB", 0),
+    )
+    for attribute, environment_key, minimum in values:
+        value = getattr(args, attribute, None)
+        if value is None:
+            continue
+        value = int(value)
+        if value < minimum:
+            raise ValueError(f"--{attribute} must be at least {minimum}")
+        os.environ[environment_key] = str(value)
+
+
 def apply_ltx2_tweaks(args) -> None:
+    _apply_performance_cli(args)
     t = DEFAULT_ENV
 
     args.use_audio_length_mask = t.use_audio_length_mask

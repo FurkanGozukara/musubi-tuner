@@ -920,10 +920,29 @@
 								<FormToggle label="H2D-only block swap" fieldPath="training.block_swap_h2d_only" checked={t.block_swap_h2d_only ?? false} onchange={(e) => update('block_swap_h2d_only', e.target.checked)} disabled={!t.blocks_to_swap || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Frozen-base LoRA block swap: keep CPU masters and stream host-to-device only. Requires gradient checkpointing." />
 								<FormToggle fieldPath="training.img_in_txt_in_offloading" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
 							</div>
-							<FormField type="number" fieldPath="training.blocks_to_checkpoint" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing} tooltip="Number of transformer blocks handled by blockwise checkpointing. Blank or -1 checkpoints all blocks; 0 disables it. Higher values reduce VRAM and increase recompute/offload overhead." />
 							<FormField label="Block swap ring size" type="number" fieldPath="training.block_swap_ring_size" value={t.block_swap_ring_size ?? 2} oninput={(e) => update('block_swap_ring_size', Number(e.target.value || 2))} min={1} disabled={!t.block_swap_h2d_only} tooltip="GPU ring buffers for H2D-only block swap. 2 is double buffering; 1 uses less VRAM with less overlap." />
 							<FormField type="number" fieldPath="training.split_attn_chunk_size" value={t.split_attn_chunk_size ?? ''} oninput={(e) => update('split_attn_chunk_size', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!t.split_attn_target} tooltip="Split attention chunk size" />
 						{/if}
+					</div>
+				</FormGroup>
+
+				<FormGroup title="LTX-2 Performance">
+					<div class="space-y-2 pt-2">
+						<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+							<FormToggle label="Fused QK norm + RoPE" fieldPath="training.ltx2_fused_norm_rope" checked={t.ltx2_fused_norm_rope ?? false} onchange={(e) => update('ltx2_fused_norm_rope', e.target.checked)} tooltip="Fuse Q/K RMSNorm and RoPE; typically saves about 6% step time on eligible BF16 CUDA shapes." />
+							<FormToggle label="Fused norm/RoPE backward" fieldPath="training.ltx2_fused_norm_rope_backward" checked={t.ltx2_fused_norm_rope_backward ?? false} onchange={(e) => update('ltx2_fused_norm_rope_backward', e.target.checked)} disabled={!t.ltx2_fused_norm_rope} tooltip="Fuse the matching backward; usually adds another 1.5-3%." />
+							<FormToggle label="Compact AV cross-AdaLN" fieldPath="training.ltx2_compact_av_cross_adaln" checked={t.ltx2_compact_av_cross_adaln ?? false} onchange={(e) => update('ltx2_compact_av_cross_adaln', e.target.checked)} disabled={t.ltx2_mode !== 'av'} tooltip="Reuse repeated AV cross-AdaLN timestep projections; useful when many tokens share conditioning timesteps." />
+							<FormToggle label="FP8 placement scope" fieldPath="training.ltx2_fp8_placement_scope" checked={t.ltx2_fp8_placement_scope ?? false} onchange={(e) => update('ltx2_fp8_placement_scope', e.target.checked)} disabled={!(t.fp8_base && t.fp8_scaled)} tooltip="Avoid repeated scaled-FP8 placement checks during a forward; can save about 8% on short checkpointed workloads." />
+							<FormToggle label="Attention auto-dispatch" fieldPath="training.ltx2_attn_auto_dispatch" checked={t.ltx2_attn_auto_dispatch ?? false} onchange={(e) => update('ltx2_attn_auto_dispatch', e.target.checked)} disabled={!t.sdpa} tooltip="Use cuDNN-prioritized SDPA for large maskless shapes; most useful for long sequences." />
+							<FormToggle label="Preserve prompt K/V" fieldPath="training.ltx2_prompt_kv_checkpoint" checked={t.ltx2_prompt_kv_checkpoint ?? false} onchange={(e) => update('ltx2_prompt_kv_checkpoint', e.target.checked)} disabled={!t.gradient_checkpointing} tooltip="Avoid rebuilding video prompt K/V during checkpoint recomputation; useful for long prompts." />
+							<FormToggle label="Trim padded prompt" fieldPath="training.ltx2_padded_prompt_trim" checked={t.ltx2_padded_prompt_trim ?? false} onchange={(e) => update('ltx2_padded_prompt_trim', e.target.checked)} tooltip="Remove a shared right-padded prompt tail before transfer and attention." />
+							<FormToggle label="Partial gradient checkpointing" fieldPath="training.ltx2_partial_gradient_checkpointing" checked={t.ltx2_partial_gradient_checkpointing ?? false} onchange={(e) => update('ltx2_partial_gradient_checkpointing', e.target.checked)} disabled={!t.gradient_checkpointing} tooltip="Retain early-block activations for speed at higher VRAM cost; keep the checkpoint count near 48 for long sequences." />
+						</div>
+						<div class="grid grid-cols-3 gap-2">
+							<FormField label="Compact min tokens" type="number" fieldPath="training.ltx2_compact_av_cross_adaln_min_tokens" value={t.ltx2_compact_av_cross_adaln_min_tokens ?? ''} oninput={(e) => update('ltx2_compact_av_cross_adaln_min_tokens', e.target.value ? Number(e.target.value) : null)} placeholder="256" min={1} disabled={!t.ltx2_compact_av_cross_adaln} />
+							<FormField label="Prompt K/V limit (MiB)" type="number" fieldPath="training.ltx2_prompt_kv_checkpoint_max_mb" value={t.ltx2_prompt_kv_checkpoint_max_mb ?? ''} oninput={(e) => update('ltx2_prompt_kv_checkpoint_max_mb', e.target.value ? Number(e.target.value) : null)} placeholder="1024" min={0} disabled={!t.ltx2_prompt_kv_checkpoint} />
+							<FormField label="Blocks to checkpoint" type="number" fieldPath="training.blocks_to_checkpoint" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing && !t.ltx2_partial_gradient_checkpointing} tooltip="For partial checkpointing, use a lower count for short sequences and a count near 48 for long sequences." />
+						</div>
 					</div>
 				</FormGroup>
 

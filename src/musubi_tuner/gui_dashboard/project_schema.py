@@ -137,6 +137,7 @@ class CachingConfig(BaseModel):
     keep_cache: bool = False
     num_workers: Optional[int] = None
     cache_distributed: bool = False
+    cpu_staged_checkpoint_loading: bool = False
     # Video decode backend (opt-in; blank/pyav keeps the original decode path)
     video_decode_backend: Optional[Literal["pyav", "decord", "torchcodec"]] = None
     video_decode_device: Optional[Literal["cpu", "cuda"]] = None
@@ -405,6 +406,16 @@ class TrainingConfig(BaseModel):
     split_attn_chunk_size: Optional[int] = None
     blockwise_checkpointing: bool = False
     blocks_to_checkpoint: Optional[int] = None
+    ltx2_fused_norm_rope: bool = False
+    ltx2_fused_norm_rope_backward: bool = False
+    ltx2_compact_av_cross_adaln: bool = False
+    ltx2_compact_av_cross_adaln_min_tokens: Optional[int] = None
+    ltx2_fp8_placement_scope: bool = False
+    ltx2_attn_auto_dispatch: bool = False
+    ltx2_prompt_kv_checkpoint: bool = False
+    ltx2_prompt_kv_checkpoint_max_mb: Optional[int] = None
+    ltx2_padded_prompt_trim: bool = False
+    ltx2_partial_gradient_checkpointing: bool = False
     ltx2_model_parallel: bool = False
     ltx2_model_parallel_devices: str = ""
     ltx2_model_parallel_splits: str = ""

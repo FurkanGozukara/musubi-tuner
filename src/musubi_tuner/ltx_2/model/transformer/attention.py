@@ -71,6 +71,9 @@ except Exception:
 
 
 _cudnn_logged = False
+_auto_dispatch_logged = False
+_CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
+_CUDNN_AUTO_MIN_SEQUENCE = 1024
 
 
 def _sdpa_cudnn_enabled() -> bool:
@@ -80,6 +83,10 @@ def _sdpa_cudnn_enabled() -> bool:
         and _SDPA_HAS_SET_PRIORITY
         and os.environ.get("LTX2_SDPA_CUDNN", "0").lower() in ("1", "true", "yes")
     )
+
+
+def _attention_auto_dispatch_enabled() -> bool:
+    return os.environ.get("LTX2_ATTN_AUTO_DISPATCH", "0").lower() in ("1", "true", "yes")
 
 
 def _cudnn_attention_callable() -> "PytorchCudnnAttention":
@@ -172,6 +179,37 @@ class PytorchCudnnAttention(AttentionCallable):
                 out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
+
+
+def _cudnn_auto_workload_is_large(q_len: int, k_len: int, dim_head: int) -> bool:
+    return min(q_len, k_len) >= _CUDNN_AUTO_MIN_SEQUENCE and q_len * k_len * dim_head >= _CUDNN_AUTO_WORK_THRESHOLD
+
+
+class ShapeAwarePytorchAttention(AttentionCallable):
+    def __init__(self) -> None:
+        global _auto_dispatch_logged
+        self.pytorch = PytorchAttention()
+        self.cudnn = PytorchCudnnAttention()
+        if not _auto_dispatch_logged:
+            logger.info("LTX2_ATTN_AUTO_DISPATCH=1: shape-aware PyTorch/cuDNN attention enabled")
+            _auto_dispatch_logged = True
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        dim_head = q.shape[-1] // heads
+        use_cudnn = (
+            mask is None
+            and not torch.compiler.is_compiling()
+            and SDPBackend is not None
+            and _SDPA_HAS_SET_PRIORITY
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and k.dtype == q.dtype
+            and v.dtype == q.dtype
+            and _cudnn_auto_workload_is_large(q.shape[1], k.shape[1], dim_head)
+        )
+        return (self.cudnn if use_cudnn else self.pytorch)(q, k, v, heads, mask)
 
 
 class XFormersAttention(AttentionCallable):
@@ -401,6 +439,8 @@ class AttentionFunction(Enum):
     def to_callable(self) -> AttentionCallable:
         """Resolve enums at init time so torch.compile can trace the attention call cleanly."""
         if self is AttentionFunction.PYTORCH:
+            if _attention_auto_dispatch_enabled():
+                return ShapeAwarePytorchAttention()
             return _cudnn_attention_callable() if _sdpa_cudnn_enabled() else PytorchAttention()
         elif self is AttentionFunction.PYTORCH_CUDNN:
             return _cudnn_attention_callable_explicit()
@@ -416,6 +456,8 @@ class AttentionFunction(Enum):
             # Default behavior: XFormers if installed else - PyTorch (cuDNN-prioritized if opted in)
             if memory_efficient_attention is not None:
                 return XFormersAttention()
+            if _attention_auto_dispatch_enabled():
+                return ShapeAwarePytorchAttention()
             return _cudnn_attention_callable() if _sdpa_cudnn_enabled() else PytorchAttention()
 
 
@@ -591,31 +633,40 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
+        precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         ensure_fp8_modules_on_device(self.to_q, x.device)
-        ensure_fp8_modules_on_device(self.to_k, x.device)
-        ensure_fp8_modules_on_device(self.to_v, x.device)
+        if precomputed_kv is None:
+            ensure_fp8_modules_on_device(self.to_k, x.device)
+            ensure_fp8_modules_on_device(self.to_v, x.device)
         if isinstance(self.to_out, torch.nn.Sequential) and self.to_out:
             ensure_fp8_modules_on_device(self.to_out[0], x.device)
         q = self.to_q(x)
-        context = x if context is None else context
-        k = self.to_k(context)
-        v = self.to_v(context)
 
-        fused_qk = None
-        if pe is not None and fused_norm_rope.is_enabled():
-            fused_qk = fused_norm_rope.try_qk_norm_rope(
-                q, k, self.q_norm.weight, self.k_norm.weight, pe, k_pe, self.q_norm.eps, self.rope_type
-            )
-        if fused_qk is not None:
-            q, k = fused_qk
-        else:
+        if precomputed_kv is not None:
+            k, v = precomputed_kv
             q = self.q_norm(q)
-            k = self.k_norm(k)
-
             if pe is not None:
                 q = apply_rotary_emb(q, pe, self.rope_type)
-                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+        else:
+            context = x if context is None else context
+            k = self.to_k(context)
+            v = self.to_v(context)
+
+            fused_qk = None
+            if pe is not None and fused_norm_rope.is_enabled():
+                fused_qk = fused_norm_rope.try_qk_norm_rope(
+                    q, k, self.q_norm.weight, self.k_norm.weight, pe, k_pe, self.q_norm.eps, self.rope_type
+                )
+            if fused_qk is not None:
+                q, k = fused_qk
+            else:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+
+                if pe is not None:
+                    q = apply_rotary_emb(q, pe, self.rope_type)
+                    k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
         if self._motion_record_enabled:
             bsz = q.shape[0]
@@ -669,3 +720,15 @@ class Attention(torch.nn.Module):
             out = out.view(b, t, self.heads * self.dim_head)
 
         return self.to_out(out)
+
+    def prepare_kv(
+        self,
+        context: torch.Tensor,
+        k_pe: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ensure_fp8_modules_on_device(self.to_k, context.device)
+        ensure_fp8_modules_on_device(self.to_v, context.device)
+        k = self.k_norm(self.to_k(context))
+        if k_pe is not None:
+            k = apply_rotary_emb(k, k_pe, self.rope_type)
+        return k, self.to_v(context)

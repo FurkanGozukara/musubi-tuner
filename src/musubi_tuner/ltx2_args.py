@@ -65,6 +65,40 @@ def add_ltx2_ema_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     return parser
 
 
+def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    group = parser.add_argument_group("LTX-2 opt-in performance")
+    flags = (
+        ("--ltx2_fused_norm_rope", "Enable fused QK normalization and RoPE."),
+        ("--ltx2_fused_norm_rope_backward", "Enable the fused split-RoPE backward path."),
+        ("--ltx2_compact_av_cross_adaln", "Compact repeated AV cross-AdaLN timesteps."),
+        ("--ltx2_fp8_placement_scope", "Reuse verified FP8 module placement within a forward scope."),
+        ("--ltx2_attn_auto_dispatch", "Use shape-aware PyTorch/cuDNN SDPA dispatch."),
+        ("--ltx2_prompt_kv_checkpoint", "Preserve video prompt K/V across checkpoint recomputation."),
+        ("--ltx2_padded_prompt_trim", "Trim a common right-padded cached-prompt tail."),
+        (
+            "--ltx2_partial_gradient_checkpointing",
+            "Use --blocks_to_checkpoint as the resident-weight checkpoint frontier.",
+        ),
+    )
+    for option, help_text in flags:
+        group.add_argument(option, action="store_true", default=None, help=help_text)
+    group.add_argument(
+        "--ltx2_compact_av_cross_adaln_min_tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Minimum token count for compact AV cross-AdaLN (default: environment or 256).",
+    )
+    group.add_argument(
+        "--ltx2_prompt_kv_checkpoint_max_mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help="Maximum prompt K/V payload in MiB (default: environment or 1024).",
+    )
+    return parser
+
+
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add LTX-2-specific arguments to parser"""
 
@@ -171,6 +205,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     add_ltx2_ema_args(parser)
+    add_ltx2_performance_args(parser)
     add_ltx2_model_parallel_args(parser)
     add_ltx2_remote_stage_args(parser)
     add_ltx2_intrinsic_cond_args(parser)

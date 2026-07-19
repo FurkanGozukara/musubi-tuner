@@ -34,6 +34,7 @@ class TransformerArgs:
     v2a_cross_attention_mask: torch.Tensor | None = None
     dcr_detach_mask: torch.Tensor | None = None
     force_keep_mask: torch.Tensor | None = None
+    precomputed_prompt_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -159,7 +160,12 @@ class TransformerArgsPreprocessor:
         # If all tokens are valid (no-op mask), return None so SDPA/FlashAttention
         # can use the fast maskless kernel path (~20-25% speedup on cross-attention).
         # Inspired by https://github.com/Nerogar/OneTrainer/pull/1109
-        if os.getenv("LTX2_SKIP_NOOP_ATTN_MASK", "0") == "1":
+        skip_noop_mask = os.getenv("LTX2_SKIP_NOOP_ATTN_MASK", "0") == "1" or os.getenv("LTX2_ATTN_AUTO_DISPATCH", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if skip_noop_mask:
             if attention_mask.dtype == torch.bool and torch.all(attention_mask):
                 return None
         if attention_mask.dtype == torch.bool:

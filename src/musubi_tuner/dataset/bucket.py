@@ -42,6 +42,56 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _trim_right_padded_prompt_context(batch: dict[str, Any], conditions: dict[str, Any]) -> Optional[int]:
+    mask = conditions.get("prompt_attention_mask")
+    if not isinstance(mask, torch.Tensor) or mask.dim() != 2 or mask.shape[1] == 0:
+        return None
+    if mask.dtype != torch.bool and mask.dtype not in (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    ):
+        return None
+    if mask.dtype != torch.bool and not torch.all((mask == 0) | (mask == 1)):
+        return None
+
+    valid = mask.to(torch.bool)
+    lengths = valid.sum(dim=1)
+    trim_length = int(lengths.max().item())
+    sequence_length = int(mask.shape[1])
+    if trim_length <= 0 or trim_length >= sequence_length:
+        return None
+    expected = torch.arange(sequence_length, device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
+    if not torch.equal(valid, expected):
+        return None
+
+    sliced: dict[int, torch.Tensor] = {}
+    tensor_keys = (
+        "prompt_attention_mask",
+        "text_mask",
+        "video_prompt_embeds",
+        "audio_prompt_embeds",
+        "prompt_embeds",
+        "text",
+    )
+    for mapping in (batch, conditions):
+        for key in tensor_keys:
+            tensor = mapping.get(key)
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.dim() >= 2
+                and tensor.shape[0] == mask.shape[0]
+                and tensor.shape[1] == sequence_length
+            ):
+                tensor_id = id(tensor)
+                if tensor_id not in sliced:
+                    sliced[tensor_id] = tensor[:, :trim_length].contiguous()
+                mapping[key] = sliced[tensor_id]
+    return trim_length
+
+
 def _stack_audio_cond_masks(masks_per_item, item_count: int, target_t: int, device) -> Optional[torch.Tensor]:
     """Stack per-item audio conditioning masks into ``[B, target_t]``.
 
@@ -892,7 +942,7 @@ class BucketBatchManager:
             audio_prompt_embeds = batch_tensor_data.get("audio_prompt_embeds")
             prompt_attention_mask = batch_tensor_data.get("prompt_attention_mask")
 
-            conditions: dict[str, torch.Tensor] = {}
+            conditions: dict[str, Any] = {}
             if isinstance(video_prompt_embeds, torch.Tensor):
                 conditions["video_prompt_embeds"] = video_prompt_embeds
                 if isinstance(audio_prompt_embeds, torch.Tensor):
@@ -937,6 +987,8 @@ class BucketBatchManager:
                     conditions["dino_features"] = torch.stack(padded)  # [B, T_pixel, N_patches, D_dino]
 
             if conditions:
+                if os.getenv("LTX2_PADDED_PROMPT_TRIM", "0") == "1":
+                    _trim_right_padded_prompt_context(batch_tensor_data, conditions)
                 batch_tensor_data["conditions"] = conditions
 
         if collect_item_keys:

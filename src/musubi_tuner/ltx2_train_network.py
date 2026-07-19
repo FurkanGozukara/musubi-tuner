@@ -24,7 +24,10 @@ from musubi_tuner.audio_supervision import (
     update_and_check_audio_supervision,
 )
 from musubi_tuner.utils import model_utils
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
+    ensure_fp8_modules_on_device,
+    prepare_fp8_placement_scope,
+)
 from musubi_tuner.modules.nf4_optimization_utils import (
     is_nf4_module,
     DEFAULT_NF4_BLOCK_SIZE,
@@ -2916,7 +2919,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 # Skip swapped blocks - they are managed by the block swap mechanism
         else:
             # No block swap - process entire model as before
-            ensure_fp8_modules_on_device(model, target_device)
+            verified_module_ids = ensure_fp8_modules_on_device(model, target_device)
+            prepare_fp8_placement_scope(base_model, target_device, verified_module_ids)
 
     def _ensure_nf4_buffers_on_device(self, model: torch.nn.Module) -> None:
         """Move NF4 scale_weight buffers to the same device as the model weights.

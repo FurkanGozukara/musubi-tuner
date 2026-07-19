@@ -11,7 +11,11 @@ from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from musubi_tuner.ltx_2.model.transformer.adaln import adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
+    ensure_fp8_modules_on_device,
+    fp8_placement_scoped_forward,
+    prepare_fp8_placement_scope,
+)
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.transformer_args import TransformerArgs
@@ -87,6 +91,7 @@ def _run_attn_with_optional_fp32_retry(
     mask: torch.Tensor | None = None,
     pe: torch.Tensor | None = None,
     k_pe: torch.Tensor | None = None,
+    precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     force_fp32: bool = False,
     force_pytorch: bool = False,
     attn_retry_fp32: bool = False,
@@ -111,8 +116,11 @@ def _run_attn_with_optional_fp32_retry(
             ctx = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
             pe_local = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
             k_pe_local = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
-            return attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local).to(dtype=x_in.dtype)
-        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
+            kv_local = tuple(t.to(torch.float32) for t in precomputed_kv) if precomputed_kv is not None else None
+            return attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local, precomputed_kv=kv_local).to(
+                dtype=x_in.dtype
+            )
+        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe, precomputed_kv=precomputed_kv)
 
     original_fn = getattr(attn_module, "attention_function", None)
 
@@ -122,10 +130,11 @@ def _run_attn_with_optional_fp32_retry(
             ctx = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
             pe_local = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
             k_pe_local = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
-            out_local = attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local)
+            kv_local = tuple(t.to(torch.float32) for t in precomputed_kv) if precomputed_kv is not None else None
+            out_local = attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local, precomputed_kv=kv_local)
             return out_local.to(dtype=x_in.dtype)
 
-        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
+        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe, precomputed_kv=precomputed_kv)
 
     try:
         if force_pytorch and original_fn is not None:
@@ -397,6 +406,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         timestep,
         prompt_timestep,
         context_mask: torch.Tensor | None,
+        precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if self.cross_attention_adaln:
             shift_q, scale_q, gate = self.get_ada_values(
@@ -414,12 +424,45 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     prompt_timestep,
                     context_mask,
                     self.norm_eps,
+                    precomputed_kv,
                 )
             attn_input = (
                 rms_norm(x, eps=self.norm_eps).to(torch.float32) * (1 + scale_q.to(torch.float32)) + shift_q.to(torch.float32)
             ).to(x.dtype)
-            return attn(attn_input, context=context, mask=context_mask) * gate
-        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
+            return (
+                attn(
+                    attn_input,
+                    context=None if precomputed_kv is not None else context,
+                    mask=context_mask,
+                    precomputed_kv=precomputed_kv,
+                )
+                * gate
+            )
+        return attn(
+            rms_norm(x, eps=self.norm_eps),
+            context=None if precomputed_kv is not None else context,
+            mask=context_mask,
+            precomputed_kv=precomputed_kv,
+        )
+
+    def prompt_kv_payload_bytes(self, args: TransformerArgs, *, audio: bool = False) -> int:
+        attn = self.audio_attn2 if audio else self.attn2
+        inner_dim = attn.heads * attn.dim_head
+        return 2 * args.context.shape[0] * args.context.shape[1] * inner_dim * args.context.element_size()
+
+    def prepare_text_cross_attention_kv(
+        self,
+        args: TransformerArgs,
+        *,
+        audio: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn = self.audio_attn2 if audio else self.attn2
+        context = args.context
+        table_name = "audio_prompt_scale_shift_table" if audio else "prompt_scale_shift_table"
+        prompt_table = getattr(self, table_name, None)
+        if self.cross_attention_adaln and prompt_table is not None and args.prompt_timestep is not None:
+            context = prepare_prompt_context(context, prompt_table, args.prompt_timestep, args.x.device, args.x.dtype)
+        return attn.prepare_kv(context)
 
     def forward(
         self,
@@ -478,7 +521,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         _swap_backward_state.last_loaded_block = None
                         _swap_backward_state.last_loaded_idx = -1
 
-                    ensure_fp8_modules_on_device(self, target_device)
+                    verified_module_ids = ensure_fp8_modules_on_device(self, target_device)
+                    prepare_fp8_placement_scope(self, target_device, verified_module_ids)
 
                 # For non-swapped (permanent) blocks: unload any pending swapped block from backward
                 # This handles transition from swapped blocks (18) to permanent blocks (17→0)
@@ -542,6 +586,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         return self._forward(video, audio, perturbations)
 
+    @fp8_placement_scoped_forward()
     def _forward(  # noqa: PLR0915
         self,
         video: TransformerArgs | None,
@@ -606,6 +651,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             mask: torch.Tensor | None = None,
             pe: torch.Tensor | None = None,
             k_pe: torch.Tensor | None = None,
+            precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
             force_fp32: bool = False,
             force_pytorch: bool = False,
         ) -> torch.Tensor:
@@ -616,6 +662,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=mask,
                 pe=pe,
                 k_pe=k_pe,
+                precomputed_kv=precomputed_kv,
                 force_fp32=force_fp32,
                 force_pytorch=force_pytorch,
                 attn_retry_fp32=attn_retry_fp32,
@@ -673,17 +720,19 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vx = vx + self._apply_text_cross_attention(
                 vx,
                 video.context,
-                lambda q, context=None, mask=None: _attn_with_retry(
+                lambda q, context=None, mask=None, precomputed_kv=None: _attn_with_retry(
                     self.attn2,
                     q,
                     context=context,
                     mask=mask,
+                    precomputed_kv=precomputed_kv,
                 ),
                 self.scale_shift_table,
                 getattr(self, "prompt_scale_shift_table", None),
                 video.timesteps,
                 video.prompt_timestep,
                 video.context_mask,
+                video.precomputed_prompt_kv,
             )
             _check_finite_local("video_after_attn2", vx)
 
@@ -714,11 +763,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
             ax = ax + self._apply_text_cross_attention(
                 ax,
                 audio.context,
-                lambda q, context=None, mask=None: _attn_with_retry(
+                lambda q, context=None, mask=None, precomputed_kv=None: _attn_with_retry(
                     self.audio_attn2,
                     q,
                     context=context,
                     mask=mask,
+                    precomputed_kv=precomputed_kv,
                     force_fp32=force_fp32_audio_ctx,
                     force_pytorch=force_pytorch_audio_ctx,
                 ),
@@ -727,6 +777,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 audio.timesteps,
                 audio.prompt_timestep,
                 audio.context_mask,
+                audio.precomputed_prompt_kv,
             )
             _check_finite_local("audio_after_attn2", ax)
 
@@ -941,6 +992,24 @@ class BasicAVTransformerBlock(torch.nn.Module):
         ensure_fp8_modules_on_device(b, cpu_device)
 
 
+def prepare_prompt_context(
+    context: torch.Tensor,
+    prompt_scale_shift_table: torch.Tensor,
+    prompt_timestep: torch.Tensor,
+    target_device: torch.device,
+    hidden_dtype: torch.dtype,
+) -> torch.Tensor:
+    prompt_adaln_fp32 = os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
+    adaln_dtype = torch.float32 if prompt_adaln_fp32 else hidden_dtype
+    shift_kv, scale_kv = (
+        prompt_scale_shift_table[None, None].to(device=target_device, dtype=adaln_dtype)
+        + prompt_timestep.to(device=target_device, dtype=adaln_dtype).reshape(context.shape[0], prompt_timestep.shape[1], 2, -1)
+    ).unbind(dim=2)
+    if prompt_adaln_fp32:
+        return (context.to(torch.float32) * (1 + scale_kv) + shift_kv).to(context.dtype)
+    return context * (1 + scale_kv.to(context.dtype)) + shift_kv.to(context.dtype)
+
+
 def apply_cross_attention_adaln(
     x: torch.Tensor,
     context: torch.Tensor,
@@ -952,24 +1021,30 @@ def apply_cross_attention_adaln(
     prompt_timestep: torch.Tensor,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     prompt_adaln_fp32 = os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
-    batch_size = x.shape[0]
-    shift_kv, scale_kv = (
-        prompt_scale_shift_table[None, None].to(device=x.device, dtype=torch.float32 if prompt_adaln_fp32 else x.dtype)
-        + prompt_timestep.to(
-            device=x.device,
-            dtype=torch.float32 if prompt_adaln_fp32 else x.dtype,
-        ).reshape(batch_size, prompt_timestep.shape[1], 2, -1)
-    ).unbind(dim=2)
     if prompt_adaln_fp32:
-        # Keep prompt AdaLN modulation in float32 to match the stability fix
-        # used in the self-attention / FF / output AdaLN paths.
         attn_input = (rms_norm(x, eps=norm_eps).to(torch.float32) * (1 + q_scale.to(torch.float32)) + q_shift.to(torch.float32)).to(
             x.dtype
         )
-        encoder_hidden_states = (context.to(torch.float32) * (1 + scale_kv) + shift_kv).to(context.dtype)
     else:
         attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale.to(x.dtype)) + q_shift.to(x.dtype)
-        encoder_hidden_states = context * (1 + scale_kv.to(context.dtype)) + shift_kv.to(context.dtype)
-    return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+    encoder_hidden_states = None
+    if precomputed_kv is None:
+        encoder_hidden_states = prepare_prompt_context(
+            context,
+            prompt_scale_shift_table,
+            prompt_timestep,
+            x.device,
+            x.dtype,
+        )
+    return (
+        attn(
+            attn_input,
+            context=encoder_hidden_states,
+            mask=context_mask,
+            precomputed_kv=precomputed_kv,
+        )
+        * q_gate
+    )

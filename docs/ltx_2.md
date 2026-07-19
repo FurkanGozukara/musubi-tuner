@@ -514,6 +514,7 @@ python ltx2_cache_latents.py ^
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 - `--video_decode_backend pyav|decord|torchcodec`: Opt-in decode backend. Omitting the flag keeps the `pyav` path. The `decord` and `torchcodec` adapters batch-decode the selected source-frame indices and require their optional runtime dependencies. If an alternate-backend decode raises, the loader logs a warning and retries that item with PyAV; a subsequent PyAV error still fails normally. Different decoder/codec implementations can produce different decoded pixels and therefore different caches, so keep one backend fixed when cache reproducibility matters. The CLI overrides `LTX2_VIDEO_DECODE_BACKEND` when supplied. Decord receives `LTX2_DECORD_NUM_THREADS` (default `1`) for each reader.
 - `--video_decode_device cpu|cuda`: Device passed to TorchCodec's `VideoDecoder` (default `cpu`); ignored by other backends. CUDA support depends on the installed TorchCodec wheel, FFmpeg libraries, and hardware. The CLI overrides `LTX2_VIDEO_DECODE_DEVICE` when supplied.
+- `--cpu_staged_checkpoint_loading`: Opt-in compatibility mode. Opens LTX checkpoint tensors on CPU and then moves them synchronously to the selected device instead of loading them directly on that device. This may work around direct CUDA safetensors loading errors in some environments. Initial model loading is slower and temporarily uses additional CPU RAM; caching speed after loading is unaffected.
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 - `--precache_sample_latents`: Cache I2V / V2V / reference-audio conditioning latents for sample prompts, then continue with normal latent caching. Requires `--sample_prompts`.
 - `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
@@ -608,6 +609,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_bnb_4bit_disable_double_quant`: Disable bitsandbytes double quantization for 4-bit loading.
 - `--gemma_bnb_4bit_compute_dtype auto|fp16|bf16|fp32`: Compute dtype for 4-bit operations (default: `auto`, uses `--mixed_precision` dtype).
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
+- `--cpu_staged_checkpoint_loading`: Opt-in compatibility mode for loading the LTX text-connector checkpoint through CPU before moving it to the selected device. This may work around direct CUDA safetensors loading errors in some environments. It does not change how separate `--gemma_root` or `--gemma_safetensors` weights are loaded.
 - `--cache_before_connector`: Also save pre-connector text features (`video_features_{dtype}`, `audio_features_{dtype}`) alongside standard post-connector embeddings. Required for `--train_connectors` during training. Does not change standard cache keys; only adds extra tensors.
 - `--atomic_cache_writes`: Opt-in safety mode. Writes text and prompt cache files to a temporary sibling file first, then replaces the final cache path only after a successful save.
 - 8-bit/4-bit loading requires `--device cuda`.
@@ -1596,7 +1598,7 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
 | `--blockwise_checkpointing` | Checkpoint transformer blocks individually and reload block state around backward. Lowest peak VRAM, but heavy CPU↔GPU traffic and recompute. |
-| `--blocks_to_checkpoint N` | Number of transformer blocks to handle with blockwise checkpointing. `-1` or omitted means all blocks; smaller values checkpoint only the final N blocks. |
+| `--blocks_to_checkpoint N` | Number of final transformer blocks selected for blockwise checkpointing. With `--ltx2_partial_gradient_checkpointing` and no offload/swap, only these final N blocks use ordinary activation checkpointing. |
 | `--offload_optimizer_during_validation` | Offload CUDA optimizer state to CPU during validation and sample previews (off by default) |
 | `--ffn_chunk_target` | `none`, `all`, `video`, or `audio` — enable FFN chunking for selected modules (`none` selects no target, distinct from `--ffn_chunk_size 0`) |
 | `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled) |
@@ -1605,18 +1607,28 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
 | `--ddp_find_unused_parameters` | Enable DDP unused-parameter detection for branchy LoRA targets (off by default) |
 | `--gemma_bnb_use_local_rank` | For Gemma 8-bit/4-bit loading, pin the quantized model to this process's `LOCAL_RANK` GPU (off by default) |
+| `--ltx2_fused_norm_rope` | Fuse Q/K RMSNorm and RoPE for eligible BF16 CUDA tensors. Typically saves about 6% step time; use when a CUDA extension can be built. Unsupported shapes and `torch.compile` fall back automatically. |
+| `--ltx2_fused_norm_rope_backward` | Fuse the matching RoPE/RMSNorm backward. Usually adds another 1.5-3%; use together with `--ltx2_fused_norm_rope`. |
+| `--ltx2_compact_av_cross_adaln` | Project repeated AV cross-AdaLN timesteps once and gather the results. Expect up to about 2% in AV training; useful when many tokens share a small set of conditioning timesteps. |
+| `--ltx2_compact_av_cross_adaln_min_tokens N` | Minimum token count for compact AV cross-AdaLN (default 256). Raise it if small AV shapes regress. |
+| `--ltx2_fp8_placement_scope` | Reuse verified module placement during one scaled-FP8 forward. Can save about 8% on short checkpointed workloads; use with `--fp8_base --fp8_scaled`. It has no effect without scaled FP8. |
+| `--ltx2_attn_auto_dispatch` | Route large maskless `--sdpa` shapes to cuDNN-prioritized attention. Gains range from negligible on short sequences to about 27% on long sequences; masked and unsupported shapes fall back automatically. Backend BF16 rounding can differ. |
+| `--ltx2_prompt_kv_checkpoint` | Keep video prompt K/V across activation-checkpoint recomputation. Can save about 9% when prompts are long and video sequences are short; use with gradient checkpointing and resident weights. It is disabled with activation/weight offload and does not optimize audio prompt K/V. |
+| `--ltx2_prompt_kv_checkpoint_max_mb MB` | Limit preserved prompt K/V payload (default 1024 MiB). Lower it to trade recomputation savings for memory. |
+| `--ltx2_padded_prompt_trim` | Remove the right-padded prompt tail shared by every sample before transfer and attention. Can save up to about 8% when cached prompts are heavily padded; it does nothing for all-valid prompts. |
+| `--ltx2_partial_gradient_checkpointing` | Checkpoint only the final `--blocks_to_checkpoint N` blocks and retain earlier activations. Can improve short-sequence throughput by about 28% at higher VRAM cost; use only without offload, swap, model parallelism, or compiled blocks. Keep N near 48 for long sequences. |
 | `--sdpa` | Use PyTorch scaled dot-product attention. |
 | `--cudnn_attn` | Outside `torch.compile`, call PyTorch SDPA with backend priority cuDNN → flash → efficient → math. If the installed PyTorch lacks priority support, warn and use plain SDPA. Under `torch.compile`, use plain SDPA because the priority context is not traceable. Masks are passed to SDPA; the backend PyTorch ultimately selects is build/shape/hardware-dependent. |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use the separately installed FlashAttention 3 interface. A reducible key-padding mask uses its variable-length function when present; if that function is absent, or the mask is query-specific, the code warns once and falls back to PyTorch SDPA. Package and hardware requirements depend on the installed FlashAttention build. |
+
+The eight LTX-2 performance switches are disabled by default.
 
 **H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
 for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
 and `--gradient_checkpointing`; it is not valid for full fine-tuning and is
 incompatible with checkpoint/activation CPU-offload modes. Invalid combinations
 are warned about or rejected. See the [Block Swap guide](./block_swap.md).
-
-**Fused qk-norm + RoPE (`LTX2_FUSED_NORM_ROPE=1`, default off).** This separately implemented CUDA path combines query/key RMSNorm and rotary embedding for eligible bf16 tensors and supports the interleaved and split layouts. It JIT-builds with CUDA fast math and requires a working CUDA extension toolchain. Ineligible tensors, extension-load failure, and `torch.compile` use the eager tensor path (extension-load failure emits a one-time warning). No numerical-parity or unchanged-training-result guarantee is made for the fused kernel; validate it against the eager path on the target build before relying on it.
 
 ### Blockwise Checkpointing
 <sub>[↑ contents](#table-of-contents)</sub>

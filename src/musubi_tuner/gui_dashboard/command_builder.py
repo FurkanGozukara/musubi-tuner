@@ -120,6 +120,31 @@ def _append_weight_noise_args(cmd: list[str], config_section) -> None:
     cmd += ["--weight_noise_scale", str(getattr(config_section, "weight_noise_scale", 0.01))]
 
 
+def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
+    flags = (
+        "ltx2_fused_norm_rope",
+        "ltx2_fused_norm_rope_backward",
+        "ltx2_compact_av_cross_adaln",
+        "ltx2_fp8_placement_scope",
+        "ltx2_attn_auto_dispatch",
+        "ltx2_prompt_kv_checkpoint",
+        "ltx2_padded_prompt_trim",
+        "ltx2_partial_gradient_checkpointing",
+    )
+    for name in flags:
+        if getattr(config_section, name, False):
+            cmd.append(f"--{name}")
+
+    values = (
+        ("ltx2_compact_av_cross_adaln_min_tokens", "ltx2_compact_av_cross_adaln"),
+        ("ltx2_prompt_kv_checkpoint_max_mb", "ltx2_prompt_kv_checkpoint"),
+    )
+    for name, enabled_by in values:
+        value = getattr(config_section, name, None)
+        if getattr(config_section, enabled_by, False) and value is not None:
+            cmd += [f"--{name}", str(value)]
+
+
 def _training_requests_lycoris(t, network_module: str) -> bool:
     return (
         "lycoris" in (network_module or "").lower()
@@ -456,6 +481,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--num_workers", str(c.num_workers)]
     if getattr(c, "cache_distributed", False):
         cmd.append("--cache_distributed")
+    if c.cpu_staged_checkpoint_loading:
+        cmd.append("--cpu_staged_checkpoint_loading")
     if getattr(c, "video_decode_backend", None):
         cmd += ["--video_decode_backend", c.video_decode_backend]
     if getattr(c, "video_decode_device", None):
@@ -560,6 +587,8 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--num_workers", str(c.num_workers)]
     if getattr(c, "cache_distributed", False):
         cmd.append("--cache_distributed")
+    if c.cpu_staged_checkpoint_loading:
+        cmd.append("--cpu_staged_checkpoint_loading")
     if c.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
     if c.gemma_load_in_4bit:
@@ -1110,6 +1139,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no-gemma_fp8_weight_offload")
     if t.ltx2_audio_only_model:
         cmd.append("--ltx2_audio_only_model")
+    _append_ltx2_performance_args(cmd, t)
 
     # Quantization
     if t.nf4_base:
@@ -2082,6 +2112,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no-gemma_fp8_weight_offload")
     if t.ltx2_audio_only_model:
         cmd.append("--ltx2_audio_only_model")
+    _append_ltx2_performance_args(cmd, t)
 
     # Optimizer
     cmd += ["--learning_rate", str(t.learning_rate)]

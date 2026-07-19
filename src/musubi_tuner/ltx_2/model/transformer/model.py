@@ -19,6 +19,8 @@ from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle, adaln
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
     ensure_fp8_modules_on_device,
+    fp8_placement_scoped_forward,
+    prepare_fp8_placement_scope,
 )
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
@@ -34,6 +36,18 @@ from musubi_tuner.ltx2_model_parallel import ModelParallelTransferConfig, move_l
 from musubi_tuner.tread import MaskInfo, TREADRouter
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_gradient_checkpointing_requested() -> bool:
+    return os.getenv("LTX2_PARTIAL_GRADIENT_CHECKPOINTING", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _prompt_kv_checkpoint_config() -> tuple[bool, int]:
+    enabled = os.getenv("LTX2_PROMPT_KV_CHECKPOINT", "0").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return False, 0
+    budget = max(0, int(os.getenv("LTX2_PROMPT_KV_CHECKPOINT_MAX_MB", "1024"))) * 1024 * 1024
+    return True, budget
 
 
 def _move_non_linear_params(module: nn.Module, device: torch.device) -> None:
@@ -125,6 +139,7 @@ def _move_transformer_args(
         v2a_cross_attention_mask=_move_tensor(args.v2a_cross_attention_mask),
         dcr_detach_mask=_move_tensor(args.dcr_detach_mask),
         force_keep_mask=_move_tensor(args.force_keep_mask),
+        precomputed_prompt_kv=_move_tensor(args.precomputed_prompt_kv),
     )
 
 
@@ -895,6 +910,15 @@ class LTXModel(torch.nn.Module):
         audio_ctx_swap_only = os.getenv("LTX2_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
         fp8_swap_sync = os.getenv("LTX2_SWAP_FP8_SYNC", "1") == "1"
         fp8_swap_sync_strict = os.getenv("LTX2_SWAP_FP8_SYNC_STRICT", "0") == "1"
+        prompt_kv_checkpoint, prompt_kv_budget = _prompt_kv_checkpoint_config()
+        if prompt_kv_checkpoint:
+            if not getattr(self, "_prompt_kv_checkpoint_logged", False):
+                logger.info(
+                    "LTX2_PROMPT_KV_CHECKPOINT=1: preserving video prompt K/V with a %s MiB payload budget",
+                    prompt_kv_budget // (1024 * 1024),
+                )
+                self._prompt_kv_checkpoint_logged = True
+        prompt_kv_payload = 0
 
         swap_manager = self._ltx2_block_swap
         swap_active = False
@@ -1338,7 +1362,8 @@ class LTXModel(torch.nn.Module):
 
             if fp8_swap_sync and in_swap_range and torch.cuda.is_available():
                 # Ensure fp8 weights + scale_weight are on the compute device after swap-in.
-                ensure_fp8_modules_on_device(block, gpu_device)
+                verified_module_ids = ensure_fp8_modules_on_device(block, gpu_device)
+                prepare_fp8_placement_scope(block, gpu_device, verified_module_ids)
                 if fp8_swap_sync_strict:
                     torch.cuda.current_stream().synchronize()
 
@@ -1354,9 +1379,27 @@ class LTXModel(torch.nn.Module):
                             with torch.cuda.stream(transfer_stream):
                                 look_block._load_weights(look_block, target_device)
 
+            preserve_video_prompt_kv = (
+                prompt_kv_checkpoint
+                and video is not None
+                and video.enabled
+                and block.training
+                and block.gradient_checkpointing
+                and not block.activation_cpu_offloading
+                and not block.weight_cpu_offloading
+                and not force_cross_fp32
+            )
+            if preserve_video_prompt_kv:
+                payload = block.prompt_kv_payload_bytes(video)
+                if prompt_kv_payload + payload <= prompt_kv_budget:
+                    video = replace(video, precomputed_prompt_kv=block.prepare_text_cross_attention_kv(video))
+                    prompt_kv_payload += payload
+
             # Execute block (it now handles checkpointing i.e. load/compute/offload)
             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
             video, audio = block(video, audio, perturbations)
+            if video is not None and video.precomputed_prompt_kv is not None:
+                video = replace(video, precomputed_prompt_kv=None)
 
             if nan_block_diag:
                 vx = video.x if video is not None and isinstance(video.x, torch.Tensor) else None
@@ -1527,6 +1570,25 @@ class LTXModel(torch.nn.Module):
         else:
             checkpoint_start = max(0, len(self.transformer_blocks) - int(blocks_to_checkpoint))
         self._checkpoint_start_idx = checkpoint_start
+        checkpoint_count = int(blocks_to_checkpoint) if blocks_to_checkpoint is not None else -1
+        partial_checkpointing = (
+            _partial_gradient_checkpointing_requested()
+            and 0 < checkpoint_count < len(self.transformer_blocks)
+            and not activation_cpu_offloading
+            and not weight_cpu_offloading
+            and not bool(self.blocks_to_swap or 0)
+            and self.offloader is None
+            and self._ltx2_block_swap is None
+            and getattr(self, "_ltx2_model_parallel_block_devices", None) is None
+            and getattr(self, "_ltx2_remote_stage_client", None) is None
+            and not any(hasattr(block, "_orig_mod") for block in self.transformer_blocks)
+        )
+        if partial_checkpointing:
+            logger.warning(
+                "LTX2_PARTIAL_GRADIENT_CHECKPOINTING=1: checkpointing blocks %s..%s and retaining earlier activations",
+                checkpoint_start,
+                len(self.transformer_blocks) - 1,
+            )
 
         for idx, block in enumerate(self.transformer_blocks):
             if blocks_to_checkpoint == 0:
@@ -1536,8 +1598,7 @@ class LTXModel(torch.nn.Module):
                 continue
 
             if idx < checkpoint_start:
-                # Use standard checkpointing (no CPU/weight offload) for early blocks.
-                block.gradient_checkpointing = True
+                block.gradient_checkpointing = not partial_checkpointing
                 block.activation_cpu_offloading = False
                 block.weight_cpu_offloading = False
                 continue
@@ -1545,6 +1606,7 @@ class LTXModel(torch.nn.Module):
             if hasattr(block, "enable_gradient_checkpointing"):
                 block.enable_gradient_checkpointing(activation_cpu_offloading, weight_cpu_offloading)
 
+    @fp8_placement_scoped_forward(prepared_only=True)
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
     ) -> tuple[torch.Tensor, torch.Tensor]:
