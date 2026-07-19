@@ -1617,6 +1617,7 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--ltx2_prompt_kv_checkpoint_max_mb MB` | Limit preserved prompt K/V payload (default 1024 MiB). Lower it to trade recomputation savings for memory. |
 | `--ltx2_padded_prompt_trim` | Remove the right-padded prompt tail shared by every sample before transfer and attention. Can save up to about 8% when cached prompts are heavily padded; it does nothing for all-valid prompts. |
 | `--ltx2_partial_gradient_checkpointing` | Checkpoint only the final `--blocks_to_checkpoint N` blocks and retain earlier activations. Can improve short-sequence throughput by about 28% at higher VRAM cost; use only without offload, swap, model parallelism, or compiled blocks. Keep N near 48 for long sequences. |
+| `--ltx2_validate_training_tensors` | Scan cached inputs, predictions, and targets for NaN/Inf every step. Disabled by default to avoid GPU synchronization; enable it when diagnosing unstable training or suspect caches. |
 | `--sdpa` | Use PyTorch scaled dot-product attention. |
 | `--cudnn_attn` | Outside `torch.compile`, call PyTorch SDPA with backend priority cuDNN → flash → efficient → math. If the installed PyTorch lacks priority support, warn and use plain SDPA. Under `torch.compile`, use plain SDPA because the priority context is not traceable. Masks are passed to SDPA; the backend PyTorch ultimately selects is build/shape/hardware-dependent. |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |

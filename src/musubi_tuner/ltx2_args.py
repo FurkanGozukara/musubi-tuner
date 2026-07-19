@@ -96,6 +96,11 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
         metavar="MB",
         help="Maximum prompt K/V payload in MiB (default: environment or 1024).",
     )
+    group.add_argument(
+        "--ltx2_validate_training_tensors",
+        action="store_true",
+        help="Check cached inputs, predictions, and targets for NaN/Inf every step.",
+    )
     return parser
 
 

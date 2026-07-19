@@ -130,6 +130,7 @@ def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
         "ltx2_prompt_kv_checkpoint",
         "ltx2_padded_prompt_trim",
         "ltx2_partial_gradient_checkpointing",
+        "ltx2_validate_training_tensors",
     )
     for name in flags:
         if getattr(config_section, name, False):

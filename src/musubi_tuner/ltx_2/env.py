@@ -196,7 +196,7 @@ class LTX2Env:
 
     # Skip steps on non-finite tensors instead of erroring.
     # recommended=False
-    skip_nonfinite_steps: bool = True
+    skip_nonfinite_steps: bool = False
 
     # Auto-set blocks_to_checkpoint when blockwise+swap are both enabled.
     # recommended=False
@@ -323,7 +323,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.av_use_video_prompt_embeds = t.av_use_video_prompt_embeds
     args.video_loss_mask_5d = t.video_loss_mask_5d
     args.align_output_device = t.align_output_device
-    args.skip_nonfinite_steps = t.skip_nonfinite_steps
+    args.skip_nonfinite_steps = t.skip_nonfinite_steps or bool(getattr(args, "ltx2_validate_training_tensors", False))
     args.auto_blocks_to_checkpoint = t.auto_blocks_to_checkpoint
     args.require_gemma_root = t.require_gemma_root
     args.skip_noop_attn_mask = t.skip_noop_attn_mask

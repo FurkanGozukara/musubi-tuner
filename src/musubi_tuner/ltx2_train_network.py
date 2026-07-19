@@ -14,6 +14,12 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
+def _validate_ltx2_cached_tensor(tensor: torch.Tensor, name: str, enabled: bool) -> None:
+    if enabled and not torch.isfinite(tensor).all():
+        raise ValueError(f"Non-finite (NaN/Inf) detected in {name}")
+
+
 from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.training.step_control import distributed_any
 from musubi_tuner.audio_supervision import (
@@ -4429,7 +4435,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             Tuple of (model_prediction, target) for loss computation
         """
         diag_enabled = os.getenv("LTX2_NAN_DIAG", "0") == "1"
-        skip_nonfinite = bool(getattr(args, "skip_nonfinite_steps", False))
+        validate_training_tensors = bool(getattr(args, "ltx2_validate_training_tensors", False))
+        skip_nonfinite = validate_training_tensors or bool(getattr(args, "skip_nonfinite_steps", False))
         nonfinite_flag = {"hit": False, "tag": None}
 
         def _check_finite(tag: str, tensor: Optional[torch.Tensor]) -> None:
@@ -4480,8 +4487,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError(
                 f"Latents channel mismatch: got {latents.shape[1]}, expected {int(in_channels)} (transformer.in_channels)"
             )
-        if not torch.isfinite(latents).all():
-            raise ValueError("Non-finite (NaN/Inf) detected in latents")
+        _validate_ltx2_cached_tensor(latents, "latents", validate_training_tensors)
         _log_stats("latents", latents)
 
         if timesteps is None or not isinstance(timesteps, torch.Tensor):
@@ -4696,9 +4702,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         text_embeds = text_embeds.to(device=accelerator.device, dtype=network_dtype)
         _log_stats("text_embeds", text_embeds)
 
-        # Check for NaN values
-        if torch.isnan(text_embeds).any():
-            raise ValueError("NaN detected in cached text embeddings!")
+        _validate_ltx2_cached_tensor(text_embeds, "cached text embeddings", validate_training_tensors)
 
         if text_mask is not None:
             if not isinstance(text_mask, torch.Tensor):
@@ -4744,10 +4748,6 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
             )
-
-        # Check for NaN in latents
-        if torch.isnan(latents).any():
-            raise ValueError("NaN detected in latents!")
 
         # Get frame rate from batch or use default
         frame_rate = batch.get("frame_rate", None)
