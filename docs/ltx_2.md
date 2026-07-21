@@ -1709,7 +1709,9 @@ Rules for this configuration:
 - **Use `--quantize_device cuda`.** Weights are then quantized directly on the GPU and the checkpoint is never staged in main RAM. `--quantize_device cpu` loads and quantizes on the host instead and raises main-RAM usage.
 - **Disable sampling during training**, or precache the sample prompts (see [Precached Sample Prompts](#precached-sample-prompts)). Sampling otherwise loads Gemma, which does not fit alongside training on a small system.
 
-Measured peak main-RAM usage for the command above is about 7.5 GB, and it is unchanged by LoRA rank. Allow at least 12 GB of installed RAM so the operating system and data loading have headroom. The same configuration requires about 19 GB of VRAM; `--fp8_base` and larger ranks raise that figure, and NF4 is the smallest base-weight format available.
+Measured peak main-RAM usage for the command above is about 7.5 GB, and it is unchanged by LoRA rank. Allow at least 12 GB of installed RAM so the operating system and data loading have headroom. The same configuration requires about 19 GB of VRAM.
+
+That VRAM figure applies to this configuration only, because it keeps every block on the GPU. Block swap makes the opposite trade: adding `--blocks_to_swap 12` to the same command lowers VRAM to about 11 GB but raises main-RAM usage to about 26 GB. Choose the configuration that matches whichever of the two is scarcer on your system. `--fp8_base` and larger ranks raise the VRAM figure, and NF4 is the smallest base-weight format available.
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>
