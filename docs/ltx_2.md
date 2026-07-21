@@ -94,6 +94,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
       - [Other Memory Options](#other-memory-options)
     - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
+    - [Low Main-RAM Training](#low-main-ram-training)
     - [NF4 Quantization](#nf4-quantization)
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
@@ -1678,6 +1679,37 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use smaller training resolutions (e.g., 512x320)
 - Reduce `--sample_vae_temporal_tile_size` to 24 or lower
 - `--use_pinned_memory_for_block_swap` speeds up block-swap transfers, but it is optional: remove it if you hit a block-swap crash (see [Troubleshooting](#troubleshooting), especially on RTX 5090 / 50xx)
+
+This configuration trades main RAM for VRAM. It requires a large amount of main RAM: measured peak for the command above is about 80 GB, and the same command fails on a system limited to 72 GB. Allow at least 96 GB of installed RAM. Do not use it on a system with limited main RAM; see [Low Main-RAM Training](#low-main-ram-training) instead.
+
+### Low Main-RAM Training
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Block swap and CPU activation offload reduce VRAM by moving transformer blocks and activations into main RAM. On a system with limited main RAM the trade must be reversed: keep the model resident on the GPU and leave main RAM nearly empty.
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --nf4_base ^
+  --quantize_device cuda ^
+  --gradient_checkpointing ^
+  --sdpa ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 ^
+  --network_alpha 16 ^
+  --output_dir output
+```
+
+Rules for this configuration:
+
+- **Do not set `--blocks_to_swap`.** Every swapped block is held in main RAM. Any non-zero value raises main-RAM usage well beyond what a small system has.
+- **Do not use `--gradient_checkpointing_cpu_offload` or `--blockwise_checkpointing`.** Both move activations and block state through main RAM.
+- **Use `--quantize_device cuda`.** Weights are then quantized directly on the GPU and the checkpoint is never staged in main RAM. `--quantize_device cpu` loads and quantizes on the host instead and raises main-RAM usage.
+- **Disable sampling during training**, or precache the sample prompts (see [Precached Sample Prompts](#precached-sample-prompts)). Sampling otherwise loads Gemma, which does not fit alongside training on a small system.
+
+Measured peak main-RAM usage for the command above is about 7.5 GB, and it is unchanged by LoRA rank. Allow at least 12 GB of installed RAM so the operating system and data loading have headroom. The same configuration requires about 19 GB of VRAM; `--fp8_base` and larger ranks raise that figure, and NF4 is the smallest base-weight format available.
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>
