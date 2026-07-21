@@ -1302,6 +1302,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Device for NF4/FP8 quantization math (default: cuda). Overrides LTX2_NF4_CALC_DEVICE / LTX2_FP8_CALC_DEVICE env vars.",
     )
     parser.add_argument(
+        "--ltx2_low_ram_load",
+        action="store_true",
+        help=(
+            "Place each weight on its final device while streaming the checkpoint, instead of loading the whole "
+            "model into main RAM first. Reduces main-RAM usage when --blocks_to_swap is set, at the cost of "
+            "holding the resident blocks on the GPU during loading. Supported for NF4, scaled FP8, and "
+            "unquantized bases."
+        ),
+    )
+    parser.add_argument(
         "--loftq_init",
         action="store_true",
         help="use LoftQ initialization for LoRA (compensates NF4 quantization error, requires --nf4_base)",

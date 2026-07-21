@@ -59,6 +59,31 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     _synchronize_device(device)
 
 
+def compute_h2d_stream_indices(num_blocks: int, blocks_to_swap: int) -> set[int]:
+    """Block indices streamed by the H2D-only offloader: evenly spaced midpoints.
+
+    Kept as the single definition so anything that needs to know which blocks will be
+    offloaded (for example placing weights during loading) cannot drift from the
+    offloader's own choice.
+    """
+    if blocks_to_swap <= 0:
+        return set()
+    return {((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)}
+
+
+def compute_offload_block_indices(num_blocks: int, blocks_to_swap: int, h2d_only: bool) -> set[int]:
+    """Block indices that will live on CPU, for either offloader layout.
+
+    Classic and aggressive block swap offload a contiguous tail; H2D-only streams an
+    evenly spaced set. Callers must not assume the tail.
+    """
+    if num_blocks <= 0 or blocks_to_swap <= 0:
+        return set()
+    if h2d_only:
+        return compute_h2d_stream_indices(num_blocks, blocks_to_swap)
+    return set(range(max(0, num_blocks - blocks_to_swap), num_blocks))
+
+
 def weighs_to_device(layer: nn.Module, device: torch.device):
     for module in layer.modules():
         if hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear"):
@@ -804,7 +829,7 @@ class LoRAStreamOffloader:
         assert device.type == "cuda", "LoRAStreamOffloader currently supports CUDA only"
 
         # ---- streaming placement: S evenly spaced block indices (midpoint formula -> distinct for S <= N) ----
-        stream_idx = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
+        stream_idx = sorted(compute_h2d_stream_indices(num_blocks, blocks_to_swap))
         self.stream_idx = stream_idx
         self.S = len(stream_idx)  # actual streaming count (>=1; dedup is a no-op unless S is close to N)
         self.rank = {b: k for k, b in enumerate(stream_idx)}  # block_idx -> position in stream_idx

@@ -95,6 +95,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [Low Main-RAM Training](#low-main-ram-training)
+      - [Reducing the Main-RAM Cost of Block Swap](#reducing-the-main-ram-cost-of-block-swap)
     - [NF4 Quantization](#nf4-quantization)
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
@@ -1709,9 +1710,34 @@ Rules for this configuration:
 - **Use `--quantize_device cuda`.** Weights are then quantized directly on the GPU and the checkpoint is never staged in main RAM. `--quantize_device cpu` loads and quantizes on the host instead and raises main-RAM usage.
 - **Disable sampling during training**, or precache the sample prompts (see [Precached Sample Prompts](#precached-sample-prompts)). Sampling otherwise loads Gemma, which does not fit alongside training on a small system.
 
-Measured peak main-RAM usage for the command above is about 7.5 GB, and it is unchanged by LoRA rank. Allow at least 12 GB of installed RAM so the operating system and data loading have headroom. The same configuration requires about 19 GB of VRAM.
+Measured peak main-RAM usage for the command above is about 7.5 GB, and it does not scale with LoRA rank. Allow at least 12 GB of installed RAM so the operating system and data loading have headroom. The same configuration requires about 19 GB of VRAM.
 
 That VRAM figure applies to this configuration only, because it keeps every block on the GPU. Block swap makes the opposite trade: adding `--blocks_to_swap 12` to the same command lowers VRAM to about 11 GB but raises main-RAM usage to about 26 GB. Choose the configuration that matches whichever of the two is scarcer on your system. `--fp8_base` and larger ranks raise the VRAM figure, and NF4 is the smallest base-weight format available.
+
+#### Reducing the Main-RAM Cost of Block Swap
+<sub>[↑ contents](#table-of-contents)</sub>
+
+The main-RAM cost of block swap above comes from the loading step, not from the swapped blocks themselves: the checkpoint is staged in main RAM in full before any block is placed. `--ltx2_low_ram_load` instead writes each weight straight to the device it will be used from, so the model is never held whole in main RAM.
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --nf4_base ^
+  --quantize_device cuda ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 16 ^
+  --ltx2_low_ram_load ^
+  ...
+```
+
+With `--blocks_to_swap 16` measured peaks are about 12 GB main RAM and 11 GB VRAM, against about 27 GB main RAM and 10 GB VRAM without the option. It trades roughly 1 GB of VRAM for roughly 15 GB of main RAM, which makes block swap usable on systems that cannot hold the whole checkpoint.
+
+Notes:
+
+- Requires `--blocks_to_swap`. Without block swap the model already loads directly onto the GPU.
+- Supported for `--nf4_base`, `--fp8_base --fp8_scaled`, and unquantized bases. The int8, INT4-ConvRot and NVFP4 loaders do not place tensors individually, so the option is rejected for them rather than silently having no effect.
+- Rejected together with `--loftq_init`, AWQ calibration, `--blockwise_checkpointing` and `--gradient_checkpointing_cpu_offload`, which all move state back through main RAM.
+- Works with `--block_swap_h2d_only`, whose offloaded blocks are chosen differently from classic block swap.
+- The option changes only where weights are written during loading, not what is computed.
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>

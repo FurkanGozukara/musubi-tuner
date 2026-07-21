@@ -56,6 +56,7 @@ DEFAULT_NF4_BLOCK_SIZE = 32
 # Pack / unpack helpers
 # ---------------------------------------------------------------------------
 
+
 def pack_uint4(indices: torch.Tensor) -> torch.Tensor:
     """Pack pairs of 4-bit indices into uint8.  ``indices`` must have even length."""
     assert indices.numel() % 2 == 0, "Number of elements must be even for uint4 packing"
@@ -79,6 +80,7 @@ def unpack_uint4(packed: torch.Tensor, num_elements: int) -> torch.Tensor:
 # Quantize / dequantize
 # ---------------------------------------------------------------------------
 
+
 def quantize_nf4_block(
     tensor: torch.Tensor,
     block_size: int = DEFAULT_NF4_BLOCK_SIZE,
@@ -96,9 +98,7 @@ def quantize_nf4_block(
     assert tensor.ndim == 2, f"Expected 2-D tensor, got {tensor.ndim}-D"
     out_features, in_features = tensor.shape
     if in_features % block_size != 0:
-        raise ValueError(
-            f"in_features ({in_features}) must be divisible by block_size ({block_size})"
-        )
+        raise ValueError(f"in_features ({in_features}) must be divisible by block_size ({block_size})")
     num_blocks = in_features // block_size
 
     # Reshape to [out, num_blocks, block_size]
@@ -163,6 +163,7 @@ def dequantize_nf4_block(
 # State-dict-level quantization (mirrors optimize_state_dict_with_fp8)
 # ---------------------------------------------------------------------------
 
+
 def optimize_state_dict_with_nf4(
     state_dict: dict,
     calc_device: Union[str, torch.device],
@@ -182,12 +183,8 @@ def optimize_state_dict_with_nf4(
 
     target_keys_list = []
     for key in list(state_dict.keys()):
-        is_target = (
-            target_layer_keys is None or any(p in key for p in target_layer_keys)
-        ) and key.endswith(".weight")
-        is_excluded = exclude_layer_keys is not None and any(
-            p in key for p in exclude_layer_keys
-        )
+        is_target = (target_layer_keys is None or any(p in key for p in target_layer_keys)) and key.endswith(".weight")
+        is_excluded = exclude_layer_keys is not None and any(p in key for p in exclude_layer_keys)
         if is_target and not is_excluded and isinstance(state_dict[key], torch.Tensor):
             target_keys_list.append(key)
 
@@ -214,12 +211,8 @@ def optimize_state_dict_with_nf4(
 
         target_device = calc_device if (calc_device is not None and move_to_device) else original_device
         state_dict[key] = packed.to(target_device)
-        state_dict[key.replace(".weight", ".scale_weight")] = scale.to(
-            dtype=original_dtype, device=target_device
-        )
-        state_dict[key.replace(".weight", ".nf4_shape")] = torch.tensor(
-            [out_features, in_features], dtype=torch.int64
-        )
+        state_dict[key.replace(".weight", ".scale_weight")] = scale.to(dtype=original_dtype, device=target_device)
+        state_dict[key.replace(".weight", ".nf4_shape")] = torch.tensor([out_features, in_features], dtype=torch.int64)
 
         optimized_count += 1
         if calc_device is not None and optimized_count % 10 == 0:
@@ -240,19 +233,20 @@ def load_safetensors_with_nf4_optimization(
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
     key_filter: Optional[Callable[[str], bool]] = None,
+    placement_fn: Optional[Callable[[str, torch.device], torch.device]] = None,
 ) -> dict:
     """Load safetensors and quantize target layers to NF4.
 
     Mirrors ``load_safetensors_with_fp8_optimization``.
+
+    When ``placement_fn`` is given it may redirect an individual tensor to another
+    device, so weights that will be offloaded are never staged on the load device.
+    Omitting it keeps the previous single-device behavior.
     """
 
     def is_target_key(key):
-        is_target = (
-            target_layer_keys is None or any(p in key for p in target_layer_keys)
-        ) and key.endswith(".weight")
-        is_excluded = exclude_layer_keys is not None and any(
-            p in key for p in exclude_layer_keys
-        )
+        is_target = (target_layer_keys is None or any(p in key for p in target_layer_keys)) and key.endswith(".weight")
+        is_excluded = exclude_layer_keys is not None and any(p in key for p in exclude_layer_keys)
         return is_target and not is_excluded
 
     optimized_count = 0
@@ -260,11 +254,7 @@ def load_safetensors_with_nf4_optimization(
 
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as original_f:
-            f = (
-                TensorWeightAdapter(weight_transform_hooks, original_f)
-                if weight_transform_hooks is not None
-                else original_f
-            )
+            f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
             keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
             for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
                 value = f.get_tensor(key)
@@ -275,6 +265,8 @@ def load_safetensors_with_nf4_optimization(
 
                 if not is_target_key(key) or value.ndim != 2:
                     target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                    if placement_fn is not None:
+                        target_device = placement_fn(key, target_device)
                     state_dict[key] = value.to(target_device)
                     continue
 
@@ -287,6 +279,8 @@ def load_safetensors_with_nf4_optimization(
                         block_size,
                     )
                     target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                    if placement_fn is not None:
+                        target_device = placement_fn(key, target_device)
                     state_dict[key] = value.to(target_device)
                     continue
 
@@ -297,13 +291,11 @@ def load_safetensors_with_nf4_optimization(
                 packed, scale = quantize_nf4_block(value, block_size)
 
                 target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                if placement_fn is not None:
+                    target_device = placement_fn(key, target_device)
                 state_dict[key] = packed.to(target_device)
-                state_dict[key.replace(".weight", ".scale_weight")] = scale.to(
-                    dtype=original_dtype, device=target_device
-                )
-                state_dict[key.replace(".weight", ".nf4_shape")] = torch.tensor(
-                    [out_features, in_features], dtype=torch.int64
-                )
+                state_dict[key.replace(".weight", ".scale_weight")] = scale.to(dtype=original_dtype, device=target_device)
+                state_dict[key.replace(".weight", ".nf4_shape")] = torch.tensor([out_features, in_features], dtype=torch.int64)
 
                 optimized_count += 1
                 if calc_device is not None and optimized_count % 10 == 0:
@@ -316,6 +308,7 @@ def load_safetensors_with_nf4_optimization(
 # ---------------------------------------------------------------------------
 # Monkey-patched forward
 # ---------------------------------------------------------------------------
+
 
 def nf4_linear_forward_patch(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     """Drop-in replacement forward for NF4-quantized Linear layers."""
@@ -413,6 +406,7 @@ def apply_nf4_monkey_patch(
 # ---------------------------------------------------------------------------
 # Detection helper
 # ---------------------------------------------------------------------------
+
 
 def is_nf4_module(module: nn.Module) -> bool:
     """Check whether *module* has been NF4-quantized (attribute-based, not dtype)."""

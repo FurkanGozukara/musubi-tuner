@@ -1180,6 +1180,11 @@ def load_ltx2_model(
     awq_alpha: float = 0.25,
     awq_num_batches: int = 8,
     transformer_block_load_range: tuple[int, int | None] | None = None,
+    *,
+    low_ram_load: bool = False,
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    offload_block_indices: Optional[set] = None,
     **_: Any,
 ):
     """Load LTX-2 (video, audio-video, or audio-only) transformer
@@ -1336,6 +1341,52 @@ def load_ltx2_model(
             )
 
         logger.info("LTX-2 range-aware load enabled for transformer blocks %d:%d", keep_start, keep_end)
+
+    # Streamed placement (opt-in). Each weight is written straight to the device it will
+    # be used from, so the whole model is never staged in main RAM. Only the training
+    # entry point enables this; every other caller keeps the previous single-device path.
+    # The caller supplies the exact offloaded block indices, because classic/aggressive
+    # swap offloads a contiguous tail while H2D-only streams an evenly spaced set.
+    _placement_fn = None
+    if not low_ram_load:
+        _swap_idx = set()
+    elif offload_block_indices is not None:
+        _swap_idx = set(offload_block_indices)
+    else:
+        from musubi_tuner.modules.custom_offloading_utils import compute_offload_block_indices
+
+        _swap_idx = compute_offload_block_indices(
+            num_blocks=num_transformer_blocks,
+            blocks_to_swap=int(blocks_to_swap or 0),
+            h2d_only=bool(block_swap_h2d_only),
+        )
+    if _swap_idx:
+        _blk_re = re.compile(r"transformer_blocks\.(\d+)\.")
+        _cpu_dev = torch.device("cpu")
+
+        def _placement_fn(key: str, default_device: torch.device) -> torch.device:
+            # Companion tensors (scale/shape/stabilizer) carry the same block path as the
+            # weight they belong to, so they follow it onto the same device.
+            match = _blk_re.search(key)
+            if match is not None and int(match.group(1)) in _swap_idx:
+                return _cpu_dev
+            return default_device
+
+        # These components are not part of the transformer, so load_state_dict discards
+        # them regardless; skipping them avoids materializing them on the load device.
+        # Comfy-style checkpoints may prefix keys, so classify the normalized name.
+        _skip_prefixes = ("vae.", "audio_vae.", "vocoder.", "text_embedding_projection.")
+        _comfy_prefix = "model.diffusion_model."
+        _prev_key_filter = state_dict_key_filter
+
+        def state_dict_key_filter(key: str) -> bool:  # noqa: F811
+            normalized = key[len(_comfy_prefix) :] if key.startswith(_comfy_prefix) else key
+            if normalized.startswith(_skip_prefixes):
+                return False
+            return True if _prev_key_filter is None else _prev_key_filter(key)
+
+        logger.info("LTX-2 low-RAM load: streaming placement for %d offloaded blocks", len(_swap_idx))
+
     fp8_block_exclude_keys = build_fp8_keep_block_exclude_keys(fp8_keep_blocks, num_transformer_blocks) if fp8_scaled else []
     if fp8_block_exclude_keys:
         logger.info(
@@ -1538,6 +1589,7 @@ def load_ltx2_model(
                 block_size=nf4_block_size,
                 move_to_device=not load_weights_on_cpu and load_device == target_device,
                 key_filter=state_dict_key_filter,
+                placement_fn=_placement_fn,
             )
             _skip_rename = False
     elif fp8_scaled:
@@ -1555,6 +1607,7 @@ def load_ltx2_model(
             target_keys=["transformer_blocks"],
             exclude_keys=fp8_exclude_keys,
             key_filter=state_dict_key_filter,
+            placement_fn=_placement_fn,
         )
     elif int8_base:
         logger.info("LTX-2 int8: loading pre-quantized Optimum-Quanto qint8 checkpoint")
@@ -1683,6 +1736,7 @@ def load_ltx2_model(
             target_keys=None,
             exclude_keys=None,
             key_filter=state_dict_key_filter,
+            placement_fn=_placement_fn,
         )
 
     # Dynamic int8/int4 loaders already rename keys during streaming quantization.
@@ -1740,7 +1794,17 @@ def load_ltx2_model(
         apply_nvfp4_training_monkey_patch(base_model)
         _trace_vram_ltx2("AFTER NVFP4 training monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
-    base_model = base_model.to(load_device)
+    if _placement_fn is not None:
+        # Preserve streamed placement: move only the non-block modules, then place each
+        # block on the device it was streamed to. A blanket .to() would undo the split.
+        _saved_blocks = base_model.transformer_blocks
+        base_model.transformer_blocks = torch.nn.ModuleList()
+        base_model = base_model.to(load_device)
+        base_model.transformer_blocks = _saved_blocks
+        for _bi, _blk in enumerate(base_model.transformer_blocks):
+            _blk.to(torch.device("cpu") if _bi in _swap_idx else load_device)
+    else:
+        base_model = base_model.to(load_device)
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")
     if fp8_upcast or fp8_upcast_stochastic:
         # Upcast FP8 linear weights during forward for stability.
@@ -1769,7 +1833,7 @@ def load_ltx2_model(
         split_attn_chunk_size=split_attn_chunk_size,
     )
 
-    if load_device == target_device:
+    if load_device == target_device and _placement_fn is None:
         model = model.to(device=target_device)
         _trace_vram_ltx2(f"AFTER model.to({target_device}) [load_device==target_device]")
     if torch.cuda.is_available():

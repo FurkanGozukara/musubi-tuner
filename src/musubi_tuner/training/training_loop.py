@@ -346,6 +346,11 @@ def train(self, args):
     blocks_to_swap = args.blocks_to_swap if args.blocks_to_swap else 0
     self.blocks_to_swap = blocks_to_swap
     loading_device = "cpu" if blocks_to_swap > 0 or model_parallel else accelerator.device
+    if blocks_to_swap > 0 and not model_parallel and getattr(args, "ltx2_low_ram_load", False):
+        # Streamed placement assigns each weight its final device during loading, so the
+        # whole model is never materialized in main RAM. Architectures without the flag
+        # keep the default CPU staging path.
+        loading_device = accelerator.device
 
     # Reset VRAM tracking for spike analysis
     if torch.cuda.is_available():

@@ -1137,6 +1137,48 @@ def warn_if_h2d_only_ignored(args: argparse.Namespace) -> bool:
     return True
 
 
+def validate_ltx2_low_ram_load(args) -> None:
+    """Reject --ltx2_low_ram_load combinations that would silently do nothing or break."""
+    if not getattr(args, "ltx2_low_ram_load", False):
+        return
+    if int(getattr(args, "blocks_to_swap", 0) or 0) <= 0:
+        raise ValueError(
+            "--ltx2_low_ram_load requires --blocks_to_swap N (N > 0). Without block swap the model "
+            "already loads directly onto the GPU and the option has no effect."
+        )
+    unsupported = [
+        name
+        for name in (
+            "int8_base",
+            "int8_base_dynamic",
+            "int8_convrot_base",
+            "int8_convrot_dynamic",
+            "int4_convrot_base",
+            "int4_convrot_dynamic",
+            "nvfp4_training_base",
+        )
+        if getattr(args, name, False)
+    ]
+    if unsupported:
+        raise ValueError(
+            "--ltx2_low_ram_load does not yet place weights for "
+            + ", ".join("--" + name for name in unsupported)
+            + ". Those loaders do not route their tensors through the placement callback, so the model "
+            "would be staged on a single device anyway. Use --nf4_base, --fp8_base/--fp8_scaled, or an "
+            "unquantized base, or drop --ltx2_low_ram_load."
+        )
+    if getattr(args, "loftq_init", False) or getattr(args, "awq_calibration", False):
+        raise ValueError(
+            "--ltx2_low_ram_load is incompatible with --loftq_init and AWQ calibration. Those paths build a "
+            "full-precision state dict before quantizing, so weights are not placed while streaming."
+        )
+    if getattr(args, "blockwise_checkpointing", False) or getattr(args, "gradient_checkpointing_cpu_offload", False):
+        raise ValueError(
+            "--ltx2_low_ram_load is incompatible with --blockwise_checkpointing and "
+            "--gradient_checkpointing_cpu_offload, which move state back through main RAM."
+        )
+
+
 class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     """Trainer for LTX-2 models with LoRA support"""
 
@@ -1210,6 +1252,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
     def train(self, args: argparse.Namespace):
         warn_if_h2d_only_ignored(args)
+        validate_ltx2_low_ram_load(args)
         if getattr(args, "debug_dataset", False):
             self._debug_dataset_and_exit(args)
             return
@@ -4138,7 +4181,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if dit_weight_dtype is None:
             logger.info("LTX-2 weight dtype not set; using %s for loading", torch_dtype_to_use)
         transformer_block_load_range = get_ltx2_remote_stage_local_keep_range(args)
+        # The offloaded block layout differs between classic/aggressive swap (contiguous
+        # tail) and H2D-only (evenly spaced), so both determinants are forwarded and the
+        # exact index set is derived once the block count is known.
         transformer = load_ltx2_model(
+            low_ram_load=bool(getattr(args, "ltx2_low_ram_load", False)),
+            blocks_to_swap=int(getattr(args, "blocks_to_swap", 0) or 0),
+            block_swap_h2d_only=bool(getattr(args, "block_swap_h2d_only", False)),
             model_path=dit_path,
             device=accelerator.device,
             load_device=loading_device,
