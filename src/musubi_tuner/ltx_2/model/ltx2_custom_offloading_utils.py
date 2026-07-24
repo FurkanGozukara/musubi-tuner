@@ -12,6 +12,15 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _copy_tensors_(destinations: list[torch.Tensor], sources: list[torch.Tensor], *, non_blocking: bool) -> None:
+    foreach_copy = getattr(torch, "_foreach_copy_", None)
+    if foreach_copy is not None:
+        foreach_copy(destinations, sources, non_blocking=non_blocking)
+        return
+    for destination, source in zip(destinations, sources):
+        destination.copy_(source, non_blocking=non_blocking)
+
+
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
 def _clean_memory_on_device(device: torch.device):
     r"""
@@ -644,17 +653,14 @@ class Offloader:
             else:
                 released_pinned_buffer = []
 
-                events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for GPU to CPU non-blocking copy
-
                 def _copy_weights_to_cpu():
-                    for event, module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
-                        events, self.pinned_buffer, weight_swap_jobs
-                    ):
-                        # CUDA to CPU, non-blocking copy
-                        with torch.cuda.stream(self.stream):
-                            with T.section("cuda to cpu"):
-                                module_pin_buf.copy_(cuda_data_view, non_blocking=True)
-                                event.record(self.stream)
+                    with torch.cuda.stream(self.stream):
+                        with T.section("cuda to cpu"):
+                            _copy_tensors_(
+                                self.pinned_buffer,
+                                [cuda_data_view for _, _, cuda_data_view, _, _ in weight_swap_jobs],
+                                non_blocking=True,
+                            )
 
                 # Copy weights to CPU (retry once if pinned buffer shape mismatch slips through)
                 try:
@@ -672,17 +678,13 @@ class Offloader:
                         raise
 
                 # CPU to CUDA
-                for event, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
-                    events, weight_swap_jobs
-                ):
-                    with torch.cuda.stream(self.stream):
-                        # Wait for cuda_data_view to be ready
-                        with T.section("wait cpu"):
-                            self.stream.wait_event(event)
-
-                        # CPU to CUDA, non-blocking copy
-                        with T.section("cpu to cuda"):
-                            cuda_data_view.copy_(cpu_data_view, non_blocking=True)
+                with torch.cuda.stream(self.stream):
+                    with T.section("cpu to cuda"):
+                        _copy_tensors_(
+                            [cuda_data_view for _, _, cuda_data_view, _, _ in weight_swap_jobs],
+                            [cpu_data_view for _, _, _, cpu_data_view, _ in weight_swap_jobs],
+                            non_blocking=True,
+                        )
 
                 # Update references
                 for module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(

@@ -50,6 +50,10 @@ def _prompt_kv_checkpoint_config() -> tuple[bool, int]:
     return True, budget
 
 
+def _needs_swap_cleanup(swap_active: bool) -> bool:
+    return bool(swap_active)
+
+
 def _move_non_linear_params(module: nn.Module, device: torch.device) -> None:
     """Move non-linear params/buffers to device; Linear weights are handled by offloader."""
     non_blocking = device.type != "cpu"
@@ -935,7 +939,7 @@ class LTXModel(torch.nn.Module):
                     self.training and torch.is_grad_enabled(),
                 )
 
-        if (swap_active and swap_manager is not None) or (self.blocks_to_swap and self.offloader is not None):
+        if _needs_swap_cleanup(swap_active):
             if video is not None and isinstance(video.x, torch.Tensor):
                 _clean_memory_on_device(video.x.device)
 
