@@ -3755,6 +3755,33 @@ def main() -> None:
             "--block_swap_h2d_only is only supported for LTX-2/2.3 LoRA-style frozen-base training. "
             "Full fine-tuning must use the regular LTX block swap path."
         )
+    if blocks_to_swap > 0 and accelerator.num_processes > 1:
+        raise ValueError(
+            "LTX-2 full fine-tuning block swap requires a single training process because DistributedDataParallel "
+            "cannot wrap a module whose parameters are split between CPU and CUDA."
+        )
+    if bool(getattr(args, "ltx2_block_swap_trainable_ring", False)):
+        incompatible_ring_options = (
+            "fp8_base",
+            "fp8_scaled",
+            "nf4_base",
+            "int8_base",
+            "int8_base_dynamic",
+            "int8_convrot_base",
+            "int8_convrot_dynamic",
+            "int4_convrot_base",
+            "int4_convrot_dynamic",
+            "nvfp4_training_base",
+            "int8_weights",
+            "qgalore_full_ft",
+            "fp8_gemm",
+        )
+        enabled_ring_conflicts = [f"--{name}" for name in incompatible_ring_options if bool(getattr(args, name, False))]
+        if enabled_ring_conflicts:
+            raise ValueError(
+                "--ltx2_block_swap_trainable_ring requires ordinary floating-point transformer block weights and is "
+                f"incompatible with: {', '.join(enabled_ring_conflicts)}."
+            )
     trainer.blocks_to_swap = blocks_to_swap
     remote_prune_local_blocks = ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_prune_local_blocks", False))
     qgalore_load_device = str(getattr(args, "qgalore_load_device", "cuda") or "cuda").lower()

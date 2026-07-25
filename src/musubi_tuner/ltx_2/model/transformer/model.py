@@ -965,6 +965,12 @@ class LTXModel(torch.nn.Module):
     ) -> tuple[TransformerArgs, TransformerArgs]:
         """Process transformer blocks with optional offloading and block swapping."""
 
+        if isinstance(self.offloader, LTX2TrainableRingOffloader):
+            forward_only = not self.training
+            if self.offloader.forward_only != forward_only:
+                self.offloader.set_forward_only(forward_only)
+                self.prepare_block_swap_before_forward()
+
         nan_block_diag = os.getenv("LTX2_NAN_BLOCK_DIAG", "0") == "1"
         strict_swap_sync = os.getenv("LTX2_SWAP_STRICT_SYNC", "0") == "1"
         force_pytorch_attn = os.getenv("LTX2_SWAP_FORCE_PYTORCH_ATTN", "0") == "1"

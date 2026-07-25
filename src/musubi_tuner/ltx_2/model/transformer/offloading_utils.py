@@ -827,7 +827,14 @@ class LTX2TrainableRingOffloader:
                 self._last_wait_rank = None
             return
 
-        if self._phase == "forward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
+        if self.forward_only and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "backward" and self._last_wait_rank == 0 and rank == 0:
+            self._finish_backward_rank(0)
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "forward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
             self._phase = "backward"
             self._finish_backward_rank(self._last_wait_rank)
         elif self._phase == "backward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
@@ -860,10 +867,13 @@ class LTX2TrainableRingOffloader:
             self._load(rank, slot)
 
     def set_forward_only(self, forward_only: bool) -> None:
-        if forward_only:
-            raise ValueError("Trainable block ring is training-only.")
-        self.forward_only = False
-        return
+        self.copy_stream.synchronize()
+        if forward_only and self._phase == "backward" and self._last_wait_rank == 0:
+            self._finish_backward_rank(0)
+            self.copy_stream.synchronize()
+        self.forward_only = forward_only
+        self._phase = "forward"
+        self._last_wait_rank = None
 
     def synchronize(self) -> None:
         self.copy_stream.synchronize()
