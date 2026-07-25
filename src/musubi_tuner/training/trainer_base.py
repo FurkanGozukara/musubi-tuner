@@ -1614,8 +1614,9 @@ class NetworkTrainer:
         if network is None:
             return None
 
-        if hasattr(network_module, "prepare_network"):
-            network.prepare_network(args)
+        prepare_network = getattr(network, "prepare_network", None)
+        if callable(prepare_network):
+            prepare_network(args)
 
         # apply network to DiT
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
