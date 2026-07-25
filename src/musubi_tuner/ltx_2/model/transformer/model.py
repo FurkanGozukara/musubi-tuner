@@ -618,6 +618,7 @@ class LTXModel(torch.nn.Module):
         )
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
         for idx, block in enumerate(self.transformer_blocks):
+            block.use_pinned_memory = use_pinned_memory
             enabled = idx >= swap_start
             setattr(block, "_h2d_stream_offloader_ref", None)
             setattr(block, "swap_weight_offload", enabled)

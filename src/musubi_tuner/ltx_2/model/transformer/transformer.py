@@ -497,6 +497,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # So we detect backward by checking if block is on CPU
                 h2d_stream_managed = self._wait_for_h2d_stream_block()
                 if getattr(self, "swap_weight_offload", False) and not h2d_stream_managed:
+                    use_pinned_swap = self.use_pinned_memory
                     first_param = next(self.parameters(), None)
                     block_on_cpu = first_param is not None and first_param.device.type == "cpu"
 
@@ -505,12 +506,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         # Unload previous block before loading current to prevent VRAM accumulation
                         prev_block = getattr(_swap_backward_state, "last_loaded_block", None)
                         if prev_block is not None and prev_block is not self:
-                            prev_block.to("cpu")
+                            if use_pinned_swap:
+                                prev_block._offload_checkpoint_pinned()
+                            else:
+                                prev_block.to("cpu")
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
 
                         # Load this block to GPU
-                        self.to(target_device)
+                        if use_pinned_swap:
+                            self.to(target_device, non_blocking=True)
+                        else:
+                            self.to(target_device)
 
                         # Track for unloading on next iteration
                         _swap_backward_state.last_loaded_block = self
@@ -528,7 +535,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # This handles transition from swapped blocks (18) to permanent blocks (17→0)
                 elif getattr(_swap_backward_state, "last_loaded_block", None) is not None:
                     prev_block = _swap_backward_state.last_loaded_block
-                    prev_block.to("cpu")
+                    use_pinned_swap = prev_block.use_pinned_memory
+                    if use_pinned_swap:
+                        prev_block._offload_checkpoint_pinned()
+                    else:
+                        prev_block.to("cpu")
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _swap_backward_state.last_loaded_block = None
@@ -990,6 +1001,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         p.data = p.data.to(d, non_blocking=True)
         _move_non_linear_params(b, cpu_device)
         ensure_fp8_modules_on_device(b, cpu_device)
+
+    @torch.no_grad()
+    def _offload_checkpoint_pinned(self) -> None:
+        def to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
+            target = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            target.copy_(tensor)
+            return target
+
+        self._apply(to_pinned_cpu)
 
 
 def prepare_prompt_context(

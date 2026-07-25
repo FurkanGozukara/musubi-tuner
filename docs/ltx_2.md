@@ -212,6 +212,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [APOLLO and QAPOLLO](#apollo-and-qapollo)
     - [Int8 / Int8 ConvRot / EMA](#int8--int8-convrot--ema)
     - [Optimizing VRAM Usage](#optimizing-vram-usage)
+      - [Block Swap for Full Fine-Tuning](#block-swap-for-full-fine-tuning)
   - [References](#references)
 
 ---
@@ -1594,7 +1595,7 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | Argument | Description |
 |----------|-------------|
 | `--blocks_to_swap X` | Offload X transformer blocks to CPU (up to one less than the model's block count; e.g. 47 for the 48-block 22B checkpoint). Higher = more VRAM saved, more CPU↔GPU overhead |
-| `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
+| `--use_pinned_memory_for_block_swap` | Use pinned host memory for faster block transfers and checkpoint recomputation; recommended for classic block swap when host RAM permits |
 | `--block_swap_h2d_only` | Stream frozen LoRA base blocks Host→Device only; requires `--blocks_to_swap X` and `--gradient_checkpointing` |
 | `--block_swap_ring_size N` | H2D-only GPU ring size. `2` (default) uses double buffering; `1` allocates one streaming buffer and cannot overlap prefetch with compute |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
@@ -4683,7 +4684,7 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 > The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
 
 > [!NOTE]
-> **Block swap with full fine-tuning.** `--blocks_to_swap N` is accepted for full-parameter runs. `--block_swap_h2d_only` is not: combining it with full fine-tuning raises an error because trainable base blocks cannot use the frozen-weight Host→Device-only schedule. Standard block swap therefore transfers trainable block state in both directions. Its peak memory and step time depend on the model, bucket, host/device interconnect, ring settings, and optimizer; benchmark the intended configuration rather than treating the LoRA measurements or historical benchmark tables below as a capacity guarantee.
+> Full fine-tuning supports standard bidirectional block swap. See [Block Swap for Full Fine-Tuning](#block-swap-for-full-fine-tuning) for the measured 24 GB profile.
 
 #### Using Full-Finetune Checkpoints for Inference
 
@@ -5079,9 +5080,34 @@ Measured int8 ConvRot rows (`--int8_weights --int8_weights_convrot auto --int8_w
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughly 20 GB in the measured matrix. BAdam reduces active optimizer and gradient state, but the dense base transformer weights still stay resident and the full transformer forward still runs every step. In the measured LTX-2.3 runs, BAdam did not bring this model into the 24 GB class, and the long runs also reached a loss plateau.
+Dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughly 20 GB in the measured matrix. Standard block swap can bring short video-only dense bf16 training into the 24 GB class without quantizing the trainable weights. Quantized full-fine-tuning paths provide another memory/speed tradeoff. BAdam reduces active optimizer and gradient state, but the dense base transformer weights still stay resident and the full transformer forward still runs every step.
 
-For 24 GB-class video-only tests, use a quantized `Linear` replacement path:
+#### Block Swap for Full Fine-Tuning
+
+Block swap keeps part of the transformer in system RAM and transfers each offloaded block to the GPU when it is needed. Full fine-tuning requires the standard bidirectional path because updated block weights must return to system RAM; `--block_swap_h2d_only` is only valid for frozen base weights such as LoRA training.
+
+Measured 24 GB starting configuration for 512x512x33 video training:
+
+```bash
+--gradient_checkpointing \
+--fused_backward_pass \
+--max_grad_norm 0 \
+--blocks_to_swap 16 \
+--use_pinned_memory_for_block_swap
+```
+
+Measured workload: 512x512x33 video-only, batch size 1.
+
+| Swapped blocks | Peak VRAM | Peak host RAM | Median step time | Slowdown vs no swap |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 45,811 MiB | 8.436 GiB | 1.850 s | 1.00x |
+| 16 | 23,045 MiB | 44.220 GiB | 2.705 s | 1.46x |
+
+The measurements used an H100 with HBM3 VRAM, DDR5-4400 system RAM, and PCIe 5.0 x16. Pinned transfer bandwidth was 51.60 GiB/s H2D and 51.51 GiB/s D2H. GDDR6 is GPU memory and is not required for the host side; block swap uses ordinary system DDR memory. For similar transfer performance, use pinned DDR5 memory with a PCIe 5.0 x16 GPU link. PCIe 4.0, fewer PCIe lanes, slow system RAM, or cross-NUMA transfers will increase step time.
+
+Start with 16 swapped blocks for 512x512x33 on a dedicated 24 GB GPU. Increase `--blocks_to_swap` when longer sequences, higher resolutions, AV training, display use, or other GPU processes require more headroom. The measured profile fits in 64 GB system RAM on a dedicated training system; 96-128 GB leaves additional headroom for the OS, data loading, and caching.
+
+For quantized 24 GB-class alternatives, use a `Linear` replacement path:
 
 - Start with Q-GaLore: `--qgalore_full_ft --qgalore_load_device cpu --qgalore_targets video --qgalore_rank 256`.
 - Int8 weight storage is the other 24 GB-class route (see [Int8 / Int8 ConvRot / EMA](#int8--int8-convrot--ema)): with `--max_grad_norm 0`, short-context video-only training fits in roughly 21-23 GB while keeping a standard non-quantized optimizer through `--fused_backward_pass`; pair it with the EMA to recover sample fidelity, and budget the EMA's host-RAM cost (about two bytes per trainable parameter with `--ema_cpu_offload`).
