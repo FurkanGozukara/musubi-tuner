@@ -305,6 +305,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.activation_cpu_offloading = False
         self.weight_cpu_offloading = False
         self.use_pinned_memory = False
+        self.async_backward_prefetch = False
+        self._async_backward_prefetch_stream = None
+        self._async_backward_prefetch_event = None
+        self._async_backward_prefetched = False
+        self._async_backward_prev_block_ref = None
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
         self.gradient_checkpointing = True
@@ -321,6 +326,52 @@ class BasicAVTransformerBlock(torch.nn.Module):
             raise RuntimeError("The H2D block-swap offloader was released while a managed block is still active.")
         offloader.wait_for_block(self.idx)
         return True
+
+    def _prepare_async_backward_block(self, target_device: torch.device) -> bool:
+        first_param = next(self.parameters(), None)
+        block_on_cpu = first_param is not None and first_param.device.type == "cpu"
+        prefetched = self._async_backward_prefetched
+        if not block_on_cpu and not prefetched:
+            return False
+
+        previous = getattr(_swap_backward_state, "last_loaded_block", None)
+        if previous is not None and previous is not self:
+            previous._offload_checkpoint_pinned()
+            torch.cuda.synchronize(target_device)
+
+        if prefetched:
+            event = self._async_backward_prefetch_event
+            if event is None:
+                raise RuntimeError(f"Missing asynchronous block-swap event for block {self.idx}.")
+            torch.cuda.current_stream(target_device).wait_event(event)
+            self._async_backward_prefetch_event = None
+            self._async_backward_prefetched = False
+        else:
+            self.to(target_device, non_blocking=True)
+
+        _swap_backward_state.last_loaded_block = self
+        _swap_backward_state.last_loaded_idx = self.idx
+        self._prefetch_previous_backward_block(target_device)
+        return True
+
+    def _prefetch_previous_backward_block(self, target_device: torch.device) -> None:
+        previous_ref = self._async_backward_prev_block_ref
+        stream = self._async_backward_prefetch_stream
+        if previous_ref is None or stream is None:
+            return
+        previous = previous_ref()
+        if previous is None:
+            return
+
+        first_param = next(previous.parameters(), None)
+        if first_param is None or first_param.device.type != "cpu":
+            return
+        with torch.cuda.stream(stream):
+            previous.to(target_device, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        previous._async_backward_prefetch_event = event
+        previous._async_backward_prefetched = True
 
     def get_ada_values(
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice, num_tokens: int = None
@@ -501,7 +552,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     first_param = next(self.parameters(), None)
                     block_on_cpu = first_param is not None and first_param.device.type == "cpu"
 
-                    if block_on_cpu:
+                    async_backward = self.async_backward_prefetch and use_pinned_swap
+                    async_backward_active = async_backward and self._prepare_async_backward_block(target_device)
+                    if not async_backward_active and block_on_cpu:
                         # Block is on CPU → we're in backward recomputation
                         # Unload previous block before loading current to prevent VRAM accumulation
                         prev_block = getattr(_swap_backward_state, "last_loaded_block", None)
@@ -522,7 +575,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         # Track for unloading on next iteration
                         _swap_backward_state.last_loaded_block = self
                         _swap_backward_state.last_loaded_idx = self.idx
-                    else:
+                    elif not async_backward_active:
                         # Block is on GPU → we're in forward pass (offloader loaded it)
                         # Reset backward state to prevent stale data affecting next backward
                         _swap_backward_state.last_loaded_block = None

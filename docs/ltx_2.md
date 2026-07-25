@@ -1620,13 +1620,14 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--ltx2_prompt_kv_checkpoint_max_mb MB` | Limit preserved prompt K/V payload (default 1024 MiB). Lower it to trade recomputation savings for memory. |
 | `--ltx2_padded_prompt_trim` | Remove the right-padded prompt tail shared by every sample before transfer and attention. Can save up to about 8% when cached prompts are heavily padded; it does nothing for all-valid prompts. |
 | `--ltx2_partial_gradient_checkpointing` | Checkpoint only the final `--blocks_to_checkpoint N` blocks and retain earlier activations. Can improve short-sequence throughput by about 28% at higher VRAM cost; use only without offload, swap, model parallelism, or compiled blocks. Keep N near 48 for long sequences. |
+| `--ltx2_block_swap_async_backward` | Prefetch the next pinned block while the current backward block computes. Measured 4.1-4.4% faster for 512x512x33 full fine-tuning; requires block swap, pinned memory, and gradient checkpointing. |
 | `--ltx2_validate_training_tensors` | Scan cached inputs, predictions, and targets for NaN/Inf every step. Disabled by default to avoid GPU synchronization; enable it when diagnosing unstable training or suspect caches. |
 | `--sdpa` | Use PyTorch scaled dot-product attention. |
 | `--cudnn_attn` | Outside `torch.compile`, call PyTorch SDPA with backend priority cuDNN → flash → efficient → math. If the installed PyTorch lacks priority support, warn and use plain SDPA. Under `torch.compile`, use plain SDPA because the priority context is not traceable. Masks are passed to SDPA; the backend PyTorch ultimately selects is build/shape/hardware-dependent. |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use the separately installed FlashAttention 3 interface. A reducible key-padding mask uses its variable-length function when present; if that function is absent, or the mask is query-specific, the code warns once and falls back to PyTorch SDPA. Package and hardware requirements depend on the installed FlashAttention build. |
 
-The eight LTX-2 performance switches are disabled by default.
+The nine LTX-2 performance switches are disabled by default.
 
 **H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
 for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
@@ -5102,6 +5103,8 @@ Measured workload: 512x512x33 video-only, batch size 1.
 | ---: | ---: | ---: | ---: | ---: |
 | 0 | 45,811 MiB | 8.436 GiB | 1.850 s | 1.00x |
 | 16 | 23,045 MiB | 44.220 GiB | 2.705 s | 1.46x |
+
+Adding `--ltx2_block_swap_async_backward` reduced the 16-block steady-state median to 2.586 and 2.593 seconds in two repeated runs, a 4.1-4.4% improvement over pinned block swap alone.
 
 The measurements used an H100 with HBM3 VRAM, DDR5-4400 system RAM, and PCIe 5.0 x16. Pinned transfer bandwidth was 51.60 GiB/s H2D and 51.51 GiB/s D2H. GDDR6 is GPU memory and is not required for the host side; block swap uses ordinary system DDR memory. For similar transfer performance, use pinned DDR5 memory with a PCIe 5.0 x16 GPU link. PCIe 4.0, fewer PCIe lanes, slow system RAM, or cross-NUMA transfers will increase step time.
 

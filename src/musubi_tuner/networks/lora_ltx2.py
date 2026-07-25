@@ -327,12 +327,25 @@ class LTX2Wrapper(nn.Module):
         supports_backward: bool | None = None,
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
+        async_backward_prefetch: bool = False,
     ):
         if isinstance(config, BlockSwapConfig):
-            return self.model.enable_block_swap(blocks_to_swap, config, swap_norms=swap_norms)
+            return self.model.enable_block_swap(
+                blocks_to_swap,
+                config,
+                swap_norms=swap_norms,
+                async_backward_prefetch=async_backward_prefetch,
+            )
         if supports_backward is None:
             raise TypeError("supports_backward is required when enable_block_swap is called without BlockSwapConfig")
-        return self.model.enable_block_swap(blocks_to_swap, config, supports_backward, use_pinned_memory, swap_norms=swap_norms)
+        return self.model.enable_block_swap(
+            blocks_to_swap,
+            config,
+            supports_backward,
+            use_pinned_memory,
+            swap_norms=swap_norms,
+            async_backward_prefetch=async_backward_prefetch,
+        )
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         return self.model.move_to_device_except_swap_blocks(device)

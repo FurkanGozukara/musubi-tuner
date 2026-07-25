@@ -4011,6 +4011,15 @@ def main() -> None:
     # Clean up memory after model loading
     clean_memory_on_device(accelerator.device)
 
+    async_backward_prefetch = bool(getattr(args, "ltx2_block_swap_async_backward", False))
+    if async_backward_prefetch:
+        if blocks_to_swap <= 0:
+            raise ValueError("--ltx2_block_swap_async_backward requires --blocks_to_swap.")
+        if not getattr(args, "use_pinned_memory_for_block_swap", False):
+            raise ValueError("--ltx2_block_swap_async_backward requires --use_pinned_memory_for_block_swap.")
+        if not args.gradient_checkpointing:
+            raise ValueError("--ltx2_block_swap_async_backward requires --gradient_checkpointing.")
+
     if blocks_to_swap > 0:
         logger.info("enable swap %s blocks to CPU from device: %s", blocks_to_swap, accelerator.device)
         transformer.enable_block_swap(
@@ -4018,6 +4027,7 @@ def main() -> None:
             accelerator.device,
             supports_backward=True,
             use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
+            async_backward_prefetch=async_backward_prefetch,
         )
         transformer.move_to_device_except_swap_blocks(accelerator.device)
 

@@ -515,6 +515,7 @@ class LTXModel(torch.nn.Module):
         supports_backward: bool | None = None,
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
+        async_backward_prefetch: bool = False,
     ) -> None:
         if isinstance(config, BlockSwapConfig):
             swap_config = config
@@ -526,8 +527,18 @@ class LTXModel(torch.nn.Module):
             device = config
             if supports_backward is None:
                 raise TypeError("supports_backward is required when enable_block_swap is called without BlockSwapConfig")
+        if async_backward_prefetch and not use_pinned_memory:
+            raise ValueError("Asynchronous backward block prefetch requires pinned block-swap memory.")
+        if async_backward_prefetch and device.type != "cuda":
+            raise ValueError("Asynchronous backward block prefetch requires a CUDA device.")
+        if async_backward_prefetch and not supports_backward:
+            raise ValueError("Asynchronous backward block prefetch requires backward block swapping.")
+        if async_backward_prefetch and swap_config is not None and swap_config.h2d_only:
+            raise ValueError("Asynchronous backward block prefetch is incompatible with H2D-only block swap.")
 
         swap_mode = getattr(self, "swap_mode", "default")
+        if async_backward_prefetch and swap_mode != "default":
+            raise ValueError("Asynchronous backward block prefetch requires the default LTX-2 block-swap mode.")
         _log_cuda_memory("before_enable_block_swap")
         self.blocks_to_swap = int(blocks_to_swap)
         self.num_blocks = len(self.transformer_blocks)
@@ -617,11 +628,18 @@ class LTXModel(torch.nn.Module):
             prefetch_window=prefetch_window,
         )
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
+        prefetch_stream = torch.cuda.Stream(device=device) if async_backward_prefetch else None
+        import weakref
+
         for idx, block in enumerate(self.transformer_blocks):
             block.use_pinned_memory = use_pinned_memory
             enabled = idx >= swap_start
             setattr(block, "_h2d_stream_offloader_ref", None)
             setattr(block, "swap_weight_offload", enabled)
+            block.async_backward_prefetch = async_backward_prefetch and enabled
+            block._async_backward_prefetch_stream = prefetch_stream
+            previous = self.transformer_blocks[idx - 1] if idx > swap_start else None
+            block._async_backward_prev_block_ref = weakref.ref(previous) if previous is not None else None
             for module in block.modules():
                 if module.__class__.__name__.endswith("Linear"):
                     setattr(module, "_h2d_stream_managed", False)
