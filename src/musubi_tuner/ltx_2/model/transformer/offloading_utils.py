@@ -409,6 +409,13 @@ class LTX2ModelOffloader(ModelOffloader):
         self.swap_norms = swap_norms
         self._aggressive_backward_handles = []
 
+    def swap_weight_devices_cuda(self, device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+        offload_event = getattr(layer_to_cuda, "_async_backward_offload_event", None)
+        if offload_event is not None:
+            self.stream.wait_event(offload_event)
+            layer_to_cuda._async_backward_offload_event = None
+        return super().swap_weight_devices_cuda(device, layer_to_cpu, layer_to_cuda)
+
     def _setup_aggressive_backward_hooks(self, blocks: List[nn.Module]) -> None:
         """Setup backward hooks to unload swapped blocks after backward pass.
 

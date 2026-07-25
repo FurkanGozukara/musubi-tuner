@@ -310,6 +310,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self._async_backward_prefetch_event = None
         self._async_backward_prefetched = False
         self._async_backward_prev_block_ref = None
+        self._async_backward_offload_event = None
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
         self.gradient_checkpointing = True
@@ -336,8 +337,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         previous = getattr(_swap_backward_state, "last_loaded_block", None)
         if previous is not None and previous is not self:
-            previous._offload_checkpoint_pinned()
-            torch.cuda.synchronize(target_device)
+            previous._offload_checkpoint_pinned(non_blocking=True)
 
         if prefetched:
             event = self._async_backward_prefetch_event
@@ -367,6 +367,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
         if first_param is None or first_param.device.type != "cpu":
             return
         with torch.cuda.stream(stream):
+            offload_event = previous._async_backward_offload_event
+            if offload_event is not None:
+                stream.wait_event(offload_event)
+                previous._async_backward_offload_event = None
             previous.to(target_device, non_blocking=True)
             event = torch.cuda.Event()
             event.record(stream)
@@ -1056,13 +1060,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
         ensure_fp8_modules_on_device(b, cpu_device)
 
     @torch.no_grad()
-    def _offload_checkpoint_pinned(self) -> None:
+    def _offload_checkpoint_pinned(self, *, non_blocking: bool = False) -> None:
         def to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
             target = torch.empty_like(tensor, device="cpu", pin_memory=True)
-            target.copy_(tensor)
+            target.copy_(tensor, non_blocking=non_blocking)
             return target
 
         self._apply(to_pinned_cpu)
+        if non_blocking:
+            self._async_backward_offload_event = torch.cuda.current_stream().record_event()
 
 
 def prepare_prompt_context(
