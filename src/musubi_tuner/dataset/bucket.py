@@ -276,6 +276,7 @@ class BucketBatchManager:
         keyframe_guide_frame_idx: int = -1,
         keyframe_guide_strength: float = 1.0,
         keyframe_guide_extras: Optional[List[Dict[str, Any]]] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -293,22 +294,72 @@ class BucketBatchManager:
         self.keyframe_guide_frame_idx = int(keyframe_guide_frame_idx)
         self.keyframe_guide_strength = float(keyframe_guide_strength)
         self.keyframe_guide_extras: List[Dict[str, Any]] = list(keyframe_guide_extras or [])
+        self.bucket_batch_sizes = self._resolve_bucket_batch_sizes(bucket_batch_sizes)
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
         for bucket_reso in self.bucket_resos:
             bucket = self.buckets[bucket_reso]
-            num_batches = math.ceil(len(bucket) / self.batch_size)
+            bucket_batch_size = self.get_batch_size(bucket_reso)
+            num_batches = math.ceil(len(bucket) / bucket_batch_size)
             for i in range(num_batches):
                 self.bucket_batch_indices.append((bucket_reso, i))
 
         # do no shuffle here to avoid multiple datasets have different order
         # self.shuffle()
 
+    @staticmethod
+    def _bucket_dimensions(bucket_reso: tuple[Any, ...]) -> tuple[int, ...]:
+        dimensions = []
+        for value in bucket_reso:
+            if type(value) is not int:
+                break
+            dimensions.append(value)
+        return tuple(dimensions)
+
+    @staticmethod
+    def _parse_bucket_key(key: str) -> tuple[int, ...]:
+        try:
+            dimensions = tuple(int(value) for value in key.lower().split("x"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid bucket_batch_sizes key {key!r}; expected WIDTHxHEIGHT or WIDTHxHEIGHTxFRAMES") from exc
+        if len(dimensions) not in (2, 3) or any(value <= 0 for value in dimensions):
+            raise ValueError(f"Invalid bucket_batch_sizes key {key!r}; expected positive WIDTHxHEIGHT or WIDTHxHEIGHTxFRAMES")
+        return dimensions
+
+    def _resolve_bucket_batch_sizes(self, overrides: Optional[Dict[str, int]]) -> Dict[tuple[int, ...], int]:
+        resolved: Dict[tuple[int, ...], int] = {}
+        for key, value in (overrides or {}).items():
+            dimensions = self._parse_bucket_key(str(key))
+            batch_size = int(value)
+            if batch_size < 1:
+                raise ValueError(f"bucket_batch_sizes[{key!r}] must be >= 1, got {value!r}")
+            if dimensions in resolved:
+                raise ValueError(f"Duplicate bucket_batch_sizes entry for {'x'.join(map(str, dimensions))}")
+            resolved[dimensions] = batch_size
+
+        available = {self._bucket_dimensions(bucket_reso) for bucket_reso in self.bucket_resos}
+        unmatched = sorted(set(resolved) - available)
+        if unmatched:
+            keys = ", ".join("x".join(map(str, dimensions)) for dimensions in unmatched)
+            raise ValueError(f"bucket_batch_sizes contains buckets not present in this dataset: {keys}")
+        return resolved
+
+    def get_batch_size(self, bucket_reso: tuple[Any, ...]) -> int:
+        return self.bucket_batch_sizes.get(self._bucket_dimensions(bucket_reso), self.batch_size)
+
+    def _batch_count(self, bucket_reso: tuple[Any, ...], batch_idx: int) -> int:
+        bucket_batch_size = self.get_batch_size(bucket_reso)
+        start = batch_idx * bucket_batch_size
+        return max(min(start + bucket_batch_size, len(self.buckets[bucket_reso])) - start, 0)
+
     def show_bucket_info(self):
         for bucket_reso in self.bucket_resos:
             bucket = self.buckets[bucket_reso]
-            logger.info(f"bucket: {bucket_reso}, count: {len(bucket)}")
+            if self.bucket_batch_sizes:
+                logger.info(f"bucket: {bucket_reso}, count: {len(bucket)}, batch_size: {self.get_batch_size(bucket_reso)}")
+            else:
+                logger.info(f"bucket: {bucket_reso}, count: {len(bucket)}")
 
         logger.info(f"total batches: {len(self)}")
 
@@ -325,7 +376,12 @@ class BucketBatchManager:
 
             # 1. Calculate total number of timesteps needed for the entire epoch
             num_batches = len(self.bucket_batch_indices)
-            total_timesteps_needed = num_batches * self.batch_size
+            if self.bucket_batch_sizes:
+                batch_counts = [self._batch_count(bucket_reso, batch_idx) for bucket_reso, batch_idx in self.bucket_batch_indices]
+                total_timesteps_needed = sum(batch_counts)
+            else:
+                batch_counts = [self.batch_size] * num_batches
+                total_timesteps_needed = num_batches * self.batch_size
 
             # 2. Generate a single large pool of stratified timesteps
             all_timesteps = []
@@ -345,11 +401,11 @@ class BucketBatchManager:
 
             # 4. Create the final timestep pool by chunking the shuffled list
             self.timestep_pool = []
-            for i in range(num_batches):
-                start_idx = i * self.batch_size
-                end_idx = start_idx + self.batch_size
+            start_idx = 0
+            for batch_count in batch_counts:
+                end_idx = start_idx + batch_count
                 self.timestep_pool.append(all_timesteps[start_idx:end_idx])
-                # print(f"timestep pool {i}: {self.timestep_pool[-1]}")
+                start_idx = end_idx
 
     def __len__(self):
         return len(self.bucket_batch_indices)
@@ -357,8 +413,9 @@ class BucketBatchManager:
     def __getitem__(self, idx):
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
-        start = batch_idx * self.batch_size
-        end = min(start + self.batch_size, len(bucket))
+        bucket_batch_size = self.get_batch_size(bucket_reso)
+        start = batch_idx * bucket_batch_size
+        end = min(start + bucket_batch_size, len(bucket))
         batch_count = max(end - start, 0)
 
         batch_tensor_data = {}

@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from typing import List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
@@ -49,6 +49,7 @@ class BaseDatasetParams:
     caption_extension: Optional[str] = None
     caption_field: Optional[str] = None
     batch_size: int = 1
+    bucket_batch_sizes: Optional[Dict[str, int]] = None
     num_repeats: int = 1
     video_loss_weight: Optional[float] = None
     audio_loss_weight: Optional[float] = None
@@ -214,6 +215,7 @@ class ConfigSanitizer:
         "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
+        "bucket_batch_sizes": {str: int},
         "image_directory": str,
         "image_jsonl_file": str,
         "control_directory": str,
@@ -226,12 +228,14 @@ class ConfigSanitizer:
         "control_resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
     }
     AUDIO_DATASET_DISTINCT_SCHEMA = {
+        "bucket_batch_sizes": {str: int},
         "audio_directory": str,
         "audio_jsonl_file": str,
         "audio_bucket_strategy": str,
         "audio_bucket_interval": float,
     }
     VIDEO_DATASET_DISTINCT_SCHEMA = {
+        "bucket_batch_sizes": {str: int},
         "video_directory": str,
         "video_jsonl_file": str,
         "control_directory": str,
@@ -624,6 +628,8 @@ def generate_dataset_group_by_blueprint(
 
 def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
     params = dict(params)
+    if params.get("bucket_batch_sizes") is None:
+        params.pop("bucket_batch_sizes", None)
 
     if not params.get("cache_directory"):
         if dataset_type == "audio":

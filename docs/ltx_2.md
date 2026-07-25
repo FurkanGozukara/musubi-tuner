@@ -323,6 +323,7 @@ other non-IC image workflows can continue using `control_directory`.
 | `source_fps` | float | auto-detected | Source video FPS. Auto-detected from video container metadata when not set. Use this to override auto-detection. |
 | `target_fps` | float | 25.0 | Target training FPS. Frames are resampled to this rate. When audio is present and its duration differs from the target video duration by more than ~1%, the waveform is time-stretched (pitch-preserving) to match; disable with `--preserve_audio_timing`. |
 | `batch_size` | int | 1 | Batch size |
+| `bucket_batch_sizes` | table | — | Opt-in exact batch-size overrides keyed by `WIDTHxHEIGHTxFRAMES`; unspecified buckets continue using `batch_size`. Larger values can improve short-bucket throughput but require more VRAM. |
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `enable_bucket` | bool | false | Enable resolution bucketing |
 | `bucket_no_upscale` | bool | false | Prevent upscaling when bucketing (only downscale to fit) |
@@ -406,8 +407,13 @@ cache_directory = "cache"
 [[datasets]]
 video_directory = "videos"
 target_frames = [1, 17, 33, 49]
+bucket_batch_sizes = { "512x512x33" = 2 }
 target_fps = 25    # optional, defaults to 25
 ```
+
+`bucket_batch_sizes` never selects values automatically. Keep
+`gradient_accumulation_steps × selected bucket batch size` consistent with the
+intended effective batch when comparing or combining bucket configurations.
 
 ### Frame Rate (FPS) Handling
 <sub>[↑ contents](#table-of-contents)</sub>

@@ -2015,11 +2015,13 @@ class BaseDataset(torch.utils.data.Dataset):
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.caption_field = caption_field
         self.batch_size = batch_size
+        self.bucket_batch_sizes = dict(bucket_batch_sizes or {})
         self.num_repeats = num_repeats
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
@@ -2483,6 +2485,7 @@ class ImageDataset(BaseDataset):
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -2521,6 +2524,7 @@ class ImageDataset(BaseDataset):
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -2910,6 +2914,7 @@ class ImageDataset(BaseDataset):
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
             keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
         )
         self.batch_manager.show_bucket_info()
 
@@ -2974,6 +2979,7 @@ class AudioDataset(BaseDataset):
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         super(AudioDataset, self).__init__(
             resolution,
@@ -3012,6 +3018,7 @@ class AudioDataset(BaseDataset):
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
@@ -3267,6 +3274,7 @@ class AudioDataset(BaseDataset):
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
             keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
         )
         self.batch_manager.show_bucket_info()
 
@@ -3348,6 +3356,7 @@ class VideoDataset(BaseDataset):
         keyframe_guide_extra_strengths: Optional[List[float]] = None,
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -3386,6 +3395,7 @@ class VideoDataset(BaseDataset):
             keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -3845,6 +3855,7 @@ class VideoDataset(BaseDataset):
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
             keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
         )
         self.batch_manager.show_bucket_info()
 
