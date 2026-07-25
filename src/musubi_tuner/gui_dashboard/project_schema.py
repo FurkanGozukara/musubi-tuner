@@ -861,6 +861,7 @@ class FullFinetuneConfig(TrainingConfig):
     flash_attn: bool = True
     fused_backward_pass: bool = True
     mem_eff_save: bool = True
+    async_checkpoint_save: bool = False
     output_name: str = "ltx2_full_ft"
     save_every_n_steps: Optional[int] = 1000
     network_module: Optional[str] = None

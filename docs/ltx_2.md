@@ -4640,6 +4640,8 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 Add `--save_merged_checkpoint` if you need to write a full merged LTX-2 checkpoint instead of only the trained transformer weights. This can add save-time memory pressure, and repeated merged saves may show slow memory growth, so validate saving separately when running close to the VRAM limit.
 
+`--async_checkpoint_save` takes an immutable CPU snapshot of each periodic transformer checkpoint and writes it in the background while training continues. Use it when checkpoint pauses matter and system RAM can hold one additional checkpoint-sized copy. The next periodic save waits for any previous write, and the final checkpoint remains synchronous. This option is not supported with FSDP, remote-stage training, EMA, Hub uploads, merged checkpoints, streaming Q-GaLore saves, or int8-weight training.
+
 TREAD can also be enabled as a training-time token-routing option. In measured LTX-2.3 runs, `selection_ratio=0.5` reduced step time by about 15-21% depending on mode. Evaluate output quality and convergence separately before using it for long runs because TREAD changes the effective token route. (Credit: [Ada123-a](https://github.com/Ada123-a) — [PR #80](https://github.com/AkaneTendo25/musubi-tuner/pull/80))
 
 ```bash

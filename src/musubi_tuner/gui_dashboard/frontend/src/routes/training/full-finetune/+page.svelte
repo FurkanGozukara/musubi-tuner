@@ -843,6 +843,7 @@
 					<FormToggle fieldPath="full_finetune.save_state" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.save_state_on_train_end" checked={t.save_state_on_train_end ?? false} onchange={(e) => update('save_state_on_train_end', e.target.checked)} />
 					<FormSelect fieldPath="full_finetune.save_state_mode" value={t.save_state_mode || 'full'} options={saveStateModeOptions} onchange={(e) => update('save_state_mode', e.target.value)} disabled={!(t.save_state || t.save_state_on_train_end)} tooltip="Full can resume optimizer state. Minimal skips optimizer, scheduler, and dataloader state." />
+					<FormToggle label="Async checkpoint save" fieldPath="full_finetune.async_checkpoint_save" checked={t.async_checkpoint_save ?? false} onchange={(e) => update('async_checkpoint_save', e.target.checked)} tooltip="Snapshot periodic FFT checkpoints to CPU and write them in the background. Reduces save pauses at the cost of roughly one checkpoint of additional system RAM." />
 					<FormToggle fieldPath="full_finetune.save_merged_checkpoint" checked={t.save_merged_checkpoint ?? false} onchange={(e) => update('save_merged_checkpoint', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.no_final_save" checked={t.no_final_save ?? false} onchange={(e) => update('no_final_save', e.target.checked)} />
 				</div>

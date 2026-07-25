@@ -2218,6 +2218,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fused_backward_pass")
     if t.mem_eff_save:
         cmd.append("--mem_eff_save")
+    if t.async_checkpoint_save:
+        cmd.append("--async_checkpoint_save")
     if t.ffn_chunk_target:
         cmd += ["--ffn_chunk_target", t.ffn_chunk_target]
     if t.ffn_chunk_size:

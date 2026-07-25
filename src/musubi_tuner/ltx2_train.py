@@ -67,6 +67,7 @@ from musubi_tuner.training.step_control import (
     synchronize_parameter_gradients,
 )
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
+from musubi_tuner.utils.async_checkpoint import AsyncCheckpointSaver, validate_async_checkpoint_save_options
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser, warn_if_h2d_only_ignored
 from musubi_tuner.ltx2_model_parallel import (
@@ -2241,6 +2242,14 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         ),
     )
     parser.add_argument(
+        "--async_checkpoint_save",
+        action="store_true",
+        help=(
+            "Write periodic full-finetuning checkpoints in the background after taking an immutable CPU snapshot. "
+            "Reduces checkpoint pauses when enough host RAM is available; the final checkpoint remains synchronous."
+        ),
+    )
+    parser.add_argument(
         "--no_final_save",
         action="store_true",
         help="Skip the final checkpoint save. Intended for smoke/stability runs; periodic step/epoch saves still work.",
@@ -3473,6 +3482,11 @@ def main() -> None:
     ltx2_model_parallel = is_ltx2_model_parallel_enabled(args)
     ltx2_remote_stage = is_ltx2_remote_stage_enabled(args)
     ltx2_fsdp = is_ltx2_fsdp_enabled(args)
+    validate_async_checkpoint_save_options(
+        args,
+        fsdp_enabled=ltx2_fsdp,
+        remote_stage_enabled=ltx2_remote_stage,
+    )
     if ltx2_model_parallel and ltx2_remote_stage:
         raise RuntimeError("--ltx2_model_parallel and --ltx2_remote_stage are experimental paths and cannot be combined")
     if ltx2_model_parallel:
@@ -5122,7 +5136,23 @@ def main() -> None:
     if train_dataset_group_for_audio_sampler is None:
         del train_dataset_group
 
-    def save_model(ckpt_name: str, unwrapped_model, steps, epoch_no, force_sync_upload=False, use_memory_efficient_saving=False):
+    def _write_checkpoint(state_dict, ckpt_file, metadata_to_save) -> None:
+        mem_eff_save_file(state_dict, ckpt_file, metadata_to_save, atomic=True)
+
+    def _async_write_complete(ckpt_file: str, seconds: float) -> None:
+        accelerator.print(f"asynchronous checkpoint write complete: {ckpt_file} ({seconds:.2f}s)")
+
+    async_checkpoint_saver = AsyncCheckpointSaver(_write_checkpoint, _async_write_complete)
+
+    def save_model(
+        ckpt_name: str,
+        unwrapped_model,
+        steps,
+        epoch_no,
+        force_sync_upload=False,
+        use_memory_efficient_saving=False,
+        allow_async=True,
+    ):
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -5227,7 +5257,14 @@ def main() -> None:
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)
-        mem_eff_save_file(state_dict, ckpt_file, metadata_to_save)
+        if args.async_checkpoint_save and allow_async:
+            stats = async_checkpoint_saver.start(state_dict, ckpt_file, metadata_to_save)
+            accelerator.print(
+                f"asynchronous checkpoint snapshot: {stats.snapshot_seconds:.2f}s, {stats.snapshot_bytes / 1024**3:.2f} GiB"
+            )
+        else:
+            async_checkpoint_saver.wait()
+            mem_eff_save_file(state_dict, ckpt_file, metadata_to_save)
 
         if args.huggingface_repo_id is not None:
             huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
@@ -7288,11 +7325,13 @@ def main() -> None:
                 num_train_epochs,
                 force_sync_upload=True,
                 use_memory_efficient_saving=args.mem_eff_save,
+                allow_async=False,
             )
             # Also save EMA if enabled
             if ema_model is not None:
                 save_ema_model(final_ckpt_name, global_step, num_train_epochs)
         save_self_flow_state()
+    async_checkpoint_saver.wait()
     if text_encoder is not None:
         trainer._cleanup_text_encoder(accelerator)
 
