@@ -83,6 +83,10 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
             "--ltx2_block_swap_async_backward",
             "Prefetch the next pinned block while the current backward block computes.",
         ),
+        (
+            "--ltx2_block_swap_trainable_ring",
+            "Coalesce trainable FFT block transfers through a preallocated pinned/GPU ring.",
+        ),
     )
     for option, help_text in flags:
         group.add_argument(option, action="store_true", default=None, help=help_text)

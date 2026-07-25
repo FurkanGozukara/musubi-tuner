@@ -11,6 +11,7 @@ from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
     LTX2BlockSwapManager,
     LTX2H2DModelOffloader,
     LTX2ModelOffloader,
+    LTX2TrainableRingOffloader,
 )
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import _clean_memory_on_device
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
@@ -516,6 +517,7 @@ class LTXModel(torch.nn.Module):
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
         async_backward_prefetch: bool = False,
+        trainable_ring: bool = False,
     ) -> None:
         if isinstance(config, BlockSwapConfig):
             swap_config = config
@@ -539,6 +541,10 @@ class LTXModel(torch.nn.Module):
         swap_mode = getattr(self, "swap_mode", "default")
         if async_backward_prefetch and swap_mode != "default":
             raise ValueError("Asynchronous backward block prefetch requires the default LTX-2 block-swap mode.")
+        if trainable_ring and swap_mode != "default":
+            raise ValueError("Trainable block ring requires the default LTX-2 block-swap mode.")
+        if trainable_ring and swap_config is not None and swap_config.h2d_only:
+            raise ValueError("Trainable block ring is incompatible with H2D-only block swap.")
         _log_cuda_memory("before_enable_block_swap")
         self.blocks_to_swap = int(blocks_to_swap)
         self.num_blocks = len(self.transformer_blocks)
@@ -616,27 +622,46 @@ class LTXModel(torch.nn.Module):
         prefetch_window = int(os.getenv("LTX2_SWAP_PREFETCH_WINDOW", "1"))
         self._prefetch_window = prefetch_window
 
-        self.offloader = LTX2ModelOffloader(
-            "ltx2_block",
-            self.transformer_blocks,
-            self.num_blocks,
-            self.blocks_to_swap,
-            supports_backward_for_offload,
-            device,
-            use_pinned_memory,
-            swap_norms=swap_norms,
-            prefetch_window=prefetch_window,
-        )
+        if trainable_ring:
+            self.offloader = LTX2TrainableRingOffloader(
+                "ltx2_block",
+                self.transformer_blocks,
+                self.num_blocks,
+                self.blocks_to_swap,
+                supports_backward_for_offload,
+                device,
+                use_pinned_memory=use_pinned_memory,
+            )
+            self._trainable_ring_state_dict_hook = self.register_state_dict_pre_hook(
+                lambda module, _prefix, _keep_vars: module.synchronize_block_swap()
+            )
+            self._trainable_ring_state_dict_post_hook = self.register_state_dict_post_hook(
+                lambda module, state_dict, prefix, _metadata: module._unpack_trainable_ring_state_dict(state_dict, prefix)
+            )
+        else:
+            self.offloader = LTX2ModelOffloader(
+                "ltx2_block",
+                self.transformer_blocks,
+                self.num_blocks,
+                self.blocks_to_swap,
+                supports_backward_for_offload,
+                device,
+                use_pinned_memory,
+                swap_norms=swap_norms,
+                prefetch_window=prefetch_window,
+            )
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
-        prefetch_stream = torch.cuda.Stream(device=device) if async_backward_prefetch else None
+        prefetch_stream = torch.cuda.Stream(device=device) if async_backward_prefetch and not trainable_ring else None
         import weakref
 
+        managed_indices = set(getattr(self.offloader, "stream_idx", range(swap_start, self.num_blocks)))
+        offloader_ref = weakref.ref(self.offloader) if trainable_ring else None
         for idx, block in enumerate(self.transformer_blocks):
             block.use_pinned_memory = use_pinned_memory
-            enabled = idx >= swap_start
-            setattr(block, "_h2d_stream_offloader_ref", None)
+            enabled = idx in managed_indices
+            setattr(block, "_h2d_stream_offloader_ref", offloader_ref if trainable_ring else None)
             setattr(block, "swap_weight_offload", enabled)
-            block.async_backward_prefetch = async_backward_prefetch and enabled
+            block.async_backward_prefetch = async_backward_prefetch and enabled and not trainable_ring
             block._async_backward_prefetch_stream = prefetch_stream
             previous = self.transformer_blocks[idx - 1] if idx > swap_start else None
             block._async_backward_prev_block_ref = weakref.ref(previous) if previous is not None else None
@@ -655,6 +680,24 @@ class LTXModel(torch.nn.Module):
         if self.blocks_to_swap and self.offloader is not None:
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
+
+    def synchronize_block_swap(self) -> None:
+        if self.offloader is not None and hasattr(self.offloader, "synchronize"):
+            self.offloader.synchronize()
+
+    def _unpack_trainable_ring_state_dict(self, state_dict, prefix: str) -> None:
+        if not isinstance(self.offloader, LTX2TrainableRingOffloader):
+            return
+        for block_idx in self.offloader.stream_idx:
+            block_prefix = f"{prefix}transformer_blocks.{block_idx}."
+            for name, _ in self.transformer_blocks[block_idx].named_parameters():
+                key = f"{block_prefix}{name}"
+                if key in state_dict:
+                    state_dict[key] = state_dict[key].detach().to("cpu", copy=True)
+            for name, _ in self.transformer_blocks[block_idx].named_buffers():
+                key = f"{block_prefix}{name}"
+                if key in state_dict:
+                    state_dict[key] = state_dict[key].detach().to("cpu", copy=True)
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
         import torch  # ensure available

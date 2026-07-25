@@ -328,6 +328,7 @@ class LTX2Wrapper(nn.Module):
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
         async_backward_prefetch: bool = False,
+        trainable_ring: bool = False,
     ):
         if isinstance(config, BlockSwapConfig):
             return self.model.enable_block_swap(
@@ -335,6 +336,7 @@ class LTX2Wrapper(nn.Module):
                 config,
                 swap_norms=swap_norms,
                 async_backward_prefetch=async_backward_prefetch,
+                trainable_ring=trainable_ring,
             )
         if supports_backward is None:
             raise TypeError("supports_backward is required when enable_block_swap is called without BlockSwapConfig")
@@ -345,6 +347,7 @@ class LTX2Wrapper(nn.Module):
             use_pinned_memory,
             swap_norms=swap_norms,
             async_backward_prefetch=async_backward_prefetch,
+            trainable_ring=trainable_ring,
         )
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
@@ -352,6 +355,9 @@ class LTX2Wrapper(nn.Module):
 
     def prepare_block_swap_before_forward(self):
         return self.model.prepare_block_swap_before_forward()
+
+    def synchronize_block_swap(self):
+        return self.model.synchronize_block_swap()
 
     def switch_block_swap_for_inference(self):
         if hasattr(self.model, "switch_block_swap_for_inference"):

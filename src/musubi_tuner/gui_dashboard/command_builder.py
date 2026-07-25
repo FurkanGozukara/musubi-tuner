@@ -131,6 +131,7 @@ def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
         "ltx2_padded_prompt_trim",
         "ltx2_partial_gradient_checkpointing",
         "ltx2_block_swap_async_backward",
+        "ltx2_block_swap_trainable_ring",
         "ltx2_validate_training_tensors",
     )
     for name in flags:

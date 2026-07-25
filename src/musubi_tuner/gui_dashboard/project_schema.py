@@ -417,6 +417,7 @@ class TrainingConfig(BaseModel):
     ltx2_padded_prompt_trim: bool = False
     ltx2_partial_gradient_checkpointing: bool = False
     ltx2_block_swap_async_backward: bool = False
+    ltx2_block_swap_trainable_ring: bool = False
     ltx2_validate_training_tensors: bool = False
     ltx2_model_parallel: bool = False
     ltx2_model_parallel_devices: str = ""

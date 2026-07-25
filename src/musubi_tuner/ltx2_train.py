@@ -4020,6 +4020,17 @@ def main() -> None:
         if not args.gradient_checkpointing:
             raise ValueError("--ltx2_block_swap_async_backward requires --gradient_checkpointing.")
 
+    trainable_ring = bool(getattr(args, "ltx2_block_swap_trainable_ring", False))
+    if trainable_ring:
+        if blocks_to_swap <= 0:
+            raise ValueError("--ltx2_block_swap_trainable_ring requires --blocks_to_swap.")
+        if not getattr(args, "use_pinned_memory_for_block_swap", False):
+            raise ValueError("--ltx2_block_swap_trainable_ring requires --use_pinned_memory_for_block_swap.")
+        if not args.gradient_checkpointing:
+            raise ValueError("--ltx2_block_swap_trainable_ring requires --gradient_checkpointing.")
+        if not bool(getattr(args, "fused_backward_pass", False)):
+            raise ValueError("--ltx2_block_swap_trainable_ring requires --fused_backward_pass.")
+
     if blocks_to_swap > 0:
         logger.info("enable swap %s blocks to CPU from device: %s", blocks_to_swap, accelerator.device)
         transformer.enable_block_swap(
@@ -4028,6 +4039,7 @@ def main() -> None:
             supports_backward=True,
             use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
             async_backward_prefetch=async_backward_prefetch,
+            trainable_ring=trainable_ring,
         )
         transformer.move_to_device_except_swap_blocks(accelerator.device)
 
@@ -5087,6 +5099,8 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
+        if hasattr(unwrapped_model, "synchronize_block_swap"):
+            unwrapped_model.synchronize_block_swap()
         accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
         if torch.cuda.is_available():
             accelerator.print(f"peak VRAM (torch.cuda.max_memory_allocated): {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
