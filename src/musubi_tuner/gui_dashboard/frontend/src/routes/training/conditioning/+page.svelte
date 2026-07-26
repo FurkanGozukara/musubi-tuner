@@ -635,6 +635,21 @@
 		<FormGroup title="Guidance (advanced, orthogonal)">
 			<div class="advanced-two-col pt-2">
 				<div class="advanced-card">
+					<span>Graded Conditioning</span>
+					<FormToggle fieldPath="training.ltx2_graded_conditioning" checked={t.ltx2_graded_conditioning ?? false} onchange={(e) => update('ltx2_graded_conditioning', e.target.checked)} tooltip="Allow explicit partial strengths for latent_idx guides and video anchors. Off keeps binary training behavior." />
+				</div>
+				<div class="advanced-card">
+					<span>Causal Temporal Attention</span>
+					<FormToggle fieldPath="training.ltx2_causal_temporal_attention" checked={t.ltx2_causal_temporal_attention ?? false} onchange={(e) => update('ltx2_causal_temporal_attention', e.target.checked)} tooltip="Restrict video self-attention to the current and earlier frames. Requires SDPA; off keeps bidirectional attention." />
+				</div>
+				<div class="advanced-card">
+					<span>Soft AV Alignment</span>
+					<FormToggle fieldPath="training.ltx2_soft_av_alignment" checked={t.ltx2_soft_av_alignment ?? false} onchange={(e) => update('ltx2_soft_av_alignment', e.target.checked)} tooltip="Bias AV cross-attention toward nearby audio/video times. Requires AV mode and SDPA." />
+					{#if t.ltx2_soft_av_alignment}
+						<FormField type="number" fieldPath="training.ltx2_soft_av_alignment_sigma" value={t.ltx2_soft_av_alignment_sigma ?? 1.0} oninput={(e) => update('ltx2_soft_av_alignment_sigma', Number(e.target.value))} step="0.05" min={0.01} tooltip="Gaussian temporal width in seconds. Start with 1.0 for general AV data or try 0.25 for lip-focused speech/singing." />
+					{/if}
+				</div>
+				<div class="advanced-card">
 					<span>Endpoint Keyframe Training</span>
 					<FormToggle fieldPath="training.keyframe_endpoint_training" checked={t.keyframe_endpoint_training ?? false} onchange={(e) => update('keyframe_endpoint_training', e.target.checked)} tooltip="Master enable for endpoint-keyframe training." />
 					{#if t.keyframe_endpoint_training}
@@ -654,6 +669,7 @@
 							<FormField type="number" fieldPath="training.video_anchor_probability" value={t.video_anchor_probability ?? 0.5} oninput={(e) => update('video_anchor_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of applying anchor training." />
 							<FormField type="number" fieldPath="training.video_anchor_count" value={t.video_anchor_count ?? 1} oninput={(e) => update('video_anchor_count', Number(e.target.value))} step="1" min={0} tooltip="Number of random anchors per sample when random anchors are enabled." />
 							<FormSelect fieldPath="training.video_anchor_strategy" value={t.video_anchor_strategy || 'endpoints_random'} options={[{ value: 'endpoints', label: 'Endpoints' }, { value: 'random', label: 'Random' }, { value: 'endpoints_random', label: 'Endpoints + Random' }]} onchange={(e) => update('video_anchor_strategy', e.target.value)} tooltip="Anchor placement strategy." />
+							<FormField type="number" fieldPath="training.video_anchor_strength" value={t.video_anchor_strength ?? 1.0} oninput={(e) => update('video_anchor_strength', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="1.0 keeps clean binary anchors. Lower values require Graded Conditioning and use effective timestep (1−strength)×sigma." />
 						</div>
 					{/if}
 				</div>

@@ -1610,7 +1610,7 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--blocks_to_checkpoint N` | Number of final transformer blocks selected for blockwise checkpointing. With `--ltx2_partial_gradient_checkpointing` and no offload/swap, only these final N blocks use ordinary activation checkpointing. |
 | `--offload_optimizer_during_validation` | Offload CUDA optimizer state to CPU during validation and sample previews (off by default) |
 | `--ffn_chunk_target` | `none`, `all`, `video`, or `audio` — enable FFN chunking for selected modules (`none` selects no target, distinct from `--ffn_chunk_size 0`) |
-| `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled) |
+| `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled). This can help inference-specific memory cases, but is not recommended for training because measured autograd peak memory and runtime increased. |
 | `--split_attn_target` | `none`, `all`, `self`, `cross`, `text_cross`, `av_cross`, `video`, `audio` — split attention target modules |
 | `--split_attn_mode` | `batch` or `query` — split by batch dimension or query length |
 | `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
@@ -1625,16 +1625,17 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--ltx2_prompt_kv_checkpoint` | Keep video prompt K/V across activation-checkpoint recomputation. Can save about 9% when prompts are long and video sequences are short; use with gradient checkpointing and resident weights. It is disabled with activation/weight offload and does not optimize audio prompt K/V. |
 | `--ltx2_prompt_kv_checkpoint_max_mb MB` | Limit preserved prompt K/V payload (default 1024 MiB). Lower it to trade recomputation savings for memory. |
 | `--ltx2_padded_prompt_trim` | Remove the right-padded prompt tail shared by every sample before transfer and attention. Can save up to about 8% when cached prompts are heavily padded; it does nothing for all-valid prompts. |
-| `--ltx2_partial_gradient_checkpointing` | Checkpoint only the final `--blocks_to_checkpoint N` blocks and retain earlier activations. Can improve short-sequence throughput by about 28% at higher VRAM cost; use only without offload, swap, model parallelism, or compiled blocks. Keep N near 48 for long sequences. |
+| `--ltx2_partial_gradient_checkpointing` | Checkpoint only the final `--blocks_to_checkpoint N` blocks and retain earlier activations. Can improve short-sequence throughput by about 28% at higher VRAM cost; use only without offload, swap, or model parallelism. Keep N near 48 for long sequences. |
+| `--ltx2_compile_inner_blocks` | With `--compile`, compile block compute while leaving checkpoint wrappers eager. Measured 18-21% higher throughput on short LoRA and about 9% at 13,728 video tokens; use for resident-weight LoRA. Dense FFT was about 2% slower and does not benefit. |
 | `--ltx2_block_swap_async_backward` | Overlap pinned block transfers with backward compute. Measured 7.9-8.0% faster for 512x512x33 full fine-tuning; requires block swap, pinned memory, and gradient checkpointing. |
 | `--ltx2_block_swap_trainable_ring` | Coalesce trainable FFT block transfers in a preallocated ring. Requires pinned block swap, gradient checkpointing, and fused backward. |
 | `--ltx2_validate_training_tensors` | Scan cached inputs, predictions, and targets for NaN/Inf every step. Disabled by default to avoid GPU synchronization; enable it when diagnosing unstable training or suspect caches. |
 | `--sdpa` | Use PyTorch scaled dot-product attention. |
 | `--cudnn_attn` | Outside `torch.compile`, call PyTorch SDPA with backend priority cuDNN → flash → efficient → math. If the installed PyTorch lacks priority support, warn and use plain SDPA. Under `torch.compile`, use plain SDPA because the priority context is not traceable. Masks are passed to SDPA; the backend PyTorch ultimately selects is build/shape/hardware-dependent. |
-| `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
+| `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` built for your CUDA + PyTorch). Key-padding masks use vectorized per-row varlen packing; measured about 6% faster for a mixed-length batch-4 prompt workload. |
 | `--flash3` | Use the separately installed FlashAttention 3 interface. A reducible key-padding mask uses its variable-length function when present; if that function is absent, or the mask is query-specific, the code warns once and falls back to PyTorch SDPA. Package and hardware requirements depend on the installed FlashAttention build. |
 
-The nine LTX-2 performance switches are disabled by default.
+The LTX-2 performance switches are disabled by default.
 
 **H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
 for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
@@ -2293,7 +2294,7 @@ LTX-2 training accepts optimizer selection through `--optimizer_type`; optimizer
 
 | Optimizer | Use when | Extra package | Fused backward | Notes |
 | --- | --- | --- | --- | --- |
-| `AdamW` | You want the standard PyTorch optimizer path. | No | No | Pass regular AdamW constructor options through `--optimizer_args`. |
+| `AdamW` | You want the standard PyTorch optimizer path. | No | No | Pass constructor options through `--optimizer_args`; on CUDA, `fused=True` is opt-in and can improve LoRA step time by about 4% while using standard fused AdamW arithmetic. |
 | `AdamW8bit`, `PagedAdamW8bit`, `PagedAdam8bit` | You want bitsandbytes optimizer-state memory savings. | `bitsandbytes` | No | The paged variants require a bitsandbytes build that provides those classes. |
 | `Adafactor` | You want Adafactor's factored optimizer state and scheduler behavior. | No | Yes | If `relative_step` is omitted, it defaults to `True`; relative-step mode uses the Adafactor scheduler path. |
 | `CAME`, `CAMESimple`, `came_simple` | You want CAME without 8-bit optimizer-state quantization. | No | Yes | Supports `stochastic_rounding`, `use_cautious`, and related CAME args through `--optimizer_args`. |
@@ -3852,7 +3853,7 @@ When a `latent_idx` guide and an intrinsic (`first_frame` / `spatial_crop` / `in
 | `latent_idx_guide_directory` | string | — | Stem-matched guide images. Activates `latent_idx` for this dataset. |
 | `latent_idx_guide_cache_directory` | string | — | Required when the source directory is set. |
 | `latent_idx_guide_frame_idx` | int | `0` | Slot to replace. Training raises `ValueError` if `frame_idx < 0` or `frame_idx + T_guide > num_frames`. |
-| `latent_idx_guide_strength` | float | `1.0` | Training requires exactly `1.0` and raises `ValueError` otherwise (out-of-range values are clamped to `[0, 1]` with a warning before the check fires). Inference accepts any value via the 5D `denoise_mask = 1 - strength`. |
+| `latent_idx_guide_strength` | float | `1.0` | Replacement strength. Values below `1.0` require `--ltx2_graded_conditioning` during training and use timestep `(1-strength) × sigma`; `0.0` disables the guide. |
 | `keyframe_guide_directory` | string | — | Stem-matched global-reference images. Activates `keyframe`. |
 | `keyframe_guide_cache_directory` | string | — | Required when the source directory is set. |
 | `keyframe_guide_frame_idx` | int | `-1` | **Pixel-frame** index (NOT latent-frame). `-1` = global reference (slightly-negative timestamps, visible to all frames). For non-negative values, multiply the desired latent-frame by `VIDEO_SCALE_FACTORS.time` first — for LTX-2 (8× temporal VAE), latent frame `L` corresponds to `frame_idx = L × 8`. Example: anchor at the last latent frame of a 9-latent-frame video → `frame_idx = 64`. |
@@ -3866,7 +3867,7 @@ The four `keyframe_guide_extra_*` arrays must all have the same length. The prim
 
 `strength` semantics differ between guide types and are NOT interchangeable:
 
-- **`latent_idx_guide_strength`** is a **replacement-lock strength**. The guide latent overwrites tokens at the slot in-place; `strength` controls the per-token `denoise_mask` for those tokens. Training requires exactly `1.0` (hard lock); only inference supports continuous `<1.0`.
+- **`latent_idx_guide_strength`** is a **replacement-lock strength**. The guide latent overwrites tokens at the slot in-place. Training is binary by default; `--ltx2_graded_conditioning` enables continuous values with effective timestep `(1-strength) × sigma`.
 - **`keyframe_guide_strength`** is an **append-guide strength**. The guide latent is appended as a new token block at the configured `frame_idx`; the original target tokens are still denoised normally. `strength` controls the appended block's `denoise_mask` (`1.0` = clean conditioning, `0.0` = effectively absent and the guide is dropped). Continuous values are accepted at both training and inference.
 
 To force frame N pixels to *exactly* match a reference image, use `latent_idx`. To *guide* the model toward a reference, use `keyframe`.
@@ -3953,6 +3954,11 @@ Optional training-time augmentation for workflows that use clean video frames as
 | `--video_anchor_probability` | `0.5` | Per-sample probability of applying video-anchor training. |
 | `--video_anchor_count` | `1` | Number of random anchors to add per sample when the strategy includes random anchors. |
 | `--video_anchor_strategy` | `endpoints_random` | `endpoints` keeps first/last frames only, `random` samples anchors uniformly, and `endpoints_random` combines both. |
+| `--video_anchor_strength` | `1.0` | Anchor strength. Lower values require `--ltx2_graded_conditioning` and use timestep `(1-strength) × sigma`; `0.0` disables anchors. |
+| `--ltx2_graded_conditioning` | off | Enables partial-strength `latent_idx` guides and video anchors. Existing binary conditioning is unchanged when off. |
+| `--ltx2_causal_temporal_attention` | off | Restricts video self-attention to the current and earlier video times for causal/streaming-oriented training. Requires `--sdpa`, may reduce throughput, and leaves normal bidirectional attention unchanged when off. |
+| `--ltx2_soft_av_alignment` | off | Biases A2V and V2A cross-attention toward tokens with nearby timestamps. Requires AV mode and `--sdpa`; off leaves cross-attention unchanged. |
+| `--ltx2_soft_av_alignment_sigma` | `0.5` | Gaussian alignment width in seconds. Smaller values impose tighter temporal locality. |
 
 Applicable when the target workflow benefits from anchor-like conditioning, such as first/last-frame control, video-to-video refinement, reference-guided training, or experiments where the model should see fixed in-clip frames while learning the surrounding motion. Not a general quality switch for every run.
 
@@ -4447,9 +4453,9 @@ Any round's Phase-B output is an RL-LoRA you can ship. If you enabled held-out s
 | `rwr` | Advantage-weighted regression: pull each sample toward its own clean `x0`, weighted by advantage. | `--rwr_temperature` |
 | `dpo` | Diffusion-DPO on each group's best vs worst sample (preference; reward only ranks). | `--dpo_beta` |
 | `ppo` | Trajectory-faithful DDPO: exact per-step importance ratio. Needs a Phase-A `--rl_sde_sampler` cache; run with CFG off. | `--ppo_clip_eps`, `--rl_sde_eta` |
-| `refl` | Online video-only differentiable-reward update. It performs one differentiable final denoising step from a re-noised detached rollout latent. | `--refl_renoise_samples`, `--refl_reward_weight`, `--nft_kl_beta` (reference-x0 MSE coefficient) |
+| `refl` | Online differentiable-reward update. It performs one differentiable final denoising step from a re-noised detached rollout latent; AV training is explicitly enabled with `--refl_av`. | `--refl_av`, `--refl_renoise_samples`, `--refl_reward_weight`, `--nft_kl_beta` (reference-x0 MSE coefficient) |
 
-`nft`/`rwr`/`ppo` and `refl` use `--nft_kl_beta` (default `1e-4`) for a frozen-reference MSE term; `dpo` does not use it. For `refl`, `--refl_grad_steps` accepts only `1`; values greater than one are rejected because multi-step differentiable denoising is not implemented. `--refl_renoise_samples M` averages `M` independent one-step estimates. ReFL rejects AV mode and every reward that requests decoded pixels/audio. The only runnable built-in differentiable reward is currently `latent_energy`; `pixel_sharpness` is an interface example whose required in-graph video decoder intentionally raises `NotImplementedError`.
+`nft`/`rwr`/`ppo` and `refl` use `--nft_kl_beta` (default `1e-4`) for a frozen-reference MSE term; `dpo` does not use it. For `refl`, `--refl_grad_steps` accepts only `1`; values greater than one are rejected because multi-step differentiable denoising is not implemented. `--refl_renoise_samples M` averages `M` independent one-step estimates. `latent_energy` operates directly on the denoised video latent; `pixel_sharpness` requires `--vae` and backpropagates through the frozen video decoder. `audio_energy` backpropagates through the frozen audio decoder and vocoder when both `--ltx2_mode av` and `--refl_av` are set. Use BF16 decoders; FP16 video-decoder backward can underflow and fail to update the adapter.
 
 ### The reward zoo
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -4474,7 +4480,7 @@ Select rewards with `--reward_fn "name:weight,name2:weight2,..."` (a bare `name`
 - **Routing.** `video` rewards drive the video branch, `audio` the audio branch, `sync` both. `audio`/`sync` rewards require `--ltx2_mode av`.
 - **Composition.** Combine rewards with weights — GRPO normalises each within its group, so different raw scales mix fine. Example: `--reward_fn "hpsv3:1.0,videoreward:0.5"`. When a low-level reward (e.g. `iqa_quality`) can be satisfied by adding high-frequency noise, pair it with the `anti_noise` guardrail and a learned visual-quality reward; over-weighting `anti_noise` prefers smooth/flat video.
 - **Physics.** Use the learned `videoscore2 dims=pc` head for semantic physical commonsense (gravity, collisions, object permanence). A frame statistic cannot tell that a ball should fall down.
-- **Differentiable rewards (for `--rl_loss refl`).** A reward declares `kind="differentiable"` and implements `score_grad(samples) -> (Tensor[N], info)`, returning one grad-carrying higher-is-better value per sample. `latent_energy` is the runnable latent-space example. `pixel_sharpness` is registered as a pixel-space interface example, but ReFL rejects its decode path as described above. The black-box rewards in the table do not implement `score_grad` and ReFL rejects them during setup.
+- **Differentiable rewards (for `--rl_loss refl`).** A reward declares `kind="differentiable"` and implements `score_grad(samples) -> (Tensor[N], info)`, returning one grad-carrying higher-is-better value per sample. Built-ins are `latent_energy`, `pixel_sharpness` (requires `--vae`), and AV-only `audio_energy` (requires `--refl_av`). Black-box rewards are rejected during ReFL setup.
 
 Reward model code is vendored (`ltx2_rewards/vendor/`), but the runtime libraries of the model-backed rewards are **not** installed with this package — each reward file lists its own `pip install` line at the top of its docstring (`iqa_quality` → `pyiqa`; `hpsv3`/`videoreward`/`videoscore2` → `qwen-vl-utils` (+`peft` for `videoreward`); `imagebind` → `ftfy regex`; `av_align`/`imagebind` have optional exact-parity extras). Checkpoints come from [`huggingface.co/zghhui/OmniNFT-Reward-Series`](https://huggingface.co/zghhui/OmniNFT-Reward-Series) where applicable; pull only the rewards your `--reward_fn` uses.
 
@@ -5129,7 +5135,6 @@ For quantized 24 GB-class alternatives, use a `Linear` replacement path:
 - Int8 weight storage is the other 24 GB-class route (see [Int8 / Int8 ConvRot / EMA](#int8--int8-convrot--ema)): with `--max_grad_norm 0`, short-context video-only training fits in roughly 21-23 GB while keeping a standard non-quantized optimizer through `--fused_backward_pass`; pair it with the EMA to recover sample fidelity, and budget the EMA's host-RAM cost (about two bytes per trainable parameter with `--ema_cpu_offload`).
 - To test QAPOLLO in the same 24 GB-class envelope, start from the QAPOLLO command above and use `--qgalore_load_device cpu --qgalore_targets video` with `optim_bits=8`. QAPOLLO uses `QAPOLLOAdamW` and the `--apollo_*` optimizer settings instead of Q-GaLore's SVD projection settings.
 - For `832x480x49`, expect roughly 21-23 GB on a 24 GB GPU, depending on rank, desktop VRAM use, and the local CUDA stack. Use `rank=128` for more headroom; try `rank=384` only after the lower-rank run leaves headroom.
-- On a display-attached RTX 3090, measured video-only 24 GB-class fit checks were roughly `10-12 s/it`, depending on frame count and method. On an RTX 4090, a conservative expectation is roughly `7-10 s/it`, but this is an estimate rather than a measured result in this document. Treat these as speed orientations only; storage, driver, desktop VRAM use, and attention backend can move them.
 - For longer contexts such as `512x512x65`, expect the run to sit close to the 24 GB limit and to be substantially slower than the short-context fit test. Start with T=33 or T=49 before scaling to T=65.
 - Defer AV, 720p, training-time sampling, and frequent validation until a video-only baseline saves and resumes successfully on the target GPU.
 - Dense `APOLLOAdamW` is not a 24 GB path because the base transformer weights remain dense. The 24 GB-class APOLLO route is QAPOLLO, with similar load/save constraints to Q-GaLore.

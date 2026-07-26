@@ -199,7 +199,10 @@
 							<FormField label="Re-noise Samples" type="number" fieldPath="rl.refl_renoise_samples" value={$projectConfig?.rl?.refl_renoise_samples ?? 1} oninput={(e) => update('refl_renoise_samples', Number(e.target.value))} step="1" min={1} tooltip="Re-noise the denoised latent at the final step this many times and average the reward gradient (variance reduction). >1 requires Grad Steps = 1." />
 							<FormField label="Reward Weight" type="number" fieldPath="rl.refl_reward_weight" value={$projectConfig?.rl?.refl_reward_weight ?? 1.0} oninput={(e) => update('refl_reward_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Scale on the maximized reward term (default 1.0). The reference-prediction MSE term uses Reference MSE Beta below." />
 						</div>
-						<div class="text-[11px] mt-2" style="color: var(--text-muted);">refl backprops a <strong>differentiable</strong> latent-space reward (currently latent_energy) through one final denoising step. It runs online without a cache. <strong>Reference MSE Beta</strong> weights the squared difference from the LoRA-disabled reference prediction. Pixel/audio rewards and black-box models are not supported by refl.</div>
+						<div class="mt-2">
+							<FormToggle fieldPath="rl.refl_av" checked={$projectConfig?.rl?.refl_av ?? false} onchange={(e) => update('refl_av', e.target.checked)} tooltip="Enable differentiable joint video/audio ReFL in AV mode. Off preserves video-only ReFL." />
+						</div>
+						<div class="text-[11px] mt-2" style="color: var(--text-muted);">refl backprops a <strong>differentiable</strong> reward through one final denoising step and runs online without a cache. <strong>Reference MSE Beta</strong> weights the frozen-reference prediction difference. Built-in targets include latent_energy, pixel_sharpness, and audio_energy.</div>
 					{/if}
 				</div>
 

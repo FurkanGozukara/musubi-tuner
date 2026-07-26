@@ -610,6 +610,111 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if getattr(t, "ltx2_compile_inner_blocks", False):
+        if not t.compile:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_compile_inner_blocks",
+                    "Compile inner LTX blocks requires torch.compile.",
+                    label="Compile Inner LTX Blocks",
+                    page="training",
+                )
+            )
+        if t.blocks_to_swap not in (None, 0) or t.blockwise_checkpointing or t.gradient_checkpointing_cpu_offload:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_compile_inner_blocks",
+                    "Compile inner LTX blocks requires resident weights and activations.",
+                    label="Compile Inner LTX Blocks",
+                    page="training",
+                )
+            )
+
+    try:
+        video_anchor_strength = float(t.video_anchor_strength)
+    except (TypeError, ValueError):
+        video_anchor_strength = float("nan")
+    if not math.isfinite(video_anchor_strength) or not 0.0 <= video_anchor_strength <= 1.0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.video_anchor_strength",
+                "Video Anchor Strength must be a finite number in the inclusive range 0.0 to 1.0.",
+                label="Video Anchor Strength",
+                page="conditioning",
+            )
+        )
+    elif video_anchor_strength != 1.0 and not t.ltx2_graded_conditioning:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.ltx2_graded_conditioning",
+                "Enable Graded Conditioning to use Video Anchor Strength below 1.0.",
+                label="Graded Conditioning",
+                page="conditioning",
+            )
+        )
+
+    if t.ltx2_causal_temporal_attention:
+        if t.ltx2_mode == "audio" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_causal_temporal_attention",
+                    "Causal Temporal Attention requires a video training path.",
+                    label="Causal Temporal Attention",
+                    page="conditioning",
+                )
+            )
+        if not t.sdpa:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_causal_temporal_attention",
+                    "Causal Temporal Attention requires SDPA.",
+                    label="Causal Temporal Attention",
+                    page="conditioning",
+                )
+            )
+
+    try:
+        soft_av_sigma = float(t.ltx2_soft_av_alignment_sigma)
+    except (TypeError, ValueError):
+        soft_av_sigma = float("nan")
+    if not math.isfinite(soft_av_sigma) or soft_av_sigma <= 0.0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.ltx2_soft_av_alignment_sigma",
+                "Soft AV Alignment Sigma must be finite and greater than zero.",
+                label="Soft AV Alignment Sigma",
+                page="conditioning",
+            )
+        )
+    if t.ltx2_soft_av_alignment:
+        if t.ltx2_mode != "av" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_soft_av_alignment",
+                    "Soft AV Alignment requires AV mode.",
+                    label="Soft AV Alignment",
+                    page="conditioning",
+                )
+            )
+        if not t.sdpa:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_soft_av_alignment",
+                    "Soft AV Alignment requires SDPA.",
+                    label="Soft AV Alignment",
+                    page="conditioning",
+                )
+            )
+
     if t.ltx2_model_parallel:
         if t.ltx2_remote_stage:
             message = "LTX2 Model Parallel and LTX2 Remote Stage cannot be enabled together."
@@ -1420,6 +1525,111 @@ def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
         message = "Full FP16 and Full BF16 cannot be enabled together."
         errors.append(_make_issue("error", "full_finetune.full_fp16", message, label="Full FP16", page="full_finetune"))
         errors.append(_make_issue("error", "full_finetune.full_bf16", message, label="Full BF16", page="full_finetune"))
+
+    if getattr(t, "ltx2_compile_inner_blocks", False):
+        if not t.compile:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_compile_inner_blocks",
+                    "Compile inner LTX blocks requires torch.compile.",
+                    label="Compile Inner LTX Blocks",
+                    page="full_finetune",
+                )
+            )
+        if t.blocks_to_swap not in (None, 0) or t.blockwise_checkpointing or t.gradient_checkpointing_cpu_offload:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_compile_inner_blocks",
+                    "Compile inner LTX blocks requires resident weights and activations.",
+                    label="Compile Inner LTX Blocks",
+                    page="full_finetune",
+                )
+            )
+
+    try:
+        video_anchor_strength = float(t.video_anchor_strength)
+    except (TypeError, ValueError):
+        video_anchor_strength = float("nan")
+    if not math.isfinite(video_anchor_strength) or not 0.0 <= video_anchor_strength <= 1.0:
+        errors.append(
+            _make_issue(
+                "error",
+                "full_finetune.video_anchor_strength",
+                "Video Anchor Strength must be a finite number in the inclusive range 0.0 to 1.0.",
+                label="Video Anchor Strength",
+                page="full_finetune",
+            )
+        )
+    elif video_anchor_strength != 1.0 and not t.ltx2_graded_conditioning:
+        errors.append(
+            _make_issue(
+                "error",
+                "full_finetune.ltx2_graded_conditioning",
+                "Enable Graded Conditioning to use Video Anchor Strength below 1.0.",
+                label="Graded Conditioning",
+                page="full_finetune",
+            )
+        )
+
+    if t.ltx2_causal_temporal_attention:
+        if t.ltx2_mode == "audio" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_causal_temporal_attention",
+                    "Causal Temporal Attention requires a video training path.",
+                    label="Causal Temporal Attention",
+                    page="full_finetune",
+                )
+            )
+        if not t.sdpa:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_causal_temporal_attention",
+                    "Causal Temporal Attention requires SDPA.",
+                    label="Causal Temporal Attention",
+                    page="full_finetune",
+                )
+            )
+
+    try:
+        soft_av_sigma = float(t.ltx2_soft_av_alignment_sigma)
+    except (TypeError, ValueError):
+        soft_av_sigma = float("nan")
+    if not math.isfinite(soft_av_sigma) or soft_av_sigma <= 0.0:
+        errors.append(
+            _make_issue(
+                "error",
+                "full_finetune.ltx2_soft_av_alignment_sigma",
+                "Soft AV Alignment Sigma must be finite and greater than zero.",
+                label="Soft AV Alignment Sigma",
+                page="full_finetune",
+            )
+        )
+    if t.ltx2_soft_av_alignment:
+        if t.ltx2_mode != "av" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_soft_av_alignment",
+                    "Soft AV Alignment requires AV mode.",
+                    label="Soft AV Alignment",
+                    page="full_finetune",
+                )
+            )
+        if not t.sdpa:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_soft_av_alignment",
+                    "Soft AV Alignment requires SDPA.",
+                    label="Soft AV Alignment",
+                    page="full_finetune",
+                )
+            )
 
     if getattr(t, "int8_weights_w8a8", False):
         if not getattr(t, "int8_weights", False):
@@ -2266,6 +2476,26 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
                         page="rl",
                     )
                 )
+        if getattr(rl, "refl_av", False) and t.ltx2_mode != "av":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.refl_av",
+                    "AV ReFL requires LTX2 Mode = av.",
+                    label="AV ReFL",
+                    page="rl",
+                )
+            )
+        if t.ltx2_mode == "av" and not getattr(rl, "refl_av", False):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.refl_av",
+                    "Enable AV ReFL to use the refl update rule in AV mode.",
+                    label="AV ReFL",
+                    page="rl",
+                )
+            )
 
     # --reward_args must be parseable key=value entries.
     for entry in _split_cli_args(rl.reward_args):

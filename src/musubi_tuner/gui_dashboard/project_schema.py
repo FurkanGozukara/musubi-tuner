@@ -416,6 +416,7 @@ class TrainingConfig(BaseModel):
     ltx2_prompt_kv_checkpoint_max_mb: Optional[int] = None
     ltx2_padded_prompt_trim: bool = False
     ltx2_partial_gradient_checkpointing: bool = False
+    ltx2_compile_inner_blocks: bool = False
     ltx2_block_swap_async_backward: bool = False
     ltx2_block_swap_trainable_ring: bool = False
     ltx2_validate_training_tensors: bool = False
@@ -789,11 +790,15 @@ class TrainingConfig(BaseModel):
     keyframe_last_frame_p: float = 1.0
     keyframe_random_interior_p: float = 0.0
     keyframe_max_random_interior: int = 0
-    # Video-anchor training (hard target-frame replacement)
+    ltx2_graded_conditioning: bool = False
+    ltx2_causal_temporal_attention: bool = False
+    ltx2_soft_av_alignment: bool = False
+    ltx2_soft_av_alignment_sigma: float = 1.0
     video_anchor_training: bool = False
     video_anchor_probability: float = 0.5
     video_anchor_count: int = 1
     video_anchor_strategy: Literal["endpoints", "random", "endpoints_random"] = "endpoints_random"
+    video_anchor_strength: float = 1.0
     # Spatial-crop region conditioning (outpaint via a clean rectangular region).
     # The region itself is set per dataset (spatial_crop_region in the dataset config);
     # only the master flag / probability / invert are CLI args.
@@ -1235,6 +1240,7 @@ class RLConfig(BaseModel):
     refl_grad_steps: int = 1  # only the single final denoising step is implemented
     refl_renoise_samples: int = 1  # independent re-noise estimates averaged at that step
     refl_reward_weight: float = 1.0  # scale on the maximized reward term
+    refl_av: bool = False
 
     # NFT loss coefficients. nft_kl_beta is a historical field name: it weights the shared
     # reference-prediction MSE for nft/rwr/ppo/refl, not a KL divergence.

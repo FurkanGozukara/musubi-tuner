@@ -99,14 +99,14 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
         type=int,
         default=None,
         metavar="N",
-        help="Minimum token count for compact AV cross-AdaLN (default: environment or 256).",
+        help="Minimum token count for compact AV cross-AdaLN (default: 256).",
     )
     group.add_argument(
         "--ltx2_prompt_kv_checkpoint_max_mb",
         type=int,
         default=None,
         metavar="MB",
-        help="Maximum prompt K/V payload in MiB (default: environment or 1024).",
+        help="Maximum prompt K/V payload in MiB (default: 1024).",
     )
     group.add_argument(
         "--ltx2_validate_training_tensors",

@@ -130,6 +130,7 @@ def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
         "ltx2_prompt_kv_checkpoint",
         "ltx2_padded_prompt_trim",
         "ltx2_partial_gradient_checkpointing",
+        "ltx2_compile_inner_blocks",
         "ltx2_block_swap_async_backward",
         "ltx2_block_swap_trainable_ring",
         "ltx2_validate_training_tensors",
@@ -985,11 +986,19 @@ def _append_ltx2_conditioning(cmd: list[str], t, config, recipe_filename: str = 
         cmd += ["--keyframe_last_frame_p", str(getattr(t, "keyframe_last_frame_p", 1.0))]
         cmd += ["--keyframe_random_interior_p", str(getattr(t, "keyframe_random_interior_p", 0.0))]
         cmd += ["--keyframe_max_random_interior", str(int(getattr(t, "keyframe_max_random_interior", 0)))]
+    if getattr(t, "ltx2_graded_conditioning", False):
+        cmd += ["--ltx2_graded_conditioning"]
+    if getattr(t, "ltx2_causal_temporal_attention", False):
+        cmd += ["--ltx2_causal_temporal_attention"]
+    if getattr(t, "ltx2_soft_av_alignment", False):
+        cmd += ["--ltx2_soft_av_alignment"]
+        cmd += ["--ltx2_soft_av_alignment_sigma", str(getattr(t, "ltx2_soft_av_alignment_sigma", 1.0))]
     if getattr(t, "video_anchor_training", False):
         cmd += ["--video_anchor_training"]
         cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
         cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
         cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
+        cmd += ["--video_anchor_strength", str(getattr(t, "video_anchor_strength", 1.0))]
     if not recipe and getattr(t, "ltx2_spatial_crop", False):
         # Region is dataset-level (spatial_crop_region); only the master flag / probability / invert.
         cmd += ["--ltx2_spatial_crop"]
@@ -3166,6 +3175,8 @@ def build_rl_train_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--refl_renoise_samples", str(rl.refl_renoise_samples)]
         if rl.refl_reward_weight != 1.0:
             cmd += ["--refl_reward_weight", str(rl.refl_reward_weight)]
+        if rl.refl_av:
+            cmd += ["--refl_av"]
     if rl_loss == "ppo":
         # ppo is trajectory-faithful DDPO: needs the SDE-sampled trajectory (Phase A
         # --rl_sde_sampler for offline; the same flag on inline generation for online).
