@@ -290,7 +290,17 @@ class LTX2RLTrainer:
                     group_size=int(args.rl_group_size),
                     reward_names=list(reward_stack.weights),
                     route_map=reward_stack.routes,
-                    sampler_settings={"num_steps": num_steps, "frame_rate": frame_rate},
+                    sampler_settings={
+                        "num_steps": num_steps,
+                        "frame_rate": frame_rate,
+                        "width": args.sample_width,
+                        "height": args.sample_height,
+                        "frames": args.sample_frames,
+                        "cfg": getattr(args, "sample_cfg", 1.0),
+                        "seed_base": int(args.seed or 0),
+                        "rl_sde_sampler": bool(getattr(args, "rl_sde_sampler", False)),
+                        "rl_sde_eta": float(getattr(args, "rl_sde_eta", 1.0)),
+                    },
                 )
                 dump_writer = RolloutCacheWriter(args.rl_dump_cache, dump_meta)
                 for grp in groups:
