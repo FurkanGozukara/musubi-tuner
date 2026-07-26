@@ -80,6 +80,10 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
             "Use --blocks_to_checkpoint as the resident-weight checkpoint frontier.",
         ),
         (
+            "--ltx2_compile_inner_blocks",
+            "Compile LTX block compute while keeping checkpoint wrappers eager.",
+        ),
+        (
             "--ltx2_block_swap_async_backward",
             "Prefetch the next pinned block while the current backward block computes.",
         ),
@@ -1976,6 +1980,8 @@ def main() -> None:
         if args.ltx_mode in short_map:
             args.ltx_mode = short_map[args.ltx_mode]
     apply_ltx2_tweaks(args)
+    if getattr(args, "ltx2_compile_inner_blocks", False) and not getattr(args, "compile", False):
+        raise ValueError("--ltx2_compile_inner_blocks requires --compile")
     args.differential_guidance_scale = float(getattr(args, "differential_guidance_scale", 3.0))
     if not math.isfinite(args.differential_guidance_scale):
         raise ValueError("--differential_guidance_scale must be finite.")

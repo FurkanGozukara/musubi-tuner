@@ -478,3 +478,60 @@ def compile_transformer(
         raise
 
     return transformer
+
+
+def compile_transformer_inner_forwards(
+    args: argparse.Namespace,
+    transformer: torch.nn.Module,
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
+    disable_linear: bool,
+) -> torch.nn.Module:
+    targets = _collect_compile_targets(target_blocks)
+    if len(targets) == 0:
+        logger.warning("Inner-block torch.compile was requested, but no compile target blocks were found")
+        return transformer
+
+    if disable_linear:
+        logger.info("Disable linear from torch.compile for swap blocks...")
+        for _, _, block in targets:
+            disable_linear_from_compile(block)
+
+    inner_forwards: list[tuple[torch.nn.Module, Callable]] = []
+    for _, i, block in targets:
+        inner_forward = getattr(block, "_forward", None)
+        if not callable(inner_forward):
+            raise TypeError(f"torch.compile target block at index {i} has no callable _forward")
+        inner_forwards.append((block, inner_forward))
+
+    _apply_inductor_config(args)
+    compile_dynamic = compile_dynamic_arg(args)
+    logger.info(
+        "Compiling DiT block compute with eager wrappers: blocks=%d, backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
+        len(inner_forwards),
+        args.compile_backend,
+        args.compile_mode,
+        compile_dynamic,
+        args.compile_fullgraph,
+    )
+    _configure_compile_cache(args, len(inner_forwards))
+
+    compiled_refs: list[tuple[torch.nn.Module, Callable]] = []
+    try:
+        for block, inner_forward in inner_forwards:
+            block._forward = torch.compile(
+                inner_forward,
+                backend=args.compile_backend,
+                mode=args.compile_mode,
+                dynamic=compile_dynamic,
+                fullgraph=args.compile_fullgraph,
+            )
+            compiled_refs.append((block, inner_forward))
+    except Exception as e:
+        for block, inner_forward in reversed(compiled_refs):
+            block._forward = inner_forward
+        if getattr(args, "compile_fallback_to_eager", False):
+            logger.warning("Inner-block torch.compile setup failed; restored eager compute and continuing: %s", e)
+            return transformer
+        raise
+
+    return transformer

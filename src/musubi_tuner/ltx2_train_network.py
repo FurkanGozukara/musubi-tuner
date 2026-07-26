@@ -4272,6 +4272,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         logger.info("compile_transformer: %d transformer_blocks resolved for torch.compile", n_blocks)
         if n_blocks == 0:
             raise RuntimeError("--compile set but 0 transformer_blocks resolved; torch.compile would be a silent no-op")
+        if getattr(args, "ltx2_compile_inner_blocks", False):
+            if self.blocks_to_swap > 0:
+                raise ValueError("--ltx2_compile_inner_blocks requires resident transformer weights")
+            if getattr(args, "blockwise_checkpointing", False) or getattr(args, "gradient_checkpointing_cpu_offload", False):
+                raise ValueError("--ltx2_compile_inner_blocks is incompatible with checkpoint CPU offload")
+            return model_utils.compile_transformer_inner_forwards(args, transformer, target_blocks, disable_linear=False)
         return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
 
     def _load_vae_impl(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
