@@ -418,6 +418,11 @@ def parse_args() -> argparse.Namespace:
         "back per shape to flash/efficient/math; under torch.compile the normal SDPA call is used.",
     )
     parser.add_argument("--sdpa", action="store_true", help="Use SDPA (same as --attn_mode sdpa)")
+    parser.add_argument(
+        "--ltx2_causal_temporal_attention",
+        action="store_true",
+        help=("Restrict video self-attention to the current and earlier video frames. Requires SDPA and is off by default."),
+    )
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument(
         "--sage_attn",
@@ -684,6 +689,11 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
     if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
         raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+    if args.ltx2_causal_temporal_attention:
+        if args.ltx_mode == "audio":
+            raise ValueError("--ltx2_causal_temporal_attention requires a video generation path")
+        if not (args.sdpa or args.attn_mode == "sdpa"):
+            raise ValueError("--ltx2_causal_temporal_attention requires --sdpa or --attn_mode sdpa")
 
     preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version=args.ltx_version)
     if preset is None:

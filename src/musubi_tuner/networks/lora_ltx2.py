@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def build_temporal_causal_attention_mask(positions: torch.Tensor) -> torch.Tensor:
+    if positions.ndim != 4 or positions.shape[1] < 1 or positions.shape[-1] != 2:
+        raise ValueError(f"Expected positions shaped [B, axes, tokens, 2], got {tuple(positions.shape)}")
+    starts = positions[:, 0, :, 0]
+    return starts.unsqueeze(2) >= starts.unsqueeze(1)
+
+
 def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
     """Normalize external LTX-2 LoRA weights into native training keys.
 
@@ -671,6 +678,10 @@ class LTX2Wrapper(nn.Module):
             video_self_attention_mask = None
             if isinstance(transformer_options, dict):
                 video_self_attention_mask = transformer_options.get("self_attention_mask")
+                if transformer_options.get("causal_temporal_attention", False):
+                    if video_self_attention_mask is not None:
+                        raise ValueError("Causal temporal attention cannot be combined with a custom self-attention mask")
+                    video_self_attention_mask = build_temporal_causal_attention_mask(video_positions)
             video_modality = Modality(
                 enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
                 latent=video_tokens,

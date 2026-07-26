@@ -3790,6 +3790,21 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
             raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
+        self._causal_temporal_attention = bool(getattr(args, "ltx2_causal_temporal_attention", False))
+        if self._causal_temporal_attention:
+            if self._ltx_mode == "audio" or self._ltx2_audio_only_model:
+                raise ValueError("--ltx2_causal_temporal_attention requires a video training path")
+            if not bool(getattr(args, "sdpa", False)):
+                raise ValueError("--ltx2_causal_temporal_attention requires --sdpa")
+        self._soft_av_alignment = bool(getattr(args, "ltx2_soft_av_alignment", False))
+        self._soft_av_alignment_sigma = float(getattr(args, "ltx2_soft_av_alignment_sigma", 0.5))
+        if not math.isfinite(self._soft_av_alignment_sigma) or self._soft_av_alignment_sigma <= 0.0:
+            raise ValueError("--ltx2_soft_av_alignment_sigma must be finite and greater than zero")
+        if self._soft_av_alignment:
+            if self._ltx_mode != "av" or self._ltx2_audio_only_model:
+                raise ValueError("--ltx2_soft_av_alignment requires --ltx2_mode av")
+            if not bool(getattr(args, "sdpa", False)):
+                raise ValueError("--ltx2_soft_av_alignment requires --sdpa")
         (
             args.video_anchor_training,
             args.video_anchor_probability,
@@ -4081,6 +4096,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         preset = getattr(args, "lora_target_preset", None)
         if preset:
             md["ss_lora_target_preset"] = preset
+        if bool(getattr(args, "ltx2_causal_temporal_attention", False)):
+            md["ss_ltx2_causal_temporal_attention"] = True
         if self._ic_lora_strategy and self._ic_lora_strategy != "none":
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
         if bool(getattr(args, "latent_temporal_weighting", False)):
@@ -5654,7 +5671,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import SpatioTemporalScaleFactors, VideoLatentShape
-            from musubi_tuner.networks.lora_ltx2 import build_keyframe_extension
+            from musubi_tuner.networks.lora_ltx2 import build_keyframe_extension, build_temporal_causal_attention_mask
 
             patchifier = VideoLatentPatchifier(patch_size=1)
 
@@ -5819,6 +5836,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=text_embeds,
                 sigma=sigma,
                 context_mask=text_mask,
+                attention_mask=(
+                    build_temporal_causal_attention_mask(combined_positions) if self._causal_temporal_attention else None
+                ),
                 force_keep_mask=force_keep_mask if self._tread_enabled else None,
             )
 
@@ -5873,7 +5893,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-            from musubi_tuner.networks.lora_ltx2 import _split_av_context, build_keyframe_extension
+            from musubi_tuner.networks.lora_ltx2 import (
+                _split_av_context,
+                build_keyframe_extension,
+                build_temporal_causal_attention_mask,
+            )
 
             unwrapped_transformer = accelerator.unwrap_model(transformer)
             base_model = unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
@@ -6216,6 +6240,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=video_ctx,
                 sigma=sigma,
                 context_mask=text_mask,
+                attention_mask=(
+                    build_temporal_causal_attention_mask(video_combined_pos) if self._causal_temporal_attention else None
+                ),
                 a2v_cross_attention_mask=a2v_mask,
                 force_keep_mask=video_force_keep_mask if self._tread_enabled else None,
             )
@@ -6629,7 +6656,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-            from musubi_tuner.networks.lora_ltx2 import _split_av_context, build_keyframe_extension
+            from musubi_tuner.networks.lora_ltx2 import (
+                _split_av_context,
+                build_keyframe_extension,
+                build_temporal_causal_attention_mask,
+            )
 
             # Per-batch audio fork. Bucket separation guarantees homogeneous batches, so this switch is
             # safe: batches WITH target audio take the full AV path; batches
@@ -6887,6 +6918,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=video_ctx,
                 sigma=sigma,
                 context_mask=text_mask,
+                attention_mask=(
+                    build_temporal_causal_attention_mask(video_combined_pos) if self._causal_temporal_attention else None
+                ),
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
                 force_keep_mask=video_force_keep_mask if self._tread_enabled else None,
             )
@@ -7108,6 +7142,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=False))
 
         resolved_transformer_options = dict(transformer_options)
+        if self._causal_temporal_attention:
+            resolved_transformer_options["causal_temporal_attention"] = True
+        if self._soft_av_alignment and audio_enabled_for_batch:
+            resolved_transformer_options["soft_av_alignment_sigma"] = self._soft_av_alignment_sigma
         if video_conditioning_mask_tokens is not None:
             resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
             base_video_timesteps = model_timesteps

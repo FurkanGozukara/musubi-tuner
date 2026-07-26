@@ -2493,6 +2493,8 @@ python ltx2_generate_video.py ^
 - If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
 - Attention backend: `--sdpa` (default), `--flash_attn`, `--flash3`, `--xformers`, or `--sage_attn` (equivalently `--attn_mode {sdpa,flash,flash3,xformers,sageattn}`). `--sage_attn` runs the DiT attention through [SageAttention](https://github.com/thu-ml/SageAttention) (requires the `sageattention` package; masked attention falls back to SDPA). It is inference-only — training rejects it. (Credit: [phazei](https://github.com/phazei) — [PR #87](https://github.com/AkaneTendo25/musubi-tuner/pull/87))
 
+- `--ltx2_causal_temporal_attention`: Use the same causal-by-video-time self-attention as a causal-trained adapter. It requires SDPA (`--sdpa` or `--attn_mode sdpa`) and a video generation mode. Keep it disabled for ordinary adapters. A matched long-form quality study found better persistent-marker stability but worse held-out event ordering and ordinary short-video CLIP/DINO consistency, so this remains an experimental continuation/AR-only option rather than a general training recommendation.
+
 #### Rendering Trained Conditioning
 <sub>[↑ contents](#table-of-contents)</sub>
 
