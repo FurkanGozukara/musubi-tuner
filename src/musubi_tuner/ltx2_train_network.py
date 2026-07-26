@@ -1258,6 +1258,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._ltx_mode: str = "video"
         self._ltx_version: str = "2.3"
         self._ltx2_audio_only_model: bool = False
+        self._soft_av_alignment: bool = False
+        self._soft_av_alignment_sigma: float = 1.0
         self._tread_enabled: bool = False
         self._tread_targets: set[str] = set()
         self._logged_audio_only_timestep_shift: bool = False
@@ -3797,7 +3799,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if not bool(getattr(args, "sdpa", False)):
                 raise ValueError("--ltx2_causal_temporal_attention requires --sdpa")
         self._soft_av_alignment = bool(getattr(args, "ltx2_soft_av_alignment", False))
-        self._soft_av_alignment_sigma = float(getattr(args, "ltx2_soft_av_alignment_sigma", 0.5))
+        self._soft_av_alignment_sigma = float(getattr(args, "ltx2_soft_av_alignment_sigma", 1.0))
         if not math.isfinite(self._soft_av_alignment_sigma) or self._soft_av_alignment_sigma <= 0.0:
             raise ValueError("--ltx2_soft_av_alignment_sigma must be finite and greater than zero")
         if self._soft_av_alignment:
@@ -4098,6 +4100,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_lora_target_preset"] = preset
         if bool(getattr(args, "ltx2_causal_temporal_attention", False)):
             md["ss_ltx2_causal_temporal_attention"] = True
+        if bool(getattr(args, "ltx2_soft_av_alignment", False)):
+            md["ss_ltx2_soft_av_alignment"] = True
+            md["ss_ltx2_soft_av_alignment_sigma"] = float(getattr(args, "ltx2_soft_av_alignment_sigma", 1.0))
         if self._ic_lora_strategy and self._ic_lora_strategy != "none":
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
         if bool(getattr(args, "latent_temporal_weighting", False)):
@@ -6231,6 +6236,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if not av_ic_v2a_enabled:
                 v2a_mask = torch.full((bsz, total_audio_seq, total_video_seq), neg_inf, device=accelerator.device, dtype=mask_dtype)
 
+            if self._soft_av_alignment:
+                from musubi_tuner.tarp_dcr import compute_soft_av_alignment_masks
+
+                soft_a2v, soft_v2a = compute_soft_av_alignment_masks(
+                    video_combined_pos,
+                    audio_combined_pos,
+                    self._soft_av_alignment_sigma,
+                    mask_dtype,
+                )
+                a2v_mask = soft_a2v if a2v_mask is None else a2v_mask + soft_a2v
+                v2a_mask = soft_v2a if v2a_mask is None else v2a_mask + soft_v2a
+
             # ---- BUILD MODALITY OBJECTS & FORWARD ----
             video_modality = Modality(
                 enabled=True,
@@ -6903,6 +6920,17 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                         device=accelerator.device,
                         dtype=mask_dtype,
                     )
+                if self._soft_av_alignment:
+                    from musubi_tuner.tarp_dcr import compute_soft_av_alignment_masks
+
+                    soft_a2v, soft_v2a = compute_soft_av_alignment_masks(
+                        video_combined_pos,
+                        target_audio_pos,
+                        self._soft_av_alignment_sigma,
+                        mask_dtype,
+                    )
+                    a2v_cross_attention_mask = soft_a2v if a2v_cross_attention_mask is None else a2v_cross_attention_mask + soft_a2v
+                    v2a_cross_attention_mask = soft_v2a if v2a_cross_attention_mask is None else v2a_cross_attention_mask + soft_v2a
             else:
                 # No target audio: text_embeds was already reduced to the video-only dim upstream by
                 # select_video_text_embeds_for_av_no_audio, so it is the video context as-is. No audio

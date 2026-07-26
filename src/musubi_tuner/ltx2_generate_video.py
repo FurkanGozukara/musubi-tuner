@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -423,6 +424,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=("Restrict video self-attention to the current and earlier video frames. Requires SDPA and is off by default."),
     )
+    parser.add_argument(
+        "--ltx2_soft_av_alignment",
+        action="store_true",
+        help="Bias AV cross-attention toward temporally aligned tokens. Requires AV mode and SDPA; off by default.",
+    )
+    parser.add_argument(
+        "--ltx2_soft_av_alignment_sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian temporal width in seconds for --ltx2_soft_av_alignment. Default 1.0.",
+    )
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument(
         "--sage_attn",
@@ -694,6 +706,13 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--ltx2_causal_temporal_attention requires a video generation path")
         if not (args.sdpa or args.attn_mode == "sdpa"):
             raise ValueError("--ltx2_causal_temporal_attention requires --sdpa or --attn_mode sdpa")
+    if not math.isfinite(args.ltx2_soft_av_alignment_sigma) or args.ltx2_soft_av_alignment_sigma <= 0.0:
+        raise ValueError("--ltx2_soft_av_alignment_sigma must be finite and greater than zero")
+    if args.ltx2_soft_av_alignment:
+        if args.ltx_mode != "av":
+            raise ValueError("--ltx2_soft_av_alignment requires --ltx2_mode av")
+        if not (args.sdpa or args.attn_mode == "sdpa"):
+            raise ValueError("--ltx2_soft_av_alignment requires --sdpa or --attn_mode sdpa")
 
     preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version=args.ltx_version)
     if preset is None:

@@ -9,7 +9,31 @@ Cross-Modal Context Learning" (arXiv:2603.18600v1).
 
 from __future__ import annotations
 
+import math
+
 import torch
+
+
+def compute_soft_av_alignment_masks(
+    video_positions: torch.Tensor,
+    audio_positions: torch.Tensor,
+    sigma_seconds: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if video_positions.ndim != 4 or video_positions.shape[1] < 1 or video_positions.shape[-1] != 2:
+        raise ValueError(f"Expected video positions [B, axes, T, 2], got {tuple(video_positions.shape)}")
+    if audio_positions.ndim != 4 or audio_positions.shape[1] < 1 or audio_positions.shape[-1] != 2:
+        raise ValueError(f"Expected audio positions [B, axes, T, 2], got {tuple(audio_positions.shape)}")
+    if video_positions.shape[0] != audio_positions.shape[0]:
+        raise ValueError("Video and audio position batches must match")
+    if not math.isfinite(sigma_seconds) or sigma_seconds <= 0.0:
+        raise ValueError("sigma_seconds must be finite and greater than zero")
+
+    video_time = video_positions[:, 0].to(torch.float32).mean(dim=-1)
+    audio_time = audio_positions[:, 0].to(torch.float32).mean(dim=-1)
+    delta = video_time.unsqueeze(2) - audio_time.unsqueeze(1)
+    a2v = (-0.5 * (delta / sigma_seconds).square()).to(dtype=dtype)
+    return a2v, a2v.transpose(1, 2).contiguous()
 
 
 def compute_tarp_a2v_mask(
@@ -52,9 +76,7 @@ def compute_tarp_a2v_mask(
     neg_inf = torch.finfo(dtype).min
 
     # Start with all blocked, open windows
-    mask = torch.full(
-        (video_seq_len, audio_seq_len), neg_inf, dtype=dtype, device=device
-    )
+    mask = torch.full((video_seq_len, audio_seq_len), neg_inf, dtype=dtype, device=device)
 
     for i in range(video_frames):
         m_i = c // 2 + c * i  # window centre
@@ -100,9 +122,7 @@ def compute_tarp_v2a_mask(
     video_seq_len = video_frames * video_spatial_tokens
     neg_inf = torch.finfo(dtype).min
 
-    mask = torch.full(
-        (audio_seq_len, video_seq_len), neg_inf, dtype=dtype, device=device
-    )
+    mask = torch.full((audio_seq_len, video_seq_len), neg_inf, dtype=dtype, device=device)
 
     # Nearest-neighbour: audio token j maps to video frame round(j * t_v / t_a)
     for j in range(audio_seq_len):

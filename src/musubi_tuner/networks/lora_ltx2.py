@@ -757,6 +757,23 @@ class LTX2Wrapper(nn.Module):
                 force_keep_mask=audio_force_keep_mask,
             )
 
+        soft_av_sigma = transformer_options.get("soft_av_alignment_sigma") if isinstance(transformer_options, dict) else None
+        if soft_av_sigma is not None and video_modality is not None and audio_modality is not None:
+            from musubi_tuner.tarp_dcr import compute_soft_av_alignment_masks
+
+            soft_a2v, soft_v2a = compute_soft_av_alignment_masks(
+                video_modality.positions,
+                audio_modality.positions,
+                float(soft_av_sigma),
+                video_latents.dtype,
+            )
+            if video_modality.a2v_cross_attention_mask is not None:
+                soft_a2v = video_modality.a2v_cross_attention_mask + soft_a2v
+            if audio_modality.v2a_cross_attention_mask is not None:
+                soft_v2a = audio_modality.v2a_cross_attention_mask + soft_v2a
+            video_modality = replace(video_modality, a2v_cross_attention_mask=soft_a2v)
+            audio_modality = replace(audio_modality, v2a_cross_attention_mask=soft_v2a)
+
         # TARP: windowed A2V cross-attention mask
         tarp_config = transformer_options.get("tarp_config") if isinstance(transformer_options, dict) else None
         if tarp_config is not None and video_modality is not None and audio_modality is not None and audio_seq_len > 0:

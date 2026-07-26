@@ -3443,7 +3443,7 @@ class LTX2SamplingMixin:
                     resolved_transformer_options["causal_temporal_attention"] = True
                 if getattr(args, "ltx2_soft_av_alignment", False):
                     resolved_transformer_options["soft_av_alignment_sigma"] = float(
-                        getattr(args, "ltx2_soft_av_alignment_sigma", 0.5)
+                        getattr(args, "ltx2_soft_av_alignment_sigma", 1.0)
                     )
                 if i2v_conditioning_mask_tokens is not None:
                     video_conditioning_mask_tokens = i2v_conditioning_mask_tokens

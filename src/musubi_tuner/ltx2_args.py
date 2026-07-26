@@ -926,8 +926,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_soft_av_alignment_sigma",
         type=float,
-        default=0.5,
-        help="Gaussian temporal width in seconds for --ltx2_soft_av_alignment. Default 0.5.",
+        default=1.0,
+        help="Gaussian temporal width in seconds for --ltx2_soft_av_alignment. Default 1.0.",
     )
     parser.add_argument(
         "--video_anchor_probability",
