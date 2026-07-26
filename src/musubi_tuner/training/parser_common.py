@@ -325,7 +325,7 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         "--log_cuda_memory_every_n_steps",
         type=int,
         default=None,
-        help="log CUDA memory stats every N optimizer steps (alloc/reserved/max).",
+        help="log CUDA memory and allocator pressure every N optimizer steps (alloc/reserved/max, inactive splits, retries, OOMs).",
     )
     parser.add_argument(
         "--log_grad_metrics",

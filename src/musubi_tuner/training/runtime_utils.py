@@ -72,11 +72,20 @@ def log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) ->
         total_mb = total_b / (1024**2)
     except Exception:
         pass
+    allocator_suffix = ""
+    try:
+        memory_stats = torch.cuda.memory_stats()
+        inactive_split_mb = memory_stats.get("inactive_split_bytes.all.current", 0) / (1024**2)
+        allocation_retries = int(memory_stats.get("num_alloc_retries", 0))
+        oom_count = int(memory_stats.get("num_ooms", 0))
+        allocator_suffix = f" inactive_split={inactive_split_mb:.0f}MB alloc_retries={allocation_retries} ooms={oom_count}"
+    except Exception:
+        pass
     if latents_shape is not None:
         if free_mb is not None and total_mb is not None:
             logger.info(
                 "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
-                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB latents=%s",
+                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB latents=%s%s",
                 tag,
                 alloc,
                 reserved,
@@ -86,11 +95,12 @@ def log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) ->
                 free_mb,
                 total_mb,
                 latents_shape,
+                allocator_suffix,
             )
         else:
             logger.info(
                 "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
-                "PEAK_SINCE_START=%.0fMB latents=%s",
+                "PEAK_SINCE_START=%.0fMB latents=%s%s",
                 tag,
                 alloc,
                 reserved,
@@ -98,12 +108,13 @@ def log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) ->
                 max_reserved,
                 global_peak_reserved,
                 latents_shape,
+                allocator_suffix,
             )
     else:
         if free_mb is not None and total_mb is not None:
             logger.info(
                 "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
-                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB",
+                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB%s",
                 tag,
                 alloc,
                 reserved,
@@ -112,16 +123,18 @@ def log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) ->
                 global_peak_reserved,
                 free_mb,
                 total_mb,
+                allocator_suffix,
             )
         else:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB PEAK_SINCE_START=%.0fMB",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB PEAK_SINCE_START=%.0fMB%s",
                 tag,
                 alloc,
                 reserved,
                 max_alloc,
                 max_reserved,
                 global_peak_reserved,
+                allocator_suffix,
             )
 
 

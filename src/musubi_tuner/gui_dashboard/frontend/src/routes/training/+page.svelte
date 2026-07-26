@@ -1006,7 +1006,7 @@
 						</div>
 						<PathInput fieldPath="training.log_tracker_config" value={t.log_tracker_config || ''} oninput={(e) => update('log_tracker_config', e.target.value)} showFiles disabled={!t.log_with} tooltip="Optional tracker config TOML path." />
 						<FormToggle fieldPath="training.log_config" checked={t.log_config ?? false} onchange={(e) => update('log_config', e.target.checked)} tooltip="Log the full training configuration at startup." />
-						<FormField type="number" fieldPath="training.log_cuda_memory_every_n_steps" value={t.log_cuda_memory_every_n_steps ?? ''} oninput={(e) => update('log_cuda_memory_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Log CUDA memory every N steps" />
+						<FormField type="number" fieldPath="training.log_cuda_memory_every_n_steps" value={t.log_cuda_memory_every_n_steps ?? ''} oninput={(e) => update('log_cuda_memory_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Log CUDA memory, fragmentation pressure, allocation retries, and OOMs every N steps" />
 						<FormField fieldPath="training.training_comment" value={t.training_comment || ''} oninput={(e) => update('training_comment', e.target.value)} placeholder="Optional training comment" tooltip="Saved in checkpoint metadata" />
 						{/if}
 					</div>
