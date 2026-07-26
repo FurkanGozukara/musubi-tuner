@@ -769,6 +769,11 @@ def rl_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=1.0,
         help="refl: scale on the maximized reward term; reference-x0 MSE uses --nft_kl_beta.",
     )
+    parser.add_argument(
+        "--refl_av",
+        action="store_true",
+        help="refl: enable differentiable joint video/audio training in --ltx2_mode av.",
+    )
     parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")
     parser.add_argument(
         "--dpo_beta", type=float, default=5.0, help="dpo: Diffusion-DPO beta (scale-invariant; preference sharpness)"

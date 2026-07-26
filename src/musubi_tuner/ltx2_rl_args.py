@@ -217,6 +217,12 @@ def add_rl_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             default=1.0,
             help="refl: scale on the maximized reward term (reference-x0 MSE uses --nft_kl_beta)",
         )
+    if "--refl_av" not in seen:
+        parser.add_argument(
+            "--refl_av",
+            action="store_true",
+            help="refl: enable differentiable joint video/audio training in --ltx2_mode av",
+        )
     if "--rwr_temperature" not in seen:
         parser.add_argument("--rwr_temperature", type=float, default=1.0, help="rwr: softmax temperature over group advantages")
     if "--dpo_beta" not in seen:

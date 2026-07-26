@@ -25,11 +25,17 @@ def _rms_energy(waveform) -> float:
     return float(t.pow(2).mean().sqrt())
 
 
+def _rms_energy_grad(waveform):
+    if waveform.numel() == 0:
+        return waveform.sum()
+    return waveform.float().pow(2).mean().sqrt()
+
+
 @register_reward("audio_energy")
 class AudioEnergyReward(BaseReward):
     """Mean RMS loudness reward — model-free, demonstrative (audio analog of ``saturation``)."""
 
-    kind = "blackbox"
+    kind = "differentiable"
     route = "audio"
     needs = frozenset({"audio_waveform"})
 
@@ -49,6 +55,18 @@ class AudioEnergyReward(BaseReward):
             rms = _rms_energy(waveform)
             scores.append(rms / (rms + self._half_point))
         return scores, {"reward": "audio_energy", "half_point": self._half_point}
+
+    def score_grad(self, samples: List[dict]):
+        import torch
+
+        scores = []
+        for sample in samples:
+            waveform = sample.get("audio_waveform")
+            if waveform is None:
+                raise KeyError("audio_energy needs a grad-carrying sample['audio_waveform']")
+            rms = _rms_energy_grad(waveform)
+            scores.append(rms / (rms + self._half_point))
+        return torch.stack(scores), {"reward": "audio_energy", "half_point": self._half_point}
 
     def teardown(self) -> None:
         pass

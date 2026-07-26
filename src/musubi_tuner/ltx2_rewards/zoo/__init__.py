@@ -13,6 +13,7 @@ usable once AV generation feeds ``audio_waveform``/``audio_file`` into the rollo
 from __future__ import annotations
 
 from . import anti_noise  # noqa: F401  (registers "anti_noise"; model-free speckle/flicker guardrail)
+from . import audio_energy  # noqa: F401  (registers "audio_energy"; differentiable waveform energy)
 from . import audiobox  # noqa: F401  (registers "audiobox"; audio aesthetics)
 from . import av_align  # noqa: F401  (registers "av_align"; algorithmic AV peak-IoU)
 from . import av_desync  # noqa: F401  (registers "av_desync"; Synchformer AV sync)
@@ -26,6 +27,7 @@ from . import videoscore2  # noqa: F401  (registers "videoscore2"; VQ/TA/PC phys
 
 __all__ = [
     "anti_noise",
+    "audio_energy",
     "audiobox",
     "av_align",
     "av_desync",

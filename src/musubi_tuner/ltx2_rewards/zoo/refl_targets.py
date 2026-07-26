@@ -6,12 +6,10 @@ per-sample reward tensor. The refl backend backprops through one final denoising
 
 Two templates:
 
-* ``latent_energy`` is the runnable latent-space example and needs no VAE decode.
-* ``pixel_sharpness`` defines the pixel-space reward interface, but the ReFL driver currently rejects
-  it because in-graph LTX-2 video decoding has not been implemented or validated there.
+* ``latent_energy`` operates in latent space and needs no VAE decode.
+* ``pixel_sharpness`` operates on frames decoded by the frozen video VAE.
 
-Both also implement detached ``score`` methods. A custom ReFL reward is currently runnable only when
-its ``needs`` set does not request decoded video or audio.
+Both also implement detached ``score`` methods.
 """
 
 from __future__ import annotations
@@ -82,7 +80,7 @@ class LatentEnergyReward(BaseReward):
 
 @register_reward("pixel_sharpness")
 class PixelSharpnessReward(BaseReward):
-    """Pixel-space interface example; unavailable in ReFL until in-graph decode is implemented."""
+    """Pixel-space high-pass energy through the frozen differentiable VAE decoder."""
 
     kind = "differentiable"
     route = "video"

@@ -2540,9 +2540,12 @@ class LTX2SamplingMixin:
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
         # Keep VAE off GPU during denoise when offloading is enabled.
-        if not offload_transformer_for_decode:
-            vae.to_device(transformer_device)
-        vae.to_dtype(original_vae_dtype)
+        if vae is not None:
+            if not offload_transformer_for_decode:
+                vae.to_device(transformer_device)
+            vae.to_dtype(original_vae_dtype)
+        elif decode_video:
+            raise ValueError("Video decoding requires a loaded VAE")
 
         # Get text embeddings
         prompt_embeds = sample_parameter.get("prompt_embeds")
@@ -3984,8 +3987,9 @@ class LTX2SamplingMixin:
             video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).to("cpu")
 
         # Restore VAE state
-        vae.to_device(original_vae_device)
-        vae.to_dtype(original_vae_dtype)
+        if vae is not None:
+            vae.to_device(original_vae_device)
+            vae.to_dtype(original_vae_dtype)
 
         if return_latents:
             # clean generated latents (model latent space) = the NFT regression targets
