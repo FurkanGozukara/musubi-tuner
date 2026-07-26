@@ -288,10 +288,8 @@ def _pack_varlen(
         dtype=torch.int32,
     )
 
-    k_list = [k[i, valid[i]] for i in range(bsz)]
-    v_list = [v[i, valid[i]] for i in range(bsz)]
-    k_packed = torch.cat(k_list, dim=0)
-    v_packed = torch.cat(v_list, dim=0)
+    k_packed = k[valid]
+    v_packed = v[valid]
 
     cu_seqlens_k = torch.zeros((bsz + 1,), device=k.device, dtype=torch.int32)
     cu_seqlens_k[1:] = torch.cumsum(seqlens_k, dim=0)
