@@ -557,6 +557,18 @@ class LTX2Wrapper(nn.Module):
                     )
                 video_conditioning_mask = video_conditioning_mask.to(device=video_tokens.device, dtype=torch.bool)
                 video_timesteps = torch.where(video_conditioning_mask, torch.zeros_like(video_timesteps), video_timesteps)
+            video_timestep_override = None
+            if isinstance(transformer_options, dict):
+                video_timestep_override = transformer_options.get("video_timestep_override")
+            if video_timestep_override is not None:
+                if not isinstance(video_timestep_override, torch.Tensor):
+                    raise TypeError(f"Expected video_timestep_override to be a torch.Tensor, got: {type(video_timestep_override)}")
+                if video_timestep_override.shape != (bsz, video_seq_len):
+                    raise ValueError(
+                        "video_timestep_override shape mismatch: "
+                        f"got {tuple(video_timestep_override.shape)}, expected {(bsz, video_seq_len)}"
+                    )
+                video_timesteps = video_timestep_override.to(device=video_tokens.device, dtype=video_timesteps.dtype)
 
             latent_coords = self._video_patchifier.get_patch_grid_bounds(
                 output_shape=VideoLatentShape(

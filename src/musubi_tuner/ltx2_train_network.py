@@ -550,17 +550,22 @@ def _normalize_video_anchor_strategy(value: Optional[str]) -> str:
     return strategy
 
 
-def _resolve_video_anchor_config(args: argparse.Namespace, *, ltx_mode: str) -> Tuple[bool, float, int, str]:
+def _resolve_video_anchor_config(args: argparse.Namespace, *, ltx_mode: str) -> Tuple[bool, float, int, str, float]:
     enabled = bool(getattr(args, "video_anchor_training", False))
     if not enabled:
-        return False, 0.0, 0, "endpoints_random"
+        return False, 0.0, 0, "endpoints_random", 1.0
 
     probability = float(getattr(args, "video_anchor_probability", 0.5))
     count = int(getattr(args, "video_anchor_count", 1))
     strategy = _normalize_video_anchor_strategy(getattr(args, "video_anchor_strategy", "endpoints_random"))
+    strength = float(getattr(args, "video_anchor_strength", 1.0))
 
     if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
         raise ValueError(f"video_anchor_probability must be a finite number in [0, 1]. Got: {probability}")
+    if not math.isfinite(strength) or strength < 0.0 or strength > 1.0:
+        raise ValueError(f"video_anchor_strength must be a finite number in [0, 1]. Got: {strength}")
+    if strength != 1.0 and not bool(getattr(args, "ltx2_graded_conditioning", False)):
+        raise ValueError("--video_anchor_strength below 1.0 requires --ltx2_graded_conditioning")
     if count < 0:
         raise ValueError(f"video_anchor_count must be >= 0. Got: {count}")
     if strategy == "random" and count < 1:
@@ -570,7 +575,7 @@ def _resolve_video_anchor_config(args: argparse.Namespace, *, ltx_mode: str) -> 
             "--video_anchor_training requires a video-target training path and cannot be used with audio-only training"
         )
 
-    return enabled, probability, count, strategy
+    return enabled, probability, count, strategy, strength
 
 
 def _build_video_anchor_frame_mask(
@@ -661,6 +666,46 @@ def _frame_mask_to_loss_mask(frame_mask: torch.Tensor, *, use_5d: bool, device: 
     return frame_loss_mask
 
 
+def _apply_graded_video_timesteps(
+    timesteps: torch.Tensor,
+    *,
+    base_timesteps: torch.Tensor,
+    target_offset: int,
+    tokens_per_frame: int,
+    latent_idx_guide_slot: Optional[Tuple[int, int, float]],
+    video_anchor_frame_mask: Optional[torch.Tensor],
+    video_anchor_strength: float,
+) -> torch.Tensor:
+    has_partial_guide = latent_idx_guide_slot is not None and 0.0 < latent_idx_guide_slot[2] < 1.0
+    has_partial_anchor = video_anchor_frame_mask is not None and 0.0 < video_anchor_strength < 1.0
+    if not has_partial_guide and not has_partial_anchor:
+        return timesteps
+
+    out = timesteps
+    base = base_timesteps.reshape(-1, 1).to(device=timesteps.device, dtype=timesteps.dtype)
+
+    if has_partial_guide:
+        slot_idx, slot_t, strength = latent_idx_guide_slot
+        out = out.clone()
+        start = target_offset + slot_idx * tokens_per_frame
+        stop = target_offset + (slot_idx + slot_t) * tokens_per_frame
+        out[:, start:stop] = base * (1.0 - strength)
+
+    if has_partial_anchor:
+        if out is timesteps:
+            out = out.clone()
+        anchor_tokens = _frame_mask_to_token_mask(
+            video_anchor_frame_mask,
+            tokens_per_frame=tokens_per_frame,
+            device=timesteps.device,
+        )
+        target = out[:, target_offset : target_offset + anchor_tokens.shape[1]]
+        target = torch.where(anchor_tokens, base * (1.0 - video_anchor_strength), target)
+        out[:, target_offset : target_offset + anchor_tokens.shape[1]] = target
+
+    return out
+
+
 def _or_intrinsic_video_token_masks(
     target_cond_mask: torch.Tensor,
     *token_masks: Optional[torch.Tensor],
@@ -698,11 +743,14 @@ def _apply_video_anchor_training(
     probability: float,
     count: int,
     strategy: str,
+    strength: float,
     device: torch.device,
     first_frame_conditioning_enabled: Optional[torch.Tensor] = None,
-    latent_idx_guide_slot: Optional[Tuple[int, int]] = None,
+    latent_idx_guide_slot: Optional[Tuple[int, int, float]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if not enabled:
+        return model_noisy_video, None
+    if strength <= 0.0:
         return model_noisy_video, None
 
     video_anchor_frame_mask = _build_video_anchor_frame_mask(
@@ -720,7 +768,7 @@ def _apply_video_anchor_training(
         first_frame_conditioning_enabled = first_frame_conditioning_enabled.to(device=device, dtype=torch.bool)
         video_anchor_frame_mask[first_frame_conditioning_enabled, 0] = False
     if latent_idx_guide_slot is not None:
-        slot_idx, slot_t = latent_idx_guide_slot
+        slot_idx, slot_t, _ = latent_idx_guide_slot
         video_anchor_frame_mask[:, slot_idx : slot_idx + slot_t] = False
     if not bool(video_anchor_frame_mask.any().item()):
         return model_noisy_video, None
@@ -3747,6 +3795,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             args.video_anchor_probability,
             args.video_anchor_count,
             args.video_anchor_strategy,
+            args.video_anchor_strength,
         ) = _resolve_video_anchor_config(args, ltx_mode=self._ltx_mode)
         self.default_guidance_scale = 1.0
         if bool(getattr(args, "av_attention_loss_weighting", False)):
@@ -4552,6 +4601,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_anchor_probability,
             video_anchor_count,
             video_anchor_strategy,
+            video_anchor_strength,
         ) = _resolve_video_anchor_config(args, ltx_mode=self._ltx_mode)
 
         conditions = batch.get("conditions")
@@ -5486,7 +5536,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # Apply latent_idx guides to model_noisy_video before the IC-LoRA branches
         latent_idx_guide_entry = batch.get("latent_idx_guide_latents") if isinstance(batch, dict) else None
         keyframe_guide_entry = batch.get("keyframe_guide_latents") if isinstance(batch, dict) else None
-        latent_idx_guide_slot: Optional[Tuple[int, int]] = None  # (frame_idx, T_g) for downstream masks
+        latent_idx_guide_slot: Optional[Tuple[int, int, float]] = None
         keyframe_guides_for_options: Optional[List[Dict[str, Any]]] = None
         if isinstance(latent_idx_guide_entry, dict):
             _gl = latent_idx_guide_entry.get("latents")
@@ -5507,29 +5557,27 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                         f"latent_idx guide out of range: frame_idx={_gfi}, T_guide={gT}, total_frames={frames_g}. "
                         f"Required: 0 <= frame_idx and frame_idx + T_guide <= total_frames."
                     )
-                if _gst < 1.0:
-                    # Training boolean conditioning masks cannot represent fractional
-                    # strength. Inference supports it via the 5D denoise_mask path.
+                if _gst < 1.0 and not bool(getattr(args, "ltx2_graded_conditioning", False)):
                     raise ValueError(
                         f"latent_idx_guide_strength={_gst} is not supported in training (only 1.0 is). "
-                        "Partial-strength latent_idx guides are an inference-only feature; for training, "
-                        "either set strength=1.0 or remove the latent_idx guide from this dataset."
+                        "Set --ltx2_graded_conditioning to enable partial-strength training."
                     )
-                model_noisy_video = model_noisy_video.clone()
-                model_noisy_video[:, :, _gfi : _gfi + gT, :, :] = _gl
-                latent_idx_guide_slot = (_gfi, gT)
-                if not getattr(self, "_warned_guide_intrinsic_overlap", False):
-                    _overlaps = _guide_intrinsic_overlaps(args, frames_g, _gfi, gT)
-                    if _overlaps:
-                        self._warned_guide_intrinsic_overlap = True
-                        logger.warning(
-                            "latent_idx_guide occupies frames [%d, %d); it takes precedence over %s "
-                            "conditioning in the overlapping frames (the guide latent is the clean "
-                            "conditioning content there, not the intrinsic's target content).",
-                            _gfi,
-                            _gfi + gT,
-                            ", ".join(_overlaps),
-                        )
+                if _gst > 0.0:
+                    model_noisy_video = model_noisy_video.clone()
+                    model_noisy_video[:, :, _gfi : _gfi + gT, :, :] = _gl
+                    latent_idx_guide_slot = (_gfi, gT, _gst)
+                    if not getattr(self, "_warned_guide_intrinsic_overlap", False):
+                        _overlaps = _guide_intrinsic_overlaps(args, frames_g, _gfi, gT)
+                        if _overlaps:
+                            self._warned_guide_intrinsic_overlap = True
+                            logger.warning(
+                                "latent_idx_guide occupies frames [%d, %d); it takes precedence over %s "
+                                "conditioning in the overlapping frames (the guide latent is the clean "
+                                "conditioning content there, not the intrinsic's target content).",
+                                _gfi,
+                                _gfi + gT,
+                                ", ".join(_overlaps),
+                            )
         if isinstance(keyframe_guide_entry, dict):
             _kgl = keyframe_guide_entry.get("latents")
             _kgfi = int(keyframe_guide_entry.get("frame_idx", -1))
@@ -5595,6 +5643,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             probability=video_anchor_probability,
             count=video_anchor_count,
             strategy=video_anchor_strategy,
+            strength=video_anchor_strength,
             device=accelerator.device,
             first_frame_conditioning_enabled=video_conditioning_enabled,
             latent_idx_guide_slot=latent_idx_guide_slot,
@@ -5632,7 +5681,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     target_conditioning_mask[video_conditioning_enabled, :first_frame_tokens] = True
             # latent_idx guide → mark its target-slot tokens as clean conditioning.
             if latent_idx_guide_slot is not None:
-                _slot_idx, _slot_T = latent_idx_guide_slot
+                _slot_idx, _slot_T, _ = latent_idx_guide_slot
                 _tokens_per_frame = tgt_height * tgt_width
                 _slot_start = _slot_idx * _tokens_per_frame
                 _slot_stop = (_slot_idx + _slot_T) * _tokens_per_frame
@@ -5655,6 +5704,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             combined_timesteps = sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
             combined_timesteps = torch.where(conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps)
+            combined_timesteps = _apply_graded_video_timesteps(
+                combined_timesteps,
+                base_timesteps=sigma,
+                target_offset=ref_seq_len,
+                tokens_per_frame=tgt_height * tgt_width,
+                latent_idx_guide_slot=latent_idx_guide_slot,
+                video_anchor_frame_mask=video_anchor_frame_mask,
+                video_anchor_strength=video_anchor_strength,
+            )
 
             frame_rate_v2v = frame_rate
             if frame_rate_v2v is None:
@@ -5915,7 +5973,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     tgt_video_cond_mask[video_conditioning_enabled, :first_frame_tokens] = True
             # latent_idx guide: mark target-side guide-slot tokens as clean conditioning
             if latent_idx_guide_slot is not None:
-                _slot_idx, _slot_T = latent_idx_guide_slot
+                _slot_idx, _slot_T, _ = latent_idx_guide_slot
                 _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
                 tgt_video_cond_mask[:, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame] = True
             if video_anchor_frame_mask is not None:
@@ -5933,6 +5991,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
             video_combined_ts = torch.where(video_cond_mask, torch.zeros_like(video_combined_ts), video_combined_ts)
+            video_combined_ts = _apply_graded_video_timesteps(
+                video_combined_ts,
+                base_timesteps=sigma,
+                target_offset=ref_video_seq_len,
+                tokens_per_frame=int(latents.shape[3]) * int(latents.shape[4]),
+                latent_idx_guide_slot=latent_idx_guide_slot,
+                video_anchor_frame_mask=video_anchor_frame_mask,
+                video_anchor_strength=video_anchor_strength,
+            )
 
             # Video positions
             av_ic_frame_rate = frame_rate if frame_rate is not None else 25
@@ -6598,7 +6665,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 if first_frame_tokens > 0:
                     tgt_video_cond_mask[video_conditioning_enabled, :first_frame_tokens] = True
             if latent_idx_guide_slot is not None:
-                _slot_idx, _slot_T = latent_idx_guide_slot
+                _slot_idx, _slot_T, _ = latent_idx_guide_slot
                 _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
                 tgt_video_cond_mask[:, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame] = True
             if video_anchor_frame_mask is not None:
@@ -6616,6 +6683,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
             video_combined_ts = torch.where(video_cond_mask, torch.zeros_like(video_combined_ts), video_combined_ts)
+            video_combined_ts = _apply_graded_video_timesteps(
+                video_combined_ts,
+                base_timesteps=sigma,
+                target_offset=ref_video_seq_len,
+                tokens_per_frame=int(latents.shape[3]) * int(latents.shape[4]),
+                latent_idx_guide_slot=latent_idx_guide_slot,
+                video_anchor_frame_mask=video_anchor_frame_mask,
+                video_anchor_strength=video_anchor_strength,
+            )
 
             ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
             tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
@@ -6897,7 +6973,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         latent_idx_guide_token_mask: Optional[torch.Tensor] = None
         latent_idx_guide_loss_mask: Optional[torch.Tensor] = None
         if latent_idx_guide_slot is not None:
-            _slot_idx, _slot_T = latent_idx_guide_slot
+            _slot_idx, _slot_T, _ = latent_idx_guide_slot
             bsz_g, _c, frames_g, h_g, w_g = latents.shape
             seq_len_g = frames_g * h_g * w_g
             tokens_per_frame = h_g * w_g
@@ -7034,6 +7110,29 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         resolved_transformer_options = dict(transformer_options)
         if video_conditioning_mask_tokens is not None:
             resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+            base_video_timesteps = model_timesteps
+            if base_video_timesteps.dim() == 1:
+                base_video_timesteps = base_video_timesteps.unsqueeze(1)
+            base_video_timesteps = base_video_timesteps.expand(
+                model_noisy_video.shape[0],
+                model_noisy_video.shape[2] * model_noisy_video.shape[3] * model_noisy_video.shape[4],
+            )
+            video_timestep_override = torch.where(
+                video_conditioning_mask_tokens,
+                torch.zeros_like(base_video_timesteps),
+                base_video_timesteps,
+            )
+            graded_video_timesteps = _apply_graded_video_timesteps(
+                video_timestep_override,
+                base_timesteps=model_timesteps,
+                target_offset=0,
+                tokens_per_frame=model_noisy_video.shape[3] * model_noisy_video.shape[4],
+                latent_idx_guide_slot=latent_idx_guide_slot,
+                video_anchor_frame_mask=video_anchor_frame_mask,
+                video_anchor_strength=video_anchor_strength,
+            )
+            if graded_video_timesteps is not video_timestep_override:
+                resolved_transformer_options["video_timestep_override"] = graded_video_timesteps
         if self._tread_enabled:
             raw_force_keep_mask = self._normalize_video_force_keep_mask(
                 batch.get("force_keep_mask"),

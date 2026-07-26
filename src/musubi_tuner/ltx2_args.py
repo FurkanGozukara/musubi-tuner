@@ -906,6 +906,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--ltx2_graded_conditioning",
+        action="store_true",
+        help=(
+            "Allow partial-strength latent_idx guides and video anchors during training. "
+            "Their effective timestep is (1-strength)*sigma. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--ltx2_causal_temporal_attention",
+        action="store_true",
+        help="Use causal-by-video-time self-attention during training. Requires --sdpa and is off by default.",
+    )
+    parser.add_argument(
+        "--ltx2_soft_av_alignment",
+        action="store_true",
+        help="Bias AV cross-attention toward temporally aligned tokens. Requires AV mode and --sdpa; off by default.",
+    )
+    parser.add_argument(
+        "--ltx2_soft_av_alignment_sigma",
+        type=float,
+        default=0.5,
+        help="Gaussian temporal width in seconds for --ltx2_soft_av_alignment. Default 0.5.",
+    )
+    parser.add_argument(
         "--video_anchor_probability",
         type=float,
         default=0.5,
@@ -926,6 +950,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Anchor placement strategy for --video_anchor_training. "
             "'endpoints' keeps first/last frames only, 'random' samples anchors uniformly, "
             "and 'endpoints_random' combines both."
+        ),
+    )
+    parser.add_argument(
+        "--video_anchor_strength",
+        type=float,
+        default=1.0,
+        help=(
+            "Conditioning strength for --video_anchor_training. 1.0 keeps clean binary anchors; "
+            "values below 1.0 require --ltx2_graded_conditioning. Default 1.0."
         ),
     )
     parser.add_argument(
