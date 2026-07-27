@@ -7,6 +7,7 @@ import logging
 import re
 import wave
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -243,7 +244,7 @@ def _save_video_mp4(path: Path, frame_chunks: list[torch.Tensor], fps: float) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     container = av.open(str(path), mode="w")
     try:
-        stream = container.add_stream("libx264", rate=fps)
+        stream = container.add_stream("libx264", rate=Fraction(str(fps)))
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv420p"
