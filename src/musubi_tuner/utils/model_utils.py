@@ -274,19 +274,26 @@ def compile_transformer(
     disable_linear: bool,
     offloaders: Optional[list[Any]] = None,
 ) -> torch.nn.Module:
-    if str(args.compile_backend).strip().casefold() == "inductor":
-        ensure_training_compile_environment()
     fallback_on_first_error = _compile_fallback_enabled()
-    resident_only_requested = bool(getattr(args, "compile_resident_blocks_only", False))
-    resident_only = resident_only_requested and disable_linear
     compile_state = {
         "enabled": True,
         "verified": set(),
         "fallback_reason": "",
         "reported_success": False,
-        "policy": "resident_only" if resident_only else "all_blocks",
+        "policy": "all_blocks",
         "plans": [],
     }
+    if str(args.compile_backend).strip().casefold() == "inductor":
+        toolchain = ensure_training_compile_environment(required=not fallback_on_first_error)
+        if not toolchain.ok:
+            return _use_eager_compile_fallback(
+                transformer,
+                compile_state,
+                f"native toolchain unavailable: {toolchain.detail}",
+            )
+    resident_only_requested = bool(getattr(args, "compile_resident_blocks_only", False))
+    resident_only = resident_only_requested and disable_linear
+    compile_state["policy"] = "resident_only" if resident_only else "all_blocks"
 
     if resident_only:
         selector_error = None
@@ -358,26 +365,39 @@ def compile_transformer(
     if args.compile_cache_size_limit is not None:
         torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
 
-    for group_index, blocks in enumerate(target_blocks):
-        compile_indices = compile_state["plans"][group_index]["compile_indices"]
-        for i in compile_indices:
-            block = blocks[i]
-            original_block = block
-            compiled_block = torch.compile(
-                block,
-                backend=args.compile_backend,
-                mode=args.compile_mode,
-                dynamic=compile_dynamic,
-                fullgraph=args.compile_fullgraph,
-            )
-            _install_first_call_fallback(
-                compiled_block,
-                original_block,
-                compile_state,
-                label=f"{original_block.__class__.__name__}[{group_index}:{i}]",
-                fallback_enabled=fallback_on_first_error,
-            )
-            blocks[i] = compiled_block
+    installed_blocks = []
+    try:
+        for group_index, blocks in enumerate(target_blocks):
+            compile_indices = compile_state["plans"][group_index]["compile_indices"]
+            for i in compile_indices:
+                block = blocks[i]
+                original_block = block
+                compiled_block = torch.compile(
+                    block,
+                    backend=args.compile_backend,
+                    mode=args.compile_mode,
+                    dynamic=compile_dynamic,
+                    fullgraph=args.compile_fullgraph,
+                )
+                _install_first_call_fallback(
+                    compiled_block,
+                    original_block,
+                    compile_state,
+                    label=f"{original_block.__class__.__name__}[{group_index}:{i}]",
+                    fallback_enabled=fallback_on_first_error,
+                )
+                blocks[i] = compiled_block
+                installed_blocks.append((blocks, i, original_block))
+    except Exception as exc:
+        if not fallback_on_first_error:
+            raise
+        for blocks, index, original_block in installed_blocks:
+            blocks[index] = original_block
+        return _use_eager_compile_fallback(
+            transformer,
+            compile_state,
+            f"torch.compile setup failed: {type(exc).__name__}: {exc}",
+        )
     compile_state["expected_compiled_blocks"] = sum(len(plan["compile_indices"]) for plan in compile_state["plans"])
     compile_state["enabled"] = compile_state["expected_compiled_blocks"] > 0
     if not compile_state["enabled"]:
@@ -395,6 +415,23 @@ def compile_transformer(
     diagnostics_path = os.environ.get("MUSUBI_COMPILE_DIAGNOSTICS_PATH")
     if diagnostics_path:
         _register_compile_diagnostics(Path(diagnostics_path), compile_state)
+    return transformer
+
+
+def _use_eager_compile_fallback(
+    transformer: torch.nn.Module,
+    compile_state: dict[str, Any],
+    reason: str,
+) -> torch.nn.Module:
+    compile_state["enabled"] = False
+    compile_state["fallback_reason"] = reason
+    compile_state["expected_compiled_blocks"] = 0
+    os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"] = "0"
+    transformer.__dict__["_musubi_compile_state"] = compile_state
+    diagnostics_path = os.environ.get("MUSUBI_COMPILE_DIAGNOSTICS_PATH")
+    if diagnostics_path:
+        _register_compile_diagnostics(Path(diagnostics_path), compile_state)
+    logger.warning("torch.compile is unavailable; continuing with eager training: %s", reason)
     return transformer
 
 

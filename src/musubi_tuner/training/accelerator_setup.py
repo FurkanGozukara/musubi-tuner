@@ -12,6 +12,7 @@ from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParal
 from accelerate.utils import TorchDynamoPlugin, DynamoBackend
 
 from musubi_tuner.training.compile_setup import (
+    disable_unavailable_dynamo_backend,
     ensure_training_compile_environment,
     native_compile_toolchain_requested,
 )
@@ -56,7 +57,8 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     DeepSpeed is not supported in this script currently.
     """
     if native_compile_toolchain_requested(args):
-        ensure_training_compile_environment()
+        compile_status = ensure_training_compile_environment()
+        disable_unavailable_dynamo_backend(args, compile_status)
 
     if args.logging_dir is None:
         logging_dir = None

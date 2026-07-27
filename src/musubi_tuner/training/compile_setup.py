@@ -58,13 +58,15 @@ def native_compile_toolchain_requested(args: Any | None = None) -> bool:
 
 def ensure_training_compile_environment(
     *,
-    required: bool = True,
+    required: bool = False,
     force: bool = False,
 ) -> CompileToolchainStatus:
-    """Prepare the current process before the first compilation attempt."""
+    """Prepare compilation, defaulting to eager training when unavailable."""
 
     global _ready_status
     if _ready_status is not None and not force:
+        if required and not _ready_status.ok:
+            raise TorchCompileToolchainError(_unavailable_message(_ready_status))
         return _ready_status
 
     project_root = Path(__file__).resolve().parents[3]
@@ -78,16 +80,32 @@ def ensure_training_compile_environment(
     )
     os.environ["MUSUBI_TORCH_COMPILE_READY"] = "1" if status.ok else "0"
     os.environ["MUSUBI_TORCH_COMPILE_DETAIL"] = status.detail
+    _ready_status = status
     if status.ok:
-        _ready_status = status
         logger.info("torch.compile toolchain ready: %s", status.detail)
         return status
 
-    message = f"torch.compile was requested but its native toolchain is unavailable: {status.detail}"
+    os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"] = "0"
+    message = _unavailable_message(status)
     if required:
         raise TorchCompileToolchainError(message)
-    logger.warning(message)
+    logger.warning("%s Continuing with eager training.", message)
     return status
+
+
+def disable_unavailable_dynamo_backend(args: Any, status: CompileToolchainStatus) -> None:
+    """Prevent Accelerate Dynamo from bypassing the eager fallback."""
+
+    if status.ok:
+        return
+    if str(getattr(args, "dynamo_backend", "") or "").strip().casefold() in _NATIVE_CODEGEN_BACKENDS:
+        args.dynamo_backend = "NO"
+    if str(os.environ.get("ACCELERATE_DYNAMO_BACKEND", "") or "").strip().casefold() in _NATIVE_CODEGEN_BACKENDS:
+        os.environ["ACCELERATE_DYNAMO_BACKEND"] = "NO"
+
+
+def _unavailable_message(status: CompileToolchainStatus) -> str:
+    return f"torch.compile was requested but its native toolchain is unavailable: {status.detail}"
 
 
 def _env_flag(name: str, default: bool) -> bool:

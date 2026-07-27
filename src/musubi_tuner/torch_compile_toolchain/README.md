@@ -78,11 +78,34 @@ Default cache directories are:
 
 Explicit `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` values are preserved.
 
+## Probe Cache
+
+Successful compiler and CUDA probes are cached inside the current installation
+at `<project>/.cache/torch_compile/toolchain_probe_v1.json`. This location stays
+install-local even when Inductor or Triton artifact caches are redirected
+elsewhere, so a fresh installation performs a fresh verification. The cache
+contains only a compiler-related environment allowlist and file fingerprints;
+it never stores the complete process environment. A matching GUI-launched
+training process trusts the exact verified environment inherited from its
+parent, so distributed workers do not repeat `probe.exe`.
+
+The persisted result expires after 30 days and is invalidated immediately when
+the compiler, CUDA Toolkit, Ninja, relevant SDK paths, requirements, Python, or
+PyTorch CUDA version changes. Set `MUSUBI_TORCH_COMPILE_FORCE_PROBE=1` or pass
+`--force-probe` to run a fresh check. Set
+`MUSUBI_TORCH_COMPILE_CACHE_PROBE=0` to disable persistence.
+
+`torch.compile` remains optional. Training logs a warning and continues eagerly
+when toolchain preparation, wrapper creation, or the first compiled call fails.
+Set `MUSUBI_TORCH_COMPILE_FALLBACK=0` only when strict fail-fast behavior is
+needed for diagnostics.
+
 ## Diagnostic
 
 ```text
 python -m musubi_tuner.torch_compile_toolchain --require-openmp --smoke-test
 python -m musubi_tuner.torch_compile_toolchain --json --verbose
+python -m musubi_tuner.torch_compile_toolchain --require-openmp --force-probe
 ```
 
 The smoke test executes a real compiled forward and backward pass on CUDA when

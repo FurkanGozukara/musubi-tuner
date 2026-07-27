@@ -18,6 +18,11 @@ def main() -> int:
     parser.add_argument("--require-ninja", action="store_true")
     parser.add_argument("--require-openmp", action="store_true")
     parser.add_argument(
+        "--force-probe",
+        action="store_true",
+        help="Ignore cached verification and run fresh compiler probes.",
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Run one real torch.compile call after discovery succeeds.",
@@ -32,6 +37,7 @@ def main() -> int:
         require_cuda_toolkit=args.require_cuda_toolkit,
         require_ninja=args.require_ninja,
         require_openmp=args.require_openmp,
+        force_probe=args.force_probe,
     )
     if args.as_json:
         print(json.dumps(status.as_dict(), indent=2))

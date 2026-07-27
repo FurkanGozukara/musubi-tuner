@@ -41,9 +41,13 @@ from musubi_tuner.torch_compile_toolchain.runtime import (
 )
 from musubi_tuner.torch_compile_toolchain import example
 from musubi_tuner.training.compile_setup import (
+    TorchCompileToolchainError,
     compile_requested,
+    disable_unavailable_dynamo_backend,
+    ensure_training_compile_environment,
     native_compile_toolchain_requested,
 )
+from musubi_tuner.training import compile_setup as training_compile_setup
 from musubi_tuner.modules.custom_offloading_utils import LoRAStreamOffloader, Offloader
 from musubi_tuner.utils import model_utils
 
@@ -501,6 +505,271 @@ class PosixDiscoveryTests(unittest.TestCase):
         self.assertEqual("/tools/g++-13", env["CUDAHOSTCXX"])
 
 
+class ProbeVerificationCacheTests(unittest.TestCase):
+    def _paths(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        compiler = root / "msvc" / "cl.exe"
+        ninja = root / "tools" / "ninja.exe"
+        cuda_root = root / "cuda"
+        nvcc = cuda_root / "bin" / "nvcc.exe"
+        for path in (compiler, ninja, nvcc):
+            _touch_executable(path)
+        return compiler, ninja, cuda_root, nvcc
+
+    def _ensure_windows(
+        self,
+        env,
+        *,
+        compiler,
+        ninja,
+        cuda_root,
+        nvcc,
+        cache_dir,
+        forbid_probes=False,
+        force_probe=False,
+    ):
+        def discover_cuda(candidate):
+            candidate["CUDA_HOME"] = str(cuda_root)
+            candidate["CUDA_PATH"] = str(cuda_root)
+            candidate["CUDACXX"] = str(nvcc)
+            return CudaDiscoveryStatus(True, "CUDA ready", str(cuda_root), True)
+
+        def discover_ninja_mock(candidate):
+            candidate["NINJA"] = str(ninja)
+            return ExecutableStatus(True, "ninja ready", str(ninja))
+
+        probe_effect = AssertionError("native probe should have been skipped") if forbid_probes else None
+        with (
+            patch("musubi_tuner.torch_compile_toolchain.environment.sys.platform", "win32"),
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment.discover_cuda_environment",
+                side_effect=discover_cuda if not forbid_probes else probe_effect,
+            ),
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment.discover_ninja",
+                side_effect=discover_ninja_mock if not forbid_probes else probe_effect,
+            ),
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment.has_cl_exe",
+                side_effect=probe_effect if forbid_probes else None,
+                return_value=True,
+            ),
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment.probe_host_cpp_compiler",
+                side_effect=probe_effect,
+                return_value=HostCompilerProbeStatus(True, "host probe passed with OpenMP"),
+            ) as host_probe,
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment.probe_cuda_compiler",
+                side_effect=probe_effect,
+                return_value=CompilerProbeStatus(True, "CUDA probe passed"),
+            ) as cuda_probe,
+            patch(
+                "musubi_tuner.torch_compile_toolchain.environment._compiler_on_path",
+                return_value=str(compiler),
+            ),
+            patch(
+                "musubi_tuner.torch_compile_toolchain.readiness_cache.torch_cuda_version",
+                return_value="13.1",
+            ),
+        ):
+            status = ensure_compile_environment(
+                env,
+                cache_dir=cache_dir,
+                require_openmp=True,
+                force_probe=force_probe,
+            )
+        return status, host_probe, cuda_probe
+
+    def test_successful_probe_is_reused_from_disk_without_running_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compiler, ninja, cuda_root, nvcc = self._paths(root)
+            cache_dir = root / "cache"
+            base = {"PATH": "base", "AWS_SECRET_ACCESS_KEY": "do-not-persist"}
+
+            first_env = dict(base)
+            first, host_probe, cuda_probe = self._ensure_windows(
+                first_env,
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+            )
+            cache_text = (cache_dir / "toolchain_probe_v1.json").read_text(encoding="utf-8")
+
+            second_env = dict(base)
+            second, skipped_host, skipped_cuda = self._ensure_windows(
+                second_env,
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+                forbid_probes=True,
+            )
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.ok)
+        self.assertEqual(1, host_probe.call_count)
+        self.assertEqual(1, cuda_probe.call_count)
+        skipped_host.assert_not_called()
+        skipped_cuda.assert_not_called()
+        self.assertIn("toolchain probe cache hit", second.detail)
+        self.assertEqual(str(cuda_root), second_env["CUDA_HOME"])
+        self.assertEqual(str(ninja), second_env["NINJA"])
+        self.assertNotIn("do-not-persist", cache_text)
+
+    def test_inherited_verified_environment_skips_child_process_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compiler, ninja, cuda_root, nvcc = self._paths(root)
+            cache_dir = root / "cache"
+            parent_env = {"PATH": "base"}
+            first, _, _ = self._ensure_windows(
+                parent_env,
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+            )
+            parent_env["MUSUBI_TORCH_COMPILE_DETAIL"] = first.detail
+            (cache_dir / "toolchain_probe_v1.json").unlink()
+
+            child_env = dict(parent_env)
+            child, skipped_host, skipped_cuda = self._ensure_windows(
+                child_env,
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+                forbid_probes=True,
+            )
+
+        self.assertTrue(child.ok)
+        skipped_host.assert_not_called()
+        skipped_cuda.assert_not_called()
+        self.assertIn("inherited toolchain verification reused", child.detail)
+
+    def test_changed_compiler_invalidates_persisted_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compiler, ninja, cuda_root, nvcc = self._paths(root)
+            cache_dir = root / "cache"
+            base = {"PATH": "base"}
+            self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+            )
+            compiler.write_bytes(b"changed compiler")
+
+            refreshed, host_probe, cuda_probe = self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+            )
+
+        self.assertTrue(refreshed.ok)
+        self.assertNotIn("toolchain probe cache hit", refreshed.detail)
+        self.assertEqual(1, host_probe.call_count)
+        self.assertEqual(1, cuda_probe.call_count)
+
+    def test_force_probe_bypasses_a_valid_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compiler, ninja, cuda_root, nvcc = self._paths(root)
+            cache_dir = root / "cache"
+            base = {"PATH": "base"}
+            self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+            )
+
+            refreshed, host_probe, cuda_probe = self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=cache_dir,
+                force_probe=True,
+            )
+
+        self.assertTrue(refreshed.ok)
+        self.assertNotIn("toolchain probe cache hit", refreshed.detail)
+        self.assertEqual(1, host_probe.call_count)
+        self.assertEqual(1, cuda_probe.call_count)
+
+    def test_validation_cache_stays_install_local_when_artifact_cache_is_redirected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compiler, ninja, cuda_root, nvcc = self._paths(root)
+            install_cache = root / "fresh-install" / ".cache" / "torch_compile"
+            artifact_cache = root / "shared-artifacts"
+            (artifact_cache / "inductor").mkdir(parents=True)
+            (artifact_cache / "triton").mkdir(parents=True)
+            base = {
+                "PATH": "base",
+                "TORCHINDUCTOR_CACHE_DIR": str(artifact_cache / "inductor"),
+                "TRITON_CACHE_DIR": str(artifact_cache / "triton"),
+            }
+
+            first, _, _ = self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=install_cache,
+            )
+            second, skipped_host, skipped_cuda = self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=install_cache,
+                forbid_probes=True,
+            )
+            fresh_install_cache = root / "second-fresh-install" / ".cache" / "torch_compile"
+            fresh_install, fresh_host, fresh_cuda = self._ensure_windows(
+                dict(base),
+                compiler=compiler,
+                ninja=ninja,
+                cuda_root=cuda_root,
+                nvcc=nvcc,
+                cache_dir=fresh_install_cache,
+            )
+            install_cache_exists = (install_cache / "toolchain_probe_v1.json").is_file()
+            fresh_install_cache_exists = (fresh_install_cache / "toolchain_probe_v1.json").is_file()
+            shared_cache_exists = (artifact_cache / "toolchain_probe_v1.json").exists()
+
+        self.assertEqual(str(artifact_cache), first.cache_root)
+        self.assertTrue(install_cache_exists)
+        self.assertTrue(fresh_install.ok)
+        self.assertNotIn("toolchain probe cache hit", fresh_install.detail)
+        self.assertTrue(fresh_install_cache_exists)
+        self.assertEqual(1, fresh_host.call_count)
+        self.assertEqual(1, fresh_cuda.call_count)
+        self.assertFalse(shared_cache_exists)
+        self.assertIn("toolchain probe cache hit", second.detail)
+        skipped_host.assert_not_called()
+        skipped_cuda.assert_not_called()
+
+
 class SubprocessAndRequestTests(unittest.TestCase):
     def test_example_uses_repository_root(self):
         self.assertEqual(Path(__file__).resolve().parents[1], example.PROJECT_ROOT)
@@ -559,6 +828,53 @@ class SubprocessAndRequestTests(unittest.TestCase):
         self.assertFalse(native_compile_toolchain_requested(args))
         args.dynamo_backend = "inductor"
         self.assertTrue(native_compile_toolchain_requested(args))
+
+
+class TrainingCompileFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.original_status = training_compile_setup._ready_status
+        training_compile_setup._ready_status = None
+
+    def tearDown(self):
+        training_compile_setup._ready_status = self.original_status
+
+    def test_unavailable_toolchain_defaults_to_nonfatal_eager_fallback(self):
+        unavailable = CompileToolchainStatus(False, "synthetic compiler failure")
+        with (
+            patch(
+                "musubi_tuner.training.compile_setup.ensure_compile_environment",
+                return_value=unavailable,
+            ) as ensure,
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            status = ensure_training_compile_environment()
+            cached_status = ensure_training_compile_environment()
+            ready = os.environ["MUSUBI_TORCH_COMPILE_READY"]
+            active = os.environ["MUSUBI_TORCH_COMPILE_ACTIVE"]
+
+        self.assertIs(unavailable, status)
+        self.assertIs(unavailable, cached_status)
+        self.assertEqual(1, ensure.call_count)
+        self.assertEqual("0", ready)
+        self.assertEqual("0", active)
+
+    def test_strict_toolchain_mode_can_still_raise(self):
+        unavailable = CompileToolchainStatus(False, "synthetic compiler failure")
+        with patch(
+            "musubi_tuner.training.compile_setup.ensure_compile_environment",
+            return_value=unavailable,
+        ):
+            ensure_training_compile_environment()
+            with self.assertRaises(TorchCompileToolchainError):
+                ensure_training_compile_environment(required=True)
+
+    def test_unavailable_toolchain_disables_accelerate_inductor_backend(self):
+        args = SimpleNamespace(dynamo_backend="inductor")
+        status = CompileToolchainStatus(False, "unavailable")
+        with patch.dict(os.environ, {"ACCELERATE_DYNAMO_BACKEND": "inductor"}, clear=False):
+            disable_unavailable_dynamo_backend(args, status)
+            self.assertEqual("NO", os.environ["ACCELERATE_DYNAMO_BACKEND"])
+        self.assertEqual("NO", args.dynamo_backend)
 
 
 class PortableCompileRuntimeTests(unittest.TestCase):
@@ -701,6 +1017,72 @@ class CompiledBlockFallbackTests(unittest.TestCase):
         torch.testing.assert_close(output, original(value))
         self.assertFalse(compiled._musubi_compile_state["enabled"])
         self.assertIn("blocks.0._orig_mod.weight", compiled.state_dict())
+
+    def test_unavailable_toolchain_leaves_transformer_eager(self):
+        transformer = self.Transformer()
+        original = transformer.blocks[0]
+        args = SimpleNamespace(
+            compile_dynamic="auto",
+            compile_backend="inductor",
+            compile_mode="default",
+            compile_fullgraph=False,
+            compile_cache_size_limit=None,
+        )
+        unavailable = CompileToolchainStatus(False, "synthetic toolchain failure")
+
+        with (
+            patch(
+                "musubi_tuner.utils.model_utils.ensure_training_compile_environment",
+                return_value=unavailable,
+            ),
+            patch("musubi_tuner.utils.model_utils.torch.compile") as compile_mock,
+            patch.dict(os.environ, {"MUSUBI_TORCH_COMPILE_FALLBACK": "1"}, clear=False),
+        ):
+            result = model_utils.compile_transformer(
+                args,
+                transformer,
+                [transformer.blocks],
+                disable_linear=False,
+            )
+
+        self.assertIs(transformer, result)
+        self.assertIs(original, result.blocks[0])
+        compile_mock.assert_not_called()
+        self.assertFalse(result._musubi_compile_state["enabled"])
+        self.assertIn("toolchain unavailable", result._musubi_compile_state["fallback_reason"])
+
+    def test_torch_compile_setup_exception_leaves_transformer_eager(self):
+        transformer = self.Transformer()
+        original = transformer.blocks[0]
+        args = SimpleNamespace(
+            compile_dynamic="auto",
+            compile_backend="inductor",
+            compile_mode="default",
+            compile_fullgraph=False,
+            compile_cache_size_limit=None,
+        )
+
+        with (
+            patch(
+                "musubi_tuner.utils.model_utils.ensure_training_compile_environment",
+                return_value=CompileToolchainStatus(True, "ready"),
+            ),
+            patch(
+                "musubi_tuner.utils.model_utils.torch.compile",
+                side_effect=RuntimeError("synthetic setup failure"),
+            ),
+            patch.dict(os.environ, {"MUSUBI_TORCH_COMPILE_FALLBACK": "1"}, clear=False),
+        ):
+            result = model_utils.compile_transformer(
+                args,
+                transformer,
+                [transformer.blocks],
+                disable_linear=False,
+            )
+
+        self.assertIs(original, result.blocks[0])
+        self.assertFalse(result._musubi_compile_state["enabled"])
+        self.assertIn("setup failed", result._musubi_compile_state["fallback_reason"])
 
     def test_fallback_disabled_still_records_verified_compiled_blocks(self):
         transformer = self.Transformer()

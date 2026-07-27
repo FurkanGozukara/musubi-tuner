@@ -23,6 +23,15 @@ from .msvc import (
     has_cl_exe,
     load_msvc_environment,
 )
+from .readiness_cache import (
+    VerifiedToolchain,
+    clear_verification_markers,
+    force_probe_requested,
+    probe_cache_enabled,
+    record_successful_verification,
+    restore_inherited_verification,
+    restore_persisted_verification,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +73,7 @@ def ensure_compile_environment(
     require_cuda_toolkit: bool = False,
     require_ninja: bool = False,
     require_openmp: bool = False,
+    force_probe: bool = False,
 ) -> CompileToolchainStatus:
     """Prepare the current or supplied environment for PyTorch Inductor.
 
@@ -77,6 +87,8 @@ def ensure_compile_environment(
             do not need Ninja, while C++/CUDA extension builds generally do.
         require_openmp: Require the host C++ probe to compile and link an OpenMP
             program. This is recommended for PyTorch Inductor training workloads.
+        force_probe: Ignore inherited and persisted verification and run fresh
+            native compiler probes.
 
     Returns:
         Toolchain status with a human-readable detail string.
@@ -84,7 +96,44 @@ def ensure_compile_environment(
 
     target_env = os.environ if env is None else env
     before = dict(target_env)
+    requirements = {
+        "require_cuda_toolkit": require_cuda_toolkit,
+        "require_ninja": require_ninja,
+        "require_openmp": require_openmp,
+    }
     cache_root = _ensure_compile_cache_dirs(target_env, project_root, cache_dir)
+    validation_cache_root = _validation_cache_root(
+        project_root,
+        cache_dir,
+        cache_root,
+    )
+    must_probe = force_probe or force_probe_requested(target_env)
+    cache_enabled = probe_cache_enabled(target_env)
+    if not must_probe:
+        inherited = restore_inherited_verification(target_env, requirements)
+        if inherited is not None:
+            return _status_from_verification(
+                inherited,
+                target_env != before,
+                cache_root,
+                "inherited toolchain verification reused",
+            )
+        if cache_enabled:
+            cached = restore_persisted_verification(
+                before,
+                target_env,
+                validation_cache_root,
+                requirements,
+            )
+            if cached is not None:
+                return _status_from_verification(
+                    cached,
+                    target_env != before,
+                    cache_root,
+                    "toolchain probe cache hit",
+                )
+    clear_verification_markers(target_env)
+
     cuda_status = discover_cuda_environment(target_env)
     if sys.platform != "win32":
         compiler_status = discover_posix_compiler(
@@ -93,7 +142,7 @@ def ensure_compile_environment(
         )
         ninja_status = discover_ninja(target_env)
         detail = _join_details(cuda_status.detail, compiler_status.detail, ninja_status.detail)
-        return CompileToolchainStatus(
+        status = CompileToolchainStatus(
             _requirements_satisfied(
                 compiler_status.ok,
                 cuda_status.ok,
@@ -108,6 +157,14 @@ def ensure_compile_environment(
             compiler_path=_status_value(compiler_status, "path"),
             ninja_path=_status_value(ninja_status, "path"),
             cache_root=cache_root,
+        )
+        return _finalize_verification(
+            status,
+            before,
+            target_env,
+            requirements,
+            cache_enabled,
+            validation_cache_root,
         )
 
     if has_cl_exe(target_env):
@@ -126,7 +183,7 @@ def ensure_compile_environment(
                 probe.detail,
                 ninja_status.detail,
             )
-            return CompileToolchainStatus(
+            status = CompileToolchainStatus(
                 _requirements_satisfied(
                     True,
                     cuda_status.ok,
@@ -141,6 +198,14 @@ def ensure_compile_environment(
                 compiler_path=_compiler_on_path(target_env),
                 ninja_path=_status_value(ninja_status, "path"),
                 cache_root=cache_root,
+            )
+            return _finalize_verification(
+                status,
+                before,
+                target_env,
+                requirements,
+                cache_enabled,
+                validation_cache_root,
             )
         if not host_probe.ok:
             logger.warning(
@@ -158,7 +223,7 @@ def ensure_compile_environment(
     if status.ok:
         cuda_status = discover_cuda_environment(target_env)
         detail = _join_details(cuda_status.detail, status.detail, ninja_status.detail)
-        return CompileToolchainStatus(
+        compile_status = CompileToolchainStatus(
             _requirements_satisfied(
                 True,
                 cuda_status.ok,
@@ -173,6 +238,14 @@ def ensure_compile_environment(
             compiler_path=_compiler_on_path(target_env),
             ninja_path=_status_value(ninja_status, "path"),
             cache_root=cache_root,
+        )
+        return _finalize_verification(
+            compile_status,
+            before,
+            target_env,
+            requirements,
+            cache_enabled,
+            validation_cache_root,
         )
     detail = _join_details(cuda_status.detail, status.detail, ninja_status.detail)
     return CompileToolchainStatus(
@@ -196,6 +269,7 @@ def prepare_compile_subprocess_env(
     require_cuda_toolkit: bool = False,
     require_ninja: bool = False,
     require_openmp: bool = False,
+    force_probe: bool = False,
 ) -> dict[str, str]:
     """Return a subprocess environment prepared only when compile is requested."""
 
@@ -208,6 +282,7 @@ def prepare_compile_subprocess_env(
             require_cuda_toolkit=require_cuda_toolkit,
             require_ninja=require_ninja,
             require_openmp=require_openmp,
+            force_probe=force_probe,
         )
         if not status.ok:
             logger.warning("torch.compile toolchain preparation: %s", status.detail)
@@ -221,6 +296,7 @@ def compile_environment_report(
     require_cuda_toolkit: bool = False,
     require_ninja: bool = False,
     require_openmp: bool = False,
+    force_probe: bool = False,
 ) -> CompileToolchainStatus:
     """Return the current process toolchain status for diagnostics."""
 
@@ -231,7 +307,68 @@ def compile_environment_report(
         require_cuda_toolkit=require_cuda_toolkit,
         require_ninja=require_ninja,
         require_openmp=require_openmp,
+        force_probe=force_probe,
     )
+
+
+def _finalize_verification(
+    status: CompileToolchainStatus,
+    base_env: MutableMapping[str, str],
+    prepared_env: MutableMapping[str, str],
+    requirements: dict[str, bool],
+    cache_enabled: bool,
+    validation_cache_root: str,
+) -> CompileToolchainStatus:
+    if not status.ok:
+        return status
+    verified = VerifiedToolchain(
+        detail=status.detail,
+        platform=status.platform,
+        cuda_root=status.cuda_root,
+        compiler_path=status.compiler_path,
+        ninja_path=status.ninja_path,
+    )
+    record_successful_verification(
+        base_env,
+        prepared_env,
+        validation_cache_root,
+        verified,
+        requirements,
+        persist=cache_enabled,
+    )
+    return status
+
+
+def _status_from_verification(
+    verified: VerifiedToolchain,
+    changed: bool,
+    cache_root: str,
+    reuse_detail: str,
+) -> CompileToolchainStatus:
+    return CompileToolchainStatus(
+        True,
+        _join_details(verified.detail, reuse_detail),
+        changed,
+        platform=verified.platform,
+        cuda_root=verified.cuda_root,
+        compiler_path=verified.compiler_path,
+        ninja_path=verified.ninja_path,
+        cache_root=cache_root,
+    )
+
+
+def _validation_cache_root(
+    project_root: str | Path | None,
+    cache_dir: str | Path | None,
+    compile_cache_root: str,
+) -> str:
+    """Keep probe readiness local to this installation when possible."""
+
+    if cache_dir is not None:
+        return str(Path(cache_dir).expanduser().resolve())
+    if project_root is not None:
+        return str(Path(project_root).expanduser().resolve() / ".cache" / "torch_compile_toolchain")
+    return compile_cache_root
 
 
 def _ensure_compile_cache_dirs(
