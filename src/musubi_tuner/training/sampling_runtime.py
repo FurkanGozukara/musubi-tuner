@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -36,6 +37,23 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
     # Create a directory to save the samples
     save_dir = os.path.join(args.output_dir, "sample")
     os.makedirs(save_dir, exist_ok=True)
+    audio_metrics = getattr(self, "_audio_metrics", None)
+    if audio_metrics is not None:
+        clap_enabled = getattr(getattr(audio_metrics, "config", None), "clap_similarity", False)
+        missing_seed_indices = [
+            int(parameter.get("enum", index)) for index, parameter in enumerate(sample_parameters) if parameter.get("seed") is None
+        ]
+        if clap_enabled and missing_seed_indices:
+            raise ValueError(
+                "Generated-sample CLAP validation requires an explicit seed for every manifest entry; "
+                f"missing seeds for sample indices {missing_seed_indices}."
+            )
+        if clap_enabled and distributed_state.num_processes > 1:
+            raise ValueError(
+                "Generated-sample CLAP validation currently requires single-process sampling so the "
+                "dataset summary cannot silently omit samples from other ranks."
+            )
+        audio_metrics.begin_validation_sample_run()
 
     # save random state to restore later
     rng_state = torch.get_rng_state()
@@ -74,6 +92,16 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
 
     transformer.switch_block_swap_for_training()
     clean_memory_on_device(accelerator.device)
+    if audio_metrics is not None and accelerator.is_main_process:
+        summary = audio_metrics.compute_validation_summary()
+        if summary:
+            logger.info("Generated-sample validation summary: %s", summary)
+            if len(accelerator.trackers) > 0:
+                accelerator.log(summary, step=steps)
+        report_path = os.path.join(save_dir, f"av_validation_{steps:06d}.json")
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump(audio_metrics.validation_sample_report(), report_file, indent=2, ensure_ascii=False)
+        logger.info("Generated-sample validation report: %s", report_path)
 
 
 def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):

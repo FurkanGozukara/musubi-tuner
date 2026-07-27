@@ -2460,6 +2460,8 @@ class LTX2SamplingMixin:
                     text_prompt=sample_parameter.get("prompt", ""),
                     device=device,
                     sample_rate=sample_rate,
+                    sample_metadata=sample_parameter,
+                    artifact_path=wav_path,
                 )
                 if sample_metrics and len(accelerator.trackers) > 0:
                     accelerator.log(sample_metrics, step=steps)

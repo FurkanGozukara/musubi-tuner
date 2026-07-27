@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class AudioMetricsConfig:
@@ -62,13 +64,21 @@ def parse_audio_metrics_args(raw_args: list[str] | None) -> dict[str, str]:
 def _config_from_kwargs(kw: dict[str, str]) -> AudioMetricsConfig:
     """Build config from parsed key=value dict with type coercion."""
     bool_keys = {
-        "latent_fd", "temporal_coherence", "av_latent_sync",
-        "mel_metrics", "spectral_convergence", "mcd", "log_spectral_distance",
-        "clap_similarity", "av_onset_alignment",
+        "latent_fd",
+        "temporal_coherence",
+        "av_latent_sync",
+        "mel_metrics",
+        "spectral_convergence",
+        "mcd",
+        "log_spectral_distance",
+        "clap_similarity",
+        "av_onset_alignment",
     }
     int_keys = {
-        "latent_fd_window", "latent_fd_compute_every",
-        "mel_compute_every", "mcd_coefficients",
+        "latent_fd_window",
+        "latent_fd_compute_every",
+        "mel_compute_every",
+        "mcd_coefficients",
     }
     str_keys = {"clap_model"}
 
@@ -88,6 +98,7 @@ def _config_from_kwargs(kw: dict[str, str]) -> AudioMetricsConfig:
 # ---------------------------------------------------------------------------
 # Running statistics for Fréchet Distance
 # ---------------------------------------------------------------------------
+
 
 class RunningStats:
     """Online mean and covariance accumulator (Welford's algorithm).
@@ -135,6 +146,7 @@ class RunningStats:
 # Pure-PyTorch Fréchet Distance
 # ---------------------------------------------------------------------------
 
+
 def _matrix_sqrt_spd(m: torch.Tensor) -> torch.Tensor:
     """Symmetric matrix square root of a symmetric PSD matrix via eigh."""
     m = 0.5 * (m + m.T)
@@ -144,8 +156,10 @@ def _matrix_sqrt_spd(m: torch.Tensor) -> torch.Tensor:
 
 
 def _frechet_distance(
-    mu1: torch.Tensor, sigma1: torch.Tensor,
-    mu2: torch.Tensor, sigma2: torch.Tensor,
+    mu1: torch.Tensor,
+    sigma1: torch.Tensor,
+    mu2: torch.Tensor,
+    sigma2: torch.Tensor,
     eps: float = 1e-6,
 ) -> float:
     """Compute Fréchet distance between two multivariate Gaussians.
@@ -171,6 +185,7 @@ def _frechet_distance(
 # Tier 1: Latent-space metrics
 # ---------------------------------------------------------------------------
 
+
 def _temporal_coherence(latent: torch.Tensor) -> float | None:
     """Cosine similarity between adjacent frames in ``[B, C, T, F]`` latent.
 
@@ -187,7 +202,8 @@ def _temporal_coherence(latent: torch.Tensor) -> float | None:
 
 
 def _av_latent_sync(
-    audio: torch.Tensor, video: torch.Tensor,
+    audio: torch.Tensor,
+    video: torch.Tensor,
 ) -> float | None:
     """Pearson correlation between audio and video per-frame energy curves.
 
@@ -239,6 +255,7 @@ def _av_latent_sync(
 # Periodic: Mel-space metrics
 # ---------------------------------------------------------------------------
 
+
 def _spectral_convergence(mel_pred: torch.Tensor, mel_target: torch.Tensor) -> float:
     """||S_pred - S_target||_F / ||S_target||_F."""
     diff_norm = torch.linalg.norm(mel_pred - mel_target)
@@ -256,7 +273,8 @@ def _dct_ii_basis(N: int, n_coeff: int, dtype: torch.dtype, device: torch.device
 
 
 def _mel_cepstral_distortion(
-    mel_pred: torch.Tensor, mel_target: torch.Tensor,
+    mel_pred: torch.Tensor,
+    mel_target: torch.Tensor,
     n_coefficients: int = 13,
 ) -> float | None:
     """MCD: DCT of log-mel, first N coefficients, Euclidean distance per frame.
@@ -308,6 +326,7 @@ def _log_spectral_distance(mel_pred: torch.Tensor, mel_target: torch.Tensor) -> 
 # Sampling-time: Embedding-space metrics (lazy-loaded)
 # ---------------------------------------------------------------------------
 
+
 class _CLAPComputer:
     """CLAP audio-text cosine similarity."""
 
@@ -322,43 +341,63 @@ class _CLAPComputer:
             return
         try:
             from transformers import ClapModel, ClapProcessor
+
             self._model = ClapModel.from_pretrained(self.model_name).to(device).eval()
             self._processor = ClapProcessor.from_pretrained(self.model_name)
         except ImportError as e:
             raise ImportError(
-                "CLAP similarity requires transformers with CLAP support. "
-                "Install with: pip install transformers>=4.30.0"
+                "CLAP similarity requires transformers with CLAP support. Install with: pip install transformers>=4.30.0"
             ) from e
 
     @torch.no_grad()
     def accumulate(
-        self, waveform: torch.Tensor, text_prompt: str,
-        device: torch.device, sample_rate: int = 24000,
+        self,
+        waveform: torch.Tensor,
+        text_prompt: str,
+        device: torch.device,
+        sample_rate: int = 24000,
     ) -> None:
         """Compute and accumulate CLAP similarity for one sample."""
         self._load_model(device)
         self._model.to(device)
 
-        # Resample to 48kHz (CLAP expectation)
-        audio_np = waveform.cpu().float().numpy()
+        # CLAP's feature extractor rejects audio that is not declared and
+        # actually sampled at 48 kHz.
+        clap_sample_rate = 48000
+        waveform = waveform.detach().cpu().float()
+        if sample_rate != clap_sample_rate:
+            try:
+                import torchaudio.functional as AF
+
+                waveform = AF.resample(waveform, int(sample_rate), clap_sample_rate)
+            except (ImportError, OSError):
+                target_samples = max(1, round(waveform.shape[-1] * clap_sample_rate / int(sample_rate)))
+                waveform = F.interpolate(
+                    waveform.reshape(-1, 1, waveform.shape[-1]),
+                    size=target_samples,
+                    mode="linear",
+                    align_corners=False,
+                ).reshape(*waveform.shape[:-1], target_samples)
+
+        audio_np = waveform.numpy()
         if audio_np.ndim == 2:
             audio_np = audio_np[0]  # mono
 
         inputs = self._processor(
             audios=[audio_np],
-            sampling_rate=sample_rate,
+            sampling_rate=clap_sample_rate,
             text=[text_prompt],
             return_tensors="pt",
             padding=True,
         )
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-        audio_emb = self._model.get_audio_features(**{
-            k: v for k, v in inputs.items() if k.startswith("input_features") or k == "is_longer"
-        })
-        text_emb = self._model.get_text_features(**{
-            k: v for k, v in inputs.items() if k.startswith("input_ids") or k == "attention_mask"
-        })
+        audio_emb = self._model.get_audio_features(
+            **{k: v for k, v in inputs.items() if k.startswith("input_features") or k == "is_longer"}
+        )
+        text_emb = self._model.get_text_features(
+            **{k: v for k, v in inputs.items() if k.startswith("input_ids") or k == "attention_mask"}
+        )
 
         cos = F.cosine_similarity(audio_emb, text_emb, dim=-1)
         self._scores.append(float(cos.mean()))
@@ -367,6 +406,10 @@ class _CLAPComputer:
         if not self._scores:
             return None
         return sum(self._scores) / len(self._scores)
+
+    @property
+    def scores(self) -> tuple[float, ...]:
+        return tuple(self._scores)
 
     def reset(self) -> None:
         self._scores.clear()
@@ -395,8 +438,8 @@ def _av_onset_alignment(
     n_frames = audio_waveform.numel() // frame_size
     if n_frames < 3:
         return None
-    audio_frames = audio_waveform[:n_frames * frame_size].reshape(n_frames, frame_size)
-    audio_energy = (audio_frames ** 2).mean(dim=-1)  # [n_frames]
+    audio_frames = audio_waveform[: n_frames * frame_size].reshape(n_frames, frame_size)
+    audio_energy = (audio_frames**2).mean(dim=-1)  # [n_frames]
     audio_flux = torch.diff(audio_energy)  # [n_frames - 1]
 
     # Video motion: L2 norm of frame differences
@@ -433,6 +476,7 @@ def _av_onset_alignment(
 # Main module
 # ---------------------------------------------------------------------------
 
+
 class AudioMetricsModule:
     """Standalone audio metrics computer.
 
@@ -453,16 +497,14 @@ class AudioMetricsModule:
         self._clap: _CLAPComputer | None = None
         if config.clap_similarity:
             self._clap = _CLAPComputer(config.clap_model)
+        self._sample_run_started_at: float | None = None
+        self._sample_records: list[dict[str, Any]] = []
 
     def on_step(self, global_step: int) -> None:
         self._step = global_step
 
     def should_compute_mel(self, global_step: int) -> bool:
-        return (
-            self.config.mel_metrics
-            and global_step > 0
-            and global_step % self.config.mel_compute_every == 0
-        )
+        return self.config.mel_metrics and global_step > 0 and global_step % self.config.mel_compute_every == 0
 
     # ----- Per-step: latent-space -----
 
@@ -615,6 +657,8 @@ class AudioMetricsModule:
         video_latent: torch.Tensor | None = None,
         device: torch.device | None = None,
         sample_rate: int = 24000,
+        sample_metadata: dict[str, Any] | None = None,
+        artifact_path: str | None = None,
     ) -> dict[str, float]:
         """Compute sampling-time metrics for one generated sample.
 
@@ -625,36 +669,87 @@ class AudioMetricsModule:
         if device is None:
             device = torch.device("cpu")
         metrics: dict[str, float] = {}
+        record: dict[str, Any] = {
+            "prompt": text_prompt or "",
+            "sample_rate": int(sample_rate),
+        }
+        if sample_metadata:
+            for key in ("enum", "seed", "width", "height", "frame_count", "sample_steps", "frame_rate"):
+                value = sample_metadata.get(key)
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    record[key] = value
+        if artifact_path is not None:
+            record["artifact_path"] = artifact_path
 
         if waveform is not None and self._clap is not None and text_prompt:
             try:
-                # Reset before accumulating so compute() returns the cosine for
-                # this prompt only — without the reset it returns a running mean
-                # over every prompt+pass+epoch ever seen, which drifts to a stale
-                # historical average.
-                self._clap.reset()
+                score_count_before = len(self._clap.scores)
                 self._clap.accumulate(waveform, text_prompt, device, sample_rate)
-                clap_score = self._clap.compute()
+                scores = self._clap.scores
+                clap_score = scores[-1] if len(scores) > score_count_before else None
                 if clap_score is not None:
                     metrics["sample_audio/clap_similarity"] = clap_score
+                    record["clap_similarity"] = clap_score
                 self._clap.offload()
             except Exception as e:
                 logger.warning("CLAP scoring failed: %s", e)
+                record["clap_error"] = str(e)
 
-        if (
-            self.config.av_onset_alignment
-            and waveform is not None
-            and video_latent is not None
-        ):
+        if self.config.av_onset_alignment and waveform is not None and video_latent is not None:
             onset = _av_onset_alignment(waveform, video_latent)
             if onset is not None:
                 metrics["sample_audio/av_onset_alignment"] = onset
+                record["av_onset_alignment"] = onset
+
+        if waveform is not None:
+            self._sample_records.append(record)
 
         return metrics
 
+    def begin_validation_sample_run(self) -> None:
+        """Reset dataset-level sampling state at the start of one manifest pass."""
+        self._sample_records.clear()
+        self._sample_run_started_at = time.perf_counter()
+        if self._clap is not None:
+            self._clap.reset()
+
     def compute_validation_summary(self) -> dict[str, float]:
-        """Return empty dict — kept for API compat. Sampling metrics are returned inline."""
-        return {}
+        """Aggregate generated-sample metrics over the current manifest pass."""
+        summary: dict[str, float] = {}
+        clap_scores = [
+            float(record["clap_similarity"])
+            for record in self._sample_records
+            if isinstance(record.get("clap_similarity"), (int, float))
+        ]
+        if clap_scores:
+            scores = torch.tensor(clap_scores, dtype=torch.float64)
+            count = int(scores.numel())
+            mean = float(scores.mean())
+            summary["sample_audio/clap_similarity_mean"] = mean
+            summary["sample_audio/clap_similarity_count"] = float(count)
+            summary["sample_audio/clap_similarity_min"] = float(scores.min())
+            summary["sample_audio/clap_similarity_max"] = float(scores.max())
+            if count >= 2:
+                std = float(scores.std(unbiased=True))
+                half_width = 1.96 * std / math.sqrt(count)
+                summary["sample_audio/clap_similarity_std"] = std
+                summary["sample_audio/clap_similarity_ci95_low"] = mean - half_width
+                summary["sample_audio/clap_similarity_ci95_high"] = mean + half_width
+        if self._sample_run_started_at is not None:
+            summary["sample_audio/validation_runtime_seconds"] = time.perf_counter() - self._sample_run_started_at
+        return summary
+
+    def validation_sample_report(self) -> dict[str, Any]:
+        """Return a JSON-serializable report with aggregate metrics and artifact provenance."""
+        return {
+            "schema_version": 1,
+            "metric_backend": {
+                "clap_model": self.config.clap_model if self._clap is not None else None,
+                "clap_enabled": self._clap is not None,
+            },
+            "summary": self.compute_validation_summary(),
+            "samples": list(self._sample_records),
+        }
 
     def reset(self) -> None:
         """Full reset of all running state."""

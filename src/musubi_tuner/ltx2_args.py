@@ -1736,7 +1736,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_metrics_args",
         type=str,
         nargs="*",
-        help="Key=value args for audio metrics, e.g. mel_metrics=true fad=true clap_similarity=true "
+        help="Key=value args for audio metrics, e.g. mel_metrics=true clap_similarity=true "
         "latent_fd_compute_every=50 mel_compute_every=100",
     )
 

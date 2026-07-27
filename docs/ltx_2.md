@@ -2540,10 +2540,17 @@ Enable with `--audio_metrics`. All logic is in `audio_metrics.py`. When disabled
 
 | Key | Description | Requires |
 |-----|-------------|----------|
-| `sample_audio/clap_similarity` | CLAP audio-text cosine similarity | transformers (already a dep) |
+| `sample_audio/clap_similarity` | Per-sample CLAP audio-text cosine similarity | transformers (already a dep) |
+| `sample_audio/clap_similarity_mean` | Mean CLAP score over the complete sample manifest pass | transformers (already a dep) |
+| `sample_audio/clap_similarity_ci95_low`, `sample_audio/clap_similarity_ci95_high` | Normal-approximation 95% confidence interval over manifest scores | transformers (already a dep) |
 | `sample_audio/av_onset_alignment` | Correlation between audio energy onsets and video motion | None |
 
-CLAP model is lazy-loaded on first sample, offloaded to CPU between uses.
+CLAP model is lazy-loaded on the first sample and offloaded to CPU between uses.
+Every manifest entry must specify an explicit seed when CLAP validation is
+enabled. One `sample/av_validation_<step>.json` report is written per manifest
+pass with aggregate metrics, runtime, prompt/seed metadata, and paths to the
+generated WAV artifacts. CLAP input is resampled to its required 48 kHz.
+FAD-CLAP is not currently implemented or exposed.
 
 ### Timestep Sampling
 <sub>[↑ contents](#table-of-contents)</sub>
