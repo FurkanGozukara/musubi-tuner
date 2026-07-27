@@ -104,6 +104,11 @@ def _read_wav_tensor(path: str):
     return torch.from_numpy(a.copy()), sr
 
 
+def _needs_video_decode(media_needs: frozenset) -> bool:
+    """Whether reward inputs require decoded video pixels or a video file."""
+    return bool(frozenset(media_needs) & {"video", "video_file"})
+
+
 def build_generate_fn(
     net_trainer,
     args,
@@ -148,6 +153,7 @@ def build_generate_fn(
     want_video_file = "video_file" in media_needs
     want_audio_file = is_av and "audio_file" in media_needs
     want_audio_waveform = is_av and "audio_waveform" in media_needs
+    decode_video = _needs_video_decode(media_needs)
     _media_dir = None
     if want_video_file or want_audio_file or want_audio_waveform:
         import atexit
@@ -184,7 +190,9 @@ def build_generate_fn(
                     do_classifier_free_guidance=getattr(args, "sample_cfg", 1.0) > 1.0,
                     guidance_scale=getattr(args, "sample_cfg", 1.0),
                     cfg_scale=None,
-                    decode_video=needs_media,
+                    # Audio-only rewards still need scoring media, but they do not need the
+                    # video VAE. Keep video decode tied to explicit video/video_file needs.
+                    decode_video=decode_video,
                     return_latents=True,
                     # AV mode: trigger audio-latent creation so do_inference runs the AV denoise
                     # loop (the wrapper splits the [video|audio] context and returns audio_x0).

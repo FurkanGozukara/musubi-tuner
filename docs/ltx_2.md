@@ -4353,6 +4353,11 @@ In the offline workflow, rollout generation/scoring and Phase-B training run as 
 - rollouts and their scores sit on disk, so you can inspect what the reward is actually rewarding before spending any training compute;
 - an interrupted run loses at most one round — every round's cache and LoRA are ordinary files.
 
+Media decoding follows each reward's declared inputs. Audio-only rewards such
+as `audio_energy`, CLAP, and Audiobox decode the generated audio without
+decoding video pixels through the video VAE. Video and synchronization rewards
+still request video decoding when they declare `video` or `video_file`.
+
 The cache is tied to the snapshot that generated it; Phase B refuses a mismatched warm-start LoRA. The primary mode is a video LoRA; `--ltx2_mode av` generates video + audio and decodes both (audio via a subprocess vocoder) so audio/sync rewards can score (the file-based readers have dependency fallbacks — e.g. the stdlib wav module for audio when torchcodec is absent). An inline single-process mode (`--rl_online`) also exists, but it holds the generator, the rewards, and the training step on one GPU at once.
 
 You configure three independent things; everything else has defaults:
