@@ -669,6 +669,11 @@ def build_cache_preview_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--stats")
     if c.cache_preview_fail_on_error:
         cmd.append("--fail_on_error")
+    if c.cache_preview_check_source:
+        cmd.append("--check_source")
+    if c.cache_preview_require_companions.strip():
+        cmd += ["--require_companions", c.cache_preview_require_companions.strip()]
+    cmd += ["--av_duration_tolerance", str(c.cache_preview_av_duration_tolerance)]
     if c.cache_preview_limit is not None:
         cmd += ["--limit", str(c.cache_preview_limit)]
     return cmd

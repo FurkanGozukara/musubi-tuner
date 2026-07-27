@@ -196,6 +196,9 @@ class CachingConfig(BaseModel):
     cache_preview_decode: bool = False
     cache_preview_stats: bool = True
     cache_preview_fail_on_error: bool = True
+    cache_preview_check_source: bool = True
+    cache_preview_require_companions: str = ""
+    cache_preview_av_duration_tolerance: float = 0.05
     cache_preview_limit: Optional[int] = None
     cache_preview_device: Literal["auto", "cpu", "cuda"] = "auto"
     cache_preview_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None

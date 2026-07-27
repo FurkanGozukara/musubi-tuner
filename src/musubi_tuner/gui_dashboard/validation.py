@@ -2252,6 +2252,30 @@ def validate_cache_preview_config(config: ProjectConfig) -> dict[str, Any]:
             )
         )
 
+    companion_roles = {part.strip().lower() for part in c.cache_preview_require_companions.split(",") if part.strip()}
+    invalid_companion_roles = sorted(companion_roles - {"video", "audio", "text"})
+    if invalid_companion_roles:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.cache_preview_require_companions",
+                f"Unknown required companion role(s): {', '.join(invalid_companion_roles)}.",
+                label="Required Companions",
+                page="caching",
+            )
+        )
+
+    if c.cache_preview_av_duration_tolerance < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.cache_preview_av_duration_tolerance",
+                "AV Duration Tolerance must be zero or greater.",
+                label="AV Duration Tolerance",
+                page="caching",
+            )
+        )
+
     return _build_report(errors, warnings)
 
 

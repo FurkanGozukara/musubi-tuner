@@ -3614,6 +3614,7 @@ class VideoDataset(BaseDataset):
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
                         item_info.source_item_key = video_key
+                        item_info.target_fps = self.target_fps
                         item_info.source_total_frames = frame_count
                         item_info.chunk_start_frame = crop_pos
                         item_info.chunk_num_frames = target_frame

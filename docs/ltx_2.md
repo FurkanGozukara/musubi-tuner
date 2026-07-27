@@ -556,6 +556,22 @@ Useful flags: `--checkpoint`, `--limit N`, `--fail_on_error`, `--no_decode`, `--
 For an AV cache that must be complete, add
 `--require_companions video,audio,text`; the full directory is inventoried
 even when `--limit` selects only a deterministic preview subset.
+Newly written LTX-2 video and audio latent caches also record the source path,
+file size, and nanosecond modification time. Add `--check_source` to report a
+changed or missing source as an error. Older caches without these source details
+remain readable and receive a warning because their freshness cannot be
+verified.
+The verifier also checks that latent tensor shapes match the geometry declared
+in their keys. Paired video/audio caches are checked for architecture and
+duration consistency; `--av_duration_tolerance` controls the allowed duration
+difference and defaults to 0.05 seconds. Newly generated caches contain the
+required FPS and duration metadata, while older pairs receive a warning when
+duration cannot be established.
+The raw safetensors metadata remains available, and every `summary.json` entry
+also exposes normalized `cache_key`, `architecture`, `source`, and `media`
+objects. Video media reports latent geometry, frame count, target FPS, and
+duration. Audio media reports latent/effective steps, mel bins, channels,
+target FPS, and duration.
 
 ### Memory Optimization for Caching
 <sub>[↑ contents](#table-of-contents)</sub>

@@ -32,12 +32,41 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SOURCE_PATH_METADATA_KEY = "source_path"
+SOURCE_SIZE_METADATA_KEY = "source_size"
+SOURCE_MTIME_NS_METADATA_KEY = "source_mtime_ns"
+
 
 # We use simple if-else approach to support multiple architectures.
 # Maybe we can use a plugin system in the future.
 
 # the keys of the dict are `<content_type>_FxHxW_<dtype>` for latents
 # and `<content_type>_<dtype|mask>` for other tensors
+
+
+def build_source_freshness_metadata(item_info: ItemInfo, source_path: Optional[str] = None) -> dict[str, str]:
+    """Return source file identity for cache freshness checks, when available."""
+    source_path = source_path or getattr(item_info, "source_item_key", None) or item_info.item_key
+    if not source_path:
+        return {}
+    source_path = os.path.abspath(os.path.expanduser(str(source_path)))
+    try:
+        source_stat = os.stat(source_path)
+    except OSError:
+        return {}
+    if not os.path.isfile(source_path):
+        return {}
+    metadata = {
+        SOURCE_PATH_METADATA_KEY: source_path,
+        SOURCE_SIZE_METADATA_KEY: str(source_stat.st_size),
+        SOURCE_MTIME_NS_METADATA_KEY: str(source_stat.st_mtime_ns),
+    }
+    target_fps = getattr(item_info, "target_fps", None)
+    if isinstance(target_fps, (int, float)) and target_fps > 0:
+        metadata["target_fps"] = str(float(target_fps))
+        if isinstance(item_info.frame_count, int) and item_info.frame_count > 0:
+            metadata["duration_seconds"] = str(float(item_info.frame_count) / float(target_fps))
+    return metadata
 
 
 def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
@@ -98,7 +127,13 @@ def save_latent_cache_ltx2(
         for key, value in extra_tensors.items():
             sd[key] = value.detach().cpu().contiguous()
 
-    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL, atomic=atomic)
+    save_latent_cache_common(
+        item_info,
+        sd,
+        ARCHITECTURE_LTX2_FULL,
+        atomic=atomic,
+        extra_metadata=build_source_freshness_metadata(item_info),
+    )
 
 
 def save_latent_cache_framepack(
@@ -323,7 +358,14 @@ def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False):
+def save_latent_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    *,
+    atomic: bool = False,
+    extra_metadata: Optional[dict[str, str]] = None,
+):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
@@ -332,6 +374,8 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+    if extra_metadata:
+        metadata.update(extra_metadata)
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0

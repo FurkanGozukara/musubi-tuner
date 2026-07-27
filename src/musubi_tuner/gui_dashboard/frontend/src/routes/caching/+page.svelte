@@ -619,8 +619,13 @@
 					<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
 						<FormToggle fieldPath="caching.cache_preview_stats" checked={caching.cache_preview_stats ?? true} onchange={(e) => updateCaching('cache_preview_stats', e.target.checked)} tooltip="Include finite min/max stats in summary.json." />
 						<FormToggle fieldPath="caching.cache_preview_fail_on_error" checked={caching.cache_preview_fail_on_error ?? true} onchange={(e) => updateCaching('cache_preview_fail_on_error', e.target.checked)} tooltip="Return a failed exit code when any cache file has validation or decode errors." />
+						<FormToggle fieldPath="caching.cache_preview_check_source" checked={caching.cache_preview_check_source ?? true} onchange={(e) => updateCaching('cache_preview_check_source', e.target.checked)} tooltip="Compare source size and modification time with stored freshness metadata." />
 						<FormToggle fieldPath="caching.cache_preview_decode" checked={caching.cache_preview_decode ?? false} onchange={(e) => updateCaching('cache_preview_decode', e.target.checked)} tooltip="Decode MP4/PNG/WAV previews with the configured LTX-2 checkpoint." />
 						<FormField type="number" fieldPath="caching.cache_preview_limit" value={caching.cache_preview_limit ?? ''} oninput={(e) => updateCaching('cache_preview_limit', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="All" tooltip="Maximum number of cache files to inspect." />
+					</div>
+					<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+						<FormField fieldPath="caching.cache_preview_require_companions" value={caching.cache_preview_require_companions || ''} oninput={(e) => updateCaching('cache_preview_require_companions', e.target.value)} placeholder="video,audio,text" tooltip="Comma-separated companion cache roles required for every logical item." />
+						<FormField type="number" fieldPath="caching.cache_preview_av_duration_tolerance" value={caching.cache_preview_av_duration_tolerance ?? 0.05} oninput={(e) => updateCaching('cache_preview_av_duration_tolerance', Number(e.target.value))} min={0} step="0.01" tooltip="Maximum allowed video/audio duration difference in seconds." />
 					</div>
 					{#if caching.cache_preview_decode}
 						<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">

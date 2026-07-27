@@ -37,7 +37,11 @@ AUDIO_FILE_RE = re.compile(r"^(?P<stem>.+)_ltx2_audio\.safetensors$")
 TEXT_FILE_RE = re.compile(r"^(?P<stem>.+)_ltx2_te\.safetensors$")
 RESOLUTION_SUFFIX_RE = re.compile(r"_\d{4}x\d{4}$")
 SEGMENT_SUFFIX_RE = re.compile(r"_\d{5}-\d+$")
+VIDEO_CACHE_RESOLUTION_RE = re.compile(r"_(?P<width>\d{4})x(?P<height>\d{4})_ltx2\.safetensors$")
 COMPANION_ROLES = frozenset({"video", "audio", "text"})
+SOURCE_PATH_METADATA_KEY = "source_path"
+SOURCE_SIZE_METADATA_KEY = "source_size"
+SOURCE_MTIME_NS_METADATA_KEY = "source_mtime_ns"
 
 
 @dataclass
@@ -50,6 +54,7 @@ class TensorSummary:
     has_inf: bool | None = None
     min: float | None = None
     max: float | None = None
+    value: int | float | None = None
 
 
 @dataclass
@@ -59,6 +64,10 @@ class FileSummary:
     kind: str = "unknown"
     status: str = "ok"
     output: str | None = None
+    cache_key: str | None = None
+    architecture: str | None = None
+    source: dict[str, Any] = field(default_factory=dict)
+    media: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
     tensors: list[TensorSummary] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -137,6 +146,16 @@ def _companion_inventory(files: list[Path]) -> dict[str, set[str]]:
     return inventory
 
 
+def _av_pair_group(path: Path) -> tuple[str, str] | None:
+    name = path.name
+    for role, pattern in (("audio", AUDIO_FILE_RE), ("video", VIDEO_FILE_RE)):
+        match = pattern.match(name)
+        if match is not None:
+            stem = RESOLUTION_SUFFIX_RE.sub("", match.group("stem"))
+            return str(path.parent / stem), role
+    return None
+
+
 def _validate_companions(
     summary: FileSummary,
     path: Path,
@@ -155,6 +174,172 @@ def _validate_companions(
         summary.errors.append(f"Missing required companion cache(s): {', '.join(missing)}")
 
 
+def _validate_source_freshness(summary: FileSummary) -> None:
+    source_path_value = summary.metadata.get(SOURCE_PATH_METADATA_KEY)
+    source_size_value = summary.metadata.get(SOURCE_SIZE_METADATA_KEY)
+    source_mtime_value = summary.metadata.get(SOURCE_MTIME_NS_METADATA_KEY)
+    if not all((source_path_value, source_size_value, source_mtime_value)):
+        summary.warnings.append("Source freshness metadata is unavailable; cache freshness was not verified.")
+        return
+
+    source_path = Path(source_path_value).expanduser()
+    try:
+        source_stat = source_path.stat()
+    except OSError as exc:
+        summary.errors.append(f"Source file is unavailable: {source_path} ({exc})")
+        summary.status = "error"
+        return
+    try:
+        expected_size = int(source_size_value)
+        expected_mtime_ns = int(source_mtime_value)
+    except ValueError:
+        summary.errors.append("Source freshness metadata contains a non-integer size or mtime.")
+        summary.status = "error"
+        return
+
+    changes: list[str] = []
+    if source_stat.st_size != expected_size:
+        changes.append(f"size {expected_size} -> {source_stat.st_size}")
+    if source_stat.st_mtime_ns != expected_mtime_ns:
+        changes.append(f"mtime_ns {expected_mtime_ns} -> {source_stat.st_mtime_ns}")
+    if changes:
+        summary.errors.append(f"Source changed after cache creation: {source_path} ({', '.join(changes)})")
+        summary.status = "error"
+
+
+def _validate_declared_geometry(summary: FileSummary) -> None:
+    cache_resolution_match = VIDEO_CACHE_RESOLUTION_RE.search(Path(summary.path).name)
+    for tensor in summary.tensors:
+        video_match = VIDEO_KEY_RE.match(tensor.key)
+        if video_match is not None and len(tensor.shape) == 4:
+            declared = tuple(int(video_match.group(name)) for name in ("frames", "height", "width"))
+            actual = tuple(tensor.shape[-3:])
+            if actual != declared:
+                summary.errors.append(f"{tensor.key}: declared video geometry {declared}, tensor has {actual}")
+            if cache_resolution_match is not None:
+                cache_pixels = (
+                    int(cache_resolution_match.group("height")),
+                    int(cache_resolution_match.group("width")),
+                )
+                latent_pixels = (tensor.shape[-2] * 32, tensor.shape[-1] * 32)
+                if latent_pixels != cache_pixels:
+                    summary.errors.append(
+                        f"{tensor.key}: cache filename declares {cache_pixels[1]}x{cache_pixels[0]} pixels, "
+                        f"latent geometry implies {latent_pixels[1]}x{latent_pixels[0]}"
+                    )
+        audio_match = AUDIO_KEY_RE.match(tensor.key)
+        if audio_match is not None and len(tensor.shape) == 3:
+            declared = tuple(int(audio_match.group(name)) for name in ("steps", "mel_bins", "channels"))
+            actual = (tensor.shape[1], tensor.shape[2], tensor.shape[0])
+            if actual != declared:
+                summary.errors.append(f"{tensor.key}: declared audio geometry {declared}, tensor has {actual}")
+    if summary.errors:
+        summary.status = "error"
+
+
+def _validate_av_pairs(summaries: list[FileSummary], *, duration_tolerance: float) -> None:
+    groups: dict[str, dict[str, FileSummary]] = {}
+    for summary in summaries:
+        pair = _av_pair_group(Path(summary.path))
+        if pair is not None:
+            group_key, role = pair
+            groups.setdefault(group_key, {})[role] = summary
+
+    for pair in groups.values():
+        video = pair.get("video")
+        audio = pair.get("audio")
+        if video is None or audio is None:
+            continue
+        architectures = {value for value in (video.metadata.get("architecture"), audio.metadata.get("architecture")) if value}
+        if len(architectures) > 1:
+            message = f"AV companion architecture mismatch: {', '.join(sorted(architectures))}"
+            video.errors.append(message)
+            audio.errors.append(message)
+
+        try:
+            video_duration = float(video.metadata["duration_seconds"])
+            audio_duration = float(audio.metadata["duration_seconds"])
+        except (KeyError, TypeError, ValueError):
+            video.warnings.append("AV duration consistency was not verified because duration metadata is unavailable.")
+            audio.warnings.append("AV duration consistency was not verified because duration metadata is unavailable.")
+        else:
+            delta = abs(video_duration - audio_duration)
+            if delta > duration_tolerance:
+                message = (
+                    f"AV companion duration mismatch: video={video_duration:.6f}s, audio={audio_duration:.6f}s, delta={delta:.6f}s"
+                )
+                video.errors.append(message)
+                audio.errors.append(message)
+        if video.errors:
+            video.status = "error"
+        if audio.errors:
+            audio.status = "error"
+
+
+def _optional_int(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _optional_float(value: str | None) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _normalized_cache_key(path: Path) -> str:
+    for pattern in (AUDIO_FILE_RE, TEXT_FILE_RE, VIDEO_FILE_RE):
+        match = pattern.match(path.name)
+        if match is not None:
+            return RESOLUTION_SUFFIX_RE.sub("", match.group("stem"))
+    return path.stem
+
+
+def _populate_normalized_metadata(summary: FileSummary, path: Path) -> None:
+    summary.cache_key = _normalized_cache_key(path)
+    summary.architecture = summary.metadata.get("architecture")
+    summary.source = {
+        key: value
+        for key, value in {
+            "path": summary.metadata.get(SOURCE_PATH_METADATA_KEY),
+            "size": _optional_int(summary.metadata.get(SOURCE_SIZE_METADATA_KEY)),
+            "mtime_ns": _optional_int(summary.metadata.get(SOURCE_MTIME_NS_METADATA_KEY)),
+        }.items()
+        if value is not None
+    }
+
+    media: dict[str, Any] = {}
+    video_tensor = next((tensor for tensor in summary.tensors if VIDEO_KEY_RE.match(tensor.key)), None)
+    if video_tensor is not None:
+        match = VIDEO_KEY_RE.match(video_tensor.key)
+        assert match is not None
+        media["video"] = {
+            "latent_frames": int(match.group("frames")),
+            "latent_height": int(match.group("height")),
+            "latent_width": int(match.group("width")),
+            "frame_count": _optional_int(summary.metadata.get("frame_count")),
+            "target_fps": _optional_float(summary.metadata.get("target_fps")),
+            "duration_seconds": _optional_float(summary.metadata.get("duration_seconds")),
+        }
+    audio_tensor = next((tensor for tensor in summary.tensors if AUDIO_KEY_RE.match(tensor.key)), None)
+    if audio_tensor is not None:
+        match = AUDIO_KEY_RE.match(audio_tensor.key)
+        assert match is not None
+        length_tensor = next((tensor for tensor in summary.tensors if tensor.key.startswith("audio_lengths_")), None)
+        media["audio"] = {
+            "latent_steps": int(match.group("steps")),
+            "mel_bins": int(match.group("mel_bins")),
+            "channels": int(match.group("channels")),
+            "effective_steps": int(length_tensor.value) if length_tensor is not None and length_tensor.value is not None else None,
+            "target_fps": _optional_float(summary.metadata.get("target_fps")),
+            "duration_seconds": _optional_float(summary.metadata.get("duration_seconds")),
+        }
+    summary.media = media
+
+
 def _tensor_stats(tensor: torch.Tensor, *, stats: bool) -> tuple[bool | None, bool | None, float | None, float | None]:
     if not torch.is_floating_point(tensor):
         return None, None, None, None
@@ -171,6 +356,10 @@ def _tensor_stats(tensor: torch.Tensor, *, stats: bool) -> tuple[bool | None, bo
 
 def _summarize_tensor(key: str, tensor: torch.Tensor, role: str, *, stats: bool) -> TensorSummary:
     has_nan, has_inf, min_value, max_value = _tensor_stats(tensor, stats=stats)
+    scalar_value: int | float | None = None
+    if tensor.numel() == 1:
+        item = tensor.detach().cpu().item()
+        scalar_value = float(item) if torch.is_floating_point(tensor) else int(item)
     return TensorSummary(
         key=key,
         shape=[int(v) for v in tensor.shape],
@@ -180,6 +369,7 @@ def _summarize_tensor(key: str, tensor: torch.Tensor, role: str, *, stats: bool)
         has_inf=has_inf,
         min=min_value,
         max=max_value,
+        value=scalar_value,
     )
 
 
@@ -444,10 +634,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_decode", action="store_true", help="Inspect only, even when --checkpoint is supplied.")
     parser.add_argument("--fail_on_error", action="store_true", help="Exit non-zero if any cache has errors.")
     parser.add_argument(
+        "--check_source",
+        action="store_true",
+        help="Compare source path, size, and mtime against freshness metadata stored in LTX-2 latent caches.",
+    )
+    parser.add_argument(
         "--require_companions",
         type=str,
         default="",
         help="Comma-separated cache roles required per item: video,audio,text. Empty disables companion checks.",
+    )
+    parser.add_argument(
+        "--av_duration_tolerance",
+        type=float,
+        default=0.05,
+        help="Maximum allowed video/audio companion duration difference in seconds.",
     )
     return parser.parse_args()
 
@@ -483,7 +684,11 @@ def main() -> None:
     summaries: list[FileSummary] = []
     for path in files:
         summary, decode_tensors = _inspect_file(path, input_path, stats=bool(args.stats))
+        _populate_normalized_metadata(summary, path)
+        _validate_declared_geometry(summary)
         _validate_companions(summary, path, companion_inventory, required_companions)
+        if args.check_source:
+            _validate_source_freshness(summary)
         if models is not None and summary.status == "ok" and decode_tensors:
             output_stem = output_dir / _safe_output_stem(summary.relative_path)
             try:
@@ -500,6 +705,7 @@ def main() -> None:
         summaries.append(summary)
         logger.info("%s: %s (%s)", summary.status, summary.relative_path, summary.kind)
 
+    _validate_av_pairs(summaries, duration_tolerance=max(float(args.av_duration_tolerance), 0.0))
     summary_path = output_dir / "summary.json"
     _write_summary(summary_path, summaries)
     logger.info("Wrote cache preview summary to %s", summary_path)

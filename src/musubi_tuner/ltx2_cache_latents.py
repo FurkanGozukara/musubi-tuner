@@ -22,6 +22,7 @@ import musubi_tuner.cache_latents as cache_latents
 from musubi_tuner.audio_io_utils import coerce_decoded_audio_to_channels_first
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.dataset.cache_io import build_source_freshness_metadata
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     AUDIO_EXTENSIONS,
@@ -603,6 +604,9 @@ def encode_and_save_audio_cache(
         "architecture": "ltx2_v1",
         "format_version": "1.0.1",
     }
+    metadata.update(build_source_freshness_metadata(item_info, source_path=audio_path))
+    metadata["duration_seconds"] = str(float(waveform.shape[-1]) / max(float(sample_rate), 1.0))
+    metadata["target_fps"] = str(float(target_fps))
 
     if atomic_cache_writes:
         save_file_atomic(sd, audio_cache_path, metadata=metadata)
