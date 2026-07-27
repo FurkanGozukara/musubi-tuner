@@ -84,6 +84,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["ref_audio_path"] = m.group(1).strip()
                 continue
 
+            m = re.match(r"vra (.+)", parg, re.IGNORECASE)
+            if m:  # held-out reference audio used only by validation metrics
+                prompt_dict["validation_reference_audio_path"] = m.group(1).strip()
+                continue
+
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
             if m:  # end image path
                 prompt_dict["end_image_path"] = m.group(1).strip()

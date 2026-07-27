@@ -2462,6 +2462,7 @@ class LTX2SamplingMixin:
                     sample_rate=sample_rate,
                     sample_metadata=sample_parameter,
                     artifact_path=wav_path,
+                    reference_audio_path=sample_parameter.get("validation_reference_audio_path"),
                 )
                 if sample_metrics and len(accelerator.trackers) > 0:
                     accelerator.log(sample_metrics, step=steps)

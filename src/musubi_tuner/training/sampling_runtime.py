@@ -40,15 +40,41 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
     audio_metrics = getattr(self, "_audio_metrics", None)
     if audio_metrics is not None:
         clap_enabled = getattr(getattr(audio_metrics, "config", None), "clap_similarity", False)
+        clap_reference_enabled = getattr(
+            getattr(audio_metrics, "config", None),
+            "clap_reference_similarity",
+            False,
+        )
+        clap_any_enabled = clap_enabled or clap_reference_enabled
         missing_seed_indices = [
             int(parameter.get("enum", index)) for index, parameter in enumerate(sample_parameters) if parameter.get("seed") is None
         ]
-        if clap_enabled and missing_seed_indices:
+        if clap_any_enabled and missing_seed_indices:
             raise ValueError(
                 "Generated-sample CLAP validation requires an explicit seed for every manifest entry; "
                 f"missing seeds for sample indices {missing_seed_indices}."
             )
-        if clap_enabled and distributed_state.num_processes > 1:
+        missing_reference_indices = [
+            int(parameter.get("enum", index))
+            for index, parameter in enumerate(sample_parameters)
+            if not parameter.get("validation_reference_audio_path")
+        ]
+        if clap_reference_enabled and missing_reference_indices:
+            raise ValueError(
+                "Generated-sample CLAP reference validation requires validation_reference_audio_path "
+                f"for every manifest entry; missing paths for sample indices {missing_reference_indices}."
+            )
+        invalid_reference_paths = [
+            str(parameter["validation_reference_audio_path"])
+            for parameter in sample_parameters
+            if parameter.get("validation_reference_audio_path") and not os.path.isfile(parameter["validation_reference_audio_path"])
+        ]
+        if clap_reference_enabled and invalid_reference_paths:
+            raise ValueError(
+                "Generated-sample CLAP reference validation paths must be readable files; "
+                f"invalid paths: {invalid_reference_paths}."
+            )
+        if clap_any_enabled and distributed_state.num_processes > 1:
             raise ValueError(
                 "Generated-sample CLAP validation currently requires single-process sampling so the "
                 "dataset summary cannot silently omit samples from other ranks."

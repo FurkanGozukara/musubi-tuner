@@ -45,6 +45,7 @@ class AudioMetricsConfig:
 
     # Sampling-time (embedding-space)
     clap_similarity: bool = False
+    clap_reference_similarity: bool = False
     clap_model: str = "laion/clap-htsat-unfused"
     av_onset_alignment: bool = False
 
@@ -72,6 +73,7 @@ def _config_from_kwargs(kw: dict[str, str]) -> AudioMetricsConfig:
         "mcd",
         "log_spectral_distance",
         "clap_similarity",
+        "clap_reference_similarity",
         "av_onset_alignment",
     }
     int_keys = {
@@ -349,18 +351,8 @@ class _CLAPComputer:
                 "CLAP similarity requires transformers with CLAP support. Install with: pip install transformers>=4.30.0"
             ) from e
 
-    @torch.no_grad()
-    def accumulate(
-        self,
-        waveform: torch.Tensor,
-        text_prompt: str,
-        device: torch.device,
-        sample_rate: int = 24000,
-    ) -> None:
-        """Compute and accumulate CLAP similarity for one sample."""
-        self._load_model(device)
-        self._model.to(device)
-
+    @staticmethod
+    def _prepare_waveform(waveform: torch.Tensor, sample_rate: int) -> tuple[Any, int]:
         # CLAP's feature extractor rejects audio that is not declared and
         # actually sampled at 48 kHz.
         clap_sample_rate = 48000
@@ -382,25 +374,55 @@ class _CLAPComputer:
         audio_np = waveform.numpy()
         if audio_np.ndim == 2:
             audio_np = audio_np[0]  # mono
+        return audio_np, clap_sample_rate
+
+    @torch.no_grad()
+    def audio_embedding(
+        self,
+        waveform: torch.Tensor,
+        device: torch.device,
+        sample_rate: int = 24000,
+    ) -> torch.Tensor:
+        self._load_model(device)
+        self._model.to(device)
+        audio_np, clap_sample_rate = self._prepare_waveform(waveform, sample_rate)
 
         inputs = self._processor(
             audios=[audio_np],
             sampling_rate=clap_sample_rate,
-            text=[text_prompt],
             return_tensors="pt",
             padding=True,
         )
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
-        audio_emb = self._model.get_audio_features(
+        return self._model.get_audio_features(
             **{k: v for k, v in inputs.items() if k.startswith("input_features") or k == "is_longer"}
         )
+
+    @torch.no_grad()
+    def text_embedding(self, text_prompt: str, device: torch.device) -> torch.Tensor:
+        self._load_model(device)
+        self._model.to(device)
+        inputs = self._processor(text=[text_prompt], return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         text_emb = self._model.get_text_features(
             **{k: v for k, v in inputs.items() if k.startswith("input_ids") or k == "attention_mask"}
         )
+        return text_emb
 
+    @torch.no_grad()
+    def accumulate(
+        self,
+        waveform: torch.Tensor,
+        text_prompt: str,
+        device: torch.device,
+        sample_rate: int = 24000,
+    ) -> torch.Tensor:
+        """Compute and accumulate CLAP similarity for one sample."""
+        audio_emb = self.audio_embedding(waveform, device, sample_rate)
+        text_emb = self.text_embedding(text_prompt, device)
         cos = F.cosine_similarity(audio_emb, text_emb, dim=-1)
         self._scores.append(float(cos.mean()))
+        return audio_emb.detach().float().cpu()
 
     def compute(self) -> float | None:
         if not self._scores:
@@ -495,10 +517,12 @@ class AudioMetricsModule:
 
         # Sampling-time: lazy-loaded computers
         self._clap: _CLAPComputer | None = None
-        if config.clap_similarity:
+        if config.clap_similarity or config.clap_reference_similarity:
             self._clap = _CLAPComputer(config.clap_model)
         self._sample_run_started_at: float | None = None
         self._sample_records: list[dict[str, Any]] = []
+        self._generated_clap_embeddings: list[torch.Tensor] = []
+        self._reference_clap_embeddings: list[torch.Tensor] = []
 
     def on_step(self, global_step: int) -> None:
         self._step = global_step
@@ -659,6 +683,7 @@ class AudioMetricsModule:
         sample_rate: int = 24000,
         sample_metadata: dict[str, Any] | None = None,
         artifact_path: str | None = None,
+        reference_audio_path: str | None = None,
     ) -> dict[str, float]:
         """Compute sampling-time metrics for one generated sample.
 
@@ -680,16 +705,40 @@ class AudioMetricsModule:
                     record[key] = value
         if artifact_path is not None:
             record["artifact_path"] = artifact_path
+        if reference_audio_path is not None:
+            record["reference_audio_path"] = reference_audio_path
 
-        if waveform is not None and self._clap is not None and text_prompt:
+        if waveform is not None and self._clap is not None:
             try:
-                score_count_before = len(self._clap.scores)
-                self._clap.accumulate(waveform, text_prompt, device, sample_rate)
-                scores = self._clap.scores
-                clap_score = scores[-1] if len(scores) > score_count_before else None
-                if clap_score is not None:
-                    metrics["sample_audio/clap_similarity"] = clap_score
-                    record["clap_similarity"] = clap_score
+                if self.config.clap_similarity and text_prompt:
+                    score_count_before = len(self._clap.scores)
+                    generated_embedding = self._clap.accumulate(waveform, text_prompt, device, sample_rate)
+                    scores = self._clap.scores
+                    clap_score = scores[-1] if len(scores) > score_count_before else None
+                    if clap_score is not None:
+                        metrics["sample_audio/clap_similarity"] = clap_score
+                        record["clap_similarity"] = clap_score
+                else:
+                    generated_embedding = self._clap.audio_embedding(waveform, device, sample_rate).detach().float().cpu()
+                self._generated_clap_embeddings.append(generated_embedding)
+                if self.config.clap_reference_similarity and reference_audio_path:
+                    import torchaudio
+
+                    reference_waveform, reference_sample_rate = torchaudio.load(reference_audio_path)
+                    reference_embedding = (
+                        self._clap.audio_embedding(
+                            reference_waveform,
+                            device,
+                            int(reference_sample_rate),
+                        )
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+                    reference_score = float(F.cosine_similarity(generated_embedding, reference_embedding, dim=-1).mean())
+                    metrics["sample_audio/clap_reference_similarity"] = reference_score
+                    record["clap_reference_similarity"] = reference_score
+                    self._reference_clap_embeddings.append(reference_embedding)
                 self._clap.offload()
             except Exception as e:
                 logger.warning("CLAP scoring failed: %s", e)
@@ -709,6 +758,8 @@ class AudioMetricsModule:
     def begin_validation_sample_run(self) -> None:
         """Reset dataset-level sampling state at the start of one manifest pass."""
         self._sample_records.clear()
+        self._generated_clap_embeddings.clear()
+        self._reference_clap_embeddings.clear()
         self._sample_run_started_at = time.perf_counter()
         if self._clap is not None:
             self._clap.reset()
@@ -735,6 +786,23 @@ class AudioMetricsModule:
                 summary["sample_audio/clap_similarity_std"] = std
                 summary["sample_audio/clap_similarity_ci95_low"] = mean - half_width
                 summary["sample_audio/clap_similarity_ci95_high"] = mean + half_width
+        reference_scores = [
+            float(record["clap_reference_similarity"])
+            for record in self._sample_records
+            if isinstance(record.get("clap_reference_similarity"), (int, float))
+        ]
+        if reference_scores:
+            scores = torch.tensor(reference_scores, dtype=torch.float64)
+            count = int(scores.numel())
+            mean = float(scores.mean())
+            summary["sample_audio/clap_reference_similarity_mean"] = mean
+            summary["sample_audio/clap_reference_similarity_count"] = float(count)
+            if count >= 2:
+                std = float(scores.std(unbiased=True))
+                half_width = 1.96 * std / math.sqrt(count)
+                summary["sample_audio/clap_reference_similarity_std"] = std
+                summary["sample_audio/clap_reference_similarity_ci95_low"] = mean - half_width
+                summary["sample_audio/clap_reference_similarity_ci95_high"] = mean + half_width
         if self._sample_run_started_at is not None:
             summary["sample_audio/validation_runtime_seconds"] = time.perf_counter() - self._sample_run_started_at
         return summary
@@ -746,6 +814,9 @@ class AudioMetricsModule:
             "metric_backend": {
                 "clap_model": self.config.clap_model if self._clap is not None else None,
                 "clap_enabled": self._clap is not None,
+                "clap_reference_similarity_enabled": self.config.clap_reference_similarity,
+                "generated_embedding_count": len(self._generated_clap_embeddings),
+                "reference_embedding_count": len(self._reference_clap_embeddings),
             },
             "summary": self.compute_validation_summary(),
             "samples": list(self._sample_records),
