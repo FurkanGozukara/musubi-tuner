@@ -553,6 +553,9 @@ python src/musubi_tuner/ltx2_cache_preview.py ^
 ```
 
 Useful flags: `--checkpoint`, `--limit N`, `--fail_on_error`, `--no_decode`, `--fps 25`.
+For an AV cache that must be complete, add
+`--require_companions video,audio,text`; the full directory is inventoried
+even when `--limit` selects only a deterministic preview subset.
 
 ### Memory Optimization for Caching
 <sub>[↑ contents](#table-of-contents)</sub>

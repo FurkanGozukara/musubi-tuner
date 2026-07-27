@@ -32,6 +32,12 @@ logging.basicConfig(level=logging.INFO)
 
 VIDEO_KEY_RE = re.compile(r"^latents_(?P<frames>\d+)x(?P<height>\d+)x(?P<width>\d+)_(?P<dtype>.+)$")
 AUDIO_KEY_RE = re.compile(r"^audio_latents_(?P<steps>\d+)x(?P<mel_bins>\d+)x(?P<channels>\d+)_(?P<dtype>.+)$")
+VIDEO_FILE_RE = re.compile(r"^(?P<stem>.+)_ltx2\.safetensors$")
+AUDIO_FILE_RE = re.compile(r"^(?P<stem>.+)_ltx2_audio\.safetensors$")
+TEXT_FILE_RE = re.compile(r"^(?P<stem>.+)_ltx2_te\.safetensors$")
+RESOLUTION_SUFFIX_RE = re.compile(r"_\d{4}x\d{4}$")
+SEGMENT_SUFFIX_RE = re.compile(r"_\d{5}-\d+$")
+COMPANION_ROLES = frozenset({"video", "audio", "text"})
 
 
 @dataclass
@@ -105,6 +111,48 @@ def _relative_path(path: Path, root: Path) -> str:
 def _safe_output_stem(relative_path: str) -> Path:
     rel = Path(relative_path)
     return rel.with_suffix("")
+
+
+def _companion_group(path: Path) -> tuple[str, str] | None:
+    name = path.name
+    for role, pattern in (("audio", AUDIO_FILE_RE), ("text", TEXT_FILE_RE), ("video", VIDEO_FILE_RE)):
+        match = pattern.match(name)
+        if match is None:
+            continue
+        stem = match.group("stem")
+        if role != "text":
+            stem = RESOLUTION_SUFFIX_RE.sub("", stem)
+            stem = SEGMENT_SUFFIX_RE.sub("", stem)
+        return str(path.parent / stem), role
+    return None
+
+
+def _companion_inventory(files: list[Path]) -> dict[str, set[str]]:
+    inventory: dict[str, set[str]] = {}
+    for path in files:
+        group = _companion_group(path)
+        if group is not None:
+            group_key, role = group
+            inventory.setdefault(group_key, set()).add(role)
+    return inventory
+
+
+def _validate_companions(
+    summary: FileSummary,
+    path: Path,
+    inventory: dict[str, set[str]],
+    required_roles: set[str],
+) -> None:
+    if not required_roles:
+        return
+    group = _companion_group(path)
+    if group is None:
+        return
+    group_key, _ = group
+    missing = sorted(required_roles - inventory.get(group_key, set()))
+    if missing:
+        summary.status = "error"
+        summary.errors.append(f"Missing required companion cache(s): {', '.join(missing)}")
 
 
 def _tensor_stats(tensor: torch.Tensor, *, stats: bool) -> tuple[bool | None, bool | None, float | None, float | None]:
@@ -395,6 +443,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stats", action="store_true", help="Compute finite min/max values in addition to NaN/Inf checks.")
     parser.add_argument("--no_decode", action="store_true", help="Inspect only, even when --checkpoint is supplied.")
     parser.add_argument("--fail_on_error", action="store_true", help="Exit non-zero if any cache has errors.")
+    parser.add_argument(
+        "--require_companions",
+        type=str,
+        default="",
+        help="Comma-separated cache roles required per item: video,audio,text. Empty disables companion checks.",
+    )
     return parser.parse_args()
 
 
@@ -405,11 +459,21 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
-    files = _iter_cache_files(input_path)
+    inventory_files = _iter_cache_files(input_path if input_path.is_dir() else input_path.parent)
+    files = [input_path] if input_path.is_file() else inventory_files
     if args.limit is not None:
         files = files[: max(int(args.limit), 0)]
     if not files:
         raise FileNotFoundError(f"No .safetensors/.pt/.pth cache files found under: {input_path}")
+
+    required_companions = {part.strip().lower() for part in args.require_companions.split(",") if part.strip()}
+    invalid_companions = sorted(required_companions - COMPANION_ROLES)
+    if invalid_companions:
+        raise ValueError(
+            f"Unknown --require_companions role(s): {', '.join(invalid_companions)}. "
+            f"Expected a comma-separated subset of: {', '.join(sorted(COMPANION_ROLES))}"
+        )
+    companion_inventory = _companion_inventory(inventory_files)
 
     dtype_default = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     dtype = str_to_dtype(args.dtype, dtype_default)
@@ -419,6 +483,7 @@ def main() -> None:
     summaries: list[FileSummary] = []
     for path in files:
         summary, decode_tensors = _inspect_file(path, input_path, stats=bool(args.stats))
+        _validate_companions(summary, path, companion_inventory, required_companions)
         if models is not None and summary.status == "ok" and decode_tensors:
             output_stem = output_dir / _safe_output_stem(summary.relative_path)
             try:
