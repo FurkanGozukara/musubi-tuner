@@ -4642,6 +4642,13 @@ Dataset preparation is the same as LoRA training: create the dataset TOML, cache
 
 Adafactor is the dense bf16 full-parameter optimizer path documented here. It reduces optimizer-state memory by storing factored row and column second-moment statistics for matrix-shaped parameters, rather than full Adam-style moment tensors. The LTX-2.3 Adafactor path uses `--fused_backward_pass`, which adds a per-parameter `step_param` path related to the [optimizer-step-in-backward pattern](https://docs.pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html). When `--max_grad_norm 0` is used, the trainer can step and clear gradients from backward hooks. When global gradient clipping is enabled, as in the benchmark table below, the trainer delays per-parameter stepping until the gradient synchronization point to preserve clipping correctness. The fused Adafactor implementation applies stochastic rounding when fp32 updates are written back into bf16 parameters.
 
+`--adafactor_triton` is an optional fast path for supported contiguous 2D BF16
+updates. It avoids parameter-sized fp32 temporaries, requires
+`--fused_backward_pass` and the manual-LR configuration shown below
+(`scale_parameter=False relative_step=False`), and keeps unsupported
+parameters on the regular fused Adafactor path. The active environment must
+provide Triton; it is imported only when this flag is enabled.
+
 **Technical tradeoffs**. This is dense bf16 training. The base model weights stay on GPU, every trainable tensor receives an update every optimizer step, and AV/reference modes add activation and conditioning memory. In the measured LTX-2.3 benchmark table, video-only rows are around 54-66 GB; AV and v2v-AV rows can approach or exceed an 80 GB GPU.
 
 Example LTX-2.3 Adafactor command:
@@ -4666,6 +4673,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
+  --adafactor_triton \
   --save_every_n_steps 5000 \
   --save_state \
   --save_state_on_train_end \

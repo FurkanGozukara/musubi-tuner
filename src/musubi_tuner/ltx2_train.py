@@ -2222,6 +2222,14 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
             "torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)"
         ),
     )
+    parser.add_argument(
+        "--adafactor_triton",
+        action="store_true",
+        help=(
+            "Use the opt-in Triton fast path for supported 2D BF16 Adafactor updates. "
+            "Requires --fused_backward_pass; unsupported parameters retain the eager path."
+        ),
+    )
     # BAdam (block-coordinate Adam wrapper).
     # All wrapper kwargs flow through --optimizer_args as key=value entries
     # (e.g. base_optimizer_type=CAME8Bit switch_block_every=25 use_gradient_release=True).
@@ -3474,6 +3482,11 @@ def main() -> None:
     accelerator = prepare_accelerator(args)
     if args.mixed_precision is None:
         args.mixed_precision = accelerator.mixed_precision
+    if bool(getattr(args, "adafactor_triton", False)):
+        if not bool(getattr(args, "fused_backward_pass", False)):
+            raise ValueError("--adafactor_triton requires --fused_backward_pass.")
+        if str(getattr(args, "optimizer_type", "")).lower() != "adafactor":
+            raise ValueError("--adafactor_triton requires --optimizer_type Adafactor.")
     if bool(getattr(args, "fused_backward_pass", False)) and str(args.mixed_precision).lower() == "fp16":
         raise ValueError(
             "--fused_backward_pass cannot be combined with FP16 mixed precision: per-parameter fused steps bypass "
@@ -4716,6 +4729,8 @@ def main() -> None:
 
     fused_step_state: dict[str, bool] | None = None
     badam_gr_active = False
+    if bool(getattr(args, "adafactor_triton", False)) and not args.fused_backward_pass:
+        raise ValueError("--adafactor_triton requires --fused_backward_pass.")
     if args.fused_backward_pass:
         base_optimizer = getattr(optimizer, "optimizer", optimizer)
         # BAdam-with-gradient_release: hooks attach to LP params via the wrapper itself.
@@ -4743,11 +4758,19 @@ def main() -> None:
         else:
             base_optimizer_name = base_optimizer.__class__.__name__.lower()
             if base_optimizer_name == "adafactor":
-                import musubi_tuner.modules.adafactor_fused as adafactor_fused
+                if bool(getattr(args, "adafactor_triton", False)):
+                    from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
 
-                adafactor_fused.patch_adafactor_fused(optimizer)
-                logger.info("Adafactor fused backward pass enabled.")
+                    patch_adafactor_triton(optimizer)
+                    logger.info("Adafactor fused backward pass enabled with the Triton 2D BF16 fast path.")
+                else:
+                    import musubi_tuner.modules.adafactor_fused as adafactor_fused
+
+                    adafactor_fused.patch_adafactor_fused(optimizer)
+                    logger.info("Adafactor fused backward pass enabled.")
             else:
+                if bool(getattr(args, "adafactor_triton", False)):
+                    raise ValueError("--adafactor_triton requires --optimizer_type Adafactor.")
                 from musubi_tuner.optimizers.backends import (
                     is_apollo_optimizer_instance,
                     is_optimi_optimizer_instance,
