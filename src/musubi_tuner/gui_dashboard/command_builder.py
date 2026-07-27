@@ -127,6 +127,7 @@ def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
         "ltx2_compact_av_cross_adaln",
         "ltx2_fp8_placement_scope",
         "ltx2_attn_auto_dispatch",
+        "ltx2_flash_attn_4",
         "ltx2_prompt_kv_checkpoint",
         "ltx2_padded_prompt_trim",
         "ltx2_partial_gradient_checkpointing",

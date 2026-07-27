@@ -248,6 +248,7 @@ def _apply_performance_cli(args) -> None:
         ("ltx2_compact_av_cross_adaln", "LTX2_COMPACT_AV_CROSS_ADALN"),
         ("ltx2_fp8_placement_scope", "LTX2_FP8_PLACEMENT_SCOPE"),
         ("ltx2_attn_auto_dispatch", "LTX2_ATTN_AUTO_DISPATCH"),
+        ("ltx2_flash_attn_4", "LTX2_FLASH_ATTN_4"),
         ("ltx2_prompt_kv_checkpoint", "LTX2_PROMPT_KV_CHECKPOINT"),
         ("ltx2_padded_prompt_trim", "LTX2_PADDED_PROMPT_TRIM"),
         ("ltx2_partial_gradient_checkpointing", "LTX2_PARTIAL_GRADIENT_CHECKPOINTING"),
@@ -256,6 +257,11 @@ def _apply_performance_cli(args) -> None:
         value = getattr(args, attribute, None)
         if value is not None:
             _set_env_bool(environment_key, bool(value))
+
+    if os.environ.get("LTX2_FLASH_ATTN_4", "0").lower() in ("1", "true", "yes", "on") and os.environ.get(
+        "LTX2_ATTN_AUTO_DISPATCH", "0"
+    ).lower() not in ("1", "true", "yes", "on"):
+        raise ValueError("--ltx2_flash_attn_4 requires --ltx2_attn_auto_dispatch")
 
     values = (
         ("ltx2_compact_av_cross_adaln_min_tokens", "LTX2_COMPACT_AV_CROSS_ADALN_MIN_TOKENS", 1),

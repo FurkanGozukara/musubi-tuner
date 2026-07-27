@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.INFO)
 _warned_flash2_mask_fallback = False
 _warned_flash2_query_mask_fallback = False
 _warned_flash3_mask_fallback = False
+_warned_flash4_mask_fallback = False
 _warned_flash3_query_mask_fallback = False
 _warned_sage_mask_fallback = False
 
@@ -22,6 +23,7 @@ memory_efficient_attention = None
 flash_attn_interface = None
 flash_attention_2 = None
 flash_attn_varlen_func = None
+flash_attention_4 = None
 try:
     from xformers.ops import memory_efficient_attention
 except ImportError:
@@ -34,6 +36,10 @@ try:
 except ImportError:
     flash_attention_2 = None
     flash_attn_varlen_func = None
+try:
+    from flash_attn.cute import flash_attn_func as flash_attention_4
+except ImportError:
+    flash_attention_4 = None
 try:
     # FlashAttention3 and XFormersAttention cannot be used together
     if memory_efficient_attention is None:
@@ -87,6 +93,10 @@ def _sdpa_cudnn_enabled() -> bool:
 
 def _attention_auto_dispatch_enabled() -> bool:
     return os.environ.get("LTX2_ATTN_AUTO_DISPATCH", "0").lower() in ("1", "true", "yes")
+
+
+def _flash_attention_4_enabled() -> bool:
+    return os.environ.get("LTX2_FLASH_ATTN_4", "0").lower() in ("1", "true", "yes")
 
 
 def _cudnn_attention_callable() -> "PytorchCudnnAttention":
@@ -190,6 +200,7 @@ class ShapeAwarePytorchAttention(AttentionCallable):
         global _auto_dispatch_logged
         self.pytorch = PytorchAttention()
         self.cudnn = PytorchCudnnAttention()
+        self.flash4 = FlashAttention4() if _flash_attention_4_enabled() else None
         if not _auto_dispatch_logged:
             logger.info("LTX2_ATTN_AUTO_DISPATCH=1: shape-aware PyTorch/cuDNN attention enabled")
             _auto_dispatch_logged = True
@@ -209,7 +220,10 @@ class ShapeAwarePytorchAttention(AttentionCallable):
             and v.dtype == q.dtype
             and _cudnn_auto_workload_is_large(q.shape[1], k.shape[1], dim_head)
         )
-        return (self.cudnn if use_cudnn else self.pytorch)(q, k, v, heads, mask)
+        if use_cudnn:
+            use_flash4 = self.flash4 is not None and dim_head == 128
+            return (self.flash4 if use_flash4 else self.cudnn)(q, k, v, heads, mask)
+        return self.pytorch(q, k, v, heads, mask)
 
 
 class XFormersAttention(AttentionCallable):
@@ -350,6 +364,35 @@ class FlashAttention3(AttentionCallable):
             out = flash_attn_interface.flash_attn_func(q.to(v.dtype), k.to(v.dtype), v)
         out = out.reshape(b, -1, heads * dim_head)
         return out
+
+
+class FlashAttention4(AttentionCallable):
+    def __init__(self) -> None:
+        if flash_attention_4 is None:
+            raise RuntimeError("FlashAttention4 requires a compatible `flash-attn-4` installation with `flash_attn.cute` support.")
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if mask is not None:
+            global _warned_flash4_mask_fallback
+            if not _warned_flash4_mask_fallback:
+                logger.warning("FlashAttention4 tensor masks are not enabled; falling back to PyTorch SDPA.")
+                _warned_flash4_mask_fallback = True
+            return _sdpa_fallback_callable()(q, k, v, heads, mask)
+
+        b, _, inner_dim = q.shape
+        dim_head = inner_dim // heads
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+        out = flash_attention_4(q.to(v.dtype), k.to(v.dtype), v)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.reshape(b, -1, inner_dim)
 
 
 class FlashAttention2(AttentionCallable):

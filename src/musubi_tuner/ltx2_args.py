@@ -73,6 +73,7 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
         ("--ltx2_compact_av_cross_adaln", "Compact repeated AV cross-AdaLN timesteps."),
         ("--ltx2_fp8_placement_scope", "Reuse verified FP8 module placement within a forward scope."),
         ("--ltx2_attn_auto_dispatch", "Use shape-aware PyTorch/cuDNN SDPA dispatch."),
+        ("--ltx2_flash_attn_4", "Use FlashAttention-4 for eligible large head-dim-128 attention shapes."),
         ("--ltx2_prompt_kv_checkpoint", "Preserve video prompt K/V across checkpoint recomputation."),
         ("--ltx2_padded_prompt_trim", "Trim a common right-padded cached-prompt tail."),
         (

@@ -412,6 +412,7 @@ class TrainingConfig(BaseModel):
     ltx2_compact_av_cross_adaln_min_tokens: Optional[int] = None
     ltx2_fp8_placement_scope: bool = False
     ltx2_attn_auto_dispatch: bool = False
+    ltx2_flash_attn_4: bool = False
     ltx2_prompt_kv_checkpoint: bool = False
     ltx2_prompt_kv_checkpoint_max_mb: Optional[int] = None
     ltx2_padded_prompt_trim: bool = False
