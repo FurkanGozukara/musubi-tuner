@@ -110,6 +110,8 @@ class LTX2RLTrainer:
         for net_arg in args.network_args or []:
             k, v = net_arg.split("=")
             net_kwargs[k] = v
+        if getattr(args, "lora_target_preset", None) is not None:
+            net_kwargs.setdefault("lora_target_preset", args.lora_target_preset)
         network = network_module.create_arch_network(
             1.0,
             args.network_dim,

@@ -88,6 +88,8 @@ class LTX2RolloutCacher:
         for net_arg in args.network_args or []:
             key, val = net_arg.split("=")
             net_kwargs[key] = val
+        if getattr(args, "lora_target_preset", None) is not None:
+            net_kwargs.setdefault("lora_target_preset", args.lora_target_preset)
         network = network_module.create_arch_network(
             1.0,
             args.network_dim,
