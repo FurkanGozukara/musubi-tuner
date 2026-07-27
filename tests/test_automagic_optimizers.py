@@ -4,7 +4,9 @@ import gc
 
 import pytest
 import torch
+from transformers import Adafactor
 
+from musubi_tuner.modules.adafactor_fused import patch_adafactor_fused
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.optimizers import Automagic, Automagic2, Automagic3
 from musubi_tuner.optimizers.optimizer_utils import stochastic_grad_accummulation
@@ -123,9 +125,10 @@ def test_materialize_stochastic_gradients_moves_to_swapped_parameter_device():
         (Automagic2, {}, False),
         (Automagic3, {"fused": True}, False),
         (Automagic3, {"fused": False}, True),
+        (torch.optim.AdamW, {}, True),
     ],
 )
-def test_block_swap_gradient_patch_is_automatic_only_for_non_fused_automagic(optimizer_class, kwargs, expected):
+def test_block_swap_gradient_patch_is_automatic_for_non_fused_optimizers(optimizer_class, kwargs, expected):
     optimizer = optimizer_class([torch.nn.Parameter(torch.ones(2))], lr=1e-4, **kwargs)
 
     assert should_patch_block_swap_gradients(SimpleNamespace(optimizer=optimizer)) is expected
@@ -142,6 +145,51 @@ def test_move_optimizer_gradients_to_parameters_handles_accelerate_wrapper():
     move_optimizer_gradients_to_parameters(SimpleNamespace(optimizer=optimizer))
 
     assert parameter.grad.device == parameter.device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to emulate block-swapped gradients")
+def test_adafactor_step_repairs_block_swapped_gradient_device():
+    parameter = torch.nn.Parameter(torch.ones(4, device="cuda", dtype=torch.bfloat16))
+    optimizer = Adafactor(
+        [parameter],
+        lr=1e-3,
+        scale_parameter=False,
+        relative_step=False,
+        warmup_init=False,
+    )
+    parameter.float().sum().backward()
+    parameter.data = parameter.data.cpu()
+
+    assert parameter.grad.device.type == "cuda"
+    assert should_patch_block_swap_gradients(optimizer)
+
+    move_optimizer_gradients_to_parameters(optimizer)
+    optimizer.step()
+
+    assert parameter.grad.device == parameter.device
+    assert optimizer.state[parameter]["step"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to emulate block-swapped gradients")
+def test_fused_adafactor_step_repairs_block_swapped_gradient_device():
+    parameter = torch.nn.Parameter(torch.ones(4, device="cuda", dtype=torch.bfloat16))
+    optimizer = Adafactor(
+        [parameter],
+        lr=1e-3,
+        scale_parameter=False,
+        relative_step=False,
+        warmup_init=False,
+    )
+    patch_adafactor_fused(optimizer)
+    parameter.float().sum().backward()
+    parameter.data = parameter.data.cpu()
+
+    assert uses_fused_backward(optimizer)
+    assert not should_patch_block_swap_gradients(optimizer)
+
+    optimizer.step_param(parameter, optimizer.param_groups[0])
+
+    assert optimizer.state[parameter]["step"] == 1
 
 
 def test_automagic_type_detection_is_case_insensitive():

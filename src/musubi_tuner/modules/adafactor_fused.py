@@ -36,6 +36,8 @@ def adafactor_step_param(self, p, group):
     if p.grad is None:
         return
     grad = p.grad
+    if grad.device != p.device:
+        grad = grad.to(p.device, non_blocking=p.device.type == "cuda")
     if grad.dtype in {torch.float16, torch.bfloat16}:
         grad = grad.float()
     if grad.is_sparse:
@@ -139,3 +141,5 @@ def adafactor_step(self, closure=None):
 def patch_adafactor_fused(optimizer: Adafactor):
     optimizer.step_param = adafactor_step_param.__get__(optimizer)
     optimizer.step = adafactor_step.__get__(optimizer)
+    optimizer._musubi_fused_backward = True
+    getattr(optimizer, "optimizer", optimizer)._musubi_fused_backward = True

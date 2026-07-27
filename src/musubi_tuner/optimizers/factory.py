@@ -160,19 +160,20 @@ def materialize_stochastic_gradients(optimizer: torch.optim.Optimizer) -> None:
 
 
 def uses_fused_backward(optimizer: torch.optim.Optimizer) -> bool:
-    """Return whether an Automagic optimizer consumes gradients during backward."""
+    """Return whether an optimizer consumes gradients during backward."""
     raw_optimizer = getattr(optimizer, "optimizer", optimizer)
-    return isinstance(raw_optimizer, Automagic2) or (
-        isinstance(raw_optimizer, (Automagic, Automagic3)) and raw_optimizer.fused
+    return (
+        bool(getattr(raw_optimizer, "_musubi_fused_backward", False))
+        or isinstance(raw_optimizer, Automagic2)
+        or (isinstance(raw_optimizer, (Automagic, Automagic3)) and raw_optimizer.fused)
     )
 
 
 def should_patch_block_swap_gradients(optimizer: torch.optim.Optimizer, requested: bool = False) -> bool:
-    """Return whether gradients must follow parameters moved by block swapping."""
+    """Return whether a non-fused optimizer may need block-swap gradient repair."""
     if requested:
         return True
-    raw_optimizer = getattr(optimizer, "optimizer", optimizer)
-    return isinstance(raw_optimizer, (Automagic, Automagic3)) and not uses_fused_backward(raw_optimizer)
+    return not uses_fused_backward(optimizer)
 
 
 def move_optimizer_gradients_to_parameters(optimizer: torch.optim.Optimizer) -> None:
