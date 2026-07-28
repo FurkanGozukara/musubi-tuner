@@ -2719,11 +2719,11 @@ class LTX2SamplingMixin:
             generator=generator,
         )
 
-        # first_frame (conditioning_latent) + inpaint masks + latent_idx guides are composed on the PURE
+        # first_frame (conditioning_latent) + inpaint masks + latent/keyframe guides are composed on the PURE
         # v2v path via composable target conditioning (_do_v2v_denoising builds them through the ltx_2
-        # ConditioningItem API plus an OR-merge; latent_idx@k generalizes the first_frame@0 anchor to any slot).
-        # NOT supported: keyframe (token-append) guides on any v2v path (the dedicated helpers bypass the
-        # append path), and any guide / first_frame on the audio-bearing av_ic / video_ref_only_av paths.
+        # ConditioningItem API plus an OR-merge, and appends keyframe tokens through the same shared
+        # layout builder as training). Guides / first_frame remain unsupported on the audio-bearing
+        # av_ic / video_ref_only_av paths.
         _pure_v2v = v2v_ref_latents is not None and not av_ic_sampling and not video_ref_only_av_sampling
         if (
             sample_parameter.get("reference_target_frame_range") is not None
@@ -2731,13 +2731,14 @@ class LTX2SamplingMixin:
         ) and not _pure_v2v:
             raise ValueError("reference target-frame routing currently requires pure v2v sampling")
         if v2v_ref_latents is not None and (
-            keyframe_guides or (latent_idx_guides and not _pure_v2v) or (conditioning_latent is not None and not _pure_v2v)
+            (keyframe_guides and not _pure_v2v)
+            or (latent_idx_guides and not _pure_v2v)
+            or (conditioning_latent is not None and not _pure_v2v)
         ):
             raise ValueError(
-                "Reference-video IC-LoRA inference composes first_frame + inpaint + latent_idx guides ONLY on "
-                "the pure v2v path (not the audio-bearing av_ic / video_ref_only_av paths), and keyframe "
-                "(token-append) guides are not composed on any v2v path. Drop keyframe guides / move conditioning "
-                "to the pure v2v path, or use --ic_lora_strategy none / audio_ref_ic."
+                "Reference-video IC-LoRA inference composes first_frame + inpaint + latent/keyframe guides only "
+                "on the pure v2v path, not the audio-bearing av_ic / video_ref_only_av paths. Move conditioning "
+                "to pure v2v, or use --ic_lora_strategy none / audio_ref_ic."
             )
 
         # Inpaint conditioning is only composed on the pure v2v denoiser; warn + drop it on the
@@ -2833,6 +2834,7 @@ class LTX2SamplingMixin:
                 inpaint_invert=bool(sample_parameter.get("inpaint_invert", False)),
                 inpaint_threshold=float(sample_parameter.get("inpaint_threshold", 0.5)),
                 latent_idx_guides=latent_idx_guides,
+                keyframe_guides=keyframe_guides,
                 reference_target_frame_ranges=sample_parameter.get("reference_target_frame_ranges"),
                 reference_target_frame_range=sample_parameter.get("reference_target_frame_range"),
             )
@@ -4055,6 +4057,7 @@ class LTX2SamplingMixin:
         inpaint_invert: bool = False,
         inpaint_threshold: float = 0.5,
         latent_idx_guides: Optional[list] = None,
+        keyframe_guides: Optional[list] = None,
         reference_target_frame_ranges: Optional[list[list[int]]] = None,
         reference_target_frame_range: Optional[list[int]] = None,
     ):
@@ -4097,6 +4100,7 @@ class LTX2SamplingMixin:
         ref_conditioning_mask = None
         ref_positions = None
         ref_frames = 0
+        reference_downscale_factor = 1
         if _has_ref:
             ref_latent_tensors = [ref.to(device=transformer_device, dtype=dit_dtype) for ref in ref_latent_tensors]
             ref_channels = int(ref_latent_tensors[0].shape[1])
@@ -4182,9 +4186,41 @@ class LTX2SamplingMixin:
         ).to(dtype=dit_dtype)
         tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / frame_rate_v2v
 
-        combined_positions = torch.cat([ref_positions, tgt_positions], dim=2) if _has_ref else tgt_positions
-
         target_seq_len = int(tgt_positions.shape[2])
+        combined_positions = torch.cat([ref_positions, tgt_positions], dim=2) if _has_ref else tgt_positions
+        keyframe_tokens = None
+        keyframe_mask = None
+        keyframe_count = 0
+        if keyframe_guides:
+            from musubi_tuner.networks.lora_ltx2 import build_keyframe_extension
+
+            keyframe_guide_dicts = []
+            for index, guide in enumerate(keyframe_guides):
+                guide_latent = getattr(guide, "latent", None)
+                if not isinstance(guide_latent, torch.Tensor) or guide_latent.dim() != 5:
+                    raise ValueError(f"keyframe_guides[{index}] latent must be 5D [B,C,T,H,W]")
+                guide_dict = {
+                    "latent": guide_latent,
+                    "frame_idx": int(getattr(guide, "frame_idx", -1)),
+                    "strength": float(getattr(guide, "strength", 1.0)),
+                }
+                collapse = getattr(guide, "collapse_to_single_pixel_frame", None)
+                if collapse is not None:
+                    guide_dict["collapse_to_single_pixel_frame"] = bool(collapse)
+                keyframe_guide_dicts.append(guide_dict)
+            keyframe_tokens, keyframe_positions, keyframe_mask, keyframe_count = build_keyframe_extension(
+                keyframe_guide_dicts,
+                bsz=bsz,
+                video_channels=int(latents.shape[1]),
+                frame_rate=frame_rate_v2v,
+                patchifier=patchifier,
+                device=transformer_device,
+                dtype=dit_dtype,
+                reference_downscale_factor=reference_downscale_factor,
+            )
+            if keyframe_count:
+                combined_positions = torch.cat([combined_positions, keyframe_positions], dim=2)
+
         routing_mask = None
         if reference_target_frame_ranges is not None and reference_target_frame_range is not None:
             if len(reference_target_frame_ranges) != 1 or list(reference_target_frame_ranges[0]) != list(
@@ -4331,6 +4367,8 @@ class LTX2SamplingMixin:
 
                 # Concatenate ref + target (target-only when reference-free)
                 combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1) if _has_ref else target_tokens
+                if keyframe_count:
+                    combined_tokens = torch.cat([combined_tokens, keyframe_tokens], dim=1)
 
                 # Target conditioning mask: pinned-clean tokens (first_frame / inpaint) ride timestep 0;
                 # all-False (plain v2v) when no composable conditioning was supplied.
@@ -4346,6 +4384,10 @@ class LTX2SamplingMixin:
                 step_sigma = sigma.view(1).expand(bsz)
                 combined_timesteps = step_sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
                 combined_timesteps = torch.where(conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps)
+                if keyframe_count:
+                    keyframe_timesteps = (keyframe_mask * step_sigma.view(bsz, 1)).to(combined_timesteps.dtype)
+                    combined_timesteps = torch.cat([combined_timesteps, keyframe_timesteps], dim=1)
+                    conditioning_mask = torch.cat([conditioning_mask, keyframe_mask == 0.0], dim=1)
 
                 perturbations = BatchedPerturbationConfig.empty(bsz)
 
@@ -4370,7 +4412,7 @@ class LTX2SamplingMixin:
                     pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
 
                     # Split and extract target predictions only
-                    pred_tokens = pred_tokens[:, ref_seq_len:, :]
+                    pred_tokens = pred_tokens[:, ref_seq_len : ref_seq_len + target_seq_len, :]
                     vel_uncond, vel_cond = pred_tokens.chunk(2)
 
                     # Unpatchify to 5D for x0 conversion
@@ -4429,7 +4471,7 @@ class LTX2SamplingMixin:
                     pred_tokens, _ = base_model(video_modality, None, perturbations)
 
                     # Extract target predictions only
-                    target_pred = pred_tokens[:, ref_seq_len:, :]
+                    target_pred = pred_tokens[:, ref_seq_len : ref_seq_len + target_seq_len, :]
                     target_pred_5d = patchifier.unpatchify(
                         target_pred,
                         output_shape=VideoLatentShape(

@@ -3910,6 +3910,10 @@ When a `latent_idx` guide and an intrinsic (`first_frame` / `spatial_crop` / `in
 
 The four `keyframe_guide_extra_*` arrays must all have the same length. The primary keyframe (above) must also be set.
 
+Guide caches use the source image/video stem rather than a sampled video-window
+stem. One independently encoded guide cache is therefore shared by all frame
+windows selected from the same source video.
+
 `strength` semantics differ between guide types and are NOT interchangeable:
 
 - **`latent_idx_guide_strength`** is a **replacement-lock strength**. The guide latent overwrites tokens at the slot in-place. Training is binary by default; `--ltx2_graded_conditioning` enables continuous values with effective timestep `(1-strength) × sigma`.

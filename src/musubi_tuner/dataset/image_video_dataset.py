@@ -2270,7 +2270,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def get_latent_idx_guide_cache_path(self, item_info: ItemInfo) -> str:
         w, h = item_info.original_size
-        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        basename = self._get_latent_guide_cache_basename(item_info)
         assert self.latent_idx_guide_cache_directory is not None, (
             "latent_idx_guide_cache_directory is required when latent_idx_guide_directory is set"
         )
@@ -2281,7 +2281,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def get_keyframe_guide_cache_path(self, item_info: ItemInfo) -> str:
         w, h = item_info.original_size
-        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        basename = self._get_latent_guide_cache_basename(item_info)
         assert self.keyframe_guide_cache_directory is not None, (
             "keyframe_guide_cache_directory is required when keyframe_guide_directory is set"
         )
@@ -2300,13 +2300,19 @@ class BaseDataset(torch.utils.data.Dataset):
         if not extras:
             return []
         w, h = item_info.original_size
-        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        basename = self._get_latent_guide_cache_basename(item_info)
         paths: list[str] = []
         for spec in extras:
             cache_dir = spec.get("cache_directory")
             assert cache_dir, "keyframe_guide_extra cache_directory is required for every extra keyframe"
             paths.append(os.path.join(cache_dir, f"{basename}_{w:04d}x{h:04d}_{self.architecture}_kf_guide.safetensors"))
         return paths
+
+    @staticmethod
+    def _get_latent_guide_cache_basename(item_info: ItemInfo) -> str:
+        """Use the stable source stem for guides shared by video frame windows."""
+        source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
+        return os.path.splitext(os.path.basename(source_key))[0]
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
