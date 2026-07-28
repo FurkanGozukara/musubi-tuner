@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import random
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -277,6 +277,7 @@ class BucketBatchManager:
         keyframe_guide_strength: float = 1.0,
         keyframe_guide_extras: Optional[List[Dict[str, Any]]] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -294,6 +295,7 @@ class BucketBatchManager:
         self.keyframe_guide_frame_idx = int(keyframe_guide_frame_idx)
         self.keyframe_guide_strength = float(keyframe_guide_strength)
         self.keyframe_guide_extras: List[Dict[str, Any]] = list(keyframe_guide_extras or [])
+        self.reference_target_frame_ranges = reference_target_frame_ranges
         self.bucket_batch_sizes = self._resolve_bucket_batch_sizes(bucket_batch_sizes)
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
@@ -1059,5 +1061,7 @@ class BucketBatchManager:
         if any(r is not None for r in spatial_crop_regions_per_item):
             batch_tensor_data["spatial_crop_region"] = spatial_crop_regions_per_item
         batch_tensor_data["captions"] = captions
+        if self.reference_target_frame_ranges:
+            batch_tensor_data["reference_target_frame_ranges"] = self.reference_target_frame_ranges
 
         return batch_tensor_data

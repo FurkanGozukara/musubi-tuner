@@ -1,6 +1,7 @@
 """LTX-2 LoRA Training Implementation."""
 
 import argparse
+import json
 import math
 import os
 import random
@@ -4092,6 +4093,53 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         """LTX-2 doesn't currently support control conditioning"""
         return False
 
+    @staticmethod
+    def _canonical_reference_target_ranges(ranges) -> Optional[str]:
+        if not ranges:
+            return None
+        return json.dumps([list(value) for value in ranges], separators=(",", ":"))
+
+    def configure_reference_target_ranges_from_datasets(self, datasets) -> None:
+        range_sets = []
+        for dataset in datasets:
+            ranges = getattr(dataset, "reference_target_frame_ranges", ())
+            range_sets.append(tuple(tuple(value) for value in ranges) if ranges else None)
+
+        active = [ranges for ranges in range_sets if ranges is not None]
+        if not active:
+            self._reference_target_frame_ranges = None
+            return
+        if len(active) != len(range_sets):
+            raise ValueError("All datasets in a routed run must use the same non-empty reference_target_frame_ranges")
+
+        canonical = self._canonical_reference_target_ranges(active[0])
+        for index, ranges in enumerate(active[1:], start=1):
+            if self._canonical_reference_target_ranges(ranges) != canonical:
+                raise ValueError(f"reference_target_frame_ranges mismatch between datasets 0 and {index}")
+        self._reference_target_frame_ranges = active[0]
+
+    def save_model_specific_state(self, output_dir: str) -> None:
+        ranges = getattr(self, "_reference_target_frame_ranges", None)
+        if ranges is None:
+            return
+        path = os.path.join(output_dir, "ltx2_reference_target_frame_ranges.json")
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(ranges, handle)
+        os.replace(tmp_path, path)
+
+    def load_model_specific_state(self, input_dir: str) -> None:
+        expected = getattr(self, "_reference_target_frame_ranges", None)
+        if expected is None:
+            return
+        path = os.path.join(input_dir, "ltx2_reference_target_frame_ranges.json")
+        if not os.path.isfile(path):
+            raise ValueError("Resume state is missing ltx2_reference_target_frame_ranges.json required by active reference routing")
+        with open(path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        if self._canonical_reference_target_ranges(saved) != self._canonical_reference_target_ranges(expected):
+            raise ValueError("Resume reference target-frame ranges do not match the active dataset")
+
     def get_checkpoint_metadata(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Return LTX-2-specific metadata for LoRA safetensors (v2v mode info, etc.)."""
         md: Dict[str, Any] = {}
@@ -4105,6 +4153,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_ltx2_soft_av_alignment_sigma"] = float(getattr(args, "ltx2_soft_av_alignment_sigma", 1.0))
         if self._ic_lora_strategy and self._ic_lora_strategy != "none":
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
+        reference_target_ranges = getattr(self, "_reference_target_frame_ranges", None)
+        if reference_target_ranges is not None:
+            md["ss_ltx2_reference_target_frame_ranges"] = self._canonical_reference_target_ranges(reference_target_ranges)
         if bool(getattr(args, "latent_temporal_weighting", False)):
             md["ss_latent_temporal_weighting"] = True
             if getattr(args, "latent_temporal_weighting_args", None):
@@ -4941,6 +4992,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             or "none"
         ).lower()
         audio_ref_ic_enabled = ic_lora_strategy == "audio_ref_ic"
+        reference_target_ranges = batch.get("reference_target_frame_ranges")
+        if reference_target_ranges is not None:
+            configured_ranges = getattr(self, "_reference_target_frame_ranges", None)
+            if self._canonical_reference_target_ranges(reference_target_ranges) != self._canonical_reference_target_ranges(
+                configured_ranges
+            ):
+                raise ValueError("Batch reference target-frame ranges do not match the configured run ranges")
+            if ic_lora_strategy != "v2v":
+                raise ValueError("reference target-frame routing currently requires --ic_lora_strategy v2v")
 
         ref_latent_tensors = _collect_reference_tensors(batch, "ref_latents", expected_ndim=5)
         ref_latents = _merge_reference_tensors(ref_latent_tensors, concat_dim=2)
@@ -5833,6 +5893,31 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 )
                 force_keep_mask = torch.cat([force_keep_mask, kf_force_keep_mask], dim=1)
 
+            base_self_attention_mask = (
+                build_temporal_causal_attention_mask(combined_positions) if self._causal_temporal_attention else None
+            )
+            if reference_target_ranges is not None:
+                from musubi_tuner.ltx2_conditioning_routing import build_reference_target_range_attention_mask
+
+                reference_token_spans = []
+                stream_offset = 0
+                for ref_tensor in ref_latent_tensors:
+                    stream_count = int(ref_tensor.shape[2] * ref_tensor.shape[3] * ref_tensor.shape[4])
+                    reference_token_spans.append((stream_offset, stream_offset + stream_count))
+                    stream_offset += stream_count
+                if stream_offset != ref_seq_len:
+                    raise ValueError(f"conditioning reference token spans total {stream_offset}, expected {ref_seq_len}")
+
+                base_self_attention_mask = build_reference_target_range_attention_mask(
+                    ranges=reference_target_ranges,
+                    positions=combined_positions,
+                    frame_rate=float(frame_rate_v2v),
+                    target_token_start=ref_seq_len,
+                    target_token_count=target_seq_len,
+                    reference_token_spans=reference_token_spans,
+                    base_mask=base_self_attention_mask,
+                )
+
             video_modality = Modality(
                 enabled=True,
                 latent=combined_tokens,
@@ -5841,9 +5926,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=text_embeds,
                 sigma=sigma,
                 context_mask=text_mask,
-                attention_mask=(
-                    build_temporal_causal_attention_mask(combined_positions) if self._causal_temporal_attention else None
-                ),
+                attention_mask=base_self_attention_mask,
                 force_keep_mask=force_keep_mask if self._tread_enabled else None,
             )
 

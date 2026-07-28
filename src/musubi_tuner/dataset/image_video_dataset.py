@@ -3357,7 +3357,18 @@ class VideoDataset(BaseDataset):
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None,
     ):
+        from musubi_tuner.ltx2_conditioning_routing import normalize_reference_target_frame_ranges
+
+        configured_references = list(reference_directories or ())
+        if not configured_references and reference_directory:
+            configured_references = [reference_directory]
+        self.reference_target_frame_ranges = normalize_reference_target_frame_ranges(
+            reference_target_frame_ranges,
+            reference_count=len(configured_references),
+        )
+
         super(VideoDataset, self).__init__(
             resolution,
             caption_extension,
@@ -3857,6 +3868,7 @@ class VideoDataset(BaseDataset):
             keyframe_guide_strength=self.keyframe_guide_strength,
             keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
             bucket_batch_sizes=self.bucket_batch_sizes,
+            reference_target_frame_ranges=getattr(self, "reference_target_frame_ranges", None),
         )
         self.batch_manager.show_bucket_info()
 

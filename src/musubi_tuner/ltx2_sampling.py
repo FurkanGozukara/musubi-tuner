@@ -342,6 +342,8 @@ class LTX2SamplingMixin:
             "v2v": sample_parameter.get("v2v_ref_path"),
             "refaudio": sample_parameter.get("ref_audio_path"),
         }
+        for index, src in enumerate(sample_parameter.get("v2v_ref_paths") or ()):
+            sources[f"v2v{index}"] = src
         for kind, src in sources.items():
             if not src:
                 continue
@@ -1789,17 +1791,28 @@ class LTX2SamplingMixin:
 
         v2v_ref_latent = None
         v2v_ref_path = sample_parameter.get("v2v_ref_path", None)
+        v2v_ref_paths = sample_parameter.get("v2v_ref_paths")
+        if v2v_ref_paths is not None:
+            if v2v_ref_path is not None:
+                raise ValueError("Use either v2v_ref_path or v2v_ref_paths, not both")
+            if not isinstance(v2v_ref_paths, (list, tuple)) or not v2v_ref_paths:
+                raise ValueError("v2v_ref_paths must be a non-empty ordered list")
+            if not all(isinstance(path, str) and path for path in v2v_ref_paths):
+                raise ValueError("Every v2v_ref_paths entry must be a non-empty path string")
+        else:
+            v2v_ref_paths = [v2v_ref_path] if v2v_ref_path else []
 
         if "v2v_ref_latent" in sample_parameter:
             v2v_ref_latent = sample_parameter["v2v_ref_latent"]
             if v2v_ref_latent is not None:
+                refs = self._normalize_reference_tensor_collection(v2v_ref_latent, expected_ndim=5)
                 device = accelerator.device
-                v2v_ref_latent = v2v_ref_latent.to(device=device, dtype=dit_dtype)
-                logger.info("V2V: using precached reference latent %s", v2v_ref_latent.shape)
-                v2v_ref_path = None
+                v2v_ref_latent = [ref.to(device=device, dtype=dit_dtype) for ref in refs]
+                logger.info("V2V: using %d precached reference latent(s)", len(v2v_ref_latent))
+                v2v_ref_paths = []
 
-        if v2v_ref_path:
-            logger.info("V2V: encoding reference")
+        if v2v_ref_paths:
+            logger.info("V2V: encoding %d ordered reference(s)", len(v2v_ref_paths))
             try:
                 vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
                 if not vae_checkpoint:
@@ -1820,17 +1833,20 @@ class LTX2SamplingMixin:
                     ref_w, ref_h = width, height
 
                 ref_frames = max(1, getattr(args, "reference_frames", 1))
-                v2v_ref_latent = self._load_and_encode_v2v_reference(
-                    ref_path=v2v_ref_path,
-                    target_height=ref_h,
-                    target_width=ref_w,
-                    vae_checkpoint_path=vae_checkpoint,
-                    device=device,
-                    dtype=dit_dtype,
-                    max_frames=ref_frames,
-                )
+                v2v_ref_latent = [
+                    self._load_and_encode_v2v_reference(
+                        ref_path=ref_path,
+                        target_height=ref_h,
+                        target_width=ref_w,
+                        vae_checkpoint_path=vae_checkpoint,
+                        device=device,
+                        dtype=dit_dtype,
+                        max_frames=ref_frames,
+                    )
+                    for ref_path in v2v_ref_paths
+                ]
             except Exception as e:
-                logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
+                logger.error("V2V: failed to load ordered references %s: %s", v2v_ref_paths, e)
                 v2v_ref_latent = None
 
         # ---- LTX-2 latent-guide specs (--gl / --gk in prompt lines) ----
@@ -2709,6 +2725,11 @@ class LTX2SamplingMixin:
         # NOT supported: keyframe (token-append) guides on any v2v path (the dedicated helpers bypass the
         # append path), and any guide / first_frame on the audio-bearing av_ic / video_ref_only_av paths.
         _pure_v2v = v2v_ref_latents is not None and not av_ic_sampling and not video_ref_only_av_sampling
+        if (
+            sample_parameter.get("reference_target_frame_range") is not None
+            or sample_parameter.get("reference_target_frame_ranges") is not None
+        ) and not _pure_v2v:
+            raise ValueError("reference target-frame routing currently requires pure v2v sampling")
         if v2v_ref_latents is not None and (
             keyframe_guides or (latent_idx_guides and not _pure_v2v) or (conditioning_latent is not None and not _pure_v2v)
         ):
@@ -2812,6 +2833,8 @@ class LTX2SamplingMixin:
                 inpaint_invert=bool(sample_parameter.get("inpaint_invert", False)),
                 inpaint_threshold=float(sample_parameter.get("inpaint_threshold", 0.5)),
                 latent_idx_guides=latent_idx_guides,
+                reference_target_frame_ranges=sample_parameter.get("reference_target_frame_ranges"),
+                reference_target_frame_range=sample_parameter.get("reference_target_frame_range"),
             )
             return video, audio_waveform
 
@@ -4009,7 +4032,7 @@ class LTX2SamplingMixin:
     def _do_v2v_denoising(
         self,
         latents: torch.Tensor,
-        v2v_ref_latents: torch.Tensor,
+        v2v_ref_latents,
         transformer,
         dit_dtype: torch.dtype,
         prompt_embeds: torch.Tensor,
@@ -4032,6 +4055,8 @@ class LTX2SamplingMixin:
         inpaint_invert: bool = False,
         inpaint_threshold: float = 0.5,
         latent_idx_guides: Optional[list] = None,
+        reference_target_frame_ranges: Optional[list[list[int]]] = None,
+        reference_target_frame_range: Optional[list[int]] = None,
     ):
         """V2V / IC-LoRA denoising: concatenate reference + target tokens with per-token timesteps.
 
@@ -4064,17 +4089,33 @@ class LTX2SamplingMixin:
         tgt_height = int(latents.shape[3])
         tgt_width = int(latents.shape[4])
         frame_rate_v2v = float(sample_parameter.get("frame_rate", 25))
-        _has_ref = v2v_ref_latents is not None
+        ref_latent_tensors = self._normalize_reference_tensor_collection(v2v_ref_latents, expected_ndim=5)
+        _has_ref = bool(ref_latent_tensors)
         ref_tokens = None
         ref_seq_len = 0
+        reference_token_spans = []
         ref_conditioning_mask = None
         ref_positions = None
         ref_frames = 0
         if _has_ref:
-            v2v_ref_latents = v2v_ref_latents.to(device=transformer_device, dtype=dit_dtype)
+            ref_latent_tensors = [ref.to(device=transformer_device, dtype=dit_dtype) for ref in ref_latent_tensors]
+            ref_channels = int(ref_latent_tensors[0].shape[1])
+            ref_height = int(ref_latent_tensors[0].shape[3])
+            ref_width = int(ref_latent_tensors[0].shape[4])
+            for index, ref in enumerate(ref_latent_tensors):
+                shape = (int(ref.shape[1]), int(ref.shape[3]), int(ref.shape[4]))
+                if shape != (ref_channels, ref_height, ref_width):
+                    raise ValueError(
+                        "Ordered V2V references must share channel and spatial latent geometry; "
+                        f"reference 0 is {(ref_channels, ref_height, ref_width)}, reference {index} is {shape}"
+                    )
+            stream_offset = 0
+            for ref in ref_latent_tensors:
+                stream_count = int(ref.shape[2] * ref.shape[3] * ref.shape[4])
+                reference_token_spans.append((stream_offset, stream_offset + stream_count))
+                stream_offset += stream_count
+            v2v_ref_latents = torch.cat(ref_latent_tensors, dim=2)
             ref_frames = int(v2v_ref_latents.shape[2])
-            ref_height = int(v2v_ref_latents.shape[3])
-            ref_width = int(v2v_ref_latents.shape[4])
 
             if ref_height == tgt_height and ref_width == tgt_width:
                 reference_downscale_factor = 1
@@ -4091,6 +4132,8 @@ class LTX2SamplingMixin:
             # Patchify reference tokens (constant across denoising steps)
             ref_tokens = patchifier.patchify(v2v_ref_latents)  # [B, ref_seq, D]
             ref_seq_len = ref_tokens.shape[1]
+            if stream_offset != ref_seq_len:
+                raise ValueError(f"Ordered V2V reference token spans total {stream_offset}, expected {ref_seq_len}")
 
             # Conditioning mask: ref=True (conditioned, t=0), target=False (denoised, t=sigma)
             ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=transformer_device, dtype=torch.bool)
@@ -4140,6 +4183,30 @@ class LTX2SamplingMixin:
         tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / frame_rate_v2v
 
         combined_positions = torch.cat([ref_positions, tgt_positions], dim=2) if _has_ref else tgt_positions
+
+        target_seq_len = int(tgt_positions.shape[2])
+        routing_mask = None
+        if reference_target_frame_ranges is not None and reference_target_frame_range is not None:
+            if len(reference_target_frame_ranges) != 1 or list(reference_target_frame_ranges[0]) != list(
+                reference_target_frame_range
+            ):
+                raise ValueError("reference_target_frame_range conflicts with reference_target_frame_ranges")
+        routed_ranges = reference_target_frame_ranges
+        if routed_ranges is None and reference_target_frame_range is not None:
+            routed_ranges = [reference_target_frame_range]
+        if routed_ranges is not None:
+            from musubi_tuner.ltx2_conditioning_routing import build_reference_target_range_attention_mask
+
+            if not _has_ref:
+                raise ValueError("reference_target_frame_ranges require reference video input")
+            routing_mask = build_reference_target_range_attention_mask(
+                ranges=routed_ranges,
+                positions=combined_positions,
+                frame_rate=float(frame_rate_v2v),
+                target_token_start=ref_seq_len,
+                target_token_count=target_seq_len,
+                reference_token_spans=reference_token_spans,
+            )
 
         # Get base model (bypass LTX2Wrapper)
         base_model = transformer.model if hasattr(transformer, "model") else transformer
@@ -4298,6 +4365,7 @@ class LTX2SamplingMixin:
                         context=prompt_embeds,  # already [neg+pos, seq, dim] from CFG setup
                         sigma=cfg_sigma,
                         context_mask=prompt_mask,
+                        attention_mask=routing_mask.repeat(2, 1, 1) if routing_mask is not None else None,
                     )
                     pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
 
@@ -4356,6 +4424,7 @@ class LTX2SamplingMixin:
                         context=prompt_embeds,
                         sigma=step_sigma,
                         context_mask=prompt_mask,
+                        attention_mask=routing_mask,
                     )
                     pred_tokens, _ = base_model(video_modality, None, perturbations)
 

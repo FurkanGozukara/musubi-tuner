@@ -119,6 +119,7 @@ class VideoDatasetParams(BaseDatasetParams):
     reference_directories: Optional[Sequence[str]] = None
     reference_audio_directory: Optional[str] = None
     reference_audio_directories: Optional[Sequence[str]] = None
+    reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -243,6 +244,7 @@ class ConfigSanitizer:
         "reference_directories": [str],
         "reference_audio_directory": str,
         "reference_audio_directories": [str],
+        "reference_target_frame_ranges": [[int]],
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,

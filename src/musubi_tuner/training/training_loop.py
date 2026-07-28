@@ -275,6 +275,12 @@ def train(self, args):
                 spatial_crop_enabled=bool(getattr(args, "ltx2_spatial_crop", False)),
             )
 
+    if hasattr(self, "configure_reference_target_ranges_from_datasets"):
+        conditioning_datasets = list(train_dataset_group.datasets)
+        if validation_dataset_group is not None:
+            conditioning_datasets.extend(validation_dataset_group.datasets)
+        self.configure_reference_target_ranges_from_datasets(conditioning_datasets)
+
     if train_dataset_group.num_train_items == 0:
         raise ValueError(
             "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
@@ -827,6 +833,8 @@ def train(self, args):
             # print(f"save model hook: {len(weights)} weights will be saved")
 
             unwrapped_network = accelerator.unwrap_model(network)
+            if hasattr(self, "save_model_specific_state"):
+                self.save_model_specific_state(output_dir)
             if hasattr(unwrapped_network, "build_adaptive_rank_runtime_state"):
                 try:
                     adaptive_rank_runtime_state = unwrapped_network.build_adaptive_rank_runtime_state()
@@ -892,6 +900,9 @@ def train(self, args):
 
     def load_model_hook(models, input_dir):
         nonlocal lr_descriptions, ema_state_loaded
+
+        if hasattr(self, "load_model_specific_state"):
+            self.load_model_specific_state(input_dir)
 
         # remove models except network
         remove_indices = []

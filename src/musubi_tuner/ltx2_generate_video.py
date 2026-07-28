@@ -12,6 +12,7 @@ image-to-video conditioning, and video-to-video reference conditioning.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -57,16 +58,20 @@ def _apply_reference_conditioning_overrides(
     *,
     reference_image: str | None = None,
     reference_video: str | None = None,
-) -> tuple[str, bool] | None:
-    if not reference_image and not reference_video:
+    reference_videos: list[str] | None = None,
+) -> tuple[list[str], bool] | None:
+    reference_videos = list(reference_videos or ())
+    if not reference_image and not reference_video and not reference_videos:
         return None
 
+    if reference_videos and (reference_image or reference_video):
+        raise ValueError("--reference_videos cannot be combined with --reference_image or --reference_video")
     if reference_image and reference_video:
         logger.warning(
             "Both --reference_image and --reference_video given; --reference_video takes priority (V2V), --reference_image ignored."
         )
 
-    ref_path = reference_video or reference_image
+    ref_paths = reference_videos or [reference_video or reference_image]
 
     # Auto-detect: if an --reference_image path is actually a video by ext, use V2V slot.
     try:
@@ -76,24 +81,29 @@ def _apply_reference_conditioning_overrides(
     except Exception:
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-    ext = os.path.splitext(ref_path)[1].lower()
-    use_v2v = bool(reference_video) or (ext in video_exts)
+    ext = os.path.splitext(ref_paths[0])[1].lower()
+    use_v2v = bool(reference_video or reference_videos) or (ext in video_exts)
 
-    if not os.path.isfile(ref_path):
-        raise FileNotFoundError(f"Reference path does not exist: {ref_path}")
+    for ref_path in ref_paths:
+        if not os.path.isfile(ref_path):
+            raise FileNotFoundError(f"Reference path does not exist: {ref_path}")
 
     for prompt_dict in prompts:
         # Explicit CLI references should override prompt-file paths and cached reference latents.
         prompt_dict.pop("image_path", None)
         prompt_dict.pop("conditioning_latent", None)
         prompt_dict.pop("v2v_ref_path", None)
+        prompt_dict.pop("v2v_ref_paths", None)
         prompt_dict.pop("v2v_ref_latent", None)
         if use_v2v:
-            prompt_dict["v2v_ref_path"] = ref_path
+            if len(ref_paths) == 1:
+                prompt_dict["v2v_ref_path"] = ref_paths[0]
+            else:
+                prompt_dict["v2v_ref_paths"] = ref_paths
         else:
-            prompt_dict["image_path"] = ref_path
+            prompt_dict["image_path"] = ref_paths[0]
 
-    return ref_path, use_v2v
+    return ref_paths, use_v2v
 
 
 def _apply_composable_conditioning_overrides(prompts: list[dict], args: argparse.Namespace) -> None:
@@ -185,6 +195,47 @@ def _apply_composable_conditioning_overrides(prompts: list[dict], args: argparse
                 prompt_dict["audio_lock_seconds"] = float(audio_lock_seconds)
             if audio_lock_interval is not None:
                 prompt_dict["audio_lock_interval"] = audio_lock_interval
+
+
+def _apply_reference_target_ranges_from_adapters(prompts: list[dict], weights: list[str]) -> None:
+    """Apply the ordered reference-routing contract stored by a trained adapter."""
+
+    encoded_ranges = {raw for path in weights if (raw := load_lora_metadata(path).get("ss_ltx2_reference_target_frame_ranges"))}
+    if not encoded_ranges:
+        return
+    if len(encoded_ranges) != 1:
+        raise ValueError("The supplied LoRAs contain different reference target-frame ranges")
+
+    try:
+        ranges = json.loads(next(iter(encoded_ranges)))
+    except json.JSONDecodeError as exc:
+        raise ValueError("LoRA has invalid ss_ltx2_reference_target_frame_ranges metadata") from exc
+    if not isinstance(ranges, list):
+        raise ValueError("LoRA reference target-frame ranges metadata must be a list")
+
+    from musubi_tuner.ltx2_conditioning_routing import normalize_reference_target_frame_ranges
+
+    for prompt in prompts:
+        ref_paths = prompt.get("v2v_ref_paths")
+        if ref_paths is None:
+            ref_paths = [prompt["v2v_ref_path"]] if prompt.get("v2v_ref_path") else []
+        if not isinstance(ref_paths, (list, tuple)) or not all(isinstance(path, str) and path for path in ref_paths):
+            raise ValueError("Prompt v2v_ref_paths must be a non-empty ordered list of paths")
+        if not ref_paths:
+            raise ValueError("Routed LoRA metadata requires V2V reference input")
+
+        normalized = normalize_reference_target_frame_ranges(ranges, reference_count=len(ref_paths))
+        routed_ranges = [list(value) for value in normalized]
+        explicit_ranges = prompt.get("reference_target_frame_ranges")
+        explicit_range = prompt.get("reference_target_frame_range")
+        if explicit_ranges is not None and [list(value) for value in explicit_ranges] != routed_ranges:
+            raise ValueError("Prompt reference_target_frame_ranges do not match the loaded LoRA metadata")
+        if explicit_range is not None:
+            if len(routed_ranges) != 1 or list(explicit_range) != routed_ranges[0]:
+                raise ValueError("Prompt reference_target_frame_range does not match the loaded LoRA metadata")
+        prompt["reference_target_frame_ranges"] = routed_ranges
+        if len(routed_ranges) == 1:
+            prompt["reference_target_frame_range"] = routed_ranges[0]
 
 
 def _parse_outpaint_region(spec: str) -> tuple[int, int, int, int]:
@@ -498,6 +549,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reference_video", type=str, default=None, help="Path to reference video file for V2V conditioning (multi-frame)."
+    )
+    parser.add_argument(
+        "--reference_videos",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Ordered V2V reference paths for multi-reference inference. "
+        "Cannot be combined with --reference_image or --reference_video.",
     )
 
     # -- Composable conditioning (inference): surface the strategy/audio/inpaint knobs the sampler
@@ -1011,17 +1070,28 @@ def main() -> None:
         logger.error("No prompts to generate. Exiting.")
         return
 
-    if args.reference_image or args.reference_video:
+    if args.reference_image or args.reference_video or args.reference_videos:
         try:
-            ref_path, use_v2v = _apply_reference_conditioning_overrides(
+            ref_paths, use_v2v = _apply_reference_conditioning_overrides(
                 prompts,
                 reference_image=args.reference_image,
                 reference_video=args.reference_video,
+                reference_videos=args.reference_videos,
             )
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
             logger.error(str(exc))
             return
-        logger.info("Reference conditioning: %s via %s slot", ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)")
+        logger.info(
+            "Reference conditioning: %s via %s slot",
+            ref_paths,
+            "V2V (v2v_ref_path[s])" if use_v2v else "I2V (image_path)",
+        )
+
+    try:
+        _apply_reference_target_ranges_from_adapters(prompts, list(args.lora_weight or ()))
+    except ValueError as exc:
+        logger.error(str(exc))
+        return
 
     if (
         args.reference_audio

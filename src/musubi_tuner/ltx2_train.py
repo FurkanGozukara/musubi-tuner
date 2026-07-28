@@ -5081,6 +5081,10 @@ def main() -> None:
             }
         )
 
+    conditioning_datasets = list(train_dataset_group.datasets)
+    if val_dataset_group is not None:
+        conditioning_datasets.extend(val_dataset_group.datasets)
+    trainer.configure_reference_target_ranges_from_datasets(conditioning_datasets)
     checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
     if checkpoint_extra_metadata:
         metadata.update(checkpoint_extra_metadata)

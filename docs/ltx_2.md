@@ -101,6 +101,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
     - [INT8 ConvRot Base](#int8-convrot-base)
     - [W4A4G4 Training](#w4a4g4-training)
+      - [ComfyUI inference export (convrot_w4a4)](#comfyui-inference-export-convrot_w4a4)
+      - [NVFP4 container](#nvfp4-container)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Function Type](#loss-function-type)
@@ -173,8 +175,9 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
         - [Notes](#notes-2)
     - [Directional Training (A2V / V2A)](#directional-training-a2v--v2a)
     - [Latent Guides](#latent-guides)
-      - [Dataset Config Options](#latent-guide-dataset-config-options)
+      - [Latent Guide Dataset Config Options](#latent-guide-dataset-config-options)
       - [IC-LoRA Compatibility Matrix](#ic-lora-compatibility-matrix)
+      - [Reference target-frame routing](#reference-target-frame-routing)
       - [Endpoint Keyframe Training](#endpoint-keyframe-training)
       - [Video Anchor Training](#video-anchor-training)
       - [Sample Prompt Flags](#sample-prompt-flags)
@@ -2509,6 +2512,7 @@ python ltx2_generate_video.py ^
 - `--vae_dtype`: Override the VAE runtime dtype for inference. If omitted, the script uses its default VAE dtype (`bfloat16`).
 - `--reference_image`: Apply one global I2V reference image to all prompts in the current inference run.
 - `--reference_video`: Apply one global V2V reference video to all prompts in the current inference run.
+- `--reference_videos PATH [PATH ...]`: Apply ordered V2V references for multi-reference pure-V2V inference. It cannot be combined with `--reference_image` or `--reference_video`.
 - If both `--reference_image` and `--reference_video` are supplied, `--reference_video` takes priority.
 - Global `--reference_image` / `--reference_video` overrides replace conflicting per-prompt `image_path` / `v2v_ref_path` entries loaded from prompt files, and also clear any cached reference latents tied to those prompt entries before sampling.
 - If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
@@ -3939,7 +3943,63 @@ keyframe_guide_extra_strengths         = [0.7]
 
 `latent_idx` overwrites the noisy-target tensor before patchify, so it works on every branch that produces video tokens. `keyframe` token-append is wired through the `LTX2Wrapper.forward` path for the simple/audio-ref-only paths and via `build_keyframe_extension` for the v2v / av_ic / video_ref_only_av IC-LoRA branches; in all cases the appended timesteps are `(1 − strength) × sigma` and the predictions are sliced off before loss.
 
-**Inference:** the `✓` above is training-only. `v2v` / `av_ic` / `video_ref_only_av` do not compose first-frame, `latent_idx`, or `keyframe` guides at sample time — only `none` and `audio_ref_ic` do, and supplying a guide with a reference-video strategy raises an error. Don't train such a LoRA expecting to sample it with guides.
+**Inference:** pure `v2v` composes token-appended `keyframe` guides through the
+same `build_keyframe_extension` layout used during training, preserving
+reference/target/keyframe ordering, positions, strengths, and target-only
+prediction slicing. It also supports first-frame, inpaint, and `latent_idx`
+conditioning. The audio-bearing reference strategies do not currently compose
+token-appended keyframe guides at sample time.
+
+### Reference target-frame routing
+
+`reference_target_frame_ranges` is an opt-in extension to the existing
+`reference_directories` interface. It limits which target-frame queries may
+directly attend to each reference, without introducing another conditioning
+schema:
+
+```toml
+reference_directories = ["data/reference_a", "data/reference_b"]
+reference_cache_directories = ["cache/reference_a", "cache/reference_b"]
+reference_target_frame_ranges = [[0, 17], [17, 33]]
+```
+
+Ranges use half-open pixel-frame coordinates `[start, end)` and are ordered
+exactly like `reference_directories`. There must be one range per reference.
+All datasets in a routed run must use the same ranges. The ranges are saved in
+LoRA metadata and training-state checkpoints, and a mismatched resume is
+rejected.
+
+Pure-v2v inference accepts the same ordered layout:
+
+```json
+{
+  "prompt": "A cinematic scene",
+  "v2v_ref_paths": ["reference_a.mp4", "reference_b.mp4"],
+  "reference_target_frame_ranges": [[0, 17], [17, 33]]
+}
+```
+
+The standalone CLI equivalent is:
+
+```bash
+python ltx2_generate_video.py ... ^
+  --reference_videos reference_a.mp4 reference_b.mp4
+```
+
+When a loaded LoRA contains `reference_target_frame_ranges` metadata, the
+standalone script injects those ranges automatically and rejects a conflicting
+prompt. A single-reference prompt may continue using `v2v_ref_path` and
+`reference_target_frame_range`; `--reference_video` remains the compatible
+single-reference CLI form.
+
+Inference encodes the references in list order, concatenates them along the
+same temporal latent axis as training, retains an individual token span for
+each reference, and applies the same attention rule. Consequently, the
+combined reference temporal geometry must satisfy the existing V2V temporal
+scale constraint relative to the target; incompatible combinations fail
+instead of silently changing positions. This feature does not replace or
+rename official reference, keyframe, intrinsic, video, or audio conditioning
+primitives.
 
 Notes on edge cases:
 - **`reference_downscale_factor`** (set on the dataset for v2v / av_ic / video_ref_only_av when ref-video resolution is lower than the target) is propagated into keyframe positions inside `build_keyframe_extension` so a downscaled keyframe carries spatial positions consistent with the ref-video. The simple path runs at full resolution and ignores this factor.
