@@ -709,6 +709,7 @@ When changing checkpoints (important):
 - Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
 - If you use `--dataset_manifest`, regenerate it from the recache step so training points to the new cache files.
 - Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) work with both `--fp8_base` and `--fp8_base --fp8_scaled`. The loader dequantizes to bf16 using the checkpoint's scale tensors before any further processing.
+- E4M3 LoRA fusion uses optional Triton stochastic rounding only on compute capability 8.9+. Unsupported GPUs, including Ampere, use the existing bf16 merge fallback; Triton is not required.
 
 Example (LTX-2.3 training):
 ```bash

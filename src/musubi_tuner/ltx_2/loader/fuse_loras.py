@@ -15,6 +15,18 @@ from musubi_tuner.ltx_2.loader.primitives import LoraStateDictWithStrength, Stat
 BLOCK_SIZE = 1024
 
 
+def _supports_triton_float8_rounding(dtype: torch.dtype, device: torch.device) -> bool:
+    if not _HAS_TRITON or device.type != "cuda":
+        return False
+
+    compute_capability = torch.cuda.get_device_capability(device)
+    if dtype == torch.float8_e4m3fn:
+        return compute_capability >= (8, 9)
+    if dtype == torch.float8_e5m2:
+        return compute_capability >= (8, 0)
+    return False
+
+
 def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.Tensor, seed: int) -> torch.Tensor:
     if not _HAS_TRITON:
         raise RuntimeError("triton is required for fused float8 add+round on CUDA")
@@ -94,7 +106,7 @@ def apply_loras(
                 continue
             deltas = weight.clone().to(dtype=target_dtype, device=device)
         elif weight.dtype == torch.float8_e4m3fn:
-            if str(device).startswith("cuda") and _HAS_TRITON:
+            if _supports_triton_float8_rounding(weight.dtype, device):
                 deltas = calculate_weight_float8_(deltas, weight)
             else:
                 deltas.add_(weight.to(dtype=deltas.dtype, device=device))
