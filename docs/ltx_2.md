@@ -1327,7 +1327,7 @@ Logged metrics include `modality_freeze/state`, `modality_freeze/video_loss_ema`
 
 **9. Use Self-Flow when representation alignment is part of the run.** `--self_flow` can add video and audio representation-alignment terms in AV mode. Keep its detailed setup in the [Self-Flow](#self-flow-self-supervised-flow-matching) section, and only enable audio alignment when you intentionally want that extra objective:
 ```bash
---self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=base
+--self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=ema
 ```
 
 **10. Route cross-modal gradients deliberately for `av_ic` and sync-sensitive runs.** `--dcr --dcr_args reference_detach=true` can be combined with the audio-aware sampler, `ema_mag`, and per-modality caption dropout. Add `--tarp` or Cross-Task Synergy only when AV sync or cross-modal alignment is the target and the compute cost is acceptable:
@@ -2984,15 +2984,15 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 ### Self-Flow (Self-Supervised Flow Matching)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The paper's Self-Flow ([arXiv 2603.06507](https://arxiv.org/abs/2603.06507), Eq. 6) is EMA self-distillation — the teacher is a weight-EMA copy of the same network — which is reproduced here by `teacher_mode=ema` / `partial_ema`. The shipped default `teacher_mode=base` is a related but **non-paper variant**: it disables the LoRA/adapter for the teacher forward pass so the teacher is the frozen pretrained base (a consistency / REPA-against-base regularizer — no separate teacher-weight copy and no teacher↔student co-adaptation). The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is an LTX-specific addition not covered by the paper attribution.
+**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The paper's Self-Flow ([arXiv 2603.06507](https://arxiv.org/abs/2603.06507), Eq. 6) is EMA self-distillation, so `teacher_mode=ema` is the default and canonical implementation. `partial_ema` is a lower-memory approximation that tracks only the selected teacher block. `teacher_mode=base` remains available for adapter training as a related but **non-paper variant**: it disables the adapter for the teacher pass and acts as a frozen-base consistency regularizer. The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is an LTX-specific addition not covered by the paper attribution.
 
 Enable with `--self_flow`. Supported in `--ltx2_mode video` and `--ltx2_mode av`. In AV mode the video alignment runs by default; an optional audio alignment branch is enabled with `lambda_audio > 0` (see the audio notes below). All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
 ```bash
-# Recommended default: base-model teacher, token-level alignment only
+# Canonical EMA teacher, token-level alignment only
 accelerate launch ... ltx2_train_network.py ^
   --self_flow ^
-  --self_flow_args teacher_mode=base student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 dual_timestep=true
+  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 dual_timestep=true
 
 # With temporal consistency (hybrid = frame alignment + motion delta)
 accelerate launch ... ltx2_train_network.py ^
@@ -3013,7 +3013,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; disables the adapter during the teacher pass, no separate teacher-weight copy — **diverges from the paper**, see the intro note), `ema` (EMA over all LoRA params — the paper's method), `partial_ema` (EMA over teacher block's LoRA params only) |
+| `teacher_mode` | `ema` | Teacher source: `ema` (canonical EMA over all trainable transformer parameters), `partial_ema` (lower-memory approximation over the selected teacher block), or `base` (adapter-only frozen-base consistency variant; **not canonical Self-Flow**) |
 | `student_block_idx` | `16` | Student feature block index (0-based; overridden by `student_block_ratio` when set) |
 | `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`; overridden by `teacher_block_ratio` when set) |
 | `student_block_ratio` | `None` | Ratio-based student layer selection. Resolves to `floor(ratio * depth)`. Takes priority over `student_block_idx`. |
@@ -3037,9 +3037,15 @@ accelerate launch ... ltx2_train_network.py ^
 | `delta_num_steps` | `1` | Number of temporal delta steps included in the delta loss (`1` = adjacent frames only) |
 | `motion_weighting` | `none` | Temporal weighting mode: `none` or `teacher_delta` |
 | `motion_weight_strength` | `0.0` | Strength of teacher-delta motion weighting for temporal terms |
-| `temporal_schedule` | `constant` | Schedule applied to **all** Self-Flow lambdas (`lambda_self_flow`, `lambda_audio`, `lambda_temporal`, `lambda_delta`): `constant`, `linear` decay, or `cosine` decay |
+| `temporal_schedule` | `constant` | Schedule applied to **all** Self-Flow lambdas (`lambda_self_flow`, `lambda_audio`, `lambda_temporal`, `lambda_delta`): `constant`, `linear`, `cosine`, or `polynomial` decay |
 | `temporal_warmup_steps` | `0` | Steps to linearly ramp all lambdas up from zero to full weight |
-| `temporal_max_steps` | `0` | Steps at which `linear` / `cosine` decay reaches zero. `0` = no decay. If omitted from `--self_flow_args`, defaults to `--max_train_steps` (decay reaches zero at end of training); set explicitly to control the endpoint, or use `temporal_schedule=constant` to disable decay |
+| `temporal_max_steps` | `0` | Step at which a decaying schedule reaches `schedule_end_weight`. `0` disables decay. If omitted for a decaying schedule, it defaults to `--max_train_steps` |
+| `schedule_end_weight` | `0.0` | Final multiplier for decaying schedules. Valid range: `[0.0, 1.0]` |
+| `schedule_power` | `1.0` | Positive exponent for `temporal_schedule=polynomial` |
+| `schedule_cutoff_step` | `0` | Hard-disable all Self-Flow terms at this global step. `0` disables the hard cutoff |
+| `similarity_cutoff` | `None` | Disable Self-Flow when the EMA video cosine reaches this threshold. Valid range: `[-1.0, 1.0]` |
+| `similarity_ema_decay` | `0.99` | EMA decay for the similarity cutoff signal. Valid range: `[0.0, 1.0)` |
+| `similarity_cutoff_mode` | `permanent` | `permanent` latches the cutoff; `recoverable` continues diagnostic capture and resumes the loss if EMA similarity drops below the threshold |
 | `teacher_momentum` | `0.999` | EMA momentum for teacher updates (`ema` / `partial_ema` modes only). Valid range: `[0.0, 1.0)` |
 | `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
 | `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
@@ -3056,20 +3062,22 @@ accelerate launch ... ltx2_train_network.py ^
 
 - Supported modes: `--ltx2_mode video`, `--ltx2_mode av`. In AV mode, video alignment is always active when `lambda_self_flow > 0`; audio alignment is active when `lambda_audio > 0`.
 - Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
-- Cost: one extra teacher forward pass per train step. `teacher_mode=base` reuses the existing model with the adapter disabled for the teacher pass instead of keeping a separate teacher-weight copy.
-- Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned) but is **not** the paper's method; `ema` / `partial_ema` are the paper's EMA self-distillation, a moving target that shrinks as training converges.
+- Cost: one extra teacher forward pass per active train step. `teacher_mode=base` reuses the existing model with the adapter disabled instead of keeping a teacher-weight copy.
+- Teacher modes: `ema` is canonical Self-Flow; `partial_ema` is a memory-saving approximation; `base` gives a pretrained-vs-finetuned gap but is **not** the paper's method.
+- Feature capture: the LTX transformer returns the requested video and audio hidden states directly. Self-Flow no longer depends on forward hooks, including under checkpointing.
 - Temporal extension (LTX-specific, **not** part of arXiv 2603.06507): when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
 - Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
 - Local patch matching: when `temporal_granularity=patch` and `patch_spatial_radius > 0`, each student patch can align to the best teacher patch inside a local spatial window, which is more tolerant to small motion and camera drift than strict same-patch matching.
 - Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.
 - Multi-step motion: `delta_num_steps > 1` extends the delta loss beyond adjacent frames using exponentially decayed step weights.
 - Motion-aware weighting: `motion_weighting=teacher_delta` upweights temporally active teacher regions, focusing the temporal loss on moving content.
-- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` apply to all Self-Flow lambdas — `lambda_self_flow`, `lambda_audio`, `lambda_temporal`, and `lambda_delta` — uniformly.
+- Scheduling: warmup, constant/linear/cosine/polynomial decay, end weight, hard cutoff, and similarity-based cutoff apply to all Self-Flow lambdas uniformly.
 - AV audio: when `lambda_audio > 0`, AV mode builds a separate dual-timestep student audio view and a cleaner teacher audio view, matching the video Self-Flow teacher/student asymmetry.
 - Validation: the primary validation loss uses the normal homogeneous noising path. `val_self_flow_loss`, when logged, is a separate diagnostic and is not added to `val_loss`.
-- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors` (EMA state only saved when `teacher_mode=ema` or `partial_ema`).
-- Resume: both state files are loaded automatically when present. Loading an EMA teacher state file with `teacher_mode=base` raises an error telling you to pass `teacher_mode=ema`/`partial_ema` or delete `self_flow_teacher_ema.safetensors`; during state load the error is caught and logged as a warning so the EMA state is skipped.
-- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/audio_cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_audio`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/audio_masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`, `self_flow/audio_tau_mean`, `self_flow/audio_tau_min_mean`.
+- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors` and `self_flow_teacher_ema.safetensors`. Projectors are also registered on the trainable network so distributed wrapping and gradient synchronization include them.
+- Resume: both state files are required and loaded automatically. Missing or incompatible Self-Flow state raises an error instead of reinitializing part of the objective.
+- Invalid or unsupported combinations fail during setup. Missing captures, missing audio features, non-finite losses, and failed temporal reshapes fail at the affected step instead of silently disabling the objective.
+- Logged metrics include `loss/self_flow`, cosine terms, scheduled lambdas, `self_flow/schedule_scale`, `self_flow/cutoff_active`, `self_flow/similarity_ema`, masking/timestep statistics, and the isolated `val_self_flow_loss` diagnostic.
 
 ### HFATO (High-Frequency Awareness Training Objective)
 <sub>[↑ contents](#table-of-contents)</sub>

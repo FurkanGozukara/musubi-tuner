@@ -962,8 +962,15 @@ class LTXModel(torch.nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig,
-    ) -> tuple[TransformerArgs, TransformerArgs]:
+        hidden_state_layer: int | None = None,
+    ) -> tuple[TransformerArgs, TransformerArgs, torch.Tensor | None, torch.Tensor | None]:
         """Process transformer blocks with optional offloading and block swapping."""
+        if hidden_state_layer is not None and not 0 <= int(hidden_state_layer) < len(self.transformer_blocks):
+            raise ValueError(
+                f"hidden_state_layer={hidden_state_layer} is out of range for {len(self.transformer_blocks)} transformer blocks"
+            )
+        captured_video_hidden = None
+        captured_audio_hidden = None
 
         if isinstance(self.offloader, LTX2TrainableRingOffloader):
             forward_only = not self.training
@@ -1472,6 +1479,9 @@ class LTXModel(torch.nn.Module):
             video, audio = block(video, audio, perturbations)
             if video is not None and video.precomputed_prompt_kv is not None:
                 video = replace(video, precomputed_prompt_kv=None)
+            if hidden_state_layer is not None and block_idx == int(hidden_state_layer):
+                captured_video_hidden = video.x if video is not None else None
+                captured_audio_hidden = audio.x if audio is not None else None
 
             if nan_block_diag:
                 vx = video.x if video is not None and isinstance(video.x, torch.Tensor) else None
@@ -1579,7 +1589,9 @@ class LTXModel(torch.nn.Module):
                 routing_now = False
                 route_ptr += 1
 
-        return video, audio
+        if hidden_state_layer is not None and captured_video_hidden is None and captured_audio_hidden is None:
+            raise RuntimeError(f"Transformer did not produce a hidden state at block {hidden_state_layer}")
+        return video, audio, captured_video_hidden, captured_audio_hidden
 
     def _process_output(
         self,
@@ -1680,8 +1692,14 @@ class LTXModel(torch.nn.Module):
 
     @fp8_placement_scoped_forward(prepared_only=True)
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        video: Modality | None,
+        audio: Modality | None,
+        perturbations: BatchedPerturbationConfig,
+        *,
+        output_hidden_states: bool = False,
+        hidden_state_layer: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for LTX models.
         Returns:
@@ -1695,10 +1713,15 @@ class LTXModel(torch.nn.Module):
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
         # Process transformer blocks
-        video_out, audio_out = self._process_transformer_blocks(
+        if output_hidden_states and hidden_state_layer is None:
+            raise ValueError("output_hidden_states=True requires hidden_state_layer")
+        if not output_hidden_states and hidden_state_layer is not None:
+            raise ValueError("hidden_state_layer requires output_hidden_states=True")
+        video_out, audio_out, video_hidden, audio_hidden = self._process_transformer_blocks(
             video=video_args,
             audio=audio_args,
             perturbations=perturbations,
+            hidden_state_layer=hidden_state_layer,
         )
 
         if self.activation_cpu_offloading and self.training:
@@ -1744,6 +1767,8 @@ class LTXModel(torch.nn.Module):
             if audio_out is not None
             else None
         )
+        if output_hidden_states:
+            return vx, ax, video_hidden, audio_hidden
         return vx, ax
 
 

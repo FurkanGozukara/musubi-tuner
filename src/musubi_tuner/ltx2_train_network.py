@@ -2103,6 +2103,117 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         self._crepa = module
 
+    def _validate_self_flow_configuration(
+        self,
+        args: argparse.Namespace,
+        config: Any,
+        *,
+        network,
+    ) -> None:
+        """Validate the complete Self-Flow contract before allocating training state."""
+        if self._ltx_mode not in {"video", "av"}:
+            raise ValueError("--self_flow currently supports --ltx_mode video or av")
+        if bool(getattr(args, "tread", False)):
+            raise ValueError(
+                "--self_flow is mutually exclusive with --tread because routed student tokens do not align "
+                "with the teacher feature sequence"
+            )
+        if self._ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av"):
+            raise ValueError(
+                f"--self_flow is not supported with --ic_lora_strategy {self._ic_lora_strategy}: "
+                "the reference-prefix path changes the per-token timestep contract"
+            )
+        if self._train_connectors:
+            raise ValueError("--self_flow is not supported while training LTX text connectors")
+        if bool(getattr(args, "ltx2_fsdp", False)):
+            raise ValueError("--self_flow is mutually exclusive with --ltx2_fsdp")
+        if is_ltx2_model_parallel_enabled(args):
+            raise ValueError("--self_flow is not supported with --ltx2_model_parallel")
+        if is_ltx2_remote_stage_enabled(args):
+            raise ValueError("--self_flow is not supported with --ltx2_remote_stage")
+        if not bool(config.dual_timestep):
+            raise ValueError("Self-Flow requires dual_timestep=true")
+        if float(config.lambda_audio) > 0.0 and self._ltx_mode != "av":
+            raise ValueError("Self-Flow lambda_audio > 0 requires --ltx_mode av")
+
+        if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
+            raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
+        if config.mask_focus_loss and config.mask_ratio <= 0.0:
+            raise ValueError("Self-Flow mask_focus_loss requires mask_ratio > 0")
+        if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
+            raise ValueError("Self-Flow teacher_momentum must be in [0, 1)")
+        if config.teacher_update_interval < 1:
+            raise ValueError("Self-Flow teacher_update_interval must be >= 1")
+        if config.student_block_ratio is not None and not (0.0 < config.student_block_ratio < 1.0):
+            raise ValueError("Self-Flow student_block_ratio must be in (0, 1)")
+        if config.teacher_block_ratio is not None and not (0.0 < config.teacher_block_ratio < 1.0):
+            raise ValueError("Self-Flow teacher_block_ratio must be in (0, 1)")
+        if config.projector_lr is not None and config.projector_lr <= 0.0:
+            raise ValueError("Self-Flow projector_lr must be > 0")
+        if config.projector_hidden_multiplier < 1:
+            raise ValueError("Self-Flow projector_hidden_multiplier must be >= 1")
+        if config.projector_activation not in {"silu", "gelu"}:
+            raise ValueError("Self-Flow projector_activation must be one of: silu, gelu")
+        if config.teacher_mode not in {"base", "ema", "partial_ema"}:
+            raise ValueError("Self-Flow teacher_mode must be one of: base, ema, partial_ema")
+        if network is None and config.teacher_mode == "base":
+            raise ValueError("Self-Flow teacher_mode=base requires an adapter network; full fine-tuning requires EMA")
+        if config.student_block_stochastic_range < 0:
+            raise ValueError("Self-Flow student_block_stochastic_range must be >= 0")
+        if config.max_loss < 0.0:
+            raise ValueError("Self-Flow max_loss must be >= 0")
+        if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
+            raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
+        if config.temporal_mode not in {"off", "frame", "delta", "hybrid"}:
+            raise ValueError("Self-Flow temporal_mode must be one of: off, frame, delta, hybrid")
+        if config.temporal_granularity not in {"frame", "patch"}:
+            raise ValueError("Self-Flow temporal_granularity must be one of: frame, patch")
+        if config.patch_spatial_radius < 0:
+            raise ValueError("Self-Flow patch_spatial_radius must be >= 0")
+        if config.patch_match_mode not in {"hard", "soft"}:
+            raise ValueError("Self-Flow patch_match_mode must be one of: hard, soft")
+        if config.patch_match_temperature <= 0.0:
+            raise ValueError("Self-Flow patch_match_temperature must be > 0")
+        if config.delta_num_steps < 1:
+            raise ValueError("Self-Flow delta_num_steps must be >= 1")
+        if config.motion_weighting not in {"none", "teacher_delta"}:
+            raise ValueError("Self-Flow motion_weighting must be one of: none, teacher_delta")
+        if config.motion_weight_strength < 0.0:
+            raise ValueError("Self-Flow motion_weight_strength must be >= 0")
+        for name in ("lambda_self_flow", "lambda_audio", "lambda_temporal", "lambda_delta"):
+            if float(getattr(config, name)) < 0.0:
+                raise ValueError(f"Self-Flow {name} must be >= 0")
+        if not any(
+            float(getattr(config, name)) > 0.0 for name in ("lambda_self_flow", "lambda_audio", "lambda_temporal", "lambda_delta")
+        ):
+            raise ValueError("Self-Flow requires at least one positive loss weight")
+        if config.lambda_temporal > 0.0 and config.temporal_mode not in {"frame", "hybrid"}:
+            raise ValueError("Self-Flow lambda_temporal > 0 requires temporal_mode=frame or hybrid")
+        if config.lambda_delta > 0.0 and config.temporal_mode not in {"delta", "hybrid"}:
+            raise ValueError("Self-Flow lambda_delta > 0 requires temporal_mode=delta or hybrid")
+        if config.temporal_tau <= 0.0:
+            raise ValueError("Self-Flow temporal_tau must be > 0")
+        if config.num_neighbors < 0:
+            raise ValueError("Self-Flow num_neighbors must be >= 0")
+        if config.temporal_schedule not in {"constant", "linear", "cosine", "polynomial"}:
+            raise ValueError("Self-Flow temporal_schedule must be one of: constant, linear, cosine, polynomial")
+        if config.temporal_warmup_steps < 0 or config.temporal_max_steps < 0:
+            raise ValueError("Self-Flow schedule step counts must be >= 0")
+        if config.temporal_max_steps > 0 and config.temporal_warmup_steps >= config.temporal_max_steps:
+            raise ValueError("Self-Flow temporal_warmup_steps must be less than temporal_max_steps")
+        if not 0.0 <= config.schedule_end_weight <= 1.0:
+            raise ValueError("Self-Flow schedule_end_weight must be in [0, 1]")
+        if config.schedule_power <= 0.0:
+            raise ValueError("Self-Flow schedule_power must be > 0")
+        if config.schedule_cutoff_step < 0:
+            raise ValueError("Self-Flow schedule_cutoff_step must be >= 0")
+        if config.similarity_cutoff is not None and not -1.0 <= config.similarity_cutoff <= 1.0:
+            raise ValueError("Self-Flow similarity_cutoff must be in [-1, 1]")
+        if not 0.0 <= config.similarity_ema_decay < 1.0:
+            raise ValueError("Self-Flow similarity_ema_decay must be in [0, 1)")
+        if config.similarity_cutoff_mode not in {"permanent", "recoverable"}:
+            raise ValueError("Self-Flow similarity_cutoff_mode must be permanent or recoverable")
+
     def _setup_self_flow(
         self,
         args: argparse.Namespace,
@@ -2114,29 +2225,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if not getattr(args, "self_flow", False):
             return
         if transformer is None:
-            logger.warning("Self-Flow enabled but transformer is unavailable — skipping setup")
-            return
-        if self._ltx_mode not in {"video", "av"}:
-            raise ValueError("--self_flow currently supports --ltx_mode video or av")
-        if bool(getattr(args, "tread", False)):
-            raise ValueError(
-                "--self_flow is mutually exclusive with --tread: TREAD routing drops/permutes tokens only in "
-                "the grad-enabled student forward (not the no_grad teacher forward), which misaligns the "
-                "per-token Self-Flow feature comparison."
-            )
-        if self._ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av"):
-            # Placed here (not in pre_train_hook) so it covers BOTH LoRA and full fine-tuning:
-            # ltx2_train.py calls _setup_self_flow directly and never runs pre_train_hook, yet
-            # reuses the same call_dit forward. The IC reference-prefix branches collapse the
-            # per-token Self-Flow timesteps to a single sigma and early-return before the
-            # teacher/distillation pass, so the Self-Flow loss would be silently 0 while the
-            # student input stays perturbed.
-            raise ValueError(
-                f"--self_flow is not supported with --ic_lora_strategy {self._ic_lora_strategy}: the IC-LoRA "
-                "reference-prefix branches collapse the per-token Self-Flow timesteps to a single sigma and "
-                "return before the teacher/distillation pass, so the Self-Flow loss would be silently 0 while "
-                "the student input stays perturbed. Disable one of the two."
-            )
+            raise RuntimeError("Self-Flow is enabled but the transformer is unavailable")
 
         from musubi_tuner.self_flow import (
             SelfFlowConfig,
@@ -2157,6 +2246,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             "delta_num_steps",
             "temporal_warmup_steps",
             "temporal_max_steps",
+            "schedule_cutoff_step",
             "student_block_stochastic_range",
         }
         float_keys = {
@@ -2173,6 +2263,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             "teacher_momentum",
             "projector_lr",
             "lambda_audio",
+            "schedule_end_weight",
+            "schedule_power",
+            "similarity_cutoff",
+            "similarity_ema_decay",
         }
         bool_keys = {
             "dual_timestep",
@@ -2196,54 +2290,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             cfg_kwargs["temporal_max_steps"] = args.max_train_steps
 
         config = SelfFlowConfig(**cfg_kwargs)
-        if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
-            raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
-        if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
-            raise ValueError("Self-Flow teacher_momentum must be in [0, 1)")
-        if config.student_block_ratio is not None and not (0.0 < config.student_block_ratio < 1.0):
-            raise ValueError("Self-Flow student_block_ratio must be in (0, 1)")
-        if config.teacher_block_ratio is not None and not (0.0 < config.teacher_block_ratio < 1.0):
-            raise ValueError("Self-Flow teacher_block_ratio must be in (0, 1)")
-        if config.projector_lr is not None and config.projector_lr <= 0.0:
-            raise ValueError("Self-Flow projector_lr must be > 0")
-        if config.teacher_mode not in {"base", "ema", "partial_ema"}:
-            raise ValueError("Self-Flow teacher_mode must be one of: base, ema, partial_ema")
-        if config.student_block_stochastic_range < 0:
-            raise ValueError("Self-Flow student_block_stochastic_range must be >= 0")
-        if config.max_loss < 0.0:
-            raise ValueError("Self-Flow max_loss must be >= 0")
-        if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
-            raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
-        if config.temporal_mode not in {"off", "frame", "delta", "hybrid"}:
-            raise ValueError("Self-Flow temporal_mode must be one of: off, frame, delta, hybrid")
-        if config.temporal_granularity not in {"frame", "patch"}:
-            raise ValueError("Self-Flow temporal_granularity must be one of: frame, patch")
-        if config.patch_spatial_radius < 0:
-            raise ValueError("Self-Flow patch_spatial_radius must be >= 0")
-        if config.patch_match_mode not in {"hard", "soft"}:
-            raise ValueError("Self-Flow patch_match_mode must be one of: hard, soft")
-        if config.patch_match_temperature <= 0.0:
-            raise ValueError("Self-Flow patch_match_temperature must be > 0")
-        if config.delta_num_steps < 1:
-            raise ValueError("Self-Flow delta_num_steps must be >= 1")
-        if config.motion_weighting not in {"none", "teacher_delta"}:
-            raise ValueError("Self-Flow motion_weighting must be one of: none, teacher_delta")
-        if config.motion_weight_strength < 0.0:
-            raise ValueError("Self-Flow motion_weight_strength must be >= 0")
-        if config.lambda_temporal < 0.0:
-            raise ValueError("Self-Flow lambda_temporal must be >= 0")
-        if config.lambda_delta < 0.0:
-            raise ValueError("Self-Flow lambda_delta must be >= 0")
-        if config.temporal_tau <= 0.0:
-            raise ValueError("Self-Flow temporal_tau must be > 0")
-        if config.num_neighbors < 0:
-            raise ValueError("Self-Flow num_neighbors must be >= 0")
-        if config.temporal_schedule not in {"constant", "linear", "cosine"}:
-            raise ValueError("Self-Flow temporal_schedule must be one of: constant, linear, cosine")
-        if config.temporal_warmup_steps < 0:
-            raise ValueError("Self-Flow temporal_warmup_steps must be >= 0")
-        if config.temporal_max_steps < 0:
-            raise ValueError("Self-Flow temporal_max_steps must be >= 0")
+        self._validate_self_flow_configuration(args, config, network=network)
 
         unwrapped_transformer = accelerator.unwrap_model(transformer)
         if network is not None:
@@ -2276,7 +2323,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 dtype = torch.bfloat16
             else:
                 dtype = torch.float32
-        module.setup(accelerator.device, dtype)
+        module.setup(accelerator.device, dtype, registration_target=self_flow_network)
         module.init_teacher(self_flow_network)
 
         resume_dir = getattr(args, "resume", None)
@@ -2299,10 +2346,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 module.load_state_dict(load_file(proj_path))
                 logger.info("Self-Flow: resumed projector weights from %s", proj_path)
             else:
-                logger.warning(
-                    "Self-Flow: no projector state found under %s on resume; projector starts from random init.",
-                    candidate_dirs,
-                )
+                raise FileNotFoundError(f"Self-Flow resume requires self_flow_projector.safetensors under one of: {candidate_dirs}")
 
             teacher_path = next(
                 (p for p in (os.path.join(d, "self_flow_teacher_ema.safetensors") for d in candidate_dirs) if os.path.exists(p)),
@@ -2311,11 +2355,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if teacher_path is not None:
                 module.load_teacher_state_dict(load_file(teacher_path))
                 logger.info("Self-Flow: resumed EMA teacher state from %s", teacher_path)
-            elif str(getattr(module.config, "teacher_mode", "base")).lower() in {"ema", "partial_ema"}:
-                logger.warning(
-                    "Self-Flow: no EMA teacher state found under %s on resume; the EMA teacher "
-                    "re-initializes from the current weights.",
-                    candidate_dirs,
+            else:
+                raise FileNotFoundError(
+                    f"Self-Flow resume requires self_flow_teacher_ema.safetensors under one of: {candidate_dirs}"
                 )
 
         self._self_flow = module
@@ -2635,6 +2677,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     ) -> tuple[Optional[torch.Tensor], Dict[str, float]]:
         """Compute Self-Flow loss addition and logging values for the current step."""
         if not self._self_flow_active or self._self_flow is None:
+            if bool(getattr(args, "self_flow", False)):
+                raise RuntimeError("Self-Flow is enabled but was not initialized")
             return None, {}
         if not bool(getattr(args, "self_flow", False)):
             return None, {}
@@ -2643,7 +2687,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         sf_ctx = self._self_flow_step_context
         if dit_inputs is None or sf_ctx is None:
             self._self_flow.cleanup_step()
-            return None, {}
+            raise RuntimeError("Self-Flow is enabled but the current step has no dual-timestep context")
         loss = self._self_flow.compute_loss_from_cached_features(
             num_latent_frames=sf_ctx.get("num_latent_frames"),
             latent_height=sf_ctx.get("latent_height"),
@@ -2652,8 +2696,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         )
 
         metrics: Dict[str, float] = {}
-        if loss is not None:
-            metrics["loss/self_flow"] = float(loss.detach().item())
+        if not isinstance(loss, torch.Tensor) or not torch.isfinite(loss):
+            raise RuntimeError("Self-Flow did not produce a finite tensor loss")
+        metrics["loss/self_flow"] = float(loss.detach().item())
         cosine = self._self_flow.last_cosine
         if cosine is not None:
             metrics["self_flow/cosine"] = float(cosine)
@@ -2670,6 +2715,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         metrics["self_flow/lambda_audio"] = float(self._self_flow._current_lambda_audio)
         metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
         metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
+        metrics["self_flow/schedule_scale"] = self._self_flow.schedule_scale
+        metrics["self_flow/cutoff_active"] = float(self._self_flow.schedule_cutoff_active)
+        similarity_ema = self._self_flow.similarity_ema
+        if similarity_ema is not None:
+            metrics["self_flow/similarity_ema"] = float(similarity_ema)
         ema_drift = self._self_flow.last_ema_drift
         if ema_drift is not None:
             metrics["self_flow/ema_drift"] = float(ema_drift)
@@ -7426,75 +7476,67 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "transformer_options": resolved_transformer_options,
             }
 
+        capture_self_flow = False
         if self._self_flow_active and self._self_flow is not None:
             self._self_flow.cleanup_step()
             network_for_self_flow = getattr(self, "_self_flow_network", None)
-            is_train_step = (
-                bool(getattr(network_for_self_flow, "training", False))
-                if network_for_self_flow is not None
-                else bool(getattr(transformer, "training", False))
-            )
-            if is_train_step and bool(getattr(args, "self_flow", False)):
+            if bool(getattr(args, "self_flow", False)) and self._self_flow.should_capture:
                 sf_ctx = self._self_flow_step_context
-                if sf_ctx is not None:
-                    teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
-                    teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
-                    if isinstance(teacher_noisy, torch.Tensor) and isinstance(teacher_timesteps, torch.Tensor):
-                        teacher_noisy_input = teacher_noisy
-                        if video_conditioning_enabled is not None and teacher_noisy_input.shape[2] > 0:
-                            teacher_noisy_input = teacher_noisy_input.clone()
-                            teacher_noisy_input[video_conditioning_enabled, :, 0:1, :, :] = latents[
-                                video_conditioning_enabled, :, 0:1, :, :
-                            ]
+                if sf_ctx is None:
+                    raise RuntimeError("Self-Flow is enabled but dual-timestep noising did not create a step context")
+                if network_for_self_flow is None:
+                    raise RuntimeError("Self-Flow teacher network is unavailable")
+                teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
+                teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
+                if not isinstance(teacher_noisy, torch.Tensor) or not isinstance(teacher_timesteps, torch.Tensor):
+                    raise RuntimeError("Self-Flow teacher input or timestep tensor is missing")
+                teacher_noisy_input = teacher_noisy
+                if video_conditioning_enabled is not None and teacher_noisy_input.shape[2] > 0:
+                    teacher_noisy_input = teacher_noisy_input.clone()
+                    teacher_noisy_input[video_conditioning_enabled, :, 0:1, :, :] = latents[
+                        video_conditioning_enabled, :, 0:1, :, :
+                    ]
 
-                        teacher_model_input_for_self_flow: Any = teacher_noisy_input.to(
-                            device=accelerator.device, dtype=network_dtype
-                        )
-                        teacher_audio_timestep = None
-                        if (
-                            isinstance(model_input, (list, tuple))
-                            and len(model_input) >= 2
-                            and isinstance(model_input[1], torch.Tensor)
-                        ):
-                            teacher_audio_source = (
-                                teacher_noisy_audio_for_self_flow
-                                if isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor)
-                                else model_input[1]
-                            )
-                            teacher_audio_input = teacher_audio_source.to(device=accelerator.device, dtype=network_dtype)
-                            teacher_model_input_for_self_flow = [teacher_model_input_for_self_flow, teacher_audio_input]
-                            teacher_audio_timestep_source = (
-                                teacher_audio_timestep_for_self_flow
-                                if isinstance(teacher_audio_timestep_for_self_flow, torch.Tensor)
-                                else audio_timestep_for_model
-                            )
-                            if isinstance(teacher_audio_timestep_source, torch.Tensor):
-                                teacher_audio_timestep = teacher_audio_timestep_source.to(
-                                    device=accelerator.device, dtype=network_dtype
-                                )
+                teacher_model_input_for_self_flow: Any = teacher_noisy_input.to(device=accelerator.device, dtype=network_dtype)
+                teacher_audio_timestep = None
+                if isinstance(model_input, (list, tuple)) and len(model_input) >= 2 and isinstance(model_input[1], torch.Tensor):
+                    teacher_audio_source = (
+                        teacher_noisy_audio_for_self_flow
+                        if isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor)
+                        else model_input[1]
+                    )
+                    teacher_audio_input = teacher_audio_source.to(device=accelerator.device, dtype=network_dtype)
+                    teacher_model_input_for_self_flow = [teacher_model_input_for_self_flow, teacher_audio_input]
+                    teacher_audio_timestep_source = (
+                        teacher_audio_timestep_for_self_flow
+                        if isinstance(teacher_audio_timestep_for_self_flow, torch.Tensor)
+                        else audio_timestep_for_model
+                    )
+                    if isinstance(teacher_audio_timestep_source, torch.Tensor):
+                        teacher_audio_timestep = teacher_audio_timestep_source.to(device=accelerator.device, dtype=network_dtype)
 
-                        teacher_timesteps_model = self._normalize_timesteps_for_model(
-                            teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
-                        )
-                        if teacher_timesteps_model.dim() == 0:
-                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
-                        if teacher_timesteps_model.dim() == 1:
-                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
+                teacher_timesteps_model = self._normalize_timesteps_for_model(
+                    teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
+                )
+                if teacher_timesteps_model.dim() == 0:
+                    teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
+                if teacher_timesteps_model.dim() == 1:
+                    teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
 
-                        if network_for_self_flow is not None:
-                            self._self_flow.prepare_teacher_features(
-                                accelerator=accelerator,
-                                transformer=transformer,
-                                network=network_for_self_flow,
-                                teacher_model_input=teacher_model_input_for_self_flow,
-                                teacher_timesteps=teacher_timesteps_model,
-                                audio_timestep=teacher_audio_timestep,
-                                text_embeds=text_embeds,
-                                text_mask=text_mask,
-                                frame_rate=frame_rate,
-                                transformer_options=resolved_transformer_options,
-                            )
                 self._self_flow.mark_student_forward()
+                self._self_flow.prepare_teacher_features(
+                    accelerator=accelerator,
+                    transformer=transformer,
+                    network=network_for_self_flow,
+                    teacher_model_input=teacher_model_input_for_self_flow,
+                    teacher_timesteps=teacher_timesteps_model,
+                    audio_timestep=teacher_audio_timestep,
+                    text_embeds=text_embeds,
+                    text_mask=text_mask,
+                    frame_rate=frame_rate,
+                    transformer_options=resolved_transformer_options,
+                )
+                capture_self_flow = True
 
         # Connector LoRA: pass pre-connector features for on-the-fly connector processing.
         if self._train_connectors:
@@ -7518,6 +7560,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             audio_timestep=audio_timestep_for_model if audio_enabled_for_batch else None,
             transformer_options=resolved_transformer_options,
         )
+        if capture_self_flow:
+            forward_kwargs["output_hidden_states"] = True
+            forward_kwargs["hidden_state_layer"] = self._self_flow.student_hidden_state_layer
         if is_ltx2_remote_stage_enabled(args):
             set_ltx2_remote_stage_cache_key(
                 transformer,
@@ -7525,6 +7570,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
         with accelerator.autocast():
             model_pred = transformer(*forward_args, **forward_kwargs)
+
+        if capture_self_flow:
+            video_hidden_pred, audio_hidden_pred = self._self_flow.cache_student_output(model_pred)
+            model_pred = [video_hidden_pred, audio_hidden_pred] if audio_hidden_pred is not None else video_hidden_pred
 
         video_pred = model_pred
         audio_pred = None

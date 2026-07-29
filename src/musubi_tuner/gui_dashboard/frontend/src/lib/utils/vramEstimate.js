@@ -165,7 +165,7 @@ export function estimateTraining(cfg) {
 
 	let selfFlowOverhead = 0;
 	if (t.self_flow) {
-		const teacherMode = String(t.self_flow_teacher_mode || 'base').toLowerCase();
+		const teacherMode = String(t.self_flow_teacher_mode || 'ema').toLowerCase();
 		if (teacherMode === 'ema') selfFlowOverhead += loraParamsGB;
 		else if (teacherMode === 'partial_ema') selfFlowOverhead += Math.max(loraParamsGB / totalBlocks, 0.01);
 

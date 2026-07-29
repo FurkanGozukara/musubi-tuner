@@ -481,7 +481,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         # ── Self-Flow ──
         self_flow_gb = 0
         if training.get("self_flow"):
-            teacher_mode = str(training.get("self_flow_teacher_mode", "base")).lower()
+            teacher_mode = str(training.get("self_flow_teacher_mode", "ema")).lower()
             if teacher_mode == "ema":
                 self_flow_gb += lora_size_gb
             elif teacher_mode == "partial_ema":

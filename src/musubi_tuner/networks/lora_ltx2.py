@@ -426,13 +426,22 @@ class LTX2Wrapper(nn.Module):
         video_modality: Optional[Modality],
         audio_modality: Optional[Modality] = None,
         perturbations: Optional[BatchedPerturbationConfig] = None,
+        *,
+        output_hidden_states: bool = False,
+        hidden_state_layer: Optional[int] = None,
     ):
         ref_modality = video_modality if video_modality is not None else audio_modality
         if ref_modality is None:
             raise ValueError("Expected at least one modality for forward_modalities")
         if perturbations is None:
             perturbations = BatchedPerturbationConfig.empty(int(ref_modality.latent.shape[0]))
-        return self.model(video_modality, audio_modality, perturbations)
+        return self.model(
+            video_modality,
+            audio_modality,
+            perturbations,
+            output_hidden_states=output_hidden_states,
+            hidden_state_layer=hidden_state_layer,
+        )
 
     def forward(
         self,
@@ -446,6 +455,8 @@ class LTX2Wrapper(nn.Module):
         audio_only: bool = False,
         video_enabled: Optional[bool] = None,
         audio_enabled: Optional[bool] = None,
+        output_hidden_states: bool = False,
+        hidden_state_layer: Optional[int] = None,
         **kwargs,
     ):
         if isinstance(x, (list, tuple)):
@@ -824,7 +835,21 @@ class LTX2Wrapper(nn.Module):
             if isinstance(transformer_options, dict) and "perturbations" in transformer_options
             else BatchedPerturbationConfig.empty(bsz)
         )
-        video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
+        model_output = self.model(
+            video_modality,
+            audio_modality,
+            perturbations,
+            output_hidden_states=output_hidden_states,
+            hidden_state_layer=hidden_state_layer,
+        )
+        video_hidden = None
+        audio_hidden = None
+        if output_hidden_states:
+            if not isinstance(model_output, (tuple, list)) or len(model_output) != 4:
+                raise RuntimeError("LTX core model did not return the requested hidden states")
+            video_pred_tokens, audio_pred_tokens, video_hidden, audio_hidden = model_output
+        else:
+            video_pred_tokens, audio_pred_tokens = model_output
 
         # Strip appended keyframe-guide tokens before unpatchify — they were
         # context-only; the patchifier expects the original token count.
@@ -852,10 +877,14 @@ class LTX2Wrapper(nn.Module):
                 dtype=ref_latents.dtype,
             )
 
+        audio_pred = (
+            self._audio_patchifier.unpatchify(audio_pred_tokens, output_shape=audio_shape) if audio_latents is not None else None
+        )
+        if output_hidden_states:
+            return video_pred, audio_pred, video_hidden, audio_hidden
         if audio_latents is None:
             return video_pred
 
-        audio_pred = self._audio_patchifier.unpatchify(audio_pred_tokens, output_shape=audio_shape)
         return [video_pred, audio_pred]
 
 

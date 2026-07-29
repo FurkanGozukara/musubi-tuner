@@ -1003,7 +1003,7 @@
 		// EMA modes keep shadow trainable params; offload_teacher_features only moves cached features.
 		let selfFlowOverhead = 0;
 		if (t.self_flow) {
-			const teacherMode = String(t.self_flow_teacher_mode || 'base').toLowerCase();
+			const teacherMode = String(t.self_flow_teacher_mode || 'ema').toLowerCase();
 			if (teacherMode === 'ema') selfFlowOverhead += loraParamsGB;
 			else if (teacherMode === 'partial_ema') selfFlowOverhead += Math.max(loraParamsGB / totalBlocks, 0.01);
 

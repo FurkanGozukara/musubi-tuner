@@ -1,5 +1,6 @@
 """Shared NetworkTrainer training loop."""
 
+import copy
 import importlib
 import inspect
 import json
@@ -861,19 +862,20 @@ def train(self, args):
                 except Exception as e:
                     logger.warning(f"Failed to save CREPA state to state dir: {e}")
             if hasattr(self, "_self_flow") and self._self_flow is not None:
-                try:
-                    from safetensors.torch import save_file
+                from safetensors.torch import save_file
 
-                    proj_sd = self._self_flow.state_dict()
-                    if proj_sd:
-                        proj_file = os.path.join(output_dir, "self_flow_projector.safetensors")
-                        save_file(proj_sd, proj_file)
-                    teacher_sd = self._self_flow.teacher_state_dict()
-                    if teacher_sd:
-                        teacher_file = os.path.join(output_dir, "self_flow_teacher_ema.safetensors")
-                        save_file(teacher_sd, teacher_file)
-                except Exception as e:
-                    logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
+                proj_sd = {
+                    key: value.detach().to(device="cpu")
+                    for key, value in self._self_flow.state_dict().items()
+                    if isinstance(value, torch.Tensor)
+                }
+                if proj_sd:
+                    proj_file = os.path.join(output_dir, "self_flow_projector.safetensors")
+                    save_file(proj_sd, proj_file)
+                teacher_sd = self._self_flow.teacher_state_dict()
+                if teacher_sd:
+                    teacher_file = os.path.join(output_dir, "self_flow_teacher_ema.safetensors")
+                    save_file(teacher_sd, teacher_file)
 
             # Save uncertainty weighting log-variance params
             if uncertainty_log_var_video is not None:
@@ -967,20 +969,19 @@ def train(self, args):
                 logger.warning(f"Failed to load CREPA state from checkpoint dir: {e}")
 
         if hasattr(self, "_self_flow") and self._self_flow is not None:
-            try:
-                from safetensors.torch import load_file
+            from safetensors.torch import load_file
 
-                proj_file = os.path.join(input_dir, "self_flow_projector.safetensors")
-                if os.path.exists(proj_file):
-                    self._self_flow.load_state_dict(load_file(proj_file))
-                    logger.info("Self-Flow: loaded projector state from %s", proj_file)
+            proj_file = os.path.join(input_dir, "self_flow_projector.safetensors")
+            if not os.path.exists(proj_file):
+                raise FileNotFoundError(f"Self-Flow checkpoint is missing {proj_file}")
+            self._self_flow.load_state_dict(load_file(proj_file))
+            logger.info("Self-Flow: loaded projector state from %s", proj_file)
 
-                teacher_file = os.path.join(input_dir, "self_flow_teacher_ema.safetensors")
-                if os.path.exists(teacher_file):
-                    self._self_flow.load_teacher_state_dict(load_file(teacher_file))
-                    logger.info("Self-Flow: loaded EMA teacher state from %s", teacher_file)
-            except Exception as e:
-                logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
+            teacher_file = os.path.join(input_dir, "self_flow_teacher_ema.safetensors")
+            if not os.path.exists(teacher_file):
+                raise FileNotFoundError(f"Self-Flow checkpoint is missing {teacher_file}")
+            self._self_flow.load_teacher_state_dict(load_file(teacher_file))
+            logger.info("Self-Flow: loaded teacher/scheduler state from %s", teacher_file)
 
         # Load uncertainty weighting log-variance params
         if uncertainty_log_var_video is not None:
@@ -1523,17 +1524,15 @@ def train(self, args):
 
         total_loss = 0.0
         total_count = 0
+        total_self_flow_loss = 0.0
+        self_flow_count = 0
         val_audio_presence_ema = float(audio_presence_ema)
         val_audio_loss_ema = float(audio_loss_ema)
         val_video_loss_ema = float(video_loss_ema)
         ema_original_params = apply_ema_weights_for_eval()
-        validation_self_flow_network = None
-        validation_self_flow_prev_training = None
-        if bool(getattr(args, "self_flow", False)):
-            validation_self_flow_network = getattr(self, "_self_flow_network", None)
-            if validation_self_flow_network is not None:
-                validation_self_flow_prev_training = bool(getattr(validation_self_flow_network, "training", False))
-                validation_self_flow_network.training = True
+        validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
+        plain_validation_args = copy.copy(args)
+        plain_validation_args.self_flow = False
 
         try:
             with torch.no_grad():
@@ -1575,7 +1574,7 @@ def train(self, args):
                             )
 
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args,
+                        plain_validation_args,
                         noise,
                         latents_tensor,
                         batch["timesteps"],
@@ -1591,7 +1590,7 @@ def train(self, args):
                     self._current_train_global_step = global_step
                     model_pred, target = _unpack_dit_output(
                         self.call_dit(
-                            args,
+                            plain_validation_args,
                             accelerator,
                             transformer,
                             latents_tensor,
@@ -1774,19 +1773,44 @@ def train(self, args):
                         finally:
                             self._crepa.cleanup_step()
 
-                    if hasattr(self, "compute_self_flow_addition"):
-                        if hasattr(self, "_self_flow") and self._self_flow is not None:
-                            self._self_flow.on_step(step)
-                        try:
-                            self_flow_loss, _ = self.compute_self_flow_addition(
+                    if validation_self_flow_enabled:
+                        if not hasattr(self, "compute_self_flow_addition"):
+                            raise RuntimeError("Self-Flow validation is enabled, but this trainer has no Self-Flow loss helper")
+
+                        self_flow_noisy_input, self_flow_timesteps = self.get_noisy_model_input_and_timesteps(
+                            args,
+                            noise,
+                            latents_tensor,
+                            batch["timesteps"],
+                            noise_scheduler,
+                            accelerator.device,
+                            dit_dtype,
+                        )
+                        _unpack_dit_output(
+                            self.call_dit(
                                 args,
                                 accelerator,
                                 transformer,
-                                network,
+                                latents_tensor,
+                                batch,
+                                noise,
+                                self_flow_noisy_input,
+                                self_flow_timesteps,
                                 network_dtype,
                             )
-                        except Exception as e:
-                            logger.warning("Self-Flow loss computation failed during validation: %s", e)
+                        )
+                        if not hasattr(self, "_self_flow") or self._self_flow is None:
+                            raise RuntimeError("Self-Flow validation is enabled, but its runtime module is not initialized")
+                        self._self_flow.on_step(step)
+                        self_flow_loss, _ = self.compute_self_flow_addition(
+                            args,
+                            accelerator,
+                            transformer,
+                            network,
+                            network_dtype,
+                        )
+                        total_self_flow_loss += float(self_flow_loss.detach().item())
+                        self_flow_count += 1
 
                     if dict_output and out is not None:
                         cts_data = out.get("_cts")
@@ -1862,22 +1886,30 @@ def train(self, args):
                     total_count += 1
         finally:
             restore_ema_weights_for_eval(ema_original_params)
-            if validation_self_flow_network is not None and validation_self_flow_prev_training is not None:
-                validation_self_flow_network.training = validation_self_flow_prev_training
 
-        loss_stats = torch.tensor([total_loss, total_count], device=accelerator.device)
+        loss_stats = torch.tensor(
+            [total_loss, total_count, total_self_flow_loss, self_flow_count],
+            device=accelerator.device,
+        )
         if accelerator.num_processes > 1:
-            loss_stats = accelerator.gather(loss_stats)
-            total_loss = float(loss_stats[:, 0].sum().item())
-            total_count = int(loss_stats[:, 1].sum().item())
+            loss_stats = accelerator.reduce(loss_stats, reduction="sum")
+            total_loss = float(loss_stats[0].item())
+            total_count = int(loss_stats[1].item())
+            total_self_flow_loss = float(loss_stats[2].item())
+            self_flow_count = int(loss_stats[3].item())
 
         if accelerator.is_main_process:
             avg_loss = total_loss / max(total_count, 1)
+            validation_metrics = {"val_loss": avg_loss}
+            if self_flow_count > 0:
+                validation_metrics["val_self_flow_loss"] = total_self_flow_loss / self_flow_count
             if len(accelerator.trackers) > 0:
-                accelerator.log({"val_loss": avg_loss}, step=step)
+                accelerator.log(validation_metrics, step=step)
             if gui_metrics is not None:
-                gui_metrics.log_event("validation", step, val_loss=avg_loss, epoch=epoch_no)
+                gui_metrics.log_event("validation", step, epoch=epoch_no, **validation_metrics)
             log_msg = f"validation loss: {avg_loss:.6f}"
+            if "val_self_flow_loss" in validation_metrics:
+                log_msg += f", Self-Flow auxiliary loss: {validation_metrics['val_self_flow_loss']:.6f}"
             if epoch_no is not None:
                 log_msg += f" (epoch {epoch_no})"
             logger.info(log_msg)
@@ -2414,18 +2446,17 @@ def train(self, args):
                 if hasattr(self, "compute_self_flow_addition"):
                     if hasattr(self, "_self_flow") and self._self_flow is not None:
                         self._self_flow.on_step(global_step)
-                    try:
-                        self_flow_loss, self_flow_metrics = self.compute_self_flow_addition(
-                            args,
-                            accelerator,
-                            transformer,
-                            network,
-                            network_dtype,
-                        )
-                        if self_flow_loss is not None:
-                            loss = loss + self_flow_loss
-                    except Exception as e:
-                        logger.warning("Self-Flow loss computation failed: %s", e)
+                    self_flow_loss, self_flow_metrics = self.compute_self_flow_addition(
+                        args,
+                        accelerator,
+                        transformer,
+                        network,
+                        network_dtype,
+                    )
+                    if bool(getattr(args, "self_flow", False)):
+                        if self_flow_loss is None:
+                            raise RuntimeError("Self-Flow is enabled but no loss was produced")
+                        loss = loss + self_flow_loss
 
                 # Cross-Task Synergy auxiliary losses
                 cts_metrics = {}
@@ -2540,11 +2571,6 @@ def train(self, args):
                             for param in self._crepa.get_trainable_params():
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
-                        if hasattr(self, "_self_flow") and self._self_flow is not None:
-                            for param in self._self_flow.get_trainable_params():
-                                if param.grad is not None:
-                                    param.grad = accelerator.reduce(param.grad, reduction="mean")
-
                     if uncertainty_state is not None:
                         synchronize_parameter_gradients(accelerator, uncertainty_state.parameters())
 
@@ -2613,15 +2639,13 @@ def train(self, args):
                 if did_optimizer_step:
                     apply_weight_noise_to_optimizer(optimizer, args, global_step=global_step)
                 if did_optimizer_step and hasattr(self, "_self_flow") and self._self_flow is not None:
-                    try:
-                        # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
-                        _sf_net = getattr(self, "_self_flow_network", None) or (
-                            accelerator.unwrap_model(network) if network is not None else None
-                        )
-                        if _sf_net is not None:
-                            self._self_flow.update_teacher(_sf_net)
-                    except Exception as e:
-                        logger.warning("Self-Flow EMA update failed: %s", e)
+                    # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
+                    _sf_net = getattr(self, "_self_flow_network", None) or (
+                        accelerator.unwrap_model(network) if network is not None else None
+                    )
+                    if _sf_net is None:
+                        raise RuntimeError("Self-Flow EMA target is unavailable after optimizer step")
+                    self._self_flow.update_teacher(_sf_net)
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 if (

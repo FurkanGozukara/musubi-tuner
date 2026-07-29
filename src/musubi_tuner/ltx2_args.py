@@ -1818,8 +1818,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "temporal_tau=1.0 num_neighbors=2 temporal_granularity=patch patch_spatial_radius=1 "
         "patch_match_mode=soft patch_match_temperature=0.2 delta_num_steps=2 "
         "motion_weighting=teacher_delta motion_weight_strength=0.5 "
-        "temporal_schedule=linear temporal_warmup_steps=200 temporal_max_steps=2000 mask_ratio=0.1 "
-        "frame_level_mask=false teacher_mode=base mask_focus_loss=false max_loss=0.0 "
+        "temporal_schedule=polynomial temporal_warmup_steps=200 temporal_max_steps=2000 "
+        "schedule_end_weight=0.0 schedule_power=2.0 schedule_cutoff_step=0 "
+        "similarity_cutoff=0.95 similarity_ema_decay=0.99 similarity_cutoff_mode=permanent mask_ratio=0.1 "
+        "frame_level_mask=false teacher_mode=ema mask_focus_loss=false max_loss=0.0 "
         "student_block_stochastic_range=2 teacher_momentum=0.999 "
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )

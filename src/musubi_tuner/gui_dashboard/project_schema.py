@@ -676,7 +676,7 @@ class TrainingConfig(BaseModel):
     # Self-Flow
     self_flow: bool = False
     self_flow_args: str = ""
-    self_flow_teacher_mode: Literal["base", "ema", "partial_ema"] = "base"
+    self_flow_teacher_mode: Literal["base", "ema", "partial_ema"] = "ema"
     self_flow_student_block_idx: int = 16
     self_flow_teacher_block_idx: int = 32
     self_flow_student_block_ratio: float = 0.3
@@ -703,9 +703,15 @@ class TrainingConfig(BaseModel):
     self_flow_delta_num_steps: int = 1
     self_flow_motion_weighting: Literal["none", "teacher_delta"] = "none"
     self_flow_motion_weight_strength: float = 0.0
-    self_flow_temporal_schedule: Literal["constant", "linear", "cosine"] = "constant"
+    self_flow_temporal_schedule: Literal["constant", "linear", "cosine", "polynomial"] = "constant"
     self_flow_temporal_warmup_steps: int = 0
     self_flow_temporal_max_steps: int = 0
+    self_flow_schedule_end_weight: float = 0.0
+    self_flow_schedule_power: float = 1.0
+    self_flow_schedule_cutoff_step: int = 0
+    self_flow_similarity_cutoff: Optional[float] = None
+    self_flow_similarity_ema_decay: float = 0.99
+    self_flow_similarity_cutoff_mode: Literal["permanent", "recoverable"] = "permanent"
     self_flow_offload_teacher_features: bool = False
 
     # HFATO (ViBe - High-Frequency Awareness Training Objective)

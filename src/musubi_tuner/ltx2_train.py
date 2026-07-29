@@ -5416,20 +5416,14 @@ def main() -> None:
         projector_file = os.path.join(args.output_dir, "self_flow_projector.safetensors")
         teacher_file = os.path.join(args.output_dir, "self_flow_teacher_ema.safetensors")
 
-        try:
-            proj_sd = module.state_dict()
-            if proj_sd:
-                proj_sd_cpu = {k: v.detach().to(device="cpu") for k, v in proj_sd.items() if isinstance(v, torch.Tensor)}
-                save_file(proj_sd_cpu, projector_file)
-        except Exception as e:
-            logger.warning("Failed to save Self-Flow projector state: %s", e)
+        proj_sd = module.state_dict()
+        if proj_sd:
+            proj_sd_cpu = {k: v.detach().to(device="cpu") for k, v in proj_sd.items() if isinstance(v, torch.Tensor)}
+            save_file(proj_sd_cpu, projector_file)
 
-        try:
-            teacher_sd = module.teacher_state_dict()
-            if teacher_sd:
-                save_file(teacher_sd, teacher_file)
-        except Exception as e:
-            logger.warning("Failed to save Self-Flow teacher EMA state: %s", e)
+        teacher_sd = module.teacher_state_dict()
+        if teacher_sd:
+            save_file(teacher_sd, teacher_file)
 
     def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
         if not train_utils.dashboard_stop_requested():
@@ -5481,27 +5475,14 @@ def main() -> None:
         trainer_was_training = bool(getattr(trainer, "training", False))
         trainer.training = False
         transformer.eval()
+        validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
+        plain_validation_args = copy.copy(args)
+        plain_validation_args.self_flow = False
 
         # Apply EMA weights for validation if available
         original_params = None
         if ema_model is not None:
             original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
-
-        self_flow_network = getattr(trainer, "_self_flow_network", None)
-        self_flow_network_was_training = (
-            bool(getattr(self_flow_network, "training", False)) if self_flow_network is not None else None
-        )
-        force_self_flow_capture = bool(
-            getattr(args, "self_flow", False)
-            and getattr(trainer, "_self_flow", None) is not None
-            and self_flow_network is not None
-            and not bool(getattr(self_flow_network, "training", False))
-        )
-        if force_self_flow_capture:
-            # Self-Flow capture is gated on the top-level module's `.training` flag.
-            # Flip only that flag so validation can populate cached teacher/student
-            # features without globally switching submodules back to train mode.
-            self_flow_network.training = True
 
         val_losses = []
         val_video_losses = []
@@ -5513,8 +5494,6 @@ def main() -> None:
         val_motion_total_losses = []
         num_batches = 0
         max_batches = args.num_validation_batches
-        validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
-
         with torch.no_grad():
             for batch in val_dataloader:
                 if max_batches is not None and num_batches >= max_batches:
@@ -5530,49 +5509,31 @@ def main() -> None:
                 latents_tensor = trainer.scale_shift_latents(latents_tensor)
                 noise = torch.randn_like(latents_tensor)
 
-                if validation_self_flow_enabled:
-                    args.self_flow = False
-                    if getattr(trainer, "_self_flow", None) is not None:
-                        trainer._self_flow.cleanup_step()
-                    trainer._self_flow_step_context = None
-                try:
-                    noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                        args,
-                        noise,
-                        latents_tensor,
-                        batch["timesteps"],
-                        noise_scheduler,
-                        accelerator.device,
-                        trainer.dit_dtype,
-                    )
-                finally:
-                    if validation_self_flow_enabled:
-                        args.self_flow = True
+                noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                    plain_validation_args,
+                    noise,
+                    latents_tensor,
+                    batch["timesteps"],
+                    noise_scheduler,
+                    accelerator.device,
+                    trainer.dit_dtype,
+                )
 
                 weighting = compute_loss_weighting_for_sd3(
                     args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, trainer.dit_dtype
                 )
 
-                if validation_self_flow_enabled:
-                    args.self_flow = False
-                    if getattr(trainer, "_self_flow", None) is not None:
-                        trainer._self_flow.cleanup_step()
-                    trainer._self_flow_step_context = None
-                try:
-                    model_pred, target = trainer.call_dit(
-                        args,
-                        accelerator,
-                        transformer,
-                        latents_tensor,
-                        batch,
-                        noise,
-                        noisy_model_input,
-                        timesteps,
-                        trainer.dit_dtype,
-                    )
-                finally:
-                    if validation_self_flow_enabled:
-                        args.self_flow = True
+                model_pred, target = trainer.call_dit(
+                    plain_validation_args,
+                    accelerator,
+                    transformer,
+                    latents_tensor,
+                    batch,
+                    noise,
+                    noisy_model_input,
+                    timesteps,
+                    trainer.dit_dtype,
+                )
 
                 dict_output = isinstance(model_pred, dict)
                 if dict_output:
@@ -5641,47 +5602,37 @@ def main() -> None:
 
                 self_flow_loss = None
                 if validation_self_flow_enabled:
-                    try:
-                        sf_noisy_model_input, sf_timesteps = trainer.get_noisy_model_input_and_timesteps(
-                            args,
-                            noise,
-                            latents_tensor,
-                            batch["timesteps"],
-                            noise_scheduler,
-                            accelerator.device,
-                            trainer.dit_dtype,
-                        )
-                        _sf_model_pred, _sf_target = trainer.call_dit(
-                            args,
-                            accelerator,
-                            transformer,
-                            latents_tensor,
-                            batch,
-                            noise,
-                            sf_noisy_model_input,
-                            sf_timesteps,
-                            trainer.dit_dtype,
-                        )
-                        if getattr(trainer, "_self_flow", None) is not None:
-                            trainer._self_flow.on_step(step)
-                        self_flow_loss, _self_flow_metrics = trainer.compute_self_flow_addition(
-                            args,
-                            accelerator,
-                            transformer,
-                            transformer,
-                            trainer.dit_dtype,
-                        )
-                        if self_flow_loss is not None:
-                            val_self_flow_losses.append(float(self_flow_loss.detach().item()))
-                    except Exception as e:
-                        if getattr(trainer, "_self_flow", None) is not None:
-                            trainer._self_flow.cleanup_step()
-                        logger.warning(
-                            "Self-Flow validation loss computation failed at step=%s batch=%s: %s",
-                            step,
-                            num_batches,
-                            e,
-                        )
+                    sf_noisy_model_input, sf_timesteps = trainer.get_noisy_model_input_and_timesteps(
+                        args,
+                        noise,
+                        latents_tensor,
+                        batch["timesteps"],
+                        noise_scheduler,
+                        accelerator.device,
+                        trainer.dit_dtype,
+                    )
+                    _sf_model_pred, _sf_target = trainer.call_dit(
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        sf_noisy_model_input,
+                        sf_timesteps,
+                        trainer.dit_dtype,
+                    )
+                    if getattr(trainer, "_self_flow", None) is None:
+                        raise RuntimeError("Self-Flow is enabled during validation but was not initialized")
+                    trainer._self_flow.on_step(step)
+                    self_flow_loss, _self_flow_metrics = trainer.compute_self_flow_addition(
+                        args,
+                        accelerator,
+                        transformer,
+                        transformer,
+                        trainer.dit_dtype,
+                    )
+                    val_self_flow_losses.append(float(self_flow_loss.detach().item()))
 
                 ewc_loss = None
                 if ewc_state is not None and float(getattr(args, "ewc_lambda", 0.0) or 0.0) > 0.0:
@@ -5749,7 +5700,7 @@ def main() -> None:
                                 attn_recorder.__enter__()
                                 try:
                                     motion_pred, _ = trainer.call_dit(
-                                        args,
+                                        plain_validation_args,
                                         accelerator,
                                         transformer,
                                         anchor_latents,
@@ -5765,7 +5716,7 @@ def main() -> None:
                             else:
                                 student_attn_maps = {}
                                 motion_pred, _ = trainer.call_dit(
-                                    args,
+                                    plain_validation_args,
                                     accelerator,
                                     transformer,
                                     anchor_latents,
@@ -5880,9 +5831,6 @@ def main() -> None:
         if original_params is not None:
             ema_model.restore(accelerator.unwrap_model(transformer), original_params)
             original_params = None
-        if force_self_flow_capture and self_flow_network is not None:
-            self_flow_network.training = bool(self_flow_network_was_training)
-
         transformer.train()
 
         # Compute average metrics
@@ -5925,11 +5873,6 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
-            if validation_self_flow_enabled:
-                args.self_flow = False
-                if getattr(trainer, "_self_flow", None) is not None:
-                    trainer._self_flow.cleanup_step()
-                trainer._self_flow_step_context = None
             with torch.no_grad():
                 for fixed_t in mt_list:
                     mt_losses: list[float] = []
@@ -5948,7 +5891,7 @@ def main() -> None:
                         override_sigma = [float(fixed_t) / 1000.0] * bsz
                         try:
                             noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                                args,
+                                plain_validation_args,
                                 noise,
                                 latents_tensor,
                                 override_sigma,
@@ -5968,7 +5911,7 @@ def main() -> None:
                             trainer.dit_dtype,
                         )
                         model_pred, target = trainer.call_dit(
-                            args,
+                            plain_validation_args,
                             accelerator,
                             transformer,
                             latents_tensor,
@@ -6053,8 +5996,6 @@ def main() -> None:
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
-            if validation_self_flow_enabled:
-                args.self_flow = True
             transformer.train()
 
         # Per-category OOD validation: basic loss only, no EWC/motion/self_flow.
@@ -6062,11 +6003,6 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
-            if validation_self_flow_enabled:
-                args.self_flow = False
-                if getattr(trainer, "_self_flow", None) is not None:
-                    trainer._self_flow.cleanup_step()
-                trainer._self_flow_step_context = None
             with torch.no_grad():
                 for cat_name, cat_loader in extra_val_dataloaders.items():
                     c_losses: list[float] = []
@@ -6083,7 +6019,7 @@ def main() -> None:
                         noise = torch.randn_like(latents_tensor)
                         try:
                             noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                                args,
+                                plain_validation_args,
                                 noise,
                                 latents_tensor,
                                 batch.get("timesteps"),
@@ -6102,7 +6038,7 @@ def main() -> None:
                             trainer.dit_dtype,
                         )
                         model_pred, target = trainer.call_dit(
-                            args,
+                            plain_validation_args,
                             accelerator,
                             transformer,
                             latents_tensor,
@@ -6186,8 +6122,6 @@ def main() -> None:
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
-            if validation_self_flow_enabled:
-                args.self_flow = True
             transformer.train()
 
         if val_metrics:
@@ -6758,22 +6692,17 @@ def main() -> None:
                 self_flow_loss = None
                 self_flow_metrics: dict[str, float] = {}
                 if bool(getattr(args, "self_flow", False)):
-                    try:
-                        if getattr(trainer, "_self_flow", None) is not None:
-                            trainer._self_flow.on_step(global_step)
-                        self_flow_loss, self_flow_metrics = trainer.compute_self_flow_addition(
-                            args,
-                            accelerator,
-                            transformer,
-                            transformer,
-                            trainer.dit_dtype,
-                        )
-                        if self_flow_loss is not None:
-                            loss = loss + self_flow_loss
-                    except Exception as e:
-                        if getattr(trainer, "_self_flow", None) is not None:
-                            trainer._self_flow.cleanup_step()
-                        logger.warning("Self-Flow loss computation failed at step=%s: %s", global_step, e)
+                    if getattr(trainer, "_self_flow", None) is None:
+                        raise RuntimeError("Self-Flow is enabled but the helper was not initialized")
+                    trainer._self_flow.on_step(global_step)
+                    self_flow_loss, self_flow_metrics = trainer.compute_self_flow_addition(
+                        args,
+                        accelerator,
+                        transformer,
+                        transformer,
+                        trainer.dit_dtype,
+                    )
+                    loss = loss + self_flow_loss
 
                 motion_pres_loss = None
                 motion_pres_loss_raw = None
@@ -7099,10 +7028,7 @@ def main() -> None:
                     apply_weight_noise_to_optimizer(optimizer, args, global_step=global_step)
 
                 if did_optimizer_step and getattr(trainer, "_self_flow", None) is not None:
-                    try:
-                        trainer._self_flow.update_teacher(accelerator.unwrap_model(transformer))
-                    except Exception as e:
-                        logger.warning("Self-Flow teacher update failed at step=%s: %s", global_step, e)
+                    trainer._self_flow.update_teacher(accelerator.unwrap_model(transformer))
 
             if accelerator.sync_gradients and not did_optimizer_step and accelerator.optimizer_step_was_skipped:
                 logger.warning("Optimizer update skipped after mixed-precision gradient overflow; global step is unchanged.")

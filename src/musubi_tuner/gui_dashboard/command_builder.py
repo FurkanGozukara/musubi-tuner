@@ -1744,7 +1744,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--self_flow")
         args_parts = []
         _append_key_value_args(args_parts, t.self_flow_args)
-        if t.self_flow_teacher_mode != "base":
+        if t.self_flow_teacher_mode != "ema":
             args_parts.append(f"teacher_mode={t.self_flow_teacher_mode}")
         if t.self_flow_student_block_idx != 16:
             args_parts.append(f"student_block_idx={t.self_flow_student_block_idx}")
@@ -1804,6 +1804,18 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"temporal_warmup_steps={t.self_flow_temporal_warmup_steps}")
         if getattr(t, "self_flow_temporal_max_steps", 0) != 0:
             args_parts.append(f"temporal_max_steps={t.self_flow_temporal_max_steps}")
+        if getattr(t, "self_flow_schedule_end_weight", 0.0) != 0.0:
+            args_parts.append(f"schedule_end_weight={t.self_flow_schedule_end_weight}")
+        if getattr(t, "self_flow_schedule_power", 1.0) != 1.0:
+            args_parts.append(f"schedule_power={t.self_flow_schedule_power}")
+        if getattr(t, "self_flow_schedule_cutoff_step", 0) != 0:
+            args_parts.append(f"schedule_cutoff_step={t.self_flow_schedule_cutoff_step}")
+        if getattr(t, "self_flow_similarity_cutoff", None) is not None:
+            args_parts.append(f"similarity_cutoff={t.self_flow_similarity_cutoff}")
+        if getattr(t, "self_flow_similarity_ema_decay", 0.99) != 0.99:
+            args_parts.append(f"similarity_ema_decay={t.self_flow_similarity_ema_decay}")
+        if getattr(t, "self_flow_similarity_cutoff_mode", "permanent") != "permanent":
+            args_parts.append(f"similarity_cutoff_mode={t.self_flow_similarity_cutoff_mode}")
         if getattr(t, "self_flow_offload_teacher_features", False):
             args_parts.append("offload_teacher_features=true")
         if args_parts:

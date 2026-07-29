@@ -5,9 +5,10 @@ Implements the Self-Flow training regularizer:
 - This module handles feature alignment loss with a teacher model.
 
 Teacher modes:
-  "base" (default): teacher = frozen pretrained base model (LoRA multipliers zeroed).
-      No extra VRAM vs EMA, stronger teacher-student gap, acts as regularizer.
-  "ema": teacher = EMA-smoothed copy of LoRA weights (original behaviour).
+  "ema" (default): teacher = EMA-smoothed copy of trainable weights.
+  "partial_ema": teacher = EMA-smoothed copy of the selected teacher block.
+  "base": teacher = frozen pretrained base model with adapters disabled. This is
+      a base-consistency regularizer, not canonical Self-Flow.
 """
 
 from __future__ import annotations
@@ -134,12 +135,18 @@ class SelfFlowConfig:
     delta_num_steps: int = 1
     motion_weighting: str = "none"  # "none" | "teacher_delta"
     motion_weight_strength: float = 0.0
-    temporal_schedule: str = "constant"  # "constant" | "linear" | "cosine"
+    temporal_schedule: str = "constant"  # "constant" | "linear" | "cosine" | "polynomial"
     temporal_warmup_steps: int = 0
     temporal_max_steps: int = 0
+    schedule_end_weight: float = 0.0
+    schedule_power: float = 1.0
+    schedule_cutoff_step: int = 0
+    similarity_cutoff: Optional[float] = None
+    similarity_ema_decay: float = 0.99
+    similarity_cutoff_mode: str = "permanent"  # "permanent" | "recoverable"
     mask_ratio: float = 0.10
     frame_level_mask: bool = False  # mask whole frames instead of individual tokens
-    teacher_mode: str = "base"  # "base" | "ema" | "partial_ema"
+    teacher_mode: str = "ema"  # "ema" | "partial_ema" | "base"
     teacher_momentum: float = 0.999
     teacher_update_interval: int = 1
     projector_hidden_multiplier: int = 1
@@ -158,6 +165,74 @@ class SelfFlowConfig:
     lambda_audio: float = 0.0  # audio representation alignment weight (0 = disabled)
 
 
+class SelfFlowScheduler:
+    """Stateful weight scheduler shared by every Self-Flow loss term."""
+
+    def __init__(self, config: SelfFlowConfig):
+        self.config = config
+        self.similarity_ema: Optional[float] = None
+        self.cutoff_latched = False
+        self.cutoff_active = False
+        self.last_scale = 1.0
+
+    def update_similarity(self, similarity: float) -> None:
+        value = float(similarity)
+        if not math.isfinite(value):
+            raise RuntimeError(f"Self-Flow cosine similarity is non-finite: {value}")
+        if self.similarity_ema is None:
+            self.similarity_ema = value
+        else:
+            decay = float(self.config.similarity_ema_decay)
+            self.similarity_ema = decay * self.similarity_ema + (1.0 - decay) * value
+
+        threshold = self.config.similarity_cutoff
+        if threshold is None:
+            return
+        reached = self.similarity_ema >= float(threshold)
+        if str(self.config.similarity_cutoff_mode).lower() == "permanent":
+            self.cutoff_latched = self.cutoff_latched or reached
+        else:
+            self.cutoff_latched = reached
+        self.cutoff_active = self.cutoff_latched
+
+    def scale(self, global_step: int) -> float:
+        step = max(0, int(global_step))
+        hard_cutoff = max(0, int(self.config.schedule_cutoff_step))
+        if (hard_cutoff > 0 and step >= hard_cutoff) or self.cutoff_latched:
+            self.cutoff_active = True
+            self.last_scale = 0.0
+            return 0.0
+        self.cutoff_active = False
+
+        warmup_steps = max(0, int(self.config.temporal_warmup_steps))
+        if warmup_steps > 0 and step < warmup_steps:
+            self.last_scale = float(step) / float(warmup_steps)
+            return self.last_scale
+
+        schedule = str(self.config.temporal_schedule).lower()
+        max_steps = max(0, int(self.config.temporal_max_steps))
+        if schedule == "constant" or max_steps <= 0:
+            self.last_scale = 1.0
+            return 1.0
+
+        progress = min(
+            max(float(step - warmup_steps), 0.0) / max(float(max_steps - warmup_steps), 1.0),
+            1.0,
+        )
+        if schedule == "linear":
+            decay = 1.0 - progress
+        elif schedule == "cosine":
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        elif schedule == "polynomial":
+            decay = (1.0 - progress) ** float(self.config.schedule_power)
+        else:
+            raise ValueError(f"Unsupported Self-Flow schedule: {schedule!r}")
+
+        end_weight = float(self.config.schedule_end_weight)
+        self.last_scale = end_weight + (1.0 - end_weight) * decay
+        return self.last_scale
+
+
 def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
     """Parse ``key=value`` list into a dict. Returns empty dict for None/[]."""
     if not raw_args:
@@ -174,19 +249,17 @@ def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
 class SelfFlowModule:
     """Training helper for Self-Flow feature alignment.
 
-    Hooks are installed on the student model blocks. Teacher features are captured
-    by running a second forward pass with EMA LoRA weights.
+    Student and teacher features are returned explicitly by the LTX transformer.
+    The teacher pass uses EMA weights unless base-consistency mode is selected.
     """
 
     def __init__(self, config: SelfFlowConfig, transformer: nn.Module):
         self.config = config
         self.transformer = transformer
 
+        self.projectors: Optional[nn.ModuleDict] = None
         self.projector: Optional[nn.Sequential] = None
         self.audio_projector: Optional[nn.Sequential] = None
-        self._hooks: list = []
-
-        self._capture_mode: str = "idle"  # "student" | "teacher" | "idle"
         self._student_features: Optional[torch.Tensor] = None
         self._teacher_features: Optional[torch.Tensor] = None
         self._student_audio_features: Optional[torch.Tensor] = None
@@ -206,7 +279,8 @@ class SelfFlowModule:
         self._resolved_student_block_idx: Optional[int] = None
         self._resolved_teacher_block_idx: Optional[int] = None
         self._active_student_block_idx: Optional[int] = None  # may differ each step when stochastic
-        self._stochastic_student_indices: list = []  # full list of hookable student blocks
+        self._stochastic_student_indices: list = []
+        self._scheduler = SelfFlowScheduler(config)
 
     @property
     def last_cosine(self) -> Optional[float]:
@@ -248,6 +322,36 @@ class SelfFlowModule:
             or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
             or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
         )
+
+    @property
+    def should_capture(self) -> bool:
+        return self.has_active_loss or (
+            self.config.similarity_cutoff is not None and str(self.config.similarity_cutoff_mode).lower() == "recoverable"
+        )
+
+    @property
+    def schedule_scale(self) -> float:
+        return float(self._scheduler.last_scale)
+
+    @property
+    def similarity_ema(self) -> Optional[float]:
+        return self._scheduler.similarity_ema
+
+    @property
+    def schedule_cutoff_active(self) -> bool:
+        return bool(self._scheduler.cutoff_active)
+
+    @property
+    def student_hidden_state_layer(self) -> int:
+        if self._active_student_block_idx is None:
+            raise RuntimeError("Self-Flow student block has not been resolved")
+        return int(self._active_student_block_idx)
+
+    @property
+    def teacher_hidden_state_layer(self) -> int:
+        if self._resolved_teacher_block_idx is None:
+            raise RuntimeError("Self-Flow teacher block has not been resolved")
+        return int(self._resolved_teacher_block_idx)
 
     def _make_activation(self) -> nn.Module:
         act = str(self.config.projector_activation).lower()
@@ -306,7 +410,7 @@ class SelfFlowModule:
             teacher_idx = self._resolve_ratio_index(self.config.teacher_block_ratio, depth, mode="ceil")
         return student_idx, teacher_idx
 
-    def setup(self, device: torch.device, dtype: torch.dtype) -> None:
+    def setup(self, device: torch.device, dtype: torch.dtype, registration_target: nn.Module) -> None:
         blocks, depth = self._get_blocks()
         student_idx, teacher_idx = self.resolve_block_indices(depth)
         if not (0 <= student_idx < depth):
@@ -328,7 +432,7 @@ class SelfFlowModule:
         self._stochastic_student_indices = list(range(lo, hi + 1))
         if stochastic_range > 0 and len(self._stochastic_student_indices) > 1:
             logger.warning(
-                "Self-Flow: student_block_stochastic_range=%d creates %d hookable student blocks [%d..%d], "
+                "Self-Flow: student_block_stochastic_range=%d selects among %d student blocks [%d..%d], "
                 "but a single projector MLP is shared across all depths. "
                 "The projector will be a compromise; consider range=0 for best alignment accuracy.",
                 stochastic_range,
@@ -348,34 +452,34 @@ class SelfFlowModule:
         inner_dim = int(getattr(self.transformer, "inner_dim", 0))
         if inner_dim <= 0:
             raise ValueError("Self-Flow could not resolve transformer.inner_dim")
-        hidden_dim = inner_dim * max(1, int(self.config.projector_hidden_multiplier))
+        hidden_dim = inner_dim * int(self.config.projector_hidden_multiplier)
         activation = self._make_activation()
-        self.projector = nn.Sequential(
+        video_projector = nn.Sequential(
             nn.Linear(inner_dim, hidden_dim),
             activation,
             nn.Linear(hidden_dim, inner_dim),
         ).to(device=device, dtype=dtype)
 
-        # Audio projector: created when lambda_audio > 0 and model has audio_inner_dim
+        projectors = nn.ModuleDict({"video": video_projector})
         if float(self.config.lambda_audio) > 0.0:
             audio_inner_dim = int(getattr(self.transformer, "audio_inner_dim", 0))
             if audio_inner_dim <= 0:
-                logger.warning(
-                    "Self-Flow lambda_audio=%.4f but transformer has no audio_inner_dim; audio alignment disabled.",
-                    self.config.lambda_audio,
-                )
-                self.config.lambda_audio = 0.0
-                self._current_lambda_audio = 0.0
-            else:
-                audio_hidden_dim = audio_inner_dim * max(1, int(self.config.projector_hidden_multiplier))
-                self.audio_projector = nn.Sequential(
-                    nn.Linear(audio_inner_dim, audio_hidden_dim),
-                    self._make_activation(),
-                    nn.Linear(audio_hidden_dim, audio_inner_dim),
-                ).to(device=device, dtype=dtype)
-                logger.info("Self-Flow audio projector created: audio_inner_dim=%d", audio_inner_dim)
+                raise ValueError(f"Self-Flow lambda_audio={self.config.lambda_audio:.4f} requires a transformer audio branch")
+            audio_hidden_dim = audio_inner_dim * int(self.config.projector_hidden_multiplier)
+            projectors["audio"] = nn.Sequential(
+                nn.Linear(audio_inner_dim, audio_hidden_dim),
+                self._make_activation(),
+                nn.Linear(audio_hidden_dim, audio_inner_dim),
+            ).to(device=device, dtype=dtype)
+            logger.info("Self-Flow audio projector created: audio_inner_dim=%d", audio_inner_dim)
 
-        self._install_hooks(blocks)
+        if "_self_flow_projectors" in registration_target._modules:
+            raise RuntimeError("Self-Flow projectors are already registered on the training model")
+        registration_target.add_module("_self_flow_projectors", projectors)
+        self.projectors = projectors
+        self.projector = projectors["video"]
+        self.audio_projector = projectors["audio"] if "audio" in projectors else None
+
         logger.info(
             "Self-Flow ready: student_block=%d teacher_block=%d student_ratio=%s teacher_ratio=%s "
             "mask_ratio=%.3f frame_level_mask=%s teacher_mode=%s lambda=%.4f "
@@ -383,7 +487,8 @@ class SelfFlowModule:
             "temporal_tau=%.3f num_neighbors=%d temporal_granularity=%s patch_spatial_radius=%d "
             "patch_match_mode=%s patch_match_temperature=%.4f delta_num_steps=%d motion_weighting=%s "
             "motion_weight_strength=%.4f temporal_schedule=%s "
-            "temporal_warmup_steps=%d temporal_max_steps=%d "
+            "temporal_warmup_steps=%d temporal_max_steps=%d schedule_end_weight=%.4f "
+            "schedule_power=%.3f schedule_cutoff_step=%d similarity_cutoff=%s "
             "max_loss=%.4f student_block_stochastic_range=%d "
             "momentum=%.4f dual_timestep=%s tokenwise_timestep=%s "
             "offload_teacher_params=%s projector_lr=%s",
@@ -410,6 +515,10 @@ class SelfFlowModule:
             self.config.temporal_schedule,
             self.config.temporal_warmup_steps,
             self.config.temporal_max_steps,
+            self.config.schedule_end_weight,
+            self.config.schedule_power,
+            self.config.schedule_cutoff_step,
+            self.config.similarity_cutoff,
             self.config.max_loss,
             int(self.config.student_block_stochastic_range),
             self.config.teacher_momentum,
@@ -418,61 +527,20 @@ class SelfFlowModule:
             str(self.config.offload_teacher_params).lower(),
             self.config.projector_lr,
         )
-        if not bool(self.config.dual_timestep):
-            logger.warning(
-                "Self-Flow: dual_timestep=False — the teacher forward pass will be skipped "
-                "and Self-Flow will produce no loss. Projector parameters and hooks are still "
-                "active but consuming resources with no benefit. Set dual_timestep=True "
-                "(the default) or disable --self_flow entirely."
+
+    @staticmethod
+    def _extract_native_hidden_states(output: Any) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not isinstance(output, (tuple, list)) or len(output) != 4:
+            raise RuntimeError(
+                "Self-Flow requested native hidden states but the LTX wrapper did not return "
+                "(video_pred, audio_pred, video_hidden, audio_hidden)"
             )
-
-    def _install_hooks(self, blocks: list[nn.Module]) -> None:
-        def _extract_video_tensor(output: Any) -> Optional[torch.Tensor]:
-            if isinstance(output, tuple) and len(output) >= 1:
-                video_out = output[0]
-                if hasattr(video_out, "x") and torch.is_tensor(video_out.x):
-                    return video_out.x
-            return None
-
-        def _extract_audio_tensor(output: Any) -> Optional[torch.Tensor]:
-            if isinstance(output, tuple) and len(output) >= 2:
-                audio_out = output[1]
-                if audio_out is not None and hasattr(audio_out, "x") and torch.is_tensor(audio_out.x):
-                    return audio_out.x
-            return None
-
-        capture_audio = self.audio_projector is not None
-
-        def _make_student_hook(block_idx: int):
-            def _hook(_module, _inputs, output):
-                if self._capture_mode != "student":
-                    return
-                if block_idx != self._active_student_block_idx:
-                    return
-                tensor = _extract_video_tensor(output)
-                if tensor is not None:
-                    self._student_features = tensor
-                if capture_audio:
-                    audio_tensor = _extract_audio_tensor(output)
-                    if audio_tensor is not None:
-                        self._student_audio_features = audio_tensor
-
-            return _hook
-
-        def _teacher_hook(_module, _inputs, output):
-            if self._capture_mode != "teacher":
-                return
-            tensor = _extract_video_tensor(output)
-            if tensor is not None:
-                self._teacher_features = tensor.detach()
-            if capture_audio:
-                audio_tensor = _extract_audio_tensor(output)
-                if audio_tensor is not None:
-                    self._teacher_audio_features = audio_tensor.detach()
-
-        for bidx in self._stochastic_student_indices:
-            self._hooks.append(blocks[bidx].register_forward_hook(_make_student_hook(bidx)))
-        self._hooks.append(blocks[int(self._resolved_teacher_block_idx)].register_forward_hook(_teacher_hook))
+        video_hidden, audio_hidden = output[2], output[3]
+        if not isinstance(video_hidden, torch.Tensor):
+            raise RuntimeError("Self-Flow video hidden state was not returned by the transformer")
+        if audio_hidden is not None and not isinstance(audio_hidden, torch.Tensor):
+            raise RuntimeError("Self-Flow audio hidden state has an invalid type")
+        return video_hidden, audio_hidden
 
     @staticmethod
     def _is_adapter_module(m: nn.Module) -> bool:
@@ -528,6 +596,8 @@ class SelfFlowModule:
         teacher_block = self._resolved_teacher_block_idx
         self._shadow_params.clear()
         for name, param in network.named_parameters():
+            if name.startswith("_self_flow_projectors.") or "._self_flow_projectors." in name:
+                continue
             if not param.requires_grad:
                 continue
             if mode == "partial_ema" and teacher_block is not None:
@@ -550,20 +620,19 @@ class SelfFlowModule:
 
         if mode == "partial_ema":
             if not self._shadow_params:
-                logger.warning(
+                raise ValueError(
                     "Self-Flow teacher_mode=partial_ema: no trainable parameters matched block %s. "
-                    "Ensure transformer_blocks.{idx} layers are included in the LoRA network. "
-                    "EMA teacher will behave identically to student (zero distillation signal). "
-                    "Consider using teacher_mode=ema or teacher_mode=base instead.",
-                    teacher_block,
+                    "Ensure that block's transformer layers are included in the training target. "
+                    "Use teacher_mode=ema or include the selected teacher block in the training target." % teacher_block
                 )
-            else:
-                logger.info(
-                    "Self-Flow teacher_mode=partial_ema: EMA for %d tensors in block %s",
-                    len(self._shadow_params),
-                    teacher_block,
-                )
+            logger.info(
+                "Self-Flow teacher_mode=partial_ema: EMA for %d tensors in block %s",
+                len(self._shadow_params),
+                teacher_block,
+            )
         else:
+            if not self._shadow_params:
+                raise ValueError("Self-Flow teacher_mode=ema found no trainable parameters for the teacher")
             logger.info("Self-Flow: initialized EMA teacher with %d tensors", len(self._shadow_params))
 
     def update_teacher(self, network: nn.Module) -> None:
@@ -621,7 +690,6 @@ class SelfFlowModule:
                 param.copy_(backup.to(device=param.device, dtype=param.dtype))
 
     def mark_student_forward(self) -> None:
-        self._capture_mode = "student"
         self._student_features = None
         self._student_audio_features = None
         if len(self._stochastic_student_indices) > 1:
@@ -629,8 +697,15 @@ class SelfFlowModule:
         else:
             self._active_student_block_idx = self._resolved_student_block_idx
 
+    def cache_student_output(self, output: Any) -> tuple[Any, Any]:
+        video_hidden, audio_hidden = self._extract_native_hidden_states(output)
+        self._student_features = video_hidden
+        self._student_audio_features = audio_hidden
+        if self.audio_projector is not None and audio_hidden is None:
+            raise RuntimeError("Self-Flow audio loss is active but the student audio hidden state is missing")
+        return output[0], output[1]
+
     def cleanup_step(self) -> None:
-        self._capture_mode = "idle"
         self._student_features = None
         self._teacher_features = None
         self._student_audio_features = None
@@ -643,36 +718,13 @@ class SelfFlowModule:
         # which runs after optimizer.step, not during compute_loss
 
     def on_step(self, global_step: int) -> None:
-        scale = self._schedule_scale(global_step)
+        scale = self._scheduler.scale(global_step)
         # Apply the schedule to every Self-Flow regularization term so the
         # logged lambdas match the documented effective weights.
         self._current_lambda_self_flow = float(self.config.lambda_self_flow) * scale
         self._current_lambda_audio = float(self.config.lambda_audio) * scale
         self._current_lambda_temporal = float(self.config.lambda_temporal) * scale
         self._current_lambda_delta = float(self.config.lambda_delta) * scale
-
-    def _schedule_scale(self, global_step: int) -> float:
-        schedule = str(self.config.temporal_schedule).lower()
-        if schedule == "constant":
-            return 1.0
-
-        warmup_steps = max(0, int(self.config.temporal_warmup_steps))
-        if warmup_steps > 0 and global_step < warmup_steps:
-            return float(global_step) / float(warmup_steps)
-
-        max_steps = max(0, int(self.config.temporal_max_steps))
-        if max_steps <= 0:
-            return 1.0
-
-        progress = min(
-            max(float(global_step - warmup_steps), 0.0) / max(float(max_steps - warmup_steps), 1.0),
-            1.0,
-        )
-        if schedule == "linear":
-            return 1.0 - progress
-        if schedule == "cosine":
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 1.0
 
     def get_trainable_params(self) -> list[torch.nn.Parameter]:
         params = []
@@ -696,9 +748,10 @@ class SelfFlowModule:
         frame_rate: int | float,
         transformer_options: Dict[str, Any],
     ) -> None:
-        if self.projector is None or not self.has_active_loss:
+        if self.projector is None or not self.should_capture:
             return
         self._teacher_features = None
+        self._teacher_audio_features = None
         prev_training = bool(getattr(transformer, "training", False))
 
         if str(self.config.teacher_mode).lower() == "base":
@@ -713,11 +766,10 @@ class SelfFlowModule:
                 )
             saved_states = self._disable_adapters(adapter_mods)
             try:
-                self._capture_mode = "teacher"
                 if prev_training:
                     transformer.eval()
                 with torch.no_grad(), accelerator.autocast():
-                    _ = transformer(
+                    output = transformer(
                         teacher_model_input,
                         timestep=teacher_timesteps,
                         audio_timestep=audio_timestep,
@@ -725,9 +777,10 @@ class SelfFlowModule:
                         attention_mask=text_mask,
                         frame_rate=frame_rate,
                         transformer_options=transformer_options,
+                        output_hidden_states=True,
+                        hidden_state_layer=self.teacher_hidden_state_layer,
                     )
             finally:
-                self._capture_mode = "idle"
                 self._restore_adapters(adapter_mods, saved_states)
                 if prev_training:
                     transformer.train()
@@ -737,11 +790,10 @@ class SelfFlowModule:
             # so _swap_in_teacher naturally only touches those params.
             backups = self._swap_in_teacher(network)
             try:
-                self._capture_mode = "teacher"
                 if prev_training:
                     transformer.eval()
                 with torch.no_grad(), accelerator.autocast():
-                    _ = transformer(
+                    output = transformer(
                         teacher_model_input,
                         timestep=teacher_timesteps,
                         audio_timestep=audio_timestep,
@@ -749,12 +801,19 @@ class SelfFlowModule:
                         attention_mask=text_mask,
                         frame_rate=frame_rate,
                         transformer_options=transformer_options,
+                        output_hidden_states=True,
+                        hidden_state_layer=self.teacher_hidden_state_layer,
                     )
             finally:
-                self._capture_mode = "idle"
                 self._restore_from_backups(network, backups)
                 if prev_training:
                     transformer.train()
+
+        teacher_hidden, teacher_audio_hidden = self._extract_native_hidden_states(output)
+        self._teacher_features = teacher_hidden.detach()
+        self._teacher_audio_features = teacher_audio_hidden.detach() if teacher_audio_hidden is not None else None
+        if self.audio_projector is not None and self._teacher_audio_features is None:
+            raise RuntimeError("Self-Flow audio loss is active but the teacher audio hidden state is missing")
 
         if bool(self.config.offload_teacher_features):
             if self._teacher_features is not None and self._teacher_features.device.type != "cpu":
@@ -1045,13 +1104,23 @@ class SelfFlowModule:
         latent_width: Optional[int] = None,
         token_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        if self.projector is None or not self.has_active_loss:
-            return None
+        if self.projector is None:
+            raise RuntimeError("Self-Flow projector is not initialized")
+        if not self.should_capture:
+            return next(self.projector.parameters()).new_zeros(())
         if self._student_features is None or self._teacher_features is None:
-            return None
+            missing = []
+            if self._student_features is None:
+                missing.append("student")
+            if self._teacher_features is None:
+                missing.append("teacher")
+            raise RuntimeError(f"Self-Flow native hidden-state capture is missing: {', '.join(missing)}")
 
         student_feat = self._student_features
         teacher_feat = self._teacher_features
+        projector_param = next(self.projector.parameters())
+        if student_feat.device != projector_param.device or student_feat.dtype != projector_param.dtype:
+            student_feat = student_feat.to(device=projector_param.device, dtype=projector_param.dtype)
         if teacher_feat.device != student_feat.device or teacher_feat.dtype != student_feat.dtype:
             teacher_feat = teacher_feat.to(device=student_feat.device, dtype=student_feat.dtype, non_blocking=True)
         if student_feat.shape[1] != teacher_feat.shape[1]:
@@ -1087,6 +1156,10 @@ class SelfFlowModule:
             cosine = F.cosine_similarity(student_proj_norm, teacher_norm, dim=-1).mean()
 
         self._last_cosine = float(cosine.detach().item())
+        if not self.has_active_loss:
+            self._scheduler.update_similarity(self._last_cosine)
+            return cosine.new_zeros(())
+
         loss = cosine.new_zeros(())
         applied_terms = 0
         if self._current_lambda_self_flow > 0.0:
@@ -1094,14 +1167,19 @@ class SelfFlowModule:
             applied_terms += 1
 
         # Audio representation alignment loss
-        if (
-            self._current_lambda_audio > 0.0
-            and self.audio_projector is not None
-            and self._student_audio_features is not None
-            and self._teacher_audio_features is not None
-        ):
+        if self._current_lambda_audio > 0.0:
+            if self.audio_projector is None:
+                raise RuntimeError("Self-Flow audio loss is active but the audio projector is unavailable")
+            if self._student_audio_features is None or self._teacher_audio_features is None:
+                raise RuntimeError("Self-Flow audio loss is active but student or teacher audio features are missing")
             audio_student = self._student_audio_features
             audio_teacher = self._teacher_audio_features
+            audio_projector_param = next(self.audio_projector.parameters())
+            if audio_student.device != audio_projector_param.device or audio_student.dtype != audio_projector_param.dtype:
+                audio_student = audio_student.to(
+                    device=audio_projector_param.device,
+                    dtype=audio_projector_param.dtype,
+                )
             if audio_teacher.device != audio_student.device or audio_teacher.dtype != audio_student.dtype:
                 audio_teacher = audio_teacher.to(device=audio_student.device, dtype=audio_student.dtype, non_blocking=True)
             if audio_student.shape[1] != audio_teacher.shape[1]:
@@ -1151,12 +1229,9 @@ class SelfFlowModule:
                     strength=self.config.motion_weight_strength,
                 )
 
-        if (
-            temporal_mode in {"frame", "hybrid"}
-            and self.current_lambda_temporal > 0.0
-            and temporal_student is not None
-            and temporal_teacher is not None
-        ):
+        if temporal_mode in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0:
+            if temporal_student is None or temporal_teacher is None:
+                raise RuntimeError("Self-Flow temporal frame loss could not reshape the captured video features")
             if temporal_granularity == "patch":
                 if temporal_student_grid is not None and temporal_teacher_grid is not None:
                     student_frames = F.normalize(temporal_student_grid, dim=-1)
@@ -1208,14 +1283,11 @@ class SelfFlowModule:
             loss = loss + self._loss_from_cosine(frame_cosine) * self.current_lambda_temporal
             applied_terms += 1
 
-        if (
-            temporal_mode in {"delta", "hybrid"}
-            and self.current_lambda_delta > 0.0
-            and temporal_student is not None
-            and temporal_teacher is not None
-            and temporal_student.shape[1] > 1
-            and temporal_teacher.shape[1] > 1
-        ):
+        if temporal_mode in {"delta", "hybrid"} and self.current_lambda_delta > 0.0:
+            if temporal_student is None or temporal_teacher is None:
+                raise RuntimeError("Self-Flow temporal delta loss could not reshape the captured video features")
+            if temporal_student.shape[1] <= 1 or temporal_teacher.shape[1] <= 1:
+                raise RuntimeError("Self-Flow temporal delta loss requires at least two latent frames")
             if temporal_granularity == "patch":
                 delta_cosine = self._multi_step_delta_cosine(
                     temporal_student,
@@ -1237,17 +1309,17 @@ class SelfFlowModule:
                     temporal_tau=self.config.temporal_tau,
                     motion_weights=frame_motion_weights,
                 )
-            if delta_cosine is not None and torch.isfinite(delta_cosine):
-                self._last_delta_cosine = float(delta_cosine.detach().item())
-                loss = loss + self._loss_from_cosine(delta_cosine) * self.current_lambda_delta
-                applied_terms += 1
+            if delta_cosine is None or not torch.isfinite(delta_cosine):
+                raise RuntimeError("Self-Flow temporal delta cosine is unavailable or non-finite")
+            self._last_delta_cosine = float(delta_cosine.detach().item())
+            loss = loss + self._loss_from_cosine(delta_cosine) * self.current_lambda_delta
+            applied_terms += 1
 
         if applied_terms == 0:
-            return None
+            raise RuntimeError("Self-Flow has positive scheduled weights but produced no loss terms")
 
         if not torch.isfinite(loss):
-            logger.warning("Self-Flow loss is non-finite (%.4g), skipping", loss.item())
-            return None
+            raise RuntimeError(f"Self-Flow loss is non-finite: {loss.detach().item():.4g}")
 
         max_loss = float(self.config.max_loss)
         if max_loss > 0.0:
@@ -1255,6 +1327,7 @@ class SelfFlowModule:
             if loss_abs > max_loss:
                 loss = loss * (max_loss / loss_abs)
 
+        self._scheduler.update_similarity(self._last_cosine)
         return loss
 
     def compute_loss(self, **_kwargs) -> Optional[torch.Tensor]:
@@ -1267,12 +1340,6 @@ class SelfFlowModule:
         )
 
     def remove_hooks(self) -> None:
-        for hook in self._hooks:
-            try:
-                hook.remove()
-            except Exception:
-                pass
-        self._hooks.clear()
         self.cleanup_step()
 
     def state_dict(self) -> Dict[str, Any]:
@@ -1311,6 +1378,15 @@ class SelfFlowModule:
 
     def teacher_state_dict(self) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {"__self_flow_step_counter__": torch.tensor([int(self._step_counter)], dtype=torch.int64)}
+        if self._scheduler.similarity_ema is not None:
+            out["__self_flow_similarity_ema__"] = torch.tensor(
+                [float(self._scheduler.similarity_ema)],
+                dtype=torch.float64,
+            )
+        out["__self_flow_cutoff_latched__"] = torch.tensor(
+            [int(self._scheduler.cutoff_latched)],
+            dtype=torch.int64,
+        )
         for name, tensor in self._shadow_params.items():
             out[f"shadow::{name}"] = tensor.detach().clone().to(device="cpu")
         return out
@@ -1318,10 +1394,11 @@ class SelfFlowModule:
     def load_teacher_state_dict(self, sd: Dict[str, Any]) -> None:
         if not sd:
             return
-        if str(self.config.teacher_mode).lower() == "base":
+        carries_ema_teacher = any(str(key).startswith("shadow::") for key in sd)
+        if str(self.config.teacher_mode).lower() == "base" and carries_ema_teacher:
             raise ValueError(
                 "Self-Flow: this checkpoint carries an EMA teacher (trained with teacher_mode=ema/"
-                "partial_ema), but the current run uses teacher_mode=base (the default). Resuming as base "
+                "partial_ema), but the current run uses teacher_mode=base. Resuming as base "
                 "would silently change the training objective and discard the EMA teacher. Pass "
                 "teacher_mode=ema (or partial_ema) to continue the paper-faithful run, or delete "
                 "self_flow_teacher_ema.safetensors from the resume directory to intentionally switch to base."
@@ -1329,6 +1406,12 @@ class SelfFlowModule:
         step_tensor = sd.get("__self_flow_step_counter__")
         if isinstance(step_tensor, torch.Tensor) and step_tensor.numel() > 0:
             self._step_counter = int(step_tensor.flatten()[0].item())
+        similarity_tensor = sd.get("__self_flow_similarity_ema__")
+        if isinstance(similarity_tensor, torch.Tensor) and similarity_tensor.numel() > 0:
+            self._scheduler.similarity_ema = float(similarity_tensor.flatten()[0].item())
+        cutoff_tensor = sd.get("__self_flow_cutoff_latched__")
+        if isinstance(cutoff_tensor, torch.Tensor) and cutoff_tensor.numel() > 0:
+            self._scheduler.cutoff_latched = bool(cutoff_tensor.flatten()[0].item())
 
         restored: Dict[str, torch.Tensor] = {}
         for key, value in sd.items():
