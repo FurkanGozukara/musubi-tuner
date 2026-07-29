@@ -1354,16 +1354,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
 
     if t.differential_guidance:
         try:
-            differential_guidance_scale = float(t.differential_guidance_scale)
-        except (TypeError, ValueError):
-            differential_guidance_scale = float("nan")
-        if not math.isfinite(differential_guidance_scale):
+            from musubi_tuner.differential_guidance import DifferentialGuidanceConfig
+
+            DifferentialGuidanceConfig.from_args(t)
+        except (TypeError, ValueError) as exc:
             errors.append(
                 _make_issue(
                     "error",
-                    "training.differential_guidance_scale",
-                    "Differential Guidance Scale must be a finite number.",
-                    label="Differential Guidance Scale",
+                    "training.differential_guidance",
+                    str(exc),
+                    label="Differential Guidance",
                     page="techniques",
                 )
             )
@@ -1373,6 +1373,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "error",
                     "training.differential_guidance",
                     "Differential Guidance requires a video/main prediction loss and cannot be used with audio-only training.",
+                    label="Differential Guidance",
+                    page="techniques",
+                )
+            )
+        if t.hfato:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.differential_guidance",
+                    "Differential Guidance cannot be combined with HFATO because HFATO replaces the video target loss.",
                     label="Differential Guidance",
                     page="techniques",
                 )

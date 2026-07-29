@@ -2892,7 +2892,31 @@ It applies this transform before the normal video/main prediction loss:
 ```text
 target = pred + scale * (target - pred)
 ```
-The default scale is `3.0` when enabled. Use `--differential_guidance_scale` to override it. Scale `1.0` is unchanged; values above `1.0` strengthen the target delta; values between `0.0` and `1.0` soften it. The feature affects training loss only and does not change inference.
+The default scale is `3.0` when enabled. Use `--differential_guidance_scale` to override it. Scale `1.0` is unchanged; values above `1.0` strengthen the target delta; values between `0.0` and `1.0` soften it. The prediction is detached while constructing the target, so under MSE a scale of `s` multiplies the current gradient by `s` while the displayed guided loss grows by `s²`.
+
+The legacy flag and scale remain constant by default. Optional controls make the strength selective:
+
+```bash
+--differential_guidance ^
+--differential_guidance_scale 2.0 ^
+--differential_guidance_schedule cosine ^
+--differential_guidance_start_scale 1.0 ^
+--differential_guidance_warmup_steps 200 ^
+--differential_guidance_hold_steps 600 ^
+--differential_guidance_decay_steps 200 ^
+--differential_guidance_end_scale 1.0 ^
+--differential_guidance_timestep_mode mid ^
+--differential_guidance_timestep_floor 1.0
+```
+
+- `schedule=linear|cosine` interpolates from `start_scale` to the main scale, optionally holds it, then decays to `end_scale`. `constant` preserves the original behavior.
+- `timestep_mode=mid|snr|inverse_snr` concentrates the extra scale at middle, low-noise, or high-noise timesteps. `timestep_floor` is the scale used where the selected weighting is zero.
+- `--differential_guidance_residual_clip N` clips individual residual elements at `N` times the per-sample RMS. Zero disables clipping.
+- `--differential_guidance_normalize_residual` RMS-normalizes each sample before scaling.
+- `--differential_guidance_adaptive_target_norm N` adjusts a bounded multiplier toward video gradient norm `N`.
+- `--differential_guidance_adaptive_target_ratio N` instead targets a video/audio gradient-norm ratio during AV training. Set only one adaptive target. `adaptive_ema`, `adaptive_rate`, `adaptive_min`, and `adaptive_max` control the response.
+
+Training logs the original and guided video losses, their ratio, scheduled and effective scales, residual RMS, clipped fraction, adaptive multiplier, and gradient feedback. The feature adds no model forwards, needs no cache, affects training only, and does not change inference. It cannot be used in audio-only mode or together with HFATO.
 
 | Technique | Extra forwards/step | Extra backwards/step | Starting value / multiplier |
 |-----------|-------------------|---------------------|----------------------|
@@ -2906,7 +2930,7 @@ The default scale is `3.0` when enabled. Use `--differential_guidance_scale` to 
 | `--cts_lambda_*` | +1 per enabled direction | 0 | 0.1 - 0.3 |
 | `--av_attention_loss_weighting` | 0 | 0 | Max 1.5, warmup 400 steps |
 | `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
-| `--differential_guidance` | 0 | 0 | Default scale 3.0 when enabled; scale 1.0 = unchanged |
+| `--differential_guidance` | 0 | 0 | Constant scale 3.0 by default; optional schedule, timestep shaping, residual control, and adaptive gradient feedback |
 
 > [!CAUTION]
 > Blank preservation and DOP together still use +2 forwards and +1 backward because their conditioning is batched. A positive DOP `anchor_interval` adds one LoRA-ON forward and backward on replay steps. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, TREAD, and Differential Guidance add no extra passes; they modify the existing forward/backward in-place.

@@ -2228,6 +2228,8 @@ def train(self, args):
                 latent_temporal_metrics: dict[str, float] = {}
                 _loss_type = getattr(args, "loss_type", "mse")
                 _huber_delta = getattr(args, "huber_delta", 1.0)
+                differential_guidance_enabled = bool(getattr(args, "differential_guidance", False))
+                differential_guidance_original_loss = None
 
                 if dict_output:
                     out = model_pred
@@ -2270,9 +2272,25 @@ def train(self, args):
 
                     video_pred = out["video_pred"]
                     video_target = out["video_target"]
-                    video_target_for_loss = self.apply_differential_guidance_target(args, video_pred, video_target)
                     video_loss_mask = out.get("video_loss_mask")
                     _hfato_data = out.get("_hfato")
+                    if differential_guidance_enabled and _hfato_data is not None:
+                        raise ValueError("Differential Guidance cannot be combined with HFATO")
+                    if differential_guidance_enabled:
+                        with torch.no_grad():
+                            differential_guidance_original_loss = _masked_loss(
+                                video_pred.detach(),
+                                video_target.detach(),
+                                video_loss_mask,
+                            )
+                    video_target_for_loss = self.apply_differential_guidance_target(
+                        args,
+                        video_pred,
+                        video_target,
+                        sigmas=out.get("video_sigma"),
+                        global_step=global_step,
+                    )
+                    mask_metrics.update(getattr(self, "_differential_guidance_step_metrics", {}))
                     if _hfato_data is not None:
                         from musubi_tuner.hfato import hfato_x0_loss
 
@@ -2285,6 +2303,12 @@ def train(self, args):
                         )
                     else:
                         video_loss = _masked_loss(video_pred, video_target_for_loss, video_loss_mask, tag="video")
+                    if differential_guidance_original_loss is not None:
+                        original_value = float(differential_guidance_original_loss.detach().item())
+                        guided_value = float(video_loss.detach().item())
+                        mask_metrics["dg/original_video_loss"] = original_value
+                        mask_metrics["dg/guided_video_loss"] = guided_value
+                        mask_metrics["dg/loss_ratio"] = guided_value / max(original_value, 1e-12)
 
                     audio_pred = out.get("audio_pred")
                     audio_target = out.get("audio_target")
@@ -2453,19 +2477,42 @@ def train(self, args):
                 else:
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=network_dtype)
-                        target = self.apply_differential_guidance_target(args, model_pred, target)
+                        if differential_guidance_enabled:
+                            with torch.no_grad():
+                                differential_guidance_original_loss = _per_element_loss(
+                                    model_pred.detach(),
+                                    target.detach(),
+                                    _loss_type,
+                                    _huber_delta,
+                                )
+                        target = self.apply_differential_guidance_target(
+                            args,
+                            model_pred,
+                            target,
+                            sigmas=timesteps if isinstance(timesteps, torch.Tensor) else None,
+                            global_step=global_step,
+                        )
+                        mask_metrics.update(getattr(self, "_differential_guidance_step_metrics", {}))
                     else:
                         model_pred = model_pred.to(dtype=network_dtype)
                     loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
 
                 if not dict_output and weighting is not None:
                     loss = loss * weighting
+                    if differential_guidance_original_loss is not None:
+                        differential_guidance_original_loss = differential_guidance_original_loss * weighting
                 # loss = loss.mean([1, 2, 3])
                 # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
                 # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
                 if not dict_output:
                     loss = loss.mean()  # mean loss over all elements in batch
+                    if differential_guidance_original_loss is not None:
+                        original_value = float(differential_guidance_original_loss.mean().detach().item())
+                        guided_value = float(loss.detach().item())
+                        mask_metrics["dg/original_video_loss"] = original_value
+                        mask_metrics["dg/guided_video_loss"] = guided_value
+                        mask_metrics["dg/loss_ratio"] = guided_value / max(original_value, 1e-12)
 
                 _prior_div_value = None
                 if dict_output:
@@ -2553,6 +2600,14 @@ def train(self, args):
                 accelerator.backward(loss)
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER backward", logger)
+                if differential_guidance_enabled and accelerator.sync_gradients:
+                    mask_metrics.update(
+                        self.update_differential_guidance_gradient_feedback(
+                            args,
+                            accelerator.unwrap_model(network),
+                            accelerator.device,
+                        )
+                    )
 
                 if dict_output and ogm_ge_state is not None:
                     maybe_add_ogm_ge_gradient_noise(

@@ -2039,6 +2039,44 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--differential_guidance")
         if t.differential_guidance_scale != 3.0:
             cmd += ["--differential_guidance_scale", str(t.differential_guidance_scale)]
+        if t.differential_guidance_schedule != "constant":
+            cmd += ["--differential_guidance_schedule", t.differential_guidance_schedule]
+        if t.differential_guidance_start_scale != 1.0:
+            cmd += ["--differential_guidance_start_scale", str(t.differential_guidance_start_scale)]
+        if t.differential_guidance_end_scale != 1.0:
+            cmd += ["--differential_guidance_end_scale", str(t.differential_guidance_end_scale)]
+        if t.differential_guidance_warmup_steps != 0:
+            cmd += ["--differential_guidance_warmup_steps", str(t.differential_guidance_warmup_steps)]
+        if t.differential_guidance_hold_steps != 0:
+            cmd += ["--differential_guidance_hold_steps", str(t.differential_guidance_hold_steps)]
+        if t.differential_guidance_decay_steps != 0:
+            cmd += ["--differential_guidance_decay_steps", str(t.differential_guidance_decay_steps)]
+        if t.differential_guidance_timestep_mode != "none":
+            cmd += ["--differential_guidance_timestep_mode", t.differential_guidance_timestep_mode]
+        if t.differential_guidance_timestep_floor != 1.0:
+            cmd += ["--differential_guidance_timestep_floor", str(t.differential_guidance_timestep_floor)]
+        if t.differential_guidance_normalize_residual:
+            cmd.append("--differential_guidance_normalize_residual")
+        if t.differential_guidance_residual_clip != 0.0:
+            cmd += ["--differential_guidance_residual_clip", str(t.differential_guidance_residual_clip)]
+        if t.differential_guidance_adaptive_target_norm != 0.0:
+            cmd += [
+                "--differential_guidance_adaptive_target_norm",
+                str(t.differential_guidance_adaptive_target_norm),
+            ]
+        if t.differential_guidance_adaptive_target_ratio != 0.0:
+            cmd += [
+                "--differential_guidance_adaptive_target_ratio",
+                str(t.differential_guidance_adaptive_target_ratio),
+            ]
+        if t.differential_guidance_adaptive_ema != 0.95:
+            cmd += ["--differential_guidance_adaptive_ema", str(t.differential_guidance_adaptive_ema)]
+        if t.differential_guidance_adaptive_rate != 0.1:
+            cmd += ["--differential_guidance_adaptive_rate", str(t.differential_guidance_adaptive_rate)]
+        if t.differential_guidance_adaptive_min != 0.25:
+            cmd += ["--differential_guidance_adaptive_min", str(t.differential_guidance_adaptive_min)]
+        if t.differential_guidance_adaptive_max != 4.0:
+            cmd += ["--differential_guidance_adaptive_max", str(t.differential_guidance_adaptive_max)]
 
     # Audio features
     if t.audio_loss_balance_mode != "none":

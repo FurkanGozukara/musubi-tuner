@@ -1,7 +1,6 @@
 """LTX-2 argument parser and training entry point."""
 
 import argparse
-import math
 import os
 import sys
 import logging
@@ -117,10 +116,78 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
     return parser
 
 
+def add_ltx2_differential_guidance_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    group = parser.add_argument_group("LTX-2 Differential Guidance")
+    group.add_argument(
+        "--differential_guidance_schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear", "cosine"],
+        help="Scale schedule. constant preserves legacy behavior; linear/cosine use the warmup/hold/decay controls.",
+    )
+    group.add_argument(
+        "--differential_guidance_start_scale",
+        type=float,
+        default=1.0,
+        help="Scale at step 0 for a linear/cosine warmup.",
+    )
+    group.add_argument(
+        "--differential_guidance_end_scale",
+        type=float,
+        default=1.0,
+        help="Final scale after a linear/cosine decay.",
+    )
+    group.add_argument("--differential_guidance_warmup_steps", type=int, default=0)
+    group.add_argument("--differential_guidance_hold_steps", type=int, default=0)
+    group.add_argument("--differential_guidance_decay_steps", type=int, default=0)
+    group.add_argument(
+        "--differential_guidance_timestep_mode",
+        type=str,
+        default="none",
+        choices=["none", "mid", "snr", "inverse_snr"],
+        help="Modulate guidance by diffusion sigma. none preserves legacy behavior.",
+    )
+    group.add_argument(
+        "--differential_guidance_timestep_floor",
+        type=float,
+        default=1.0,
+        help="Scale used where timestep modulation has zero weight.",
+    )
+    group.add_argument(
+        "--differential_guidance_normalize_residual",
+        action="store_true",
+        help="RMS-normalize each sample's prediction residual before target scaling.",
+    )
+    group.add_argument(
+        "--differential_guidance_residual_clip",
+        type=float,
+        default=0.0,
+        help="Clip residual elements to this multiple of per-sample RMS. 0 disables clipping.",
+    )
+    group.add_argument(
+        "--differential_guidance_adaptive_target_norm",
+        type=float,
+        default=0.0,
+        help="Adapt the scale multiplier toward this pre-auxiliary video gradient norm. 0 disables.",
+    )
+    group.add_argument(
+        "--differential_guidance_adaptive_target_ratio",
+        type=float,
+        default=0.0,
+        help="Adapt toward this video/audio gradient-norm ratio in AV training. 0 disables.",
+    )
+    group.add_argument("--differential_guidance_adaptive_ema", type=float, default=0.95)
+    group.add_argument("--differential_guidance_adaptive_rate", type=float, default=0.1)
+    group.add_argument("--differential_guidance_adaptive_min", type=float, default=0.25)
+    group.add_argument("--differential_guidance_adaptive_max", type=float, default=4.0)
+    return parser
+
+
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add LTX-2-specific arguments to parser"""
 
     parser.set_defaults(network_module="networks.lora_ltx2")
+    add_ltx2_differential_guidance_args(parser)
 
     parser.add_argument(
         "--ltx2_checkpoint",
@@ -2073,13 +2140,14 @@ def main() -> None:
     apply_ltx2_tweaks(args)
     if getattr(args, "ltx2_compile_inner_blocks", False) and not getattr(args, "compile", False):
         raise ValueError("--ltx2_compile_inner_blocks requires --compile")
-    args.differential_guidance_scale = float(getattr(args, "differential_guidance_scale", 3.0))
-    if not math.isfinite(args.differential_guidance_scale):
-        raise ValueError("--differential_guidance_scale must be finite.")
-    if bool(getattr(args, "differential_guidance", False)) and (
-        getattr(args, "ltx_mode", "video") == "audio" or bool(getattr(args, "ltx2_audio_only_model", False))
-    ):
-        raise ValueError("--differential_guidance requires a video/main prediction loss and cannot be used in audio-only mode.")
+    if bool(getattr(args, "differential_guidance", False)):
+        from musubi_tuner.differential_guidance import DifferentialGuidanceConfig
+
+        DifferentialGuidanceConfig.from_args(args)
+        if getattr(args, "ltx_mode", "video") == "audio" or bool(getattr(args, "ltx2_audio_only_model", False)):
+            raise ValueError("--differential_guidance requires a video/main prediction loss and cannot be used in audio-only mode.")
+        if bool(getattr(args, "hfato", False)):
+            raise ValueError("--differential_guidance cannot be combined with --hfato.")
     if getattr(args, "auto_blocks_to_checkpoint", False):
         if getattr(args, "blockwise_checkpointing", False) and int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
             if int(getattr(args, "blocks_to_checkpoint", -1)) == -1:

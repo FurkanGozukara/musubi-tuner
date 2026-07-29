@@ -283,6 +283,7 @@ NetworkTrainer.modify_video_loss_per_element = _trainer_hooks.modify_video_loss_
 NetworkTrainer.modify_audio_loss_per_element = _trainer_hooks.modify_audio_loss_per_element
 NetworkTrainer.compute_video_extra_loss = _trainer_hooks.compute_video_extra_loss
 NetworkTrainer.apply_differential_guidance_target = _trainer_hooks.apply_differential_guidance_target
+NetworkTrainer.update_differential_guidance_gradient_feedback = _trainer_hooks.update_differential_guidance_gradient_feedback
 
 __all__ = [
     "DiTOutput",

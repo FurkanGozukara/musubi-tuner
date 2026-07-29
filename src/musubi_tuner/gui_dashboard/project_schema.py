@@ -685,6 +685,22 @@ class TrainingConfig(BaseModel):
     # Differential Guidance
     differential_guidance: bool = False
     differential_guidance_scale: float = 3.0
+    differential_guidance_schedule: Literal["constant", "linear", "cosine"] = "constant"
+    differential_guidance_start_scale: float = 1.0
+    differential_guidance_end_scale: float = 1.0
+    differential_guidance_warmup_steps: int = 0
+    differential_guidance_hold_steps: int = 0
+    differential_guidance_decay_steps: int = 0
+    differential_guidance_timestep_mode: Literal["none", "mid", "snr", "inverse_snr"] = "none"
+    differential_guidance_timestep_floor: float = 1.0
+    differential_guidance_normalize_residual: bool = False
+    differential_guidance_residual_clip: float = 0.0
+    differential_guidance_adaptive_target_norm: float = 0.0
+    differential_guidance_adaptive_target_ratio: float = 0.0
+    differential_guidance_adaptive_ema: float = 0.95
+    differential_guidance_adaptive_rate: float = 0.1
+    differential_guidance_adaptive_min: float = 0.25
+    differential_guidance_adaptive_max: float = 4.0
 
     # CREPA
     crepa: bool = False

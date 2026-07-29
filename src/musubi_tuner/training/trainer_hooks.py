@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import math
 
 import torch
+
+from musubi_tuner.differential_guidance import (
+    collect_differential_guidance_grad_norms,
+    get_differential_guidance_controller,
+)
 
 
 def is_model_parallel_enabled(self, args) -> bool:
@@ -70,13 +74,34 @@ def apply_differential_guidance_target(
     args: argparse.Namespace,
     pred: torch.Tensor,
     target: torch.Tensor,
+    *,
+    sigmas: torch.Tensor | None = None,
+    global_step: int | None = None,
 ) -> torch.Tensor:
     if not bool(getattr(args, "differential_guidance", False)):
+        self._differential_guidance_step_metrics = {}
         return target
-    scale = float(getattr(args, "differential_guidance_scale", 3.0))
-    if not math.isfinite(scale):
-        raise ValueError("--differential_guidance_scale must be finite.")
-    if scale == 1.0:
-        return target
-    detached_pred = pred.detach().to(device=target.device, dtype=target.dtype)
-    return detached_pred + scale * (target - detached_pred)
+    controller = get_differential_guidance_controller(self, args)
+    adjusted, metrics = controller.transform_target(
+        pred,
+        target,
+        sigmas=sigmas,
+        global_step=int(getattr(self, "_current_train_global_step", 0) if global_step is None else global_step),
+    )
+    self._differential_guidance_step_metrics = metrics
+    return adjusted
+
+
+def update_differential_guidance_gradient_feedback(
+    self,
+    args: argparse.Namespace,
+    network: torch.nn.Module,
+    device: torch.device,
+) -> dict[str, float]:
+    if not bool(getattr(args, "differential_guidance", False)):
+        return {}
+    controller = get_differential_guidance_controller(self, args)
+    if not controller.config.adaptive_enabled:
+        return {}
+    video_norm, audio_norm = collect_differential_guidance_grad_norms(network, device=device)
+    return controller.update_gradient_feedback(video_norm, audio_norm)
