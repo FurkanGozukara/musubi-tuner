@@ -921,7 +921,7 @@ def load_comfy_int4_convrot_state_dict(
                 if key_filter is not None and not key_filter(key):
                     continue
                 value = f.get_tensor(key)
-                if key.endswith(".weight") and key[: -len(".weight")] in scale_bases and value.dtype == torch.uint8:
+                if key.endswith(".weight") and key[: -len(".weight")] in scale_bases and value.dtype in (torch.uint8, torch.int8):
                     base = key[: -len(".weight")]
                     cfg = comfy_cfg.get(base) or {}
                     cfg_bits = int(cfg.get("bits", 0) or 0)
@@ -943,7 +943,10 @@ def load_comfy_int4_convrot_state_dict(
                     if in_features <= 0:
                         in_features = padded_features
 
-                    sd[key] = value
+                    # Comfy's convrot_w4a4 layout stores the packed nibbles in an
+                    # int8 tensor. The trainer runtime uses uint8 for the same raw
+                    # byte layout, so convert modulo 256 without unpacking.
+                    sd[key] = value.to(torch.uint8) if value.dtype == torch.int8 else value
                     if base + ".int4_shape" not in sd:
                         sd[base + ".int4_shape"] = torch.tensor(
                             [int(value.shape[0]), in_features, padded_features],

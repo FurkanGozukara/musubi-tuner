@@ -4,18 +4,21 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from dataclasses import asdict
+import hashlib
 import logging
 import os
 import time
 
 import safetensors
 import torch
-from safetensors.torch import save_file
 from tqdm import tqdm
 
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 from musubi_tuner.modules.nvfp4_training import (
+    NVFP4LayerQuality,
     NVFP4_TARGET_PATTERNS,
     NVFP4_TRAINING_METADATA_MARKER,
     NVFP4_TRAINING_STABILIZER_RANK_METADATA,
@@ -25,7 +28,7 @@ from musubi_tuner.modules.nvfp4_training import (
     write_nvfp4_quality_report,
 )
 from musubi_tuner.utils.device_utils import clean_memory_on_device
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, StreamingSafetensorsWriter, safetensors_resume_id
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,25 @@ def default_quality_report_path(output_model: str) -> str:
     return f"{base}.quality.json"
 
 
+def _layer_seed_context(model_key: str, seed: int, device: torch.device):
+    digest = hashlib.sha256(f"{int(seed)}:{model_key}".encode("utf-8")).digest()
+    layer_seed = int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+    devices = []
+    if device.type == "cuda":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    context = torch.random.fork_rng(devices=devices)
+
+    class _SeedContext:
+        def __enter__(self):
+            context.__enter__()
+            torch.manual_seed(layer_seed)
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return context.__exit__(exc_type, exc_val, exc_tb)
+
+    return _SeedContext()
+
+
 def quantize_model(
     input_model: str,
     output_model: str,
@@ -49,6 +71,8 @@ def quantize_model(
     calc_device: str,
     quality_report: str | None,
     stabilizer_rank: int = 32,
+    resume: bool = False,
+    resume_seed: int = 0,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -63,20 +87,59 @@ def quantize_model(
     if stabilizer_rank > 0:
         logger.info("NVFP4 stabilizer: rank %d low-rank branch (SVD of the weight)", stabilizer_rank)
 
-    state_dict: dict[str, torch.Tensor] = {}
-    quality_layers = []
-    quantized_count = 0
-    skipped_count = 0
-    passthrough_count = 0
+    output_metadata = dict(original_metadata)
+    output_metadata[NVFP4_TRAINING_METADATA_MARKER] = "true"
+    output_metadata["nvfp4_training_storage"] = "packed_e2m1_tile16_scales"
+    if stabilizer_rank > 0:
+        output_metadata[NVFP4_TRAINING_STABILIZER_RANK_METADATA] = str(int(stabilizer_rank))
+
+    output_dir = os.path.dirname(output_model)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    resume_fingerprint = safetensors_resume_id(
+        input_model,
+        {
+            "format": "ltx2_nvfp4_training",
+            "calc_device": str(device),
+            "stabilizer_rank": int(stabilizer_rank),
+            "collect_quality": quality_report is not None,
+            "resume_seed": int(resume_seed),
+        },
+    )
     t0 = time.time()
 
-    with MemoryEfficientSafeOpen(input_model) as f:
+    with (
+        MemoryEfficientSafeOpen(input_model) as f,
+        StreamingSafetensorsWriter(
+            output_model,
+            metadata=output_metadata,
+            resume=resume,
+            resume_id=resume_fingerprint,
+        ) as writer,
+    ):
+        progress = writer.progress
+        quality_by_key = dict(progress.get("quality_by_key", {}))
+        quantized_count = int(progress.get("quantized_count", 0))
+        skipped_count = int(progress.get("skipped_count", 0))
+        passthrough_count = int(progress.get("passthrough_count", 0))
+        groups_since_checkpoint = 0
+
+        def progress_state() -> dict:
+            return {
+                "quality_by_key": quality_by_key,
+                "quantized_count": quantized_count,
+                "skipped_count": skipped_count,
+                "passthrough_count": passthrough_count,
+            }
+
         keys = list(f.keys())
         fp8_scale_keys = {key for key in keys if key.endswith(".weight_scale") or key.endswith(".input_scale")}
         if fp8_scale_keys:
             logger.info("Detected %d FP8 scale tensors; FP8 weights will be dequantized before NVFP4", len(fp8_scale_keys))
         for key in tqdm(keys, desc="Quantizing NVFP4", unit="tensor"):
             if key in fp8_scale_keys:
+                continue
+            if writer.is_group_complete(key):
                 continue
             value = f.get_tensor(key)
             if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
@@ -94,37 +157,36 @@ def quantize_model(
                     skipped_count += 1
                 else:
                     passthrough_count += 1
-                state_dict[key] = value
+                writer.write_tensor(key, value)
+                writer.mark_group_complete(key)
+                groups_since_checkpoint += 1
+                if groups_since_checkpoint >= 32:
+                    writer.checkpoint(progress=progress_state())
+                    groups_since_checkpoint = 0
                 continue
 
-            entries, quality = quantize_nvfp4_training_tensor(
-                value,
-                stabilizer_rank=stabilizer_rank,
-                calc_device=device,
-                collect_quality=quality_report is not None,
-                key=model_key,
-            )
+            seed_context = _layer_seed_context(model_key, resume_seed, device) if resume and stabilizer_rank > 0 else nullcontext()
+            with seed_context:
+                entries, quality = quantize_nvfp4_training_tensor(
+                    value,
+                    stabilizer_rank=stabilizer_rank,
+                    calc_device=device,
+                    collect_quality=quality_report is not None,
+                    key=model_key,
+                )
             base = key[: -len(".weight")]
             for suffix, tensor in entries.items():
-                state_dict[base + suffix] = tensor.cpu()
+                writer.write_tensor(base + suffix, tensor.cpu())
             if quality is not None:
-                quality_layers.append(quality)
+                quality_by_key[model_key] = asdict(quality)
             quantized_count += 1
+            writer.mark_group_complete(key)
+            writer.checkpoint(progress=progress_state())
+            groups_since_checkpoint = 0
             if device.type == "cuda" and quantized_count % 20 == 0:
                 clean_memory_on_device(device)
-
-    output_metadata = dict(original_metadata)
-    output_metadata[NVFP4_TRAINING_METADATA_MARKER] = "true"
-    output_metadata["nvfp4_training_storage"] = "packed_e2m1_tile16_scales"
-    if stabilizer_rank > 0:
-        output_metadata[NVFP4_TRAINING_STABILIZER_RANK_METADATA] = str(int(stabilizer_rank))
-
-    output_dir = os.path.dirname(output_model)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    logger.info("Saving NVFP4 training checkpoint to %s", output_model)
-    save_file(state_dict, output_model, metadata=output_metadata)
+        logger.info("Finalizing streamed NVFP4 training checkpoint at %s", output_model)
+        writer.finalize(progress=progress_state())
 
     elapsed = time.time() - t0
     input_size = os.path.getsize(input_model) / (1024**3)
@@ -139,6 +201,7 @@ def quantize_model(
         output_size,
     )
 
+    quality_layers = [NVFP4LayerQuality(**quality_by_key[key]) for key in sorted(quality_by_key)]
     if quality_report is not None:
         report = write_nvfp4_quality_report(
             quality_report,
@@ -198,6 +261,20 @@ def main() -> None:
         help="Quality JSON path. Defaults to <output_model_without_ext>.quality.json unless --no_quality_report is set.",
     )
     parser.add_argument("--no_quality_report", action="store_true", help="Skip quality metric report generation")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Keep an incomplete output plus a journal and resume from the last durable tensor group. "
+            "The source file and output-affecting options must remain unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--resume_seed",
+        type=int,
+        default=0,
+        help="Base seed for deterministic per-layer stabilizer SVD when --resume is enabled (default: 0)",
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -213,6 +290,8 @@ def main() -> None:
         calc_device=args.calc_device,
         quality_report=quality_report,
         stabilizer_rank=int(args.stabilizer_rank),
+        resume=bool(args.resume),
+        resume_seed=int(args.resume_seed),
     )
 
 

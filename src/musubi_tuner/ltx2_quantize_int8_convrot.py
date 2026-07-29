@@ -4,19 +4,21 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+import hashlib
 import logging
 import os
 import time
 
 import safetensors
 import torch
-from safetensors.torch import save_file
 from tqdm import tqdm
 
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 from musubi_tuner.modules.convrot_policy import load_convrot_policy
 from musubi_tuner.modules.int8_convrot_utils import (
+    Int8ConvRotLayerQuality,
     best_int8_convrot_groupsize,
     comfy_quant_tensor,
     parse_int8_convrot_groupsizes,
@@ -25,7 +27,7 @@ from musubi_tuner.modules.int8_convrot_utils import (
     write_quality_report,
 )
 from musubi_tuner.utils.device_utils import clean_memory_on_device
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, StreamingSafetensorsWriter, safetensors_resume_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,16 @@ def default_quality_report_path(output_model: str) -> str:
     return f"{base}.quality.json"
 
 
+def _optional_file_digest(path: str | None) -> str | None:
+    if not path:
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def quantize_model(
     input_model: str,
     output_model: str,
@@ -57,6 +69,7 @@ def quantize_model(
     mse_clip: bool,
     quality_report: str | None,
     policy_path: str | None = None,
+    resume: bool = False,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -71,14 +84,50 @@ def quantize_model(
     logger.info("INT8 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT8 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
 
-    state_dict: dict[str, torch.Tensor] = {}
-    quality_layers = []
-    quantized_count = 0
-    skipped_count = 0
-    passthrough_count = 0
+    output_metadata = dict(original_metadata)
+    output_metadata["int8_convrot_quantized"] = "true"
+    output_metadata["int8_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
+    output_metadata["int8_convrot_mse_clip"] = "true" if mse_clip else "false"
+    output_dir = os.path.dirname(output_model)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    resume_fingerprint = safetensors_resume_id(
+        input_model,
+        {
+            "format": "ltx2_int8_convrot",
+            "calc_device": str(device),
+            "groupsizes": list(groupsizes),
+            "mse_clip": bool(mse_clip),
+            "collect_quality": quality_report is not None,
+            "policy_digest": _optional_file_digest(policy_path),
+        },
+    )
     t0 = time.time()
 
-    with MemoryEfficientSafeOpen(input_model) as f:
+    with (
+        MemoryEfficientSafeOpen(input_model) as f,
+        StreamingSafetensorsWriter(
+            output_model,
+            metadata=output_metadata,
+            resume=resume,
+            resume_id=resume_fingerprint,
+        ) as writer,
+    ):
+        progress = writer.progress
+        quality_by_key = dict(progress.get("quality_by_key", {}))
+        quantized_count = int(progress.get("quantized_count", 0))
+        skipped_count = int(progress.get("skipped_count", 0))
+        passthrough_count = int(progress.get("passthrough_count", 0))
+        groups_since_checkpoint = 0
+
+        def progress_state() -> dict:
+            return {
+                "quality_by_key": quality_by_key,
+                "quantized_count": quantized_count,
+                "skipped_count": skipped_count,
+                "passthrough_count": passthrough_count,
+            }
+
         keys = list(f.keys())
         fp8_scale_keys = {key for key in keys if key.endswith(".weight_scale") or key.endswith(".input_scale")}
         if fp8_scale_keys:
@@ -88,6 +137,8 @@ def quantize_model(
             )
         for key in tqdm(keys, desc="Quantizing INT8 ConvRot", unit="tensor"):
             if key in fp8_scale_keys:
+                continue
+            if writer.is_group_complete(key):
                 continue
             value = f.get_tensor(key)
             if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
@@ -107,7 +158,12 @@ def quantize_model(
                     skipped_count += 1
                 else:
                     passthrough_count += 1
-                state_dict[key] = value
+                writer.write_tensor(key, value)
+                writer.mark_group_complete(key)
+                groups_since_checkpoint += 1
+                if groups_since_checkpoint >= 32:
+                    writer.checkpoint(progress=progress_state())
+                    groups_since_checkpoint = 0
                 continue
 
             assert group_size is not None
@@ -120,26 +176,19 @@ def quantize_model(
                 key=model_key,
             )
             base = key[: -len(".weight")]
-            state_dict[key] = q.cpu()
-            state_dict[base + ".weight_scale"] = scale.cpu()
-            state_dict[base + ".comfy_quant"] = comfy_quant_tensor(group_size)
+            writer.write_tensor(key, q.cpu())
+            writer.write_tensor(base + ".weight_scale", scale.cpu())
+            writer.write_tensor(base + ".comfy_quant", comfy_quant_tensor(group_size))
             if quality is not None:
-                quality_layers.append(quality)
+                quality_by_key[model_key] = asdict(quality)
             quantized_count += 1
+            writer.mark_group_complete(key)
+            writer.checkpoint(progress=progress_state())
+            groups_since_checkpoint = 0
             if device.type == "cuda" and quantized_count % 20 == 0:
                 clean_memory_on_device(device)
-
-    output_metadata = dict(original_metadata)
-    output_metadata["int8_convrot_quantized"] = "true"
-    output_metadata["int8_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
-    output_metadata["int8_convrot_mse_clip"] = "true" if mse_clip else "false"
-
-    output_dir = os.path.dirname(output_model)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    logger.info("Saving INT8 ConvRot checkpoint to %s", output_model)
-    save_file(state_dict, output_model, metadata=output_metadata)
+        logger.info("Finalizing streamed INT8 ConvRot checkpoint at %s", output_model)
+        writer.finalize(progress=progress_state())
 
     elapsed = time.time() - t0
     input_size = os.path.getsize(input_model) / (1024**3)
@@ -154,6 +203,7 @@ def quantize_model(
         output_size,
     )
 
+    quality_layers = [Int8ConvRotLayerQuality(**quality_by_key[key]) for key in sorted(quality_by_key)]
     if quality_report is not None:
         report = write_quality_report(
             quality_report,
@@ -206,6 +256,14 @@ def main() -> None:
         help="Optional ltx2_convrot_policy_v1 JSON; quantize=false rules keep matching weights in floating point",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Keep an incomplete output plus a journal and resume from the last durable tensor group. "
+            "The source file, policy, and output-affecting options must remain unchanged."
+        ),
+    )
+    parser.add_argument(
         "--quality_report",
         default=None,
         help="Quality JSON path. Defaults to <output_model_without_ext>.quality.json unless --no_quality_report is set.",
@@ -224,6 +282,7 @@ def main() -> None:
         mse_clip=not args.no_mse_clip,
         quality_report=quality_report,
         policy_path=args.convrot_policy,
+        resume=bool(args.resume),
     )
 
 

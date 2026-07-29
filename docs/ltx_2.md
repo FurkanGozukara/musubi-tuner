@@ -1928,6 +1928,7 @@ Options:
 - `--int8_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
 - `--convrot_policy`: apply a shared per-layer INT8/INT4 ConvRot storage/compute policy. `quantize=false` keeps a matching weight in floating point during dynamic quantization; `compute=dequantize` keeps compressed storage but uses a transient dense floating-point matmul.
 - `ltx2_quantize_int8_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
+- The standalone converter writes its output tensor-by-tensor into one standard safetensors file, so it does not retain the full converted `state_dict` in host RAM. Pass `--resume` from the initial invocation to keep an incomplete file and journal that can continue after interruption; the source checkpoint, policy, and output-affecting options must remain unchanged.
 
 Quality reports include per-layer cosine similarity, MSE, MAE, max absolute error, and SQNR for the reconstructed weight (`dequantize + inverse rotate`) versus the source weight. Inspect `summary.min_cosine`, `summary.weighted_sqnr_db`, and the worst layers by `mse` or `max_abs_error`.
 
@@ -2017,6 +2018,7 @@ Options:
 - `--int4_convrot_activation_calibration_max_layers`: maximum number of matched INT4 ConvRot layers to measure (default `0`, all matched layers).
 - `--int4_convrot_activation_calibration_only`: write the activation calibration report and exit before optimizer updates.
 - `ltx2_quantize_int4_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
+- The standalone `int4cr` and `comfy_convrot_w4a4` converters stream directly into one standard safetensors file instead of retaining the full converted `state_dict`. Pass `--resume` from the initial invocation to keep an incomplete file and journal; completed quantized layers are checkpointed immediately. With a nonzero stabilizer rank, `--resume_seed` supplies the deterministic per-layer SVD seed used by resumable conversion.
 
 Notes:
 - Requires LoRA training (`--network_module`); full-parameter fine-tuning of the frozen INT4 ConvRot base is not supported.
@@ -2166,6 +2168,8 @@ python ltx2_train_network.py ^
 Notes:
 - A converter output stores packed E2M1 nibbles, a per-`16x16`-tile fp8 scale, a per-tensor fp32 scale, `.nvfp4_shape` metadata, and optional stabilizer factors, and is loaded directly.
 - `python src/musubi_tuner/ltx2_quantize_nvfp4.py --stabilizer_rank N`: split a rank-`N` randomized low-rank component off each weight before NVFP4 quantization and store it as two bfloat16 factors (`.nvfp4_stab_l1`/`.nvfp4_stab_l2`); the residual is quantized. `0` disables it. The factors load automatically when present. `--output_model` defaults to `<input>.nvfp4t.safetensors`; `--quality_report PATH` writes per-layer reconstruction metrics (defaults to `<output>.quality.json`; `--no_quality_report` skips it).
+- The converter streams directly into one standard safetensors file. Pass `--resume` from the initial invocation to keep an incomplete file and journal; completed quantized layers are durable immediately, and `--resume_seed` makes their randomized stabilizer decomposition deterministic per layer.
+- `LTX2_NVFP4_BACKWARD=bf16`: opt into a hybrid input-gradient path that reconstructs the frozen residual in bf16 and runs a bf16 GEMM. The default `quantized` mode preserves the W4A4G4 gradient path. The bf16 mode avoids transposing and repacking the packed weight for a scaled-MMA backward, but temporarily materializes the dense bf16 residual and changes gradient numerics; benchmark both step time and peak VRAM on the target system.
 - Targets the same layer set as the INT4 ConvRot converter (transformer-block attention/FFN Linear weights); norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors stay in bf16.
 - Weight scales are shared across each `16x16` tile so the transposed weight layout used in the backward pass reuses the same scale tiles without requantization. Activations and grad-outputs are quantized dynamically per NVFP4 `1x16` micro-block.
 - `LTX2_NVFP4_BACKEND=auto` (default) selects the Triton `tl.dot_scaled` provider when it is importable and compute capability is `>= 10.0`; otherwise it selects `emulate`. The Triton provider has not been run on Blackwell hardware in this repository, so `auto` on such hardware is experimental and can fall back to emulation after a runtime failure. `emulate` round-trips activations/grad-output through the same quantizer, dequantizes the base, and performs a floating-point matrix multiply; it is a functional implementation, not a performance or bitwise substitute for scaled MMA. Explicit `triton` rejects unsupported hardware/builds instead of silently selecting emulation.

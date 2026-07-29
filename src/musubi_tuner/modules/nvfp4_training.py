@@ -53,6 +53,13 @@ Backends (env ``LTX2_NVFP4_BACKEND`` = ``auto`` | ``emulate`` | ``triton``)
     clear ``RuntimeError`` if selected without support. Every Triton API use is feature
     detected (``hasattr(tl, "dot_scaled")``).
   * ``auto``: ``triton`` when importable and sm >= 10, else ``emulate``.
+
+Backward mode (env ``LTX2_NVFP4_BACKWARD`` = ``quantized`` | ``bf16``)
+----------------------------------------------------------------------
+  * ``quantized`` (default): preserve the W4A4G4 input-gradient path described above.
+  * ``bf16``: reconstruct the frozen residual in bf16 and use a bf16 input-gradient GEMM.
+    This avoids transposing and repacking the packed weight for a scaled-MMA backward,
+    at the cost of a temporary dense bf16 residual and higher-precision gradients.
 """
 
 from __future__ import annotations
@@ -481,6 +488,16 @@ def resolve_nvfp4_backend(device: torch.device | None) -> str:
     raise ValueError("LTX2_NVFP4_BACKEND must be one of auto, emulate, triton")
 
 
+def resolve_nvfp4_backward_mode() -> str:
+    """Resolve the frozen-backbone input-gradient implementation."""
+    requested = os.getenv("LTX2_NVFP4_BACKWARD", "quantized").strip().lower()
+    if requested in ("", "quantized", "nvfp4"):
+        return "quantized"
+    if requested == "bf16":
+        return "bf16"
+    raise ValueError("LTX2_NVFP4_BACKWARD must be one of quantized, bf16")
+
+
 def _autocast_output_dtype(x: torch.Tensor) -> torch.dtype:
     if not x.is_floating_point():
         return x.dtype
@@ -539,6 +556,30 @@ def _backward_emulate_backbone(
     go_qdq = quantize_dequantize_nvfp4_microblocks(go_pad)  # fp32 [M, N_pad]
     r_deq = dequantize_nvfp4_weight_tiles(packed_weight, tile_scale, tensor_scale, n_pad, k_pad, dtype=torch.float32)
     gx = go_qdq @ r_deq  # [M, K_pad]
+    return gx[:, :in_features]
+
+
+def _backward_bf16_backbone(
+    go2d: torch.Tensor,
+    packed_weight: torch.Tensor,
+    tile_scale: torch.Tensor,
+    tensor_scale: torch.Tensor,
+    out_features: int,
+    in_features: int,
+    n_pad: int,
+    k_pad: int,
+) -> torch.Tensor:
+    """Input gradient through a dense bf16 reconstruction of the frozen residual."""
+    go_pad = F.pad(go2d, (0, n_pad - out_features)) if n_pad > out_features else go2d
+    r_deq = dequantize_nvfp4_weight_tiles(
+        packed_weight,
+        tile_scale,
+        tensor_scale,
+        n_pad,
+        k_pad,
+        dtype=torch.bfloat16,
+    )
+    gx = go_pad.to(torch.bfloat16) @ r_deq
     return gx[:, :in_features]
 
 
@@ -697,6 +738,7 @@ class _NVFP4TrainingLinearFunction(torch.autograd.Function):
         x2d = x.reshape(-1, in_features)
 
         backend = resolve_nvfp4_backend(x.device)
+        active_backend = backend
         backbone = None
         if backend == "triton":
             try:
@@ -707,6 +749,7 @@ class _NVFP4TrainingLinearFunction(torch.autograd.Function):
                 if os.getenv("LTX2_NVFP4_BACKEND", "auto").strip().lower() in ("", "auto"):
                     logger.debug("NVFP4 triton forward failed; falling back to emulate: %s", exc)
                     backbone = None
+                    active_backend = "emulate"
                 else:
                     raise
         if backbone is None:
@@ -722,7 +765,8 @@ class _NVFP4TrainingLinearFunction(torch.autograd.Function):
 
         ctx.save_for_backward(packed_weight, tile_scale, tensor_scale, nvfp4_shape, stab_l1, stab_l2)
         ctx.has_stabilizer = has_stabilizer
-        ctx.backend = backend
+        ctx.backend = active_backend
+        ctx.backward_mode = resolve_nvfp4_backward_mode()
         ctx.input_dtype = x.dtype
         ctx.original_shape = original_shape
         return y.to(output_dtype).reshape(*original_shape[:-1], out_features)
@@ -736,7 +780,18 @@ class _NVFP4TrainingLinearFunction(torch.autograd.Function):
         go2d = grad_output.reshape(-1, out_features)
 
         gx = None
-        if ctx.backend == "triton":
+        if ctx.backward_mode == "bf16":
+            gx = _backward_bf16_backbone(
+                go2d,
+                packed_weight,
+                tile_scale,
+                tensor_scale,
+                out_features,
+                in_features,
+                n_pad,
+                k_pad,
+            )
+        elif ctx.backend == "triton":
             try:
                 gx = _backward_triton_backbone(
                     go2d, packed_weight, tile_scale, tensor_scale, out_features, in_features, n_pad, k_pad

@@ -1,5 +1,7 @@
+import copy
 from dataclasses import dataclass
 import gc
+import hashlib
 import math
 import os
 import re
@@ -13,6 +15,27 @@ from typing import Callable, Dict, Any, Union, Optional
 from safetensors.torch import load_file, save_file
 
 from musubi_tuner.utils.device_utils import synchronize_device
+
+
+_SAFETENSORS_TYPES = {
+    torch.float64: "F64",
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.int64: "I64",
+    torch.int32: "I32",
+    torch.int16: "I16",
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.bool: "BOOL",
+    getattr(torch, "float8_e5m2", None): "F8_E5M2",
+    getattr(torch, "float8_e4m3fn", None): "F8_E4M3",
+}
+_SAFETENSORS_TYPES.pop(None, None)
+_SAFETENSORS_TYPE_SIZES = {name: torch.empty((), dtype=dtype).element_size() for dtype, name in _SAFETENSORS_TYPES.items()}
+_SAFETENSORS_HEADER_ALIGN = 256
+_STREAMING_SAFETENSORS_STATE_VERSION = 1
+_STREAMING_SAFETENSORS_HEADER_RESERVE = 8 * 1024 * 1024
 
 
 def _make_atomic_temp_path(filename: str) -> str:
@@ -118,6 +141,306 @@ def _write_tensor_bytes(f, tensor: torch.Tensor) -> None:
     tensor_bytes.cpu().numpy().tofile(f)
 
 
+def _validate_safetensors_metadata(metadata: Dict[str, Any] | None) -> Dict[str, str]:
+    validated = {}
+    for key, value in (metadata or {}).items():
+        if not isinstance(key, str):
+            raise ValueError(f"Metadata key must be a string, got {type(key)}")
+        validated[key] = value if isinstance(value, str) else str(value)
+    return validated
+
+
+def _json_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def safetensors_resume_id(source_path: str, options: Dict[str, Any]) -> str:
+    """Return a path-private fingerprint for a converter source and its output-affecting options."""
+    source_path = os.path.abspath(os.fspath(source_path))
+    source_stat = os.stat(source_path)
+    return _json_digest(
+        {
+            "source": source_path,
+            "size": int(source_stat.st_size),
+            "mtime_ns": int(source_stat.st_mtime_ns),
+            "options": options,
+        }
+    )
+
+
+class StreamingSafetensorsWriter:
+    """Write one standard safetensors file incrementally with optional crash resume.
+
+    The file starts with a fixed-size padded header region. Tensor payloads are appended
+    immediately, while the final header is installed only after every group has completed.
+    In resumable mode a sidecar journal records the last durable payload offset; an
+    uncommitted tail is truncated when the writer is reopened.
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        metadata: Dict[str, Any] | None = None,
+        resume: bool = False,
+        resume_id: str | None = None,
+        header_reserve: int = _STREAMING_SAFETENSORS_HEADER_RESERVE,
+    ):
+        self.filename = os.path.abspath(os.fspath(filename))
+        self.metadata = _validate_safetensors_metadata(metadata)
+        self.resume_enabled = bool(resume)
+        self.resume_id = str(resume_id or "")
+        self.header_reserve = int(header_reserve)
+        if self.header_reserve < _SAFETENSORS_HEADER_ALIGN:
+            raise ValueError(f"header_reserve must be at least {_SAFETENSORS_HEADER_ALIGN} bytes")
+        if self.header_reserve % _SAFETENSORS_HEADER_ALIGN:
+            raise ValueError(f"header_reserve must be divisible by {_SAFETENSORS_HEADER_ALIGN}")
+        if self.resume_enabled and not self.resume_id:
+            raise ValueError("resume_id is required when resume=True")
+
+        output_dir = os.path.dirname(self.filename)
+        os.makedirs(output_dir, exist_ok=True)
+        basename = os.path.basename(self.filename)
+        if self.resume_enabled:
+            self.temp_path = os.path.join(output_dir, f".{basename}.incomplete")
+            self.journal_path = os.path.join(output_dir, f".{basename}.resume.json")
+        else:
+            self.temp_path = _make_atomic_temp_path(self.filename)
+            self.journal_path = None
+
+        self._data_start = 8 + self.header_reserve
+        self._tensor_entries: list[dict[str, Any]] = []
+        self._tensor_names: set[str] = set()
+        self._completed_groups: set[str] = set()
+        self._progress: dict[str, Any] = {}
+        self._offset = 0
+        self._finalized = False
+        self._closed = False
+
+        temp_exists = os.path.exists(self.temp_path)
+        journal_exists = bool(self.journal_path and os.path.exists(self.journal_path))
+        if self.resume_enabled and not temp_exists and journal_exists and os.path.exists(self.filename):
+            # A crash can occur after the completed temporary file is atomically
+            # installed but before its now-stale journal is removed. Starting a
+            # fresh conversion is safe here; the existing final output remains in
+            # place until the new run finalizes.
+            _remove_temp_file(self.journal_path)
+            journal_exists = False
+        if self.resume_enabled and temp_exists != journal_exists:
+            raise RuntimeError(
+                f"Streaming safetensors resume state is incomplete for {self.filename}: "
+                "both the incomplete file and resume journal are required"
+            )
+        if self.resume_enabled and temp_exists:
+            self._load_resume_state()
+        else:
+            self._file = open(self.temp_path, "w+b")
+            self._file.write(struct.pack("<Q", self.header_reserve))
+            self._file.write(b" " * self.header_reserve)
+            self._file.flush()
+            os.fsync(self._file.fileno())
+            if self.resume_enabled:
+                self.checkpoint()
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        return copy.deepcopy(self._progress)
+
+    def is_group_complete(self, group: str) -> bool:
+        return group in self._completed_groups
+
+    def write_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self._finalized or self._closed:
+            raise RuntimeError("Cannot write to a closed streaming safetensors writer")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Tensor name must be a non-empty string")
+        if name == "__metadata__":
+            raise ValueError("__metadata__ is reserved by the safetensors format")
+        if name in self._tensor_names:
+            raise ValueError(f"Duplicate tensor name in streaming safetensors output: {name}")
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor for {name}, got {type(tensor)}")
+        dtype_name = _SAFETENSORS_TYPES.get(tensor.dtype)
+        if dtype_name is None:
+            raise ValueError(f"Unsupported safetensors dtype for {name}: {tensor.dtype}")
+
+        materialized = tensor.detach().contiguous()
+        size = int(materialized.numel() * materialized.element_size())
+        start = self._offset
+        end = start + size
+        self._file.seek(self._data_start + start)
+        try:
+            if size:
+                _write_tensor_bytes(self._file, materialized)
+        except Exception:
+            self._file.truncate(self._data_start + start)
+            self._file.seek(self._data_start + start)
+            raise
+        self._tensor_entries.append(
+            {
+                "name": name,
+                "dtype": dtype_name,
+                "shape": list(materialized.shape),
+                "data_offsets": [start, end],
+            }
+        )
+        self._tensor_names.add(name)
+        self._offset = end
+
+    def mark_group_complete(self, group: str) -> None:
+        if not isinstance(group, str) or not group:
+            raise ValueError("Completed group name must be a non-empty string")
+        self._completed_groups.add(group)
+
+    def checkpoint(self, *, progress: dict[str, Any] | None = None) -> None:
+        if self._finalized or self._closed:
+            raise RuntimeError("Cannot checkpoint a closed streaming safetensors writer")
+        if progress is not None:
+            self._progress = copy.deepcopy(progress)
+        self._file.flush()
+        if not self.resume_enabled:
+            return
+        os.fsync(self._file.fileno())
+        state = {
+            "version": _STREAMING_SAFETENSORS_STATE_VERSION,
+            "resume_id": self.resume_id,
+            "metadata_digest": _json_digest(self.metadata),
+            "header_reserve": self.header_reserve,
+            "offset": self._offset,
+            "tensors": self._tensor_entries,
+            "completed_groups": sorted(self._completed_groups),
+            "progress": self._progress,
+        }
+        journal_temp = _make_atomic_temp_path(self.journal_path)
+        try:
+            with open(journal_temp, "w", encoding="utf-8") as journal:
+                json.dump(state, journal, sort_keys=True, separators=(",", ":"))
+                journal.flush()
+                os.fsync(journal.fileno())
+            os.replace(journal_temp, self.journal_path)
+        except Exception:
+            _remove_temp_file(journal_temp)
+            raise
+
+    def finalize(self, *, progress: dict[str, Any] | None = None) -> None:
+        if self._finalized:
+            return
+        self.checkpoint(progress=progress)
+        header: dict[str, Any] = {}
+        if self.metadata:
+            header["__metadata__"] = self.metadata
+        for entry in self._tensor_entries:
+            header[entry["name"]] = {
+                "dtype": entry["dtype"],
+                "shape": entry["shape"],
+                "data_offsets": entry["data_offsets"],
+            }
+        encoded = json.dumps(header, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        if len(encoded) > self.header_reserve:
+            raise RuntimeError(
+                f"Safetensors header requires {len(encoded)} bytes, exceeding the reserved {self.header_reserve} bytes"
+            )
+        encoded += b" " * (self.header_reserve - len(encoded))
+        self._file.seek(0)
+        self._file.write(struct.pack("<Q", self.header_reserve))
+        self._file.write(encoded)
+        self._file.truncate(self._data_start + self._offset)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        self._file.close()
+        self._closed = True
+        os.replace(self.temp_path, self.filename)
+        if self.journal_path:
+            _remove_temp_file(self.journal_path)
+        self._finalized = True
+
+    def close(self) -> None:
+        if not self._closed:
+            self._file.close()
+            self._closed = True
+
+    def _load_resume_state(self) -> None:
+        with open(self.journal_path, "r", encoding="utf-8") as journal:
+            state = json.load(journal)
+        if state.get("version") != _STREAMING_SAFETENSORS_STATE_VERSION:
+            raise RuntimeError(f"Unsupported streaming safetensors resume state version: {state.get('version')}")
+        if state.get("resume_id") != self.resume_id:
+            raise RuntimeError("Streaming safetensors resume state does not match the requested source/options")
+        if state.get("metadata_digest") != _json_digest(self.metadata):
+            raise RuntimeError("Streaming safetensors resume metadata does not match the requested output metadata")
+        if int(state.get("header_reserve", -1)) != self.header_reserve:
+            raise RuntimeError("Streaming safetensors header reserve changed since the interrupted run")
+
+        entries = state.get("tensors", [])
+        if not isinstance(entries, list):
+            raise RuntimeError("Streaming safetensors resume journal has an invalid tensor list")
+        offset = 0
+        names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("Streaming safetensors resume journal has an invalid tensor entry")
+            name = entry.get("name")
+            dtype_name = entry.get("dtype")
+            shape = entry.get("shape")
+            data_offsets = entry.get("data_offsets")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name == "__metadata__"
+                or not isinstance(dtype_name, str)
+                or dtype_name not in _SAFETENSORS_TYPE_SIZES
+                or not isinstance(shape, list)
+                or any(not isinstance(dim, int) or isinstance(dim, bool) or dim < 0 for dim in shape)
+                or not isinstance(data_offsets, list)
+                or len(data_offsets) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in data_offsets)
+            ):
+                raise RuntimeError("Streaming safetensors resume journal has invalid tensor metadata")
+            start, end = data_offsets
+            expected_size = math.prod(shape) * _SAFETENSORS_TYPE_SIZES[dtype_name]
+            if name in names or start != offset or end < start or end - start != expected_size:
+                raise RuntimeError("Streaming safetensors resume journal has invalid tensor offsets")
+            names.add(name)
+            offset = end
+        if offset != int(state.get("offset", -1)):
+            raise RuntimeError("Streaming safetensors resume journal has an invalid final offset")
+
+        self._tensor_entries = entries
+        self._tensor_names = names
+        completed_groups = state.get("completed_groups", [])
+        progress = state.get("progress", {})
+        if not isinstance(completed_groups, list) or any(not isinstance(group, str) or not group for group in completed_groups):
+            raise RuntimeError("Streaming safetensors resume journal has invalid completed groups")
+        if not isinstance(progress, dict):
+            raise RuntimeError("Streaming safetensors resume journal has invalid progress")
+        self._completed_groups = set(completed_groups)
+        self._progress = progress
+        self._offset = offset
+        self._file = open(self.temp_path, "r+b")
+        expected_size = self._data_start + self._offset
+        actual_size = os.fstat(self._file.fileno()).st_size
+        if actual_size < expected_size:
+            self._file.close()
+            raise RuntimeError("Streaming safetensors incomplete file is shorter than its resume journal")
+        self._file.seek(0)
+        stored_reserve = struct.unpack("<Q", self._file.read(8))[0]
+        if stored_reserve != self.header_reserve:
+            self._file.close()
+            raise RuntimeError("Streaming safetensors incomplete file has an invalid reserved header")
+        if actual_size > expected_size:
+            self._file.truncate(expected_size)
+        self._file.seek(expected_size)
+
+    def __enter__(self) -> "StreamingSafetensorsWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+        if not self._finalized and not self.resume_enabled:
+            _remove_temp_file(self.temp_path)
+
+
 def mem_eff_save_file(
     tensors: Dict[str, torch.Tensor | LazyTensorForSave],
     filename: str,
@@ -129,50 +452,30 @@ def mem_eff_save_file(
     memory efficient save file
     """
 
-    _TYPES = {
-        torch.float64: "F64",
-        torch.float32: "F32",
-        torch.float16: "F16",
-        torch.bfloat16: "BF16",
-        torch.int64: "I64",
-        torch.int32: "I32",
-        torch.int16: "I16",
-        torch.int8: "I8",
-        torch.uint8: "U8",
-        torch.bool: "BOOL",
-        getattr(torch, "float8_e5m2", None): "F8_E5M2",
-        getattr(torch, "float8_e4m3fn", None): "F8_E4M3",
-    }
-    _ALIGN = 256
-
-    def validate_metadata(metadata: Dict[str, Any]) -> Dict[str, str]:
-        validated = {}
-        for key, value in metadata.items():
-            if not isinstance(key, str):
-                raise ValueError(f"Metadata key must be a string, got {type(key)}")
-            if not isinstance(value, str):
-                print(f"Warning: Metadata value for key '{key}' is not a string. Converting to string.")
-                validated[key] = str(value)
-            else:
-                validated[key] = value
-        return validated
-
     # print(f"Using memory efficient save file: {filename}")
 
     header = {}
     offset = 0
     if metadata:
-        header["__metadata__"] = validate_metadata(metadata)
+        header["__metadata__"] = _validate_safetensors_metadata(metadata)
     for k, v in tensors.items():
         if _tensor_numel(v) == 0:  # empty tensor
-            header[k] = {"dtype": _TYPES[_tensor_dtype(v)], "shape": _tensor_shape(v), "data_offsets": [offset, offset]}
+            header[k] = {
+                "dtype": _SAFETENSORS_TYPES[_tensor_dtype(v)],
+                "shape": _tensor_shape(v),
+                "data_offsets": [offset, offset],
+            }
         else:
             size = _tensor_numel(v) * _tensor_element_size(v)
-            header[k] = {"dtype": _TYPES[_tensor_dtype(v)], "shape": _tensor_shape(v), "data_offsets": [offset, offset + size]}
+            header[k] = {
+                "dtype": _SAFETENSORS_TYPES[_tensor_dtype(v)],
+                "shape": _tensor_shape(v),
+                "data_offsets": [offset, offset + size],
+            }
             offset += size
 
     hjson = json.dumps(header).encode("utf-8")
-    hjson += b" " * (-(len(hjson) + 8) % _ALIGN)
+    hjson += b" " * (-(len(hjson) + 8) % _SAFETENSORS_HEADER_ALIGN)
 
     temp_path = _make_atomic_temp_path(filename) if atomic else None
     output_filename = temp_path if temp_path is not None else filename

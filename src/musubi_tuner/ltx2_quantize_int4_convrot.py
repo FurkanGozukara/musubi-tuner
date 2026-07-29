@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from dataclasses import asdict
+import hashlib
 import json
 import logging
 import math
@@ -12,7 +15,6 @@ import time
 
 import safetensors
 import torch
-from safetensors.torch import save_file
 from tqdm import tqdm
 
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
@@ -24,6 +26,7 @@ from musubi_tuner.modules.int4_convrot_utils import (
     INT4_CONVROT_METADATA_MARKER,
     INT4_CONVROT_STABILIZER_L1_SUFFIX,
     INT4_CONVROT_STABILIZER_L2_SUFFIX,
+    Int4ConvRotLayerQuality,
     best_int4_convrot_groupsize,
     comfy_quant_tensor,
     compare_int4_convrot_group_scales,
@@ -46,7 +49,7 @@ from musubi_tuner.modules.int4_convrot_awq import (
     summarize_int4_convrot_awq_scales,
 )
 from musubi_tuner.utils.device_utils import clean_memory_on_device
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, StreamingSafetensorsWriter, safetensors_resume_id
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,35 @@ def default_quality_report_path(output_model: str) -> str:
     return f"{base}.quality.json"
 
 
+def _optional_file_digest(path: str | None) -> str | None:
+    if not path:
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _layer_seed_context(model_key: str, seed: int, device: torch.device):
+    digest = hashlib.sha256(f"{int(seed)}:{model_key}".encode("utf-8")).digest()
+    layer_seed = int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+    devices = []
+    if device.type == "cuda":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    context = torch.random.fork_rng(devices=devices)
+
+    class _SeedContext:
+        def __enter__(self):
+            context.__enter__()
+            torch.manual_seed(layer_seed)
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return context.__exit__(exc_type, exc_val, exc_tb)
+
+    return _SeedContext()
+
+
 def quantize_model(
     input_model: str,
     output_model: str,
@@ -86,6 +118,8 @@ def quantize_model(
     group_scales: int = 0,
     group_ratio_q8: bool = False,
     compare_group_scales: str | tuple[int, ...] | None = None,
+    resume: bool = False,
+    resume_seed: int = 0,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -132,8 +166,6 @@ def quantize_model(
     if not (0.0 <= float(awq_alpha) <= 1.0):
         raise ValueError(f"INT4 ConvRot AWQ alpha must be in [0, 1], got {awq_alpha}")
     loaded_awq_scales = None
-    generated_awq_scales: dict[str, torch.Tensor] = {}
-    applied_awq_scales: dict[str, torch.Tensor] = {}
     awq_save_path = None
     if awq_calibration:
         awq_save_path = awq_scales or default_int4_convrot_awq_scales_path(output_model)
@@ -141,16 +173,76 @@ def quantize_model(
     elif awq_scales:
         loaded_awq_scales = load_int4_convrot_awq_scales(awq_scales)
 
-    state_dict: dict[str, torch.Tensor] = {}
-    quality_layers = []
-    group_scale_comparisons = []
-    applied_int4_parameters = []
-    quantized_count = 0
-    skipped_count = 0
-    passthrough_count = 0
+    output_metadata = dict(original_metadata)
+    output_metadata[INT4_CONVROT_METADATA_MARKER] = "true"
+    output_metadata["int4_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
+    output_metadata["int4_convrot_mse_clip"] = "true" if mse_clip else "false"
+    output_metadata["int4_convrot_scale_refine_steps"] = str(int(scale_refine_steps))
+    output_metadata["int4_convrot_group_scales"] = str(int(group_scales))
+    output_metadata["int4_convrot_group_ratio_q8"] = "true" if group_ratio_q8 else "false"
+    if policy is not None and policy.has_int4_quantization_parameters():
+        output_metadata["int4_convrot_per_layer_quantization"] = "true"
+    output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
+    output_metadata["int4_convrot_rotation"] = "hadamard" if rotate else "none"
+    output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
+    output_metadata["int4_convrot_awq_alpha"] = str(float(awq_alpha))
+    if stabilizer_rank > 0:
+        output_metadata["int4_convrot_stabilizer_rank"] = str(int(stabilizer_rank))
+
+    output_dir = os.path.dirname(output_model)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    resume_fingerprint = safetensors_resume_id(
+        input_model,
+        {
+            "format": "ltx2_int4_convrot",
+            "calc_device": str(device),
+            "groupsizes": list(groupsizes),
+            "mse_clip": bool(mse_clip),
+            "awq_calibration": bool(awq_calibration),
+            "awq_alpha": float(awq_alpha),
+            "awq_source_digest": _optional_file_digest(awq_scales) if awq_scales and not awq_calibration else None,
+            "stabilizer_rank": int(stabilizer_rank),
+            "rotate": bool(rotate),
+            "policy_digest": _optional_file_digest(policy_path),
+            "scale_refine_steps": int(scale_refine_steps),
+            "group_scales": int(group_scales),
+            "group_ratio_q8": bool(group_ratio_q8),
+            "compare_group_scales": list(comparison_candidates),
+            "collect_quality": quality_report is not None,
+            "resume_seed": int(resume_seed),
+        },
+    )
     t0 = time.time()
 
-    with MemoryEfficientSafeOpen(input_model) as f:
+    with (
+        MemoryEfficientSafeOpen(input_model) as f,
+        StreamingSafetensorsWriter(
+            output_model,
+            metadata=output_metadata,
+            resume=resume,
+            resume_id=resume_fingerprint,
+        ) as writer,
+    ):
+        progress = writer.progress
+        quality_by_key = dict(progress.get("quality_by_key", {}))
+        comparison_by_key = dict(progress.get("comparison_by_key", {}))
+        applied_parameters_by_key = dict(progress.get("applied_parameters_by_key", {}))
+        quantized_count = int(progress.get("quantized_count", 0))
+        skipped_count = int(progress.get("skipped_count", 0))
+        passthrough_count = int(progress.get("passthrough_count", 0))
+        groups_since_checkpoint = 0
+
+        def progress_state() -> dict:
+            return {
+                "quality_by_key": quality_by_key,
+                "comparison_by_key": comparison_by_key,
+                "applied_parameters_by_key": applied_parameters_by_key,
+                "quantized_count": quantized_count,
+                "skipped_count": skipped_count,
+                "passthrough_count": passthrough_count,
+            }
+
         keys = list(f.keys())
         fp8_scale_keys = {key for key in keys if key.endswith(".weight_scale") or key.endswith(".input_scale")}
         if fp8_scale_keys:
@@ -160,6 +252,8 @@ def quantize_model(
             )
         for key in tqdm(keys, desc="Quantizing INT4 ConvRot", unit="tensor"):
             if key in fp8_scale_keys:
+                continue
+            if writer.is_group_complete(key):
                 continue
             value = f.get_tensor(key)
             if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
@@ -179,7 +273,12 @@ def quantize_model(
                     skipped_count += 1
                 else:
                     passthrough_count += 1
-                state_dict[key] = value
+                writer.write_tensor(key, value)
+                writer.mark_group_complete(key)
+                groups_since_checkpoint += 1
+                if groups_since_checkpoint >= 32:
+                    writer.checkpoint(progress=progress_state())
+                    groups_since_checkpoint = 0
                 continue
 
             assert group_size is not None
@@ -193,7 +292,6 @@ def quantize_model(
             awq_scale = None
             if awq_calibration:
                 awq_scale = compute_int4_convrot_awq_scale(value, alpha=float(awq_alpha))
-                generated_awq_scales[model_key] = awq_scale
             elif loaded_awq_scales is not None:
                 awq_scale = loaded_awq_scales.get(model_key)
                 if awq_scale is None:
@@ -202,17 +300,18 @@ def quantize_model(
                     raise ValueError(f"INT4 ConvRot AWQ scales missing required key for {model_key}")
             if awq_scale is not None:
                 value = apply_int4_convrot_awq_scale_to_weight(value, awq_scale)
-                applied_awq_scales[model_key] = awq_scale
 
             stabilizer = None
             if stabilizer_rank > 0:
-                stabilizer = compute_int4_convrot_stabilizer(
-                    value,
-                    group_size=group_size,
-                    rank=stabilizer_rank,
-                    calc_device=device,
-                    rotate=rotate,
-                )
+                seed_context = _layer_seed_context(model_key, resume_seed, device) if resume else nullcontext()
+                with seed_context:
+                    stabilizer = compute_int4_convrot_stabilizer(
+                        value,
+                        group_size=group_size,
+                        rank=stabilizer_rank,
+                        calc_device=device,
+                        rotate=rotate,
+                    )
             quant_kwargs = {
                 "group_size": group_size,
                 "calc_device": device,
@@ -234,84 +333,83 @@ def quantize_model(
             else:
                 q, scale, shape, quality = quantize_int4_convrot_weight(value, **quant_kwargs)
             if quality_report is not None:
-                applied_int4_parameters.append(
-                    {
-                        "key": model_key,
-                        "group_scales_requested": layer_parameters.group_scales,
-                        "group_scales_resolved": (
-                            int(group_scale_state.group_size.detach().reshape(-1)[0].item()) if group_scale_state is not None else 0
-                        ),
-                        "group_ratio_q8": bool(layer_parameters.group_ratio_q8 and group_scale_state is not None),
-                        "scale_refine_steps": layer_parameters.scale_refine_steps,
-                    }
-                )
+                applied_parameters_by_key[model_key] = {
+                    "key": model_key,
+                    "group_scales_requested": layer_parameters.group_scales,
+                    "group_scales_resolved": (
+                        int(group_scale_state.group_size.detach().reshape(-1)[0].item()) if group_scale_state is not None else 0
+                    ),
+                    "group_ratio_q8": bool(layer_parameters.group_ratio_q8 and group_scale_state is not None),
+                    "scale_refine_steps": layer_parameters.scale_refine_steps,
+                }
             if comparison_candidates:
-                group_scale_comparisons.append(
-                    compare_int4_convrot_group_scales(
-                        value,
-                        candidates=comparison_candidates,
-                        selected_group_scales=layer_parameters.group_scales,
-                        selected_quality=quality,
-                        selected_group_ratio=group_scale_state.ratio if group_scale_state is not None else None,
-                        group_size=group_size,
-                        calc_device=device,
-                        mse_clip=mse_clip,
-                        key=model_key,
-                        stabilizer=stabilizer,
-                        rotate=rotate,
-                        scale_refine_steps=layer_parameters.scale_refine_steps,
-                    )
+                comparison_by_key[model_key] = compare_int4_convrot_group_scales(
+                    value,
+                    candidates=comparison_candidates,
+                    selected_group_scales=layer_parameters.group_scales,
+                    selected_quality=quality,
+                    selected_group_ratio=group_scale_state.ratio if group_scale_state is not None else None,
+                    group_size=group_size,
+                    calc_device=device,
+                    mse_clip=mse_clip,
+                    key=model_key,
+                    stabilizer=stabilizer,
+                    rotate=rotate,
+                    scale_refine_steps=layer_parameters.scale_refine_steps,
                 )
             base = key[: -len(".weight")]
             in_features = int(shape.detach().cpu().reshape(-1)[1].item())
             padded_features = int(shape.detach().cpu().reshape(-1)[2].item())
-            state_dict[key] = q.cpu()
-            state_dict[base + ".weight_scale"] = scale.cpu()
-            state_dict[base + ".int4_shape"] = shape.cpu()
+            writer.write_tensor(key, q.cpu())
+            writer.write_tensor(base + ".weight_scale", scale.cpu())
+            writer.write_tensor(base + ".int4_shape", shape.cpu())
             if group_scale_state is not None:
-                state_dict[base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX] = group_scale_state.ratio.cpu()
-                state_dict[base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX] = group_scale_state.group_size.cpu()
-                state_dict[base + ".int4_convrot_groupsize"] = torch.tensor(group_size, dtype=torch.int32)
+                writer.write_tensor(base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX, group_scale_state.ratio.cpu())
+                writer.write_tensor(base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX, group_scale_state.group_size.cpu())
+                writer.write_tensor(base + ".int4_convrot_groupsize", torch.tensor(group_size, dtype=torch.int32))
                 if not rotate:
-                    state_dict[base + ".int4_rotation"] = torch.tensor(0, dtype=torch.int32)
+                    writer.write_tensor(base + ".int4_rotation", torch.tensor(0, dtype=torch.int32))
             else:
-                state_dict[base + ".comfy_quant"] = comfy_quant_tensor(
-                    group_size,
-                    in_features,
-                    padded_features,
-                    convrot=rotate,
-                    awq=awq_scale is not None,
-                    stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
+                writer.write_tensor(
+                    base + ".comfy_quant",
+                    comfy_quant_tensor(
+                        group_size,
+                        in_features,
+                        padded_features,
+                        convrot=rotate,
+                        awq=awq_scale is not None,
+                        stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
+                    ),
                 )
             if awq_scale is not None:
-                state_dict[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.cpu().float()
+                writer.write_tensor(base + INT4_CONVROT_AWQ_SCALE_SUFFIX, awq_scale.cpu().float())
             if stabilizer is not None:
-                state_dict[base + INT4_CONVROT_STABILIZER_L1_SUFFIX] = stabilizer[0].cpu()
-                state_dict[base + INT4_CONVROT_STABILIZER_L2_SUFFIX] = stabilizer[1].cpu()
+                writer.write_tensor(base + INT4_CONVROT_STABILIZER_L1_SUFFIX, stabilizer[0].cpu())
+                writer.write_tensor(base + INT4_CONVROT_STABILIZER_L2_SUFFIX, stabilizer[1].cpu())
             if quality is not None:
-                quality_layers.append(quality)
+                quality_by_key[model_key] = asdict(quality)
             quantized_count += 1
+            writer.mark_group_complete(key)
+            writer.checkpoint(progress=progress_state())
+            groups_since_checkpoint = 0
             if device.type == "cuda" and quantized_count % 20 == 0:
                 clean_memory_on_device(device)
+        logger.info("Finalizing streamed INT4 ConvRot checkpoint at %s", output_model)
+        writer.finalize(progress=progress_state())
 
-    output_metadata = dict(original_metadata)
-    output_metadata[INT4_CONVROT_METADATA_MARKER] = "true"
-    output_metadata["int4_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
-    output_metadata["int4_convrot_mse_clip"] = "true" if mse_clip else "false"
-    output_metadata["int4_convrot_scale_refine_steps"] = str(int(scale_refine_steps))
-    output_metadata["int4_convrot_group_scales"] = str(int(group_scales))
-    output_metadata["int4_convrot_group_ratio_q8"] = "true" if group_ratio_q8 else "false"
-    if policy is not None and policy.has_int4_quantization_parameters():
-        output_metadata["int4_convrot_per_layer_quantization"] = "true"
-    output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
-    output_metadata["int4_convrot_rotation"] = "hadamard" if rotate else "none"
-    output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
-    output_metadata["int4_convrot_awq_alpha"] = str(float(awq_alpha))
-    if stabilizer_rank > 0:
-        output_metadata["int4_convrot_stabilizer_rank"] = str(int(stabilizer_rank))
-
-    if generated_awq_scales and awq_save_path:
-        save_int4_convrot_awq_scales(generated_awq_scales, awq_save_path)
+    applied_awq_scales: dict[str, torch.Tensor] = {}
+    if awq_calibration or loaded_awq_scales is not None:
+        with MemoryEfficientSafeOpen(output_model) as output_file:
+            for scale_key in output_file.keys():
+                if not scale_key.endswith(INT4_CONVROT_AWQ_SCALE_SUFFIX):
+                    continue
+                base = scale_key[: -len(INT4_CONVROT_AWQ_SCALE_SUFFIX)]
+                source_weight_key = base + ".weight"
+                renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(source_weight_key)
+                model_key = renamed if renamed is not None else source_weight_key
+                applied_awq_scales[model_key] = output_file.get_tensor(scale_key).float()
+    if awq_calibration and applied_awq_scales and awq_save_path:
+        save_int4_convrot_awq_scales(applied_awq_scales, awq_save_path)
     if applied_awq_scales:
         summary = summarize_int4_convrot_awq_scales(applied_awq_scales)
         logger.info(
@@ -322,13 +420,6 @@ def quantize_model(
             summary.get("max", 0.0),
             summary.get("mean", 0.0),
         )
-
-    output_dir = os.path.dirname(output_model)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    logger.info("Saving INT4 ConvRot checkpoint to %s", output_model)
-    save_file(state_dict, output_model, metadata=output_metadata)
 
     elapsed = time.time() - t0
     input_size = os.path.getsize(input_model) / (1024**3)
@@ -343,6 +434,9 @@ def quantize_model(
         output_size,
     )
 
+    quality_layers = [Int4ConvRotLayerQuality(**quality_by_key[key]) for key in sorted(quality_by_key)]
+    group_scale_comparisons = [comparison_by_key[key] for key in sorted(comparison_by_key)]
+    applied_int4_parameters = [applied_parameters_by_key[key] for key in sorted(applied_parameters_by_key)]
     if quality_report is not None:
         report = write_quality_report(
             quality_report,
@@ -460,6 +554,7 @@ def export_comfy_convrot_w4a4(
     *,
     calc_device: str,
     linear_dtype: str = "int4",
+    resume: bool = False,
 ) -> None:
     """Export a ComfyUI-loadable ``convrot_w4a4`` checkpoint.
 
@@ -482,17 +577,47 @@ def export_comfy_convrot_w4a4(
     with safetensors.safe_open(input_model, framework="pt") as f:
         original_metadata = f.metadata() or {}
 
-    state_dict: dict[str, torch.Tensor] = {}
-    quantized_count = 0
-    passthrough_count = 0
-    fallback_layers: list[tuple[str, int]] = []
+    output_dir = os.path.dirname(output_model)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    resume_fingerprint = safetensors_resume_id(
+        input_model,
+        {
+            "format": "comfy_convrot_w4a4",
+            "calc_device": str(device),
+            "linear_dtype": linear_dtype,
+        },
+    )
     t0 = time.time()
 
-    with MemoryEfficientSafeOpen(input_model) as f:
+    with (
+        MemoryEfficientSafeOpen(input_model) as f,
+        StreamingSafetensorsWriter(
+            output_model,
+            metadata=dict(original_metadata),
+            resume=resume,
+            resume_id=resume_fingerprint,
+        ) as writer,
+    ):
+        progress = writer.progress
+        quantized_count = int(progress.get("quantized_count", 0))
+        passthrough_count = int(progress.get("passthrough_count", 0))
+        fallback_by_key = dict(progress.get("fallback_by_key", {}))
+        groups_since_checkpoint = 0
+
+        def progress_state() -> dict:
+            return {
+                "quantized_count": quantized_count,
+                "passthrough_count": passthrough_count,
+                "fallback_by_key": fallback_by_key,
+            }
+
         keys = list(f.keys())
         fp8_scale_keys = {key for key in keys if key.endswith(".weight_scale") or key.endswith(".input_scale")}
         for key in tqdm(keys, desc="Exporting convrot_w4a4", unit="tensor"):
             if key in fp8_scale_keys:
+                continue
+            if writer.is_group_complete(key):
                 continue
             value = f.get_tensor(key)
             if value.is_floating_point() and value.dtype.itemsize == 1 and key.endswith(".weight"):
@@ -505,36 +630,46 @@ def export_comfy_convrot_w4a4(
 
             is_target, _model_key = _is_comfy_convrot_target(key, value)
             if not is_target:
-                state_dict[key] = value
+                writer.write_tensor(key, value)
                 passthrough_count += 1
+                writer.mark_group_complete(key)
+                groups_since_checkpoint += 1
+                if groups_since_checkpoint >= 32:
+                    writer.checkpoint(progress=progress_state())
+                    groups_since_checkpoint = 0
                 continue
 
             in_features = int(value.shape[1])
             if in_features % _COMFY_CONVROT_GROUPSIZE != 0:
                 # 16-bit fallback tier: in_features not divisible by the ConvRot group size (256).
-                state_dict[key] = value
-                fallback_layers.append((key, in_features))
+                writer.write_tensor(key, value)
+                fallback_by_key[key] = in_features
+                writer.mark_group_complete(key)
+                groups_since_checkpoint += 1
+                if groups_since_checkpoint >= 32:
+                    writer.checkpoint(progress=progress_state())
+                    groups_since_checkpoint = 0
                 continue
 
             qdata, scale = _quantize_comfy_convrot_w4a4_weight(
                 value.to(device=device, dtype=torch.float32), _COMFY_CONVROT_GROUPSIZE
             )
             base = key[: -len(".weight")]
-            state_dict[key] = qdata.cpu().contiguous()
-            state_dict[base + ".weight_scale"] = scale.cpu().contiguous()
-            state_dict[base + ".comfy_quant"] = _comfy_quant_conf_tensor(_COMFY_CONVROT_GROUPSIZE, linear_dtype)
+            writer.write_tensor(key, qdata.cpu().contiguous())
+            writer.write_tensor(base + ".weight_scale", scale.cpu().contiguous())
+            writer.write_tensor(base + ".comfy_quant", _comfy_quant_conf_tensor(_COMFY_CONVROT_GROUPSIZE, linear_dtype))
             quantized_count += 1
+            writer.mark_group_complete(key)
+            writer.checkpoint(progress=progress_state())
+            groups_since_checkpoint = 0
             if device.type == "cuda" and quantized_count % 20 == 0:
                 clean_memory_on_device(device)
 
-    output_dir = os.path.dirname(output_model)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    # Preserve the source metadata unchanged; ComfyUI keys off the per-weight .comfy_quant blobs.
-    logger.info("Saving comfy_convrot_w4a4 checkpoint to %s", output_model)
-    save_file(state_dict, output_model, metadata=dict(original_metadata))
+        logger.info("Finalizing streamed comfy_convrot_w4a4 checkpoint at %s", output_model)
+        writer.finalize(progress=progress_state())
 
-    if fallback_layers:
+    fallback_layers = list(fallback_by_key.items())
+    if fallback_by_key:
         logger.warning(
             "comfy_convrot_w4a4: %d target Linear(s) kept 16-bit (in_features not divisible by %d): %s",
             len(fallback_layers),
@@ -666,6 +801,20 @@ def main() -> None:
         help="Quality JSON path. Defaults to <output_model_without_ext>.quality.json unless --no_quality_report is set.",
     )
     parser.add_argument("--no_quality_report", action="store_true", help="Skip quality metric report generation")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Keep an incomplete output plus a journal and resume from the last durable tensor group. "
+            "The source file, policy/AWQ inputs, and output-affecting options must remain unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--resume_seed",
+        type=int,
+        default=0,
+        help="Base seed for deterministic per-layer stabilizer SVD when --resume is enabled (default: 0)",
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -696,6 +845,7 @@ def main() -> None:
             output_model=args.output_model,
             calc_device=args.calc_device,
             linear_dtype=args.comfy_linear_dtype,
+            resume=bool(args.resume),
         )
         return
 
@@ -719,6 +869,8 @@ def main() -> None:
         group_scales=int(args.int4_convrot_group_scales),
         group_ratio_q8=bool(args.int4_convrot_group_ratio_q8),
         compare_group_scales=args.int4_convrot_compare_group_scales,
+        resume=bool(args.resume),
+        resume_seed=int(args.resume_seed),
     )
 
 
