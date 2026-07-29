@@ -1289,6 +1289,10 @@ def train(self, args):
         base, ext = os.path.splitext(ckpt_name)
         return f"{base}_ema{ext or '.safetensors'}"
 
+    def _self_flow_ema_ckpt_name(ckpt_name: str) -> str:
+        base, ext = os.path.splitext(ckpt_name)
+        return f"{base}_self_flow_ema{ext or '.safetensors'}"
+
     def apply_ema_weights_for_eval() -> dict[str, torch.Tensor] | None:
         if ema_model is None:
             return None
@@ -1297,6 +1301,17 @@ def train(self, args):
     def restore_ema_weights_for_eval(original_params: dict[str, torch.Tensor] | None) -> None:
         if ema_model is not None and original_params is not None:
             ema_model.restore(accelerator.unwrap_model(network), original_params)
+
+    def apply_self_flow_weights_for_eval() -> dict[str, torch.Tensor] | None:
+        module = getattr(self, "_self_flow", None)
+        if module is None or not module.has_ema_teacher:
+            return None
+        return module.apply_teacher_weights(accelerator.unwrap_model(network))
+
+    def restore_self_flow_weights_for_eval(original_params: dict[str, torch.Tensor] | None) -> None:
+        module = getattr(self, "_self_flow", None)
+        if module is not None and original_params is not None:
+            module.restore_student_weights(accelerator.unwrap_model(network), original_params)
 
     def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False, extra_metadata=None):
         os.makedirs(args.output_dir, exist_ok=True)
@@ -1420,20 +1435,50 @@ def train(self, args):
         finally:
             ema_model.restore(unwrapped_nw, original_params)
 
+    def save_self_flow_ema_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        module = getattr(self, "_self_flow", None)
+        if module is None or not module.has_ema_teacher:
+            return
+        teacher_ckpt_name = _self_flow_ema_ckpt_name(ckpt_name)
+        original_params = module.apply_teacher_weights(unwrapped_nw)
+        try:
+            save_model(
+                teacher_ckpt_name,
+                unwrapped_nw,
+                steps,
+                epoch_no,
+                force_sync_upload=force_sync_upload,
+                extra_metadata={
+                    "ss_is_ema": True,
+                    "ss_self_flow_checkpoint_role": "teacher_ema",
+                    "ss_self_flow_teacher_mode": module.config.teacher_mode,
+                    "ss_self_flow_teacher_momentum": module.config.teacher_momentum,
+                },
+            )
+        finally:
+            module.restore_student_weights(unwrapped_nw, original_params)
+
     def save_checkpoint_with_optional_ema(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
         if bool(getattr(args, "save_ema_only", False)) and ema_model is not None:
             save_ema_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
-            return
-
-        save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
-        if ema_model is not None:
-            save_ema_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+        else:
+            save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+            if ema_model is not None:
+                save_ema_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=force_sync_upload)
+        save_self_flow_ema_model(
+            ckpt_name,
+            unwrapped_nw,
+            steps,
+            epoch_no,
+            force_sync_upload=force_sync_upload,
+        )
 
     def remove_model(old_ckpt_name):
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
         ckpt_files = [old_ckpt_file]
         if not old_ckpt_name.endswith("_ema.safetensors"):
             ckpt_files.append(os.path.join(args.output_dir, _ema_ckpt_name(old_ckpt_name)))
+            ckpt_files.append(os.path.join(args.output_dir, _self_flow_ema_ckpt_name(old_ckpt_name)))
 
         for ckpt_file in ckpt_files:
             if os.path.exists(ckpt_file):
@@ -1530,6 +1575,7 @@ def train(self, args):
         val_audio_loss_ema = float(audio_loss_ema)
         val_video_loss_ema = float(video_loss_ema)
         ema_original_params = apply_ema_weights_for_eval()
+        self_flow_original_params = apply_self_flow_weights_for_eval()
         validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
         plain_validation_args = copy.copy(args)
         plain_validation_args.self_flow = False
@@ -1885,6 +1931,7 @@ def train(self, args):
                     total_loss += loss.detach().item()
                     total_count += 1
         finally:
+            restore_self_flow_weights_for_eval(self_flow_original_params)
             restore_ema_weights_for_eval(ema_original_params)
 
         loss_stats = torch.tensor(
@@ -1923,9 +1970,11 @@ def train(self, args):
 
     def sample_images_with_optional_ema(epoch_no, step_no):
         ema_original_params = apply_ema_weights_for_eval()
+        self_flow_original_params = apply_self_flow_weights_for_eval()
         try:
             self.sample_images(accelerator, args, epoch_no, step_no, vae, transformer, sample_parameters, dit_dtype)
         finally:
+            restore_self_flow_weights_for_eval(self_flow_original_params)
             restore_ema_weights_for_eval(ema_original_params)
 
     # For --sample_at_first (skip on resume — samples were already generated)

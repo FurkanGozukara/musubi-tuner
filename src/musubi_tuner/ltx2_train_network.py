@@ -2111,14 +2111,16 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         network,
     ) -> None:
         """Validate the complete Self-Flow contract before allocating training state."""
-        if self._ltx_mode not in {"video", "av"}:
-            raise ValueError("--self_flow currently supports --ltx_mode video or av")
+        if self._ltx_mode not in {"video", "av", "audio"}:
+            raise ValueError("--self_flow supports --ltx_mode video, av, or audio")
         if bool(getattr(args, "tread", False)):
             raise ValueError(
                 "--self_flow is mutually exclusive with --tread because routed student tokens do not align "
                 "with the teacher feature sequence"
             )
-        if self._ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av"):
+        if self._ic_lora_strategy in ("v2v", "av_ic", "video_ref_only_av") or (
+            self._ltx_mode == "audio" and self._ic_lora_strategy != "none"
+        ):
             raise ValueError(
                 f"--self_flow is not supported with --ic_lora_strategy {self._ic_lora_strategy}: "
                 "the reference-prefix path changes the per-token timestep contract"
@@ -2133,11 +2135,29 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError("--self_flow is not supported with --ltx2_remote_stage")
         if not bool(config.dual_timestep):
             raise ValueError("Self-Flow requires dual_timestep=true")
-        if float(config.lambda_audio) > 0.0 and self._ltx_mode != "av":
-            raise ValueError("Self-Flow lambda_audio > 0 requires --ltx_mode av")
+        if float(config.lambda_audio) > 0.0 and self._ltx_mode not in {"av", "audio"}:
+            raise ValueError("Self-Flow lambda_audio > 0 requires --ltx_mode av or audio")
+        if self._ltx_mode == "audio":
+            if float(config.lambda_audio) <= 0.0:
+                raise ValueError("Audio-only Self-Flow requires lambda_audio > 0")
+            if any(float(value) > 0.0 for value in (config.lambda_self_flow, config.lambda_temporal, config.lambda_delta)):
+                raise ValueError("Audio-only Self-Flow requires lambda_self_flow=0, lambda_temporal=0, and lambda_delta=0")
+            if bool(config.frame_level_mask) or bool(config.mask_focus_loss):
+                raise ValueError("Audio-only Self-Flow does not support video-only frame_level_mask or mask_focus_loss")
+            if config.similarity_cutoff is not None:
+                raise ValueError("Audio-only Self-Flow does not support similarity_cutoff")
+            if is_audio_extend_enabled(args) or is_audio_inpaint_mask_enabled(args):
+                raise ValueError(
+                    "Audio-only Self-Flow cannot be combined with audio extend/inpaint conditioning because "
+                    "the canonical objective requires matched student and teacher token layouts"
+                )
 
         if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
             raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
+        if config.image_mask_ratio is not None and not 0.0 <= config.image_mask_ratio <= 0.5:
+            raise ValueError("Self-Flow image_mask_ratio must be in [0, 0.5]")
+        if config.audio_mask_ratio is not None and not 0.0 <= config.audio_mask_ratio <= 0.5:
+            raise ValueError("Self-Flow audio_mask_ratio must be in [0, 0.5]")
         if config.mask_focus_loss and config.mask_ratio <= 0.0:
             raise ValueError("Self-Flow mask_focus_loss requires mask_ratio > 0")
         if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
@@ -2259,6 +2279,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             "patch_match_temperature",
             "motion_weight_strength",
             "mask_ratio",
+            "image_mask_ratio",
+            "audio_mask_ratio",
             "max_loss",
             "teacher_momentum",
             "projector_lr",
@@ -2968,6 +2990,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        match_training_distribution: bool = False,
     ) -> torch.Tensor:
         """Sample audio timesteps in the same sigma range used by video timesteps."""
         min_timestep = getattr(args, "min_timestep", None)
@@ -2976,7 +3000,36 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         max_sigma = (float(max_timestep) / 1000.0) if max_timestep is not None else 1.0
         if max_sigma < min_sigma:
             raise ValueError(f"Invalid timestep range: min_sigma={min_sigma} > max_sigma={max_sigma}")
-        sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        timestep_sampling = str(getattr(args, "timestep_sampling", "shifted_logit_normal")).lower()
+        if timestep_sampling == "sigma":
+            timestep_sampling = "shifted_logit_normal"
+        if match_training_distribution and timestep_sampling == "shifted_logit_normal":
+            audio_seq_lens = self._resolve_audio_only_sequence_lengths(batch_size, device)
+            if audio_seq_lens is None:
+                raise ValueError("Self-Flow audio timestep sampling requires cached audio sequence-length metadata")
+            shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
+            shifts = self._apply_shifted_logit_auto_shift_bounds(args, shifts, force_clamp=True)
+            shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+            if shifted_logit_shift_override is not None:
+                shifts = torch.full((batch_size,), float(shifted_logit_shift_override), device=device, dtype=torch.float32)
+            base_uniform = None
+            if self.num_timestep_buckets is not None and self.num_timestep_buckets > 1:
+                base_uniform = torch.tensor(
+                    [self.get_bucketed_timestep() for _ in range(batch_size)],
+                    device=device,
+                    dtype=torch.float32,
+                )
+            sigmas = self._sample_shifted_logit_normal_sigmas(
+                batch_size,
+                shifts,
+                std=float(getattr(args, "logit_std", 1.0)),
+                mode=self._resolve_shifted_logit_mode(args),
+                eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+                uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+                uniform_samples=base_uniform,
+            )
+        else:
+            sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
         sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
         return sigmas.to(device=device, dtype=dtype).view(batch_size, 1)
 
@@ -3527,7 +3580,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             t_tokens = sigmas.view(batch_size, 1).expand(batch_size, seq_len)
             s_tokens = sigmas_alt.view(batch_size, 1).expand(batch_size, seq_len)
 
-            mask_ratio = float(getattr(self._self_flow.config, "mask_ratio", 0.10))
+            mask_ratio = self._self_flow.effective_video_mask_ratio(frames)
             mask_ratio = max(0.0, min(0.5, mask_ratio))
             if bool(getattr(self._self_flow.config, "frame_level_mask", False)):
                 # Mask whole frames rather than individual tokens.
@@ -4226,6 +4279,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     def get_checkpoint_metadata(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Return LTX-2-specific metadata for LoRA safetensors (v2v mode info, etc.)."""
         md: Dict[str, Any] = {}
+        if bool(getattr(args, "self_flow", False)):
+            md["ss_self_flow"] = True
+            md["ss_self_flow_args"] = " ".join(str(value) for value in (getattr(args, "self_flow_args", None) or []))
+            module = getattr(self, "_self_flow", None)
+            if module is not None:
+                md["ss_self_flow_teacher_mode"] = str(module.config.teacher_mode)
+                md["ss_self_flow_teacher_momentum"] = float(module.config.teacher_momentum)
+                md["ss_self_flow_checkpoint_role"] = "student"
         preset = getattr(args, "lora_target_preset", None)
         if preset:
             md["ss_lora_target_preset"] = preset
@@ -5199,6 +5260,41 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             audio_noise = torch.randn_like(audio_latents)
             sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
+            teacher_noisy_audio_for_self_flow = None
+            teacher_audio_timestep_for_self_flow = None
+            audio_timestep_local = audio_model_timesteps
+            if (
+                self._self_flow_active
+                and self._self_flow is not None
+                and bool(getattr(args, "self_flow", False))
+                and bool(getattr(self._self_flow.config, "dual_timestep", True))
+            ):
+                alt_audio_sigmas = self._sample_independent_audio_timesteps(
+                    args,
+                    batch_size=audio_model_timesteps.shape[0],
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                    match_training_distribution=True,
+                )
+                audio_sf = prepare_self_flow_audio_view(
+                    audio_latents=audio_latents,
+                    audio_noise=audio_noise,
+                    base_audio_sigmas=audio_model_timesteps,
+                    alt_audio_sigmas=alt_audio_sigmas,
+                    mask_ratio=self._self_flow.effective_audio_mask_ratio,
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                )
+                noisy_audio = audio_sf["student_noisy_audio"]
+                audio_timestep_local = audio_sf["student_audio_timesteps"]
+                teacher_noisy_audio_for_self_flow = audio_sf["teacher_noisy_audio"].detach()
+                teacher_audio_timestep_for_self_flow = audio_sf["teacher_audio_timesteps"].detach()
+                self._self_flow_step_context = {
+                    "audio_self_flow_mask": audio_sf["audio_mask"].detach(),
+                    "audio_masked_token_ratio": float(audio_sf["audio_masked_token_ratio"].detach().item()),
+                    "audio_tau_mean": float(audio_sf["audio_tau_mean"].detach().item()),
+                    "audio_tau_min_mean": float(audio_sf["audio_tau_min_mean"].detach().item()),
+                }
 
             # Compute target and loss mask BEFORE IC block so they can be concatenated with ref tokens.
             audio_target = audio_noise - audio_latents
@@ -5241,7 +5337,6 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 dtype=network_dtype,
             )
 
-            audio_timestep_local = audio_model_timesteps
             # Audio intrinsic conditioning (prefix/suffix extension); no-op + no RNG when disabled.
             noisy_audio, audio_timestep_local, audio_loss_mask = _maybe_apply_audio_extend(
                 args,
@@ -5398,17 +5493,63 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     transformer,
                     build_ltx2_remote_stage_cache_key(args, batch, timesteps=model_timesteps, noise=noise),
                 )
+
+            capture_self_flow = False
+            if self._self_flow_active and self._self_flow is not None and bool(getattr(args, "self_flow", False)):
+                if self._self_flow_step_context is None:
+                    raise RuntimeError("Audio-only Self-Flow did not create a dual-timestep context")
+                network_for_self_flow = getattr(self, "_self_flow_network", None)
+                if network_for_self_flow is None:
+                    raise RuntimeError("Self-Flow teacher network is unavailable")
+                if not isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor) or not isinstance(
+                    teacher_audio_timestep_for_self_flow, torch.Tensor
+                ):
+                    raise RuntimeError("Audio-only Self-Flow teacher input or timesteps are missing")
+                self._self_flow.cleanup_step()
+                if self._self_flow.should_capture:
+                    self._self_flow.mark_student_forward()
+                    self._self_flow.prepare_teacher_features(
+                        accelerator=accelerator,
+                        transformer=transformer,
+                        network=network_for_self_flow,
+                        teacher_model_input=[video_latents, teacher_noisy_audio_for_self_flow],
+                        teacher_timesteps=teacher_audio_timestep_for_self_flow[:, :1],
+                        audio_timestep=teacher_audio_timestep_for_self_flow,
+                        text_embeds=text_embeds,
+                        text_mask=text_mask,
+                        frame_rate=frame_rate,
+                        transformer_options=resolved_transformer_options,
+                        extra_forward_kwargs={"audio_only": True},
+                    )
+                    capture_self_flow = True
+
+            self._last_dit_inputs = {
+                "model_input": [video_latents, noisy_audio],
+                "model_timesteps": model_timesteps,
+                "audio_model_timesteps": audio_timestep_local,
+                "text_embeds": text_embeds,
+                "text_mask": text_mask,
+                "frame_rate": frame_rate,
+                "transformer_options": resolved_transformer_options,
+            }
+            audio_forward_kwargs = {
+                "timestep": model_timesteps,
+                "audio_timestep": audio_timestep_local,
+                "context": text_embeds,
+                "attention_mask": text_mask,
+                "frame_rate": frame_rate,
+                "transformer_options": resolved_transformer_options,
+                "audio_only": True,
+            }
+            if capture_self_flow:
+                audio_forward_kwargs["output_hidden_states"] = True
+                audio_forward_kwargs["hidden_state_layer"] = self._self_flow.student_hidden_state_layer
             with accelerator.autocast():
-                model_pred = transformer(
-                    [video_latents, noisy_audio],
-                    timestep=model_timesteps,
-                    audio_timestep=audio_timestep_local,
-                    context=text_embeds,
-                    attention_mask=text_mask,
-                    frame_rate=frame_rate,
-                    transformer_options=resolved_transformer_options,
-                    audio_only=True,
-                )
+                model_pred = transformer([video_latents, noisy_audio], **audio_forward_kwargs)
+
+            if capture_self_flow:
+                video_hidden_pred, audio_hidden_pred = self._self_flow.cache_student_output(model_pred)
+                model_pred = [video_hidden_pred, audio_hidden_pred]
 
             video_pred = model_pred
             audio_pred = None
@@ -5438,7 +5579,6 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if out_audio["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out_audio['audio_loss_weight']}")
 
-            self._last_dit_inputs = None  # audio-only path — skip preservation
             return out_audio, torch.tensor(0.0, device=accelerator.device)
 
         first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
@@ -6619,7 +6759,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                             audio_noise=audio_noise,
                             base_audio_sigmas=base_audio_sigmas,
                             alt_audio_sigmas=alt_audio_sigmas,
-                            mask_ratio=float(getattr(self._self_flow.config, "mask_ratio", 0.10)),
+                            mask_ratio=self._self_flow.effective_audio_mask_ratio,
                             device=accelerator.device,
                             dtype=network_dtype,
                         )

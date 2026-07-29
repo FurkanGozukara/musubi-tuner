@@ -1806,7 +1806,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--self_flow",
         action="store_true",
         help="Enable Self-Flow regularization (dual-timestep noising + EMA-teacher feature alignment). "
-        "Supported for --ltx_mode video and --ltx_mode av (video branch only in av). "
+        "Supported for --ltx_mode video, --ltx_mode av, and --ltx_mode audio. "
         "Single-frame image-like samples are supported via --ltx_mode video.",
     )
     parser.add_argument(
@@ -1820,9 +1820,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "motion_weighting=teacher_delta motion_weight_strength=0.5 "
         "temporal_schedule=polynomial temporal_warmup_steps=200 temporal_max_steps=2000 "
         "schedule_end_weight=0.0 schedule_power=2.0 schedule_cutoff_step=0 "
-        "similarity_cutoff=0.95 similarity_ema_decay=0.99 similarity_cutoff_mode=permanent mask_ratio=0.1 "
+        "similarity_cutoff=0.95 similarity_ema_decay=0.99 similarity_cutoff_mode=permanent "
+        "mask_ratio=0.1 image_mask_ratio=0.25 audio_mask_ratio=0.5 "
         "frame_level_mask=false teacher_mode=ema mask_focus_loss=false max_loss=0.0 "
-        "student_block_stochastic_range=2 teacher_momentum=0.999 "
+        "student_block_stochastic_range=2 teacher_momentum=0.9999 "
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )
 

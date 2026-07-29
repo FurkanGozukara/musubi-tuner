@@ -145,13 +145,15 @@ class SelfFlowConfig:
     similarity_ema_decay: float = 0.99
     similarity_cutoff_mode: str = "permanent"  # "permanent" | "recoverable"
     mask_ratio: float = 0.10
+    image_mask_ratio: Optional[float] = None  # defaults to mask_ratio when unset
+    audio_mask_ratio: Optional[float] = None  # defaults to mask_ratio when unset
     frame_level_mask: bool = False  # mask whole frames instead of individual tokens
     teacher_mode: str = "ema"  # "ema" | "partial_ema" | "base"
     teacher_momentum: float = 0.999
     teacher_update_interval: int = 1
     projector_hidden_multiplier: int = 1
     projector_activation: str = "silu"  # "silu" | "gelu"
-    loss_type: str = "negative_cosine"  # "negative_cosine" | "one_minus_cosine"
+    loss_type: str = "one_minus_cosine"  # "negative_cosine" | "one_minus_cosine"
     dual_timestep: bool = True
     tokenwise_timestep: bool = True
     mask_focus_loss: bool = False  # focus rep loss on masked (higher-noise) tokens only
@@ -264,6 +266,7 @@ class SelfFlowModule:
         self._teacher_features: Optional[torch.Tensor] = None
         self._student_audio_features: Optional[torch.Tensor] = None
         self._teacher_audio_features: Optional[torch.Tensor] = None
+        self._step_uses_audio = False
 
         self._shadow_params: Dict[str, torch.Tensor] = {}
         self._step_counter: int = 0
@@ -340,6 +343,30 @@ class SelfFlowModule:
     @property
     def schedule_cutoff_active(self) -> bool:
         return bool(self._scheduler.cutoff_active)
+
+    @property
+    def has_ema_teacher(self) -> bool:
+        return bool(self._shadow_params)
+
+    @property
+    def effective_audio_mask_ratio(self) -> float:
+        value = self.config.audio_mask_ratio
+        return float(self.config.mask_ratio if value is None else value)
+
+    def effective_video_mask_ratio(self, num_latent_frames: int) -> float:
+        if int(num_latent_frames) == 1 and self.config.image_mask_ratio is not None:
+            return float(self.config.image_mask_ratio)
+        return float(self.config.mask_ratio)
+
+    @property
+    def needs_video_features(self) -> bool:
+        temporal_mode = str(self.config.temporal_mode).lower()
+        return (
+            self._current_lambda_self_flow > 0.0
+            or (temporal_mode in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
+            or (temporal_mode in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
+            or self.config.similarity_cutoff is not None
+        )
 
     @property
     def student_hidden_state_layer(self) -> int:
@@ -482,7 +509,7 @@ class SelfFlowModule:
 
         logger.info(
             "Self-Flow ready: student_block=%d teacher_block=%d student_ratio=%s teacher_ratio=%s "
-            "mask_ratio=%.3f frame_level_mask=%s teacher_mode=%s lambda=%.4f "
+            "mask_ratio=%.3f image_mask_ratio=%s audio_mask_ratio=%.3f frame_level_mask=%s teacher_mode=%s lambda=%.4f "
             "temporal_mode=%s lambda_temporal=%.4f lambda_delta=%.4f "
             "temporal_tau=%.3f num_neighbors=%d temporal_granularity=%s patch_spatial_radius=%d "
             "patch_match_mode=%s patch_match_temperature=%.4f delta_num_steps=%d motion_weighting=%s "
@@ -497,6 +524,8 @@ class SelfFlowModule:
             self.config.student_block_ratio,
             self.config.teacher_block_ratio,
             self.config.mask_ratio,
+            self.config.image_mask_ratio,
+            self.effective_audio_mask_ratio,
             str(self.config.frame_level_mask).lower(),
             self.config.teacher_mode,
             self.config.lambda_self_flow,
@@ -529,15 +558,15 @@ class SelfFlowModule:
         )
 
     @staticmethod
-    def _extract_native_hidden_states(output: Any) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _extract_native_hidden_states(output: Any) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not isinstance(output, (tuple, list)) or len(output) != 4:
             raise RuntimeError(
                 "Self-Flow requested native hidden states but the LTX wrapper did not return "
                 "(video_pred, audio_pred, video_hidden, audio_hidden)"
             )
         video_hidden, audio_hidden = output[2], output[3]
-        if not isinstance(video_hidden, torch.Tensor):
-            raise RuntimeError("Self-Flow video hidden state was not returned by the transformer")
+        if video_hidden is not None and not isinstance(video_hidden, torch.Tensor):
+            raise RuntimeError("Self-Flow video hidden state has an invalid type")
         if audio_hidden is not None and not isinstance(audio_hidden, torch.Tensor):
             raise RuntimeError("Self-Flow audio hidden state has an invalid type")
         return video_hidden, audio_hidden
@@ -662,6 +691,7 @@ class SelfFlowModule:
             self._last_ema_drift = drift_sum / drift_count
 
     def _swap_in_teacher(self, network: nn.Module) -> Dict[str, torch.Tensor]:
+        """Temporarily rebind tracked parameters to EMA storage without cloning student weights."""
         backups: Dict[str, torch.Tensor] = {}
         if not self._shadow_params:
             return backups
@@ -671,11 +701,11 @@ class SelfFlowModule:
                 if shadow_name is None:
                     continue
                 shadow = self._shadow_params[shadow_name]
-                backups[name] = param.detach().clone()
+                backups[name] = param.data
                 if shadow.device != param.device or shadow.dtype != param.dtype:
-                    param.copy_(shadow.to(device=param.device, dtype=param.dtype))
+                    param.data = shadow.to(device=param.device, dtype=param.dtype)
                 else:
-                    param.copy_(shadow)
+                    param.data = shadow
         return backups
 
     @staticmethod
@@ -687,7 +717,34 @@ class SelfFlowModule:
                 backup = backups.get(name)
                 if backup is None:
                     continue
-                param.copy_(backup.to(device=param.device, dtype=param.dtype))
+                param.data = backup
+
+    def apply_teacher_weights(self, network: nn.Module) -> Dict[str, torch.Tensor]:
+        """Activate the EMA teacher for evaluation, sampling, or adapter export."""
+        return self._swap_in_teacher(network)
+
+    def restore_student_weights(self, network: nn.Module, backups: Dict[str, torch.Tensor]) -> None:
+        """Restore weights returned by :meth:`apply_teacher_weights`."""
+        self._restore_from_backups(network, backups)
+
+    @staticmethod
+    def is_auxiliary_state_name(name: str) -> bool:
+        return name.startswith("_self_flow_projectors.") or "._self_flow_projectors." in name
+
+    def build_teacher_model_state_dict(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """Build a deployable model state dict with EMA parameters and ordinary model buffers."""
+        if not self._shadow_params:
+            raise RuntimeError("Self-Flow has no EMA teacher weights to export")
+        state: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if self.is_auxiliary_state_name(name):
+                continue
+            shadow_name = self._resolve_shadow_name(name, self._shadow_params)
+            state[name] = self._shadow_params[shadow_name] if shadow_name is not None else param.data
+        for name, buffer in model.named_buffers():
+            if not self.is_auxiliary_state_name(name):
+                state[name] = buffer
+        return state
 
     def mark_student_forward(self) -> None:
         self._student_features = None
@@ -701,7 +758,9 @@ class SelfFlowModule:
         video_hidden, audio_hidden = self._extract_native_hidden_states(output)
         self._student_features = video_hidden
         self._student_audio_features = audio_hidden
-        if self.audio_projector is not None and audio_hidden is None:
+        if self.needs_video_features and video_hidden is None:
+            raise RuntimeError("Self-Flow video loss is active but the student video hidden state is missing")
+        if self._step_uses_audio and self.audio_projector is not None and audio_hidden is None:
             raise RuntimeError("Self-Flow audio loss is active but the student audio hidden state is missing")
         return output[0], output[1]
 
@@ -714,6 +773,7 @@ class SelfFlowModule:
         self._last_audio_cosine = None
         self._last_frame_cosine = None
         self._last_delta_cosine = None
+        self._step_uses_audio = False
         # Note: _last_ema_drift is NOT cleared here — it's updated in update_teacher
         # which runs after optimizer.step, not during compute_loss
 
@@ -747,12 +807,26 @@ class SelfFlowModule:
         text_mask: Optional[torch.Tensor],
         frame_rate: int | float,
         transformer_options: Dict[str, Any],
+        extra_forward_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         if self.projector is None or not self.should_capture:
             return
         self._teacher_features = None
         self._teacher_audio_features = None
+        self._step_uses_audio = audio_timestep is not None and self._current_lambda_audio > 0.0
         prev_training = bool(getattr(transformer, "training", False))
+        teacher_forward_kwargs = {
+            "timestep": teacher_timesteps,
+            "audio_timestep": audio_timestep,
+            "context": text_embeds,
+            "attention_mask": text_mask,
+            "frame_rate": frame_rate,
+            "transformer_options": transformer_options,
+            "output_hidden_states": True,
+            "hidden_state_layer": self.teacher_hidden_state_layer,
+        }
+        if extra_forward_kwargs:
+            teacher_forward_kwargs.update(extra_forward_kwargs)
 
         if str(self.config.teacher_mode).lower() == "base":
             # Teacher = frozen pretrained base: disable all adapters for this pass so each forward
@@ -769,17 +843,7 @@ class SelfFlowModule:
                 if prev_training:
                     transformer.eval()
                 with torch.no_grad(), accelerator.autocast():
-                    output = transformer(
-                        teacher_model_input,
-                        timestep=teacher_timesteps,
-                        audio_timestep=audio_timestep,
-                        context=text_embeds,
-                        attention_mask=text_mask,
-                        frame_rate=frame_rate,
-                        transformer_options=transformer_options,
-                        output_hidden_states=True,
-                        hidden_state_layer=self.teacher_hidden_state_layer,
-                    )
+                    output = transformer(teacher_model_input, **teacher_forward_kwargs)
             finally:
                 self._restore_adapters(adapter_mods, saved_states)
                 if prev_training:
@@ -793,26 +857,18 @@ class SelfFlowModule:
                 if prev_training:
                     transformer.eval()
                 with torch.no_grad(), accelerator.autocast():
-                    output = transformer(
-                        teacher_model_input,
-                        timestep=teacher_timesteps,
-                        audio_timestep=audio_timestep,
-                        context=text_embeds,
-                        attention_mask=text_mask,
-                        frame_rate=frame_rate,
-                        transformer_options=transformer_options,
-                        output_hidden_states=True,
-                        hidden_state_layer=self.teacher_hidden_state_layer,
-                    )
+                    output = transformer(teacher_model_input, **teacher_forward_kwargs)
             finally:
                 self._restore_from_backups(network, backups)
                 if prev_training:
                     transformer.train()
 
         teacher_hidden, teacher_audio_hidden = self._extract_native_hidden_states(output)
-        self._teacher_features = teacher_hidden.detach()
+        self._teacher_features = teacher_hidden.detach() if teacher_hidden is not None else None
         self._teacher_audio_features = teacher_audio_hidden.detach() if teacher_audio_hidden is not None else None
-        if self.audio_projector is not None and self._teacher_audio_features is None:
+        if self.needs_video_features and self._teacher_features is None:
+            raise RuntimeError("Self-Flow video loss is active but the teacher video hidden state is missing")
+        if self._step_uses_audio and self.audio_projector is not None and self._teacher_audio_features is None:
             raise RuntimeError("Self-Flow audio loss is active but the teacher audio hidden state is missing")
 
         if bool(self.config.offload_teacher_features):
@@ -1108,66 +1164,74 @@ class SelfFlowModule:
             raise RuntimeError("Self-Flow projector is not initialized")
         if not self.should_capture:
             return next(self.projector.parameters()).new_zeros(())
-        if self._student_features is None or self._teacher_features is None:
-            missing = []
-            if self._student_features is None:
-                missing.append("student")
-            if self._teacher_features is None:
-                missing.append("teacher")
-            raise RuntimeError(f"Self-Flow native hidden-state capture is missing: {', '.join(missing)}")
 
         student_feat = self._student_features
         teacher_feat = self._teacher_features
-        projector_param = next(self.projector.parameters())
-        if student_feat.device != projector_param.device or student_feat.dtype != projector_param.dtype:
-            student_feat = student_feat.to(device=projector_param.device, dtype=projector_param.dtype)
-        if teacher_feat.device != student_feat.device or teacher_feat.dtype != student_feat.dtype:
-            teacher_feat = teacher_feat.to(device=student_feat.device, dtype=student_feat.dtype, non_blocking=True)
-        if student_feat.shape[1] != teacher_feat.shape[1]:
-            min_tokens = min(student_feat.shape[1], teacher_feat.shape[1])
-            student_feat = student_feat[:, :min_tokens]
-            teacher_feat = teacher_feat[:, :min_tokens]
-            if token_mask is not None and token_mask.shape[1] > min_tokens:
-                token_mask = token_mask[:, :min_tokens]
+        cosine: Optional[torch.Tensor] = None
+        if self.needs_video_features and (student_feat is None or teacher_feat is None):
+            missing = []
+            if student_feat is None:
+                missing.append("student")
+            if teacher_feat is None:
+                missing.append("teacher")
+            raise RuntimeError(f"Self-Flow native hidden-state capture is missing: {', '.join(missing)}")
 
-        student_proj = self.projector(student_feat)
-        teacher_feat = teacher_feat.detach()
+        if student_feat is not None and teacher_feat is not None:
+            projector_param = next(self.projector.parameters())
+            if student_feat.device != projector_param.device or student_feat.dtype != projector_param.dtype:
+                student_feat = student_feat.to(device=projector_param.device, dtype=projector_param.dtype)
+            if teacher_feat.device != student_feat.device or teacher_feat.dtype != student_feat.dtype:
+                teacher_feat = teacher_feat.to(device=student_feat.device, dtype=student_feat.dtype, non_blocking=True)
+            if student_feat.shape[1] != teacher_feat.shape[1]:
+                min_tokens = min(student_feat.shape[1], teacher_feat.shape[1])
+                student_feat = student_feat[:, :min_tokens]
+                teacher_feat = teacher_feat[:, :min_tokens]
+                if token_mask is not None and token_mask.shape[1] > min_tokens:
+                    token_mask = token_mask[:, :min_tokens]
 
-        student_proj_norm = F.normalize(student_proj, dim=-1)
-        teacher_norm = F.normalize(teacher_feat, dim=-1)
+            student_proj = self.projector(student_feat)
+            teacher_feat = teacher_feat.detach()
 
-        # Optionally focus the rep loss on masked (higher-noise) tokens only.
-        if self.config.mask_focus_loss and token_mask is not None:
-            valid = token_mask.to(device=student_proj_norm.device)  # [B, T]
-            feat_tokens = student_proj_norm.shape[1]
-            mask_tokens = valid.shape[1]
-            if mask_tokens != feat_tokens:
-                if mask_tokens > feat_tokens:
-                    valid = valid[:, :feat_tokens]
+            student_proj_norm = F.normalize(student_proj, dim=-1)
+            teacher_norm = F.normalize(teacher_feat, dim=-1)
+
+            # Optionally focus the rep loss on masked (higher-noise) tokens only.
+            if self.config.mask_focus_loss and token_mask is not None:
+                valid = token_mask.to(device=student_proj_norm.device)  # [B, T]
+                feat_tokens = student_proj_norm.shape[1]
+                mask_tokens = valid.shape[1]
+                if mask_tokens != feat_tokens:
+                    if mask_tokens > feat_tokens:
+                        valid = valid[:, :feat_tokens]
+                    else:
+                        # mask shorter than features — only score tokens that are masked
+                        student_proj_norm = student_proj_norm[:, :mask_tokens]
+                        teacher_norm = teacher_norm[:, :mask_tokens]
+                if valid.any():
+                    cosine = F.cosine_similarity(student_proj_norm[valid], teacher_norm[valid], dim=-1).mean()
                 else:
-                    # mask shorter than features — only score tokens that are masked
-                    student_proj_norm = student_proj_norm[:, :mask_tokens]
-                    teacher_norm = teacher_norm[:, :mask_tokens]
-            if valid.any():
-                cosine = F.cosine_similarity(student_proj_norm[valid], teacher_norm[valid], dim=-1).mean()
+                    cosine = F.cosine_similarity(student_proj_norm, teacher_norm, dim=-1).mean()
             else:
                 cosine = F.cosine_similarity(student_proj_norm, teacher_norm, dim=-1).mean()
-        else:
-            cosine = F.cosine_similarity(student_proj_norm, teacher_norm, dim=-1).mean()
 
-        self._last_cosine = float(cosine.detach().item())
-        if not self.has_active_loss:
-            self._scheduler.update_similarity(self._last_cosine)
-            return cosine.new_zeros(())
+        self._last_cosine = float(cosine.detach().item()) if cosine is not None else None
+        step_has_active_loss = self.needs_video_features or (self._step_uses_audio and self._current_lambda_audio > 0.0)
+        if not step_has_active_loss:
+            similarity = self._last_cosine if self._last_cosine is not None else self._last_audio_cosine
+            if similarity is not None:
+                self._scheduler.update_similarity(similarity)
+            return next(self.projector.parameters()).new_zeros(())
 
-        loss = cosine.new_zeros(())
+        loss = next(self.projector.parameters()).new_zeros(())
         applied_terms = 0
         if self._current_lambda_self_flow > 0.0:
+            if cosine is None:
+                raise RuntimeError("Self-Flow video loss is active but video cosine similarity is unavailable")
             loss = loss + self._loss_from_cosine(cosine) * self._current_lambda_self_flow
             applied_terms += 1
 
         # Audio representation alignment loss
-        if self._current_lambda_audio > 0.0:
+        if self._step_uses_audio and self._current_lambda_audio > 0.0:
             if self.audio_projector is None:
                 raise RuntimeError("Self-Flow audio loss is active but the audio projector is unavailable")
             if self._student_audio_features is None or self._teacher_audio_features is None:
@@ -1201,19 +1265,27 @@ class SelfFlowModule:
         # Temporal losses operate in the original feature space (not projected) so that
         # frame-to-frame deltas reflect the transformer's actual spatiotemporal representations
         # rather than the learned projection.
-        temporal_student = self._reshape_temporal_features(student_feat, num_latent_frames)
-        temporal_teacher = self._reshape_temporal_features(teacher_feat, num_latent_frames)
-        temporal_student_grid = self._reshape_temporal_grid(
-            student_feat,
-            num_latent_frames=num_latent_frames,
-            latent_height=latent_height,
-            latent_width=latent_width,
+        temporal_student = self._reshape_temporal_features(student_feat, num_latent_frames) if student_feat is not None else None
+        temporal_teacher = self._reshape_temporal_features(teacher_feat, num_latent_frames) if teacher_feat is not None else None
+        temporal_student_grid = (
+            self._reshape_temporal_grid(
+                student_feat,
+                num_latent_frames=num_latent_frames,
+                latent_height=latent_height,
+                latent_width=latent_width,
+            )
+            if student_feat is not None
+            else None
         )
-        temporal_teacher_grid = self._reshape_temporal_grid(
-            teacher_feat,
-            num_latent_frames=num_latent_frames,
-            latent_height=latent_height,
-            latent_width=latent_width,
+        temporal_teacher_grid = (
+            self._reshape_temporal_grid(
+                teacher_feat,
+                num_latent_frames=num_latent_frames,
+                latent_height=latent_height,
+                latent_width=latent_width,
+            )
+            if teacher_feat is not None
+            else None
         )
         temporal_motion_weights = None
         temporal_motion_grid_weights = None
@@ -1327,7 +1399,9 @@ class SelfFlowModule:
             if loss_abs > max_loss:
                 loss = loss * (max_loss / loss_abs)
 
-        self._scheduler.update_similarity(self._last_cosine)
+        similarity = self._last_cosine if self._last_cosine is not None else self._last_audio_cosine
+        if similarity is not None:
+            self._scheduler.update_similarity(similarity)
         return loss
 
     def compute_loss(self, **_kwargs) -> Optional[torch.Tensor]:
@@ -1400,7 +1474,7 @@ class SelfFlowModule:
                 "Self-Flow: this checkpoint carries an EMA teacher (trained with teacher_mode=ema/"
                 "partial_ema), but the current run uses teacher_mode=base. Resuming as base "
                 "would silently change the training objective and discard the EMA teacher. Pass "
-                "teacher_mode=ema (or partial_ema) to continue the paper-faithful run, or delete "
+                "teacher_mode=ema (or partial_ema) to continue the canonical run, or delete "
                 "self_flow_teacher_ema.safetensors from the resume directory to intentionally switch to base."
             )
         step_tensor = sd.get("__self_flow_step_counter__")

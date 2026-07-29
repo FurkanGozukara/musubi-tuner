@@ -5166,6 +5166,9 @@ def main() -> None:
     def _write_checkpoint(state_dict, ckpt_file, metadata_to_save) -> None:
         mem_eff_save_file(state_dict, ckpt_file, metadata_to_save, atomic=True)
 
+    def _is_self_flow_auxiliary_state(name: str) -> bool:
+        return name.startswith("_self_flow_projectors.") or "._self_flow_projectors." in name
+
     def _async_write_complete(ckpt_file: str, seconds: float) -> None:
         accelerator.print(f"asynchronous checkpoint write complete: {ckpt_file} ({seconds:.2f}s)")
 
@@ -5232,8 +5235,12 @@ def main() -> None:
                 return
         else:
             # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
-            state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
-            state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
+            state_dict = {
+                name: param.data for name, param in save_model_ref.named_parameters() if not _is_self_flow_auxiliary_state(name)
+            }
+            state_dict.update(
+                {name: buf for name, buf in save_model_ref.named_buffers() if not _is_self_flow_auxiliary_state(name)}
+            )
         if text_encoder is not None:
             unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
             text_encoder_ref = getattr(unwrapped_text_encoder, "_orig_mod", None) or unwrapped_text_encoder
@@ -5349,12 +5356,64 @@ def main() -> None:
             except Exception as exc:
                 logger.warning("Failed to save remote LTX-2 stage checkpoint: %s", exc)
 
+        save_self_flow_ema_model(ckpt_name, steps, epoch_no, metadata_to_save)
+
+    def save_self_flow_ema_model(ckpt_name: str, steps: int, epoch_no: int, base_metadata: dict) -> None:
+        """Save the Self-Flow EMA teacher as a directly loadable transformer checkpoint."""
+        module = getattr(trainer, "_self_flow", None)
+        if module is None or not module.has_ema_teacher or not accelerator.is_main_process:
+            return
+
+        # The student snapshot may still be writing in the background.  Avoid two
+        # concurrent full-model writers (and their host-memory peaks) before
+        # materializing the equally large Self-Flow evaluation model.
+        async_checkpoint_saver.wait()
+        teacher_ckpt_name = ckpt_name.replace(".safetensors", "_self_flow_ema.safetensors")
+        teacher_ckpt_file = os.path.join(args.output_dir, teacher_ckpt_name)
+        accelerator.print(f"\nsaving Self-Flow EMA teacher checkpoint: {teacher_ckpt_file}")
+
+        unwrapped = accelerator.unwrap_model(transformer)
+        save_model_ref = getattr(unwrapped, "_orig_mod", None) or unwrapped
+        teacher_state_dict = module.build_teacher_model_state_dict(save_model_ref)
+        if text_encoder is not None:
+            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            text_encoder_ref = getattr(unwrapped_text_encoder, "_orig_mod", None) or unwrapped_text_encoder
+            for name, param in text_encoder_ref.named_parameters():
+                teacher_state_dict[f"text_encoder.{name}"] = param.data
+            for name, buffer in text_encoder_ref.named_buffers():
+                teacher_state_dict[f"text_encoder.{name}"] = buffer
+
+        teacher_state_dict, extra_meta = _prepare_state_dict_for_save(teacher_state_dict, args)
+        teacher_metadata = dict(base_metadata)
+        teacher_metadata.update(
+            {
+                "ss_is_ema": "True",
+                "ss_self_flow_checkpoint_role": "teacher_ema",
+                "ss_self_flow_teacher_mode": str(module.config.teacher_mode),
+                "ss_self_flow_teacher_momentum": str(module.config.teacher_momentum),
+                "ss_steps": str(steps),
+                "ss_epoch": str(epoch_no),
+            }
+        )
+        if extra_meta:
+            teacher_metadata.update(extra_meta)
+
+        if args.mem_eff_save:
+            mem_eff_save_file(teacher_state_dict, teacher_ckpt_file, teacher_metadata)
+        else:
+            save_file(teacher_state_dict, teacher_ckpt_file, teacher_metadata)
+
     def remove_model(old_ckpt_name: str) -> None:
-        old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-        if os.path.exists(old_ckpt_file):
-            accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
-            os.remove(old_ckpt_file)
-        train_utils.remove_checkpoint_metadata(old_ckpt_file)
+        old_ckpt_files = [os.path.join(args.output_dir, old_ckpt_name)]
+        if not old_ckpt_name.endswith("_self_flow_ema.safetensors"):
+            old_ckpt_files.append(
+                os.path.join(args.output_dir, old_ckpt_name.replace(".safetensors", "_self_flow_ema.safetensors"))
+            )
+        for old_ckpt_file in old_ckpt_files:
+            if os.path.exists(old_ckpt_file):
+                accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
+                os.remove(old_ckpt_file)
+            train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
     def save_ema_model(ckpt_name: str, steps: int, epoch_no: int) -> None:
         """Save EMA weights as a separate checkpoint."""
@@ -5370,6 +5429,8 @@ def main() -> None:
         save_model_ref = getattr(unwrapped, "_orig_mod", None) or unwrapped
         ema_state_dict = {}
         for name, param in save_model_ref.named_parameters():
+            if _is_self_flow_auxiliary_state(name):
+                continue
             if name in ema_model.shadow_params:
                 ema_state_dict[name] = ema_model.shadow_params[name].cpu()
             else:
@@ -5378,7 +5439,8 @@ def main() -> None:
 
         # Add non-parameter state (buffers)
         for name, buf in save_model_ref.named_buffers():
-            ema_state_dict[name] = buf.cpu()
+            if not _is_self_flow_auxiliary_state(name):
+                ema_state_dict[name] = buf.cpu()
 
         ema_state_dict, extra_meta = _prepare_state_dict_for_save(ema_state_dict, args)
 
@@ -5424,6 +5486,17 @@ def main() -> None:
         teacher_sd = module.teacher_state_dict()
         if teacher_sd:
             save_file(teacher_sd, teacher_file)
+
+    def apply_self_flow_weights_for_eval() -> dict[str, torch.Tensor] | None:
+        module = getattr(trainer, "_self_flow", None)
+        if module is None or not module.has_ema_teacher:
+            return None
+        return module.apply_teacher_weights(accelerator.unwrap_model(transformer))
+
+    def restore_self_flow_weights_for_eval(original_params: dict[str, torch.Tensor] | None) -> None:
+        module = getattr(trainer, "_self_flow", None)
+        if module is not None and original_params is not None:
+            module.restore_student_weights(accelerator.unwrap_model(transformer), original_params)
 
     def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
         if not train_utils.dashboard_stop_requested():
@@ -5483,6 +5556,7 @@ def main() -> None:
         original_params = None
         if ema_model is not None:
             original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+        self_flow_original_params = apply_self_flow_weights_for_eval()
 
         val_losses = []
         val_video_losses = []
@@ -5827,7 +5901,9 @@ def main() -> None:
 
                 num_batches += 1
 
-        # Restore original weights if EMA was applied
+        # Restore original weights before any optional follow-up validation sweep.
+        restore_self_flow_weights_for_eval(self_flow_original_params)
+        self_flow_original_params = None
         if original_params is not None:
             ema_model.restore(accelerator.unwrap_model(transformer), original_params)
             original_params = None
@@ -5873,6 +5949,7 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            self_flow_original_params = apply_self_flow_weights_for_eval()
             with torch.no_grad():
                 for fixed_t in mt_list:
                     mt_losses: list[float] = []
@@ -5993,6 +6070,8 @@ def main() -> None:
                         val_metrics[f"val/{t_key}/video_loss"] = sum(mt_video_losses) / len(mt_video_losses)
                     if mt_audio_losses:
                         val_metrics[f"val/{t_key}/audio_loss"] = sum(mt_audio_losses) / len(mt_audio_losses)
+            restore_self_flow_weights_for_eval(self_flow_original_params)
+            self_flow_original_params = None
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
@@ -6003,6 +6082,7 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            self_flow_original_params = apply_self_flow_weights_for_eval()
             with torch.no_grad():
                 for cat_name, cat_loader in extra_val_dataloaders.items():
                     c_losses: list[float] = []
@@ -6119,6 +6199,8 @@ def main() -> None:
                         val_metrics[f"val/{cat_name}/video_loss"] = sum(c_video) / len(c_video)
                     if c_audio:
                         val_metrics[f"val/{cat_name}/audio_loss"] = sum(c_audio) / len(c_audio)
+            restore_self_flow_weights_for_eval(self_flow_original_params)
+            self_flow_original_params = None
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
@@ -6164,6 +6246,7 @@ def main() -> None:
             cuda_rng_state = None
 
         try:
+            self_flow_original_params = apply_self_flow_weights_for_eval()
             with offload_optimizer_state_during_validation(
                 optimizer,
                 accelerator,
@@ -6197,6 +6280,8 @@ def main() -> None:
             except Exception:
                 pass
         finally:
+            if "self_flow_original_params" in locals():
+                restore_self_flow_weights_for_eval(self_flow_original_params)
             try:
                 torch.set_rng_state(cpu_rng_state)
             except Exception:

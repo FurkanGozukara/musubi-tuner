@@ -1325,7 +1325,7 @@ This can be combined with the audio-aware sampler, `--audio_loss_balance_mode em
 
 Logged metrics include `modality_freeze/state`, `modality_freeze/video_loss_ema`, and `modality_freeze/audio_loss_ema`.
 
-**9. Use Self-Flow when representation alignment is part of the run.** `--self_flow` can add video and audio representation-alignment terms in AV mode. Keep its detailed setup in the [Self-Flow](#self-flow-self-supervised-flow-matching) section, and only enable audio alignment when you intentionally want that extra objective:
+**9. Use Self-Flow when representation alignment is part of the run.** `--self_flow` can add video or audio representation alignment in video, AV, and audio-only modes. Keep its detailed setup in the [Self-Flow](#self-flow-self-supervised-flow-matching) section, and only enable audio alignment when you intentionally want that objective:
 ```bash
 --self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=ema
 ```
@@ -2988,15 +2988,20 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 ### Self-Flow (Self-Supervised Flow Matching)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The paper's Self-Flow ([arXiv 2603.06507](https://arxiv.org/abs/2603.06507), Eq. 6) is EMA self-distillation, so `teacher_mode=ema` is the default and canonical implementation. `partial_ema` is a lower-memory approximation that tracks only the selected teacher block. `teacher_mode=base` remains available for adapter training as a related but **non-paper variant**: it disables the adapter for the teacher pass and acts as a frozen-base consistency regularizer. The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is an LTX-specific addition not covered by the paper attribution.
+**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. `teacher_mode=ema` is the default and canonical implementation. `partial_ema` is a lower-memory approximation that tracks only the selected teacher block. `teacher_mode=base` remains available for adapter training as a related frozen-base consistency variant: it disables the adapter for the teacher pass. The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is LTX-specific.
 
-Enable with `--self_flow`. Supported in `--ltx2_mode video` and `--ltx2_mode av`. In AV mode the video alignment runs by default; an optional audio alignment branch is enabled with `lambda_audio > 0` (see the audio notes below). All parameters are passed via `--self_flow_args` as `key=value` pairs:
+Enable with `--self_flow`. Supported in `--ltx2_mode video`, `--ltx2_mode av`, and `--ltx2_mode audio`. In AV mode the video alignment runs by default and audio alignment is enabled with `lambda_audio > 0`. Audio-only mode requires `lambda_audio > 0` and the video/temporal lambdas set to zero. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
 ```bash
 # Canonical EMA teacher, token-level alignment only
 accelerate launch ... ltx2_train_network.py ^
   --self_flow ^
-  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 dual_timestep=true
+  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.8 mask_ratio=0.1 teacher_momentum=0.9999 dual_timestep=true
+
+# Canonical audio objective (run with --ltx2_mode audio)
+accelerate launch ... ltx2_train_network.py ^
+  --self_flow ^
+  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0 lambda_audio=0.8 lambda_temporal=0 lambda_delta=0 audio_mask_ratio=0.5 teacher_momentum=0.9999
 
 # With temporal consistency (hybrid = frame alignment + motion delta)
 accelerate launch ... ltx2_train_network.py ^
@@ -3024,10 +3029,13 @@ accelerate launch ... ltx2_train_network.py ^
 | `teacher_block_ratio` | `None` | Ratio-based teacher layer selection. Resolves to `ceil(ratio * depth)`. Takes priority over `teacher_block_idx`. |
 | `student_block_stochastic_range` | `0` | Randomly vary the student capture block ±N blocks each step. `0` = fixed block. Adds regularization diversity; note a single projector is shared across all depth variants. |
 | `lambda_self_flow` | `0.1` | Loss weight for the video token-level representation alignment term |
-| `lambda_audio` | `0.0` | Loss weight for audio representation alignment. When `> 0`, captures audio hidden states from the same student/teacher blocks and aligns them via a separate audio projector MLP. Requires `--ltx2_mode av`. `0` = disabled (backward compatible). |
+| `lambda_audio` | `0.0` | Loss weight for audio representation alignment. When `> 0`, captures audio hidden states from the same student/teacher blocks and aligns them via a separate audio projector MLP. Supported in `--ltx2_mode av` and `--ltx2_mode audio`. `0` = disabled. |
 | `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
+| `image_mask_ratio` | `None` | Optional mask ratio used automatically for single-frame image batches. `None` inherits `mask_ratio`; the canonical value is `0.25`. |
+| `audio_mask_ratio` | `None` | Independent audio-token mask ratio. `None` inherits `mask_ratio`; the canonical value is `0.5`. |
 | `frame_level_mask` | `false` | When `true`, mask whole latent frames instead of individual tokens. More semantically coherent masking for video. |
 | `mask_focus_loss` | `false` | When `true`, compute the representation loss only on masked (higher-noise) tokens. Default: loss over all tokens. |
+| `loss_type` | `one_minus_cosine` | Representation objective. The canonical value is `one_minus_cosine`; `negative_cosine` has the same gradient but shifts the reported and capped scalar loss by a constant. |
 | `max_loss` | `0.0` | Cap Self-Flow loss magnitude by rescaling if total loss exceeds this value. `0` = disabled. Useful to prevent Self-Flow from dominating the main task loss early in training. |
 | `temporal_mode` | `off` | Temporal extension mode: `off`, `frame`, `delta`, or `hybrid` |
 | `lambda_temporal` | `0.0` | Loss weight for frame-level temporal neighbor alignment |
@@ -3064,22 +3072,24 @@ accelerate launch ... ltx2_train_network.py ^
 #### Notes
 <sub>[↑ contents](#table-of-contents)</sub>
 
-- Supported modes: `--ltx2_mode video`, `--ltx2_mode av`. In AV mode, video alignment is always active when `lambda_self_flow > 0`; audio alignment is active when `lambda_audio > 0`.
-- Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
+- Supported modes: `--ltx2_mode video`, `--ltx2_mode av`, and `--ltx2_mode audio`. In AV mode, each minibatch applies only the alignment terms for modalities present in that batch.
+- Image-like training is supported through single-frame samples in `--ltx2_mode video`; `image_mask_ratio` lets mixed image/video runs use a distinct image mask without changing video masking. Keep `temporal_mode=off` for the canonical objective.
+- Canonical hyperparameters are `lambda_self_flow`/gamma `0.8`, `teacher_momentum=0.9999`, and mask ratios `0.25` (image), `0.10` (video), and `0.50` (audio). They are shown explicitly above rather than imposed on existing configurations.
 - Cost: one extra teacher forward pass per active train step. `teacher_mode=base` reuses the existing model with the adapter disabled instead of keeping a teacher-weight copy.
-- Teacher modes: `ema` is canonical Self-Flow; `partial_ema` is a memory-saving approximation; `base` gives a pretrained-vs-finetuned gap but is **not** the paper's method.
+- Teacher modes: `ema` is canonical Self-Flow; `partial_ema` is a memory-saving approximation; `base` gives a pretrained-vs-finetuned consistency objective.
 - Feature capture: the LTX transformer returns the requested video and audio hidden states directly. Self-Flow no longer depends on forward hooks, including under checkpointing.
-- Temporal extension (LTX-specific, **not** part of arXiv 2603.06507): when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
+- Temporal extension (LTX-specific): when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
 - Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
 - Local patch matching: when `temporal_granularity=patch` and `patch_spatial_radius > 0`, each student patch can align to the best teacher patch inside a local spatial window, which is more tolerant to small motion and camera drift than strict same-patch matching.
 - Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.
 - Multi-step motion: `delta_num_steps > 1` extends the delta loss beyond adjacent frames using exponentially decayed step weights.
 - Motion-aware weighting: `motion_weighting=teacher_delta` upweights temporally active teacher regions, focusing the temporal loss on moving content.
 - Scheduling: warmup, constant/linear/cosine/polynomial decay, end weight, hard cutoff, and similarity-based cutoff apply to all Self-Flow lambdas uniformly.
-- AV audio: when `lambda_audio > 0`, AV mode builds a separate dual-timestep student audio view and a cleaner teacher audio view, matching the video Self-Flow teacher/student asymmetry.
+- Audio: when `lambda_audio > 0`, AV and audio-only modes build a separate dual-timestep student audio view and a homogeneous cleaner teacher view from the same clean latent and noise. Audio-only `t` and `s` use the same configured training distribution.
 - Validation: the primary validation loss uses the normal homogeneous noising path. `val_self_flow_loss`, when logged, is a separate diagnostic and is not added to `val_loss`.
 - State files (Accelerate `*-state` folder): `self_flow_projector.safetensors` and `self_flow_teacher_ema.safetensors`. Projectors are also registered on the trainable network so distributed wrapping and gradient synchronization include them.
 - Resume: both state files are required and loaded automatically. Missing or incompatible Self-Flow state raises an error instead of reinitializing part of the objective.
+- Evaluation/export: sample previews and validation use the Self-Flow EMA copy. Every student checkpoint also gets a normal loadable `*_self_flow_ema.safetensors` companion (and the usual `.comfy.safetensors` conversion for adapters). Projectors remain resume-only auxiliary state and are not included in deployable full-transformer checkpoints.
 - Invalid or unsupported combinations fail during setup. Missing captures, missing audio features, non-finite losses, and failed temporal reshapes fail at the affected step instead of silently disabling the objective.
 - Logged metrics include `loss/self_flow`, cosine terms, scheduled lambdas, `self_flow/schedule_scale`, `self_flow/cutoff_active`, `self_flow/similarity_ema`, masking/timestep statistics, and the isolated `val_self_flow_loss` diagnostic.
 
