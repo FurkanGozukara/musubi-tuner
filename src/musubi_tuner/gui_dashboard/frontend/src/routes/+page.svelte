@@ -993,8 +993,7 @@
 
 		// ── Preservation / DOP ──
 		let preservationOverhead = 0;
-		if (t.blank_preservation) preservationOverhead += activationTotal * 0.35;
-		if (t.dop) preservationOverhead += activationTotal * 0.35;
+		if (t.blank_preservation || t.dop) preservationOverhead += activationTotal * 0.35;
 		if (t.audio_dop) preservationOverhead += activationTotal * 0.35;
 		if (t.prior_divergence) preservationOverhead += activationTotal * 0.15;
 

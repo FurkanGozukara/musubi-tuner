@@ -2780,11 +2780,49 @@ Optional techniques that constrain how the LoRA modifies the base model. All are
 --blank_preservation --blank_preservation_args multiplier=1.0
 ```
 
-**Differential Output Preservation (DOP)** — Prevents the LoRA from altering class-prompt output, scoping the LoRA effect to the trigger word only:
+**Differential Output Preservation (DOP)** — Constrains the LoRA to reproduce the frozen model on trigger-free conditioning.
+
+Fixed mode preserves one or more class prompts:
 ```bash
 --dop --dop_args class=woman multiplier=1.0
+--dop --dop_args "class=woman|person" "bank=woman outdoors;portrait of a person"
 ```
-The `class` parameter should be a general description without your trigger word (e.g., `woman`, `cat`, `landscape`).
+Use `|` for rotating class variants and `;` for additional exact prompts.
+
+Caption-replacement mode preserves the scene and action described by every training caption while removing its trigger:
+```bash
+--dop --use_precached_preservation ^
+  --dop_args mode=caption_replace trigger=sks class=woman loss=relative_huber
+```
+For a caption such as `sks woman walking through a rainy city`, the preservation condition is `woman walking through a rainy city`. Multi-concept mappings use `replace`:
+```bash
+--dop_args mode=caption_replace "replace=sks=>woman|person;sksdog=>dog"
+```
+Caption replacement requires a matching preservation cache. Fixed mode can encode live at startup or use the same cache path.
+
+Important DOP values:
+
+| Value | Default | Effect |
+|-------|---------|--------|
+| `mode` | `fixed` | `fixed` or per-caption `caption_replace` |
+| `loss` | `mse` | `mse`, `relative_mse`, or spike-resistant `relative_huber` |
+| `huber_delta`, `relative_eps` | `1.0`, `1e-6` | Robust-loss transition and denominator floor |
+| `temporal_weight` | `0` | Preserves frame-to-frame output deltas |
+| `inside_weight`, `outside_weight` | `1`, `1` | Weights DOP inside/outside the dataset video loss mask |
+| `timestep_bins` | `0` | Cycles through deterministic sigma strata; zero reuses training timesteps |
+| `timestep_min`, `timestep_max` | `0`, `1` | Sigma range used by timestep strata |
+| `timestep_weight` | `none` | `none`, `snr`, `inverse_snr`, or `mid` |
+| `adaptive_target` | `0` | Relative-drift target; zero keeps the fixed multiplier |
+| `adaptive_ema`, `adaptive_rate` | `0.95`, `0.1` | Drift smoothing and multiplier response rate |
+| `adaptive_min`, `adaptive_max` | `0`, `100` | Adaptive multiplier limits |
+| `adaptive_warmup` | `0` | Steps before multiplier updates |
+| `microbatch` | `0` | Preservation batch size; zero batches all conditions together |
+| `anchor_size`, `anchor_interval` | `0`, `0` | Capture exact input/teacher-output tuples and replay one every N steps |
+| `anchor_weight`, `anchor_path` | `1`, empty | Replay strength and optional persistent anchor-bank path |
+| `strict_cache` | `true` | Reject prompt-rewrite or text-encoder identity mismatches |
+
+Blank preservation and DOP share the same LoRA-OFF and LoRA-ON passes when both are enabled. Setting `microbatch` may split those passes to lower peak memory.
+Training and validation log `dop/relative_drift`, `dop/preservation_score = 1 / (1 + drift)`, the temporal component, effective multiplier, and drift EMA. Compare validation task loss with preservation score when tuning the constraint instead of minimizing either value alone.
 
 **Prior Divergence** — Encourages the LoRA to produce outputs that differ from the base model on training prompts, discouraging overly weak LoRA effects:
 ```bash
@@ -2871,7 +2909,7 @@ The default scale is `3.0` when enabled. Use `--differential_guidance_scale` to 
 | `--differential_guidance` | 0 | 0 | Default scale 3.0 when enabled; scale 1.0 = unchanged |
 
 > [!CAUTION]
-> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, TREAD, and Differential Guidance add no extra passes; they modify the existing forward/backward in-place.
+> Blank preservation and DOP together still use +2 forwards and +1 backward because their conditioning is batched. A positive DOP `anchor_interval` adds one LoRA-ON forward and backward on replay steps. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, TREAD, and Differential Guidance add no extra passes; they modify the existing forward/backward in-place.
 
 ### CREPA (Cross-frame Representation Alignment)
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -2972,7 +3010,7 @@ python ltx2_cache_dino_features.py ^
 
 Output: `*_ltx2_dino.safetensors` files alongside your latent caches, containing per-frame patch tokens `[T, N_patches, D]`. For `dinov2_vitb14` at 518px input: `N_patches=1369`, `D=768`, so each frame adds ~2MB (float16). Disk usage scales linearly with frame count.
 
-**Precaching preservation prompts:** Blank preservation and DOP require Gemma to encode their prompts at training startup. To avoid loading Gemma during training, precache the embeddings during the text encoder caching step:
+**Precaching preservation prompts:** Fixed DOP and blank preservation can avoid loading Gemma during training:
 ```bash
 python ltx2_cache_text_encoder_outputs.py --dataset_config ... --ltx2_checkpoint ... --gemma_root ... ^
   --precache_preservation_prompts --blank_preservation --dop --dop_class_prompt "woman"
@@ -2983,7 +3021,16 @@ python ltx2_train_network.py ... ^
   --blank_preservation --dop --dop_args class=woman ^
   --use_precached_preservation
 ```
-The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by default (same directory as your dataset cache). Use `--preservation_prompts_cache <path>` to override the location in either command. Prior divergence does not need precaching (it uses the training batch's own embeddings).
+Caption-replacement DOP caches every unique rewritten caption in a deduplicated shared prompt bank. The `.pt` file contains the strict index; embeddings are lazy-loaded from hashed safetensors shards in the adjacent `<cache-name>_dop_bank` directory, with a bounded in-memory LRU:
+```bash
+python ltx2_cache_text_encoder_outputs.py --dataset_config ... --ltx2_checkpoint ... --gemma_root ... ^
+  --precache_preservation_prompts --dop ^
+  --dop_args mode=caption_replace trigger=sks class=woman
+
+python ltx2_train_network.py ... --dop --use_precached_preservation ^
+  --dop_args mode=caption_replace trigger=sks class=woman loss=relative_huber
+```
+Prompt-related values (`mode`, `class`, `trigger`, `replace`, and `bank`) must match between caching and training. Loss, weighting, adaptive, microbatch, and replay values are training-only and do not affect the prompt-cache identity. Cache mismatch is an error by default. The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt`; `--preservation_prompts_cache <path>` overrides it in both commands. Prior divergence does not need precaching.
 
 ### Self-Flow (Self-Supervised Flow Matching)
 <sub>[↑ contents](#table-of-contents)</sub>

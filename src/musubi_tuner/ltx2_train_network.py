@@ -1942,7 +1942,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if not (blank or dop or prior_div or audio_dop):
             return
 
-        from musubi_tuner.preservation import PreservationConfig, PreservationHelper, parse_preservation_args
+        from musubi_tuner.preservation import (
+            PreservationConfig,
+            PreservationHelper,
+            configure_dop,
+            parse_preservation_args,
+        )
 
         # Validate audio_dop requirements
         if audio_dop:
@@ -1971,9 +1976,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             audio_dop=audio_dop,
             audio_dop_multiplier=float(audio_dop_kw.get("multiplier", 1.0)),
         )
+        if dop:
+            configure_dop(cfg, dop_kw)
 
-        # Warn about DOP without class prompt (acts identical to blank preservation)
-        if dop and not cfg.dop_class_prompt:
+        # Fixed empty-prompt DOP is equivalent to blank preservation.
+        if dop and cfg.dop_mode == "fixed" and not cfg.dop_class_prompt and not cfg.dop_prompt_bank_prompts:
             logger.warning(
                 "DOP enabled but no class prompt specified (--dop_args class=<prompt>). "
                 "This will use an empty prompt, which is identical to blank preservation."
@@ -1988,11 +1995,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # Log VRAM impact: each technique adds extra transformer forward passes per step
         extra_fwd = 0
         extra_bwd = 0
-        if blank:
-            extra_fwd += 2  # no-grad OFF + with-grad ON
-            extra_bwd += 1
-        if dop:
-            extra_fwd += 2
+        if blank or dop:
+            extra_fwd += 2  # batched no-grad OFF + with-grad ON
             extra_bwd += 1
         if prior_div:
             extra_fwd += 1  # no-grad OFF only
@@ -2000,11 +2004,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             extra_fwd += 2  # no-grad OFF + with-grad ON (non-audio steps only)
             extra_bwd += 1
         logger.info(
-            "Preservation enabled: blank=%s (x%.2f), dop=%s (class=%r, x%.2f), prior_div=%s (x%.3f), audio_dop=%s (x%.2f)",
+            "Preservation enabled: blank=%s (x%.2f), dop=%s (mode=%s, prompts=%d, loss=%s, x%.2f), "
+            "prior_div=%s (x%.3f), audio_dop=%s (x%.2f)",
             cfg.blank_preservation,
             cfg.blank_multiplier,
             cfg.dop,
-            cfg.dop_class_prompt,
+            cfg.dop_mode,
+            len(cfg.dop_class_prompts) + len(cfg.dop_prompt_bank_prompts),
+            cfg.dop_loss_type,
             cfg.dop_multiplier,
             cfg.prior_divergence,
             cfg.prior_divergence_multiplier,
@@ -2463,29 +2470,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         helper = self._preservation_helper
         cfg = helper.config
 
-        if cfg.blank_preservation:
-            val = helper.compute_preservation_backward(
-                "blank",
+        if cfg.blank_preservation or cfg.dop:
+            _combined_loss, combined_metrics = helper.compute_preservation_losses(
                 self,
                 transformer,
                 network,
                 accelerator,
                 dit_inputs,
                 network_dtype,
+                backward=True,
+                update_state=True,
             )
-            losses["loss/blank_pres"] = val
-
-        if cfg.dop:
-            val = helper.compute_preservation_backward(
-                "dop",
-                self,
-                transformer,
-                network,
-                accelerator,
-                dit_inputs,
-                network_dtype,
-            )
-            losses["loss/dop"] = val
+            losses.update(combined_metrics)
 
         if cfg.audio_dop and self._ltx_mode == "av":
             is_non_audio_batch = dit_inputs.get("audio_model_timesteps") is None
@@ -2516,72 +2512,28 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         helper = self._preservation_helper
         if helper is None:
             return None
-
-        cfg = helper.config
-        if technique == "blank":
-            embed, mask, mult = cfg.blank_embed, cfg.blank_mask, cfg.blank_multiplier
-        elif technique == "dop":
-            embed, mask, mult = cfg.dop_embed, cfg.dop_mask, cfg.dop_multiplier
-        else:
+        if technique not in {"blank", "dop"}:
             raise ValueError(f"Unknown preservation technique: {technique}")
-
-        if embed is None or mask is None:
-            return None
-
-        device = accelerator.device
-        bsz = dit_inputs["model_timesteps"].shape[0]
-        pres_embed = embed.unsqueeze(0).expand(bsz, -1, -1).to(device=device, dtype=network_dtype)
-        pres_mask = mask.unsqueeze(0).expand(bsz, -1).to(device=device)
-
-        model_input = dit_inputs["model_input"]
-        if isinstance(model_input, (list, tuple)):
-            model_input = model_input[0]
-
-        pres_inputs = {
-            "model_input": model_input,
-            "model_timesteps": dit_inputs["model_timesteps"],
-            "text_embeds": pres_embed,
-            "text_mask": pres_mask,
-            "frame_rate": dit_inputs["frame_rate"],
-            "transformer_options": dit_inputs["transformer_options"],
-        }
-
-        helper._prepare_block_swap(transformer, accelerator)
-        network.set_multiplier(0.0)
+        cfg = helper.config
+        original_blank = cfg.blank_preservation
+        original_dop = cfg.dop
         try:
-            with torch.no_grad(), accelerator.autocast():
-                prior_pred = transformer(
-                    pres_inputs["model_input"],
-                    timestep=pres_inputs["model_timesteps"],
-                    context=pres_inputs["text_embeds"],
-                    attention_mask=pres_inputs["text_mask"],
-                    frame_rate=pres_inputs["frame_rate"],
-                    transformer_options=pres_inputs["transformer_options"],
-                )
-            if isinstance(prior_pred, (list, tuple)):
-                prior_pred = prior_pred[0]
-            prior_pred = prior_pred.detach()
-        finally:
-            network.set_multiplier(1.0)
-
-        helper._prepare_block_swap(transformer, accelerator)
-        with torch.no_grad(), accelerator.autocast():
-            pres_pred = transformer(
-                pres_inputs["model_input"],
-                timestep=pres_inputs["model_timesteps"],
-                context=pres_inputs["text_embeds"],
-                attention_mask=pres_inputs["text_mask"],
-                frame_rate=pres_inputs["frame_rate"],
-                transformer_options=pres_inputs["transformer_options"],
+            cfg.blank_preservation = technique == "blank"
+            cfg.dop = technique == "dop"
+            loss, _metrics = helper.compute_preservation_losses(
+                self,
+                transformer,
+                network,
+                accelerator,
+                dit_inputs,
+                network_dtype,
+                backward=False,
+                update_state=False,
             )
-        if isinstance(pres_pred, (list, tuple)):
-            pres_pred = pres_pred[0]
-
-        pres_loss = F.mse_loss(pres_pred.float(), prior_pred.float()) * mult
-        if not torch.isfinite(pres_loss):
-            logger.warning("Validation preservation %s loss is non-finite (%.4g), skipping.", technique, pres_loss.item())
-            return None
-        return pres_loss
+            return loss
+        finally:
+            cfg.blank_preservation = original_blank
+            cfg.dop = original_dop
 
     def _compute_validation_audio_dop_loss(
         self,
@@ -2665,17 +2617,20 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             total_loss = value if total_loss is None else total_loss + value
             metrics[name] = float(value.detach().item())
 
-        if cfg.blank_preservation:
-            _accumulate(
-                "loss/blank_pres",
-                self._compute_validation_preservation_loss("blank", accelerator, transformer, network, dit_inputs, network_dtype),
+        if cfg.blank_preservation or cfg.dop:
+            combined_loss, combined_metrics = helper.compute_preservation_losses(
+                self,
+                transformer,
+                network,
+                accelerator,
+                dit_inputs,
+                network_dtype,
+                backward=False,
+                update_state=False,
             )
-
-        if cfg.dop:
-            _accumulate(
-                "loss/dop",
-                self._compute_validation_preservation_loss("dop", accelerator, transformer, network, dit_inputs, network_dtype),
-            )
+            if combined_loss is not None:
+                total_loss = combined_loss if total_loss is None else total_loss + combined_loss
+            metrics.update(combined_metrics)
 
         if cfg.audio_dop and self._ltx_mode == "av":
             is_non_audio_batch = dit_inputs.get("audio_model_timesteps") is None
@@ -5531,6 +5486,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "text_mask": text_mask,
                 "frame_rate": frame_rate,
                 "transformer_options": resolved_transformer_options,
+                "captions": _resolve_batch_captions(batch) or [""] * int(model_timesteps.shape[0]),
+                "clean_video": latents,
+                "video_noise": noise,
+                "video_loss_mask": None,
             }
             audio_forward_kwargs = {
                 "timestep": model_timesteps,
@@ -7614,6 +7573,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "text_mask": text_mask,
                 "frame_rate": frame_rate,
                 "transformer_options": resolved_transformer_options,
+                "captions": _resolve_batch_captions(batch) or [""] * int(model_timesteps.shape[0]),
+                "clean_video": latents,
+                "video_noise": noise,
+                "video_loss_mask": video_loss_mask,
             }
 
         capture_self_flow = False

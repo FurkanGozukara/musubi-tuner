@@ -633,6 +633,18 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--dop")
             if c.dop_class_prompt:
                 cmd += ["--dop_class_prompt", c.dop_class_prompt]
+            dop_cache_args: list[str] = []
+            _append_key_value_args(dop_cache_args, c.dop_args)
+            if c.dop_mode != "fixed":
+                dop_cache_args.append(f"mode={c.dop_mode}")
+            if c.dop_trigger:
+                dop_cache_args.append(f"trigger={c.dop_trigger}")
+            if c.dop_replacements:
+                dop_cache_args.append(f"replace={c.dop_replacements}")
+            if c.dop_prompt_bank:
+                dop_cache_args.append(f"bank={c.dop_prompt_bank}")
+            if dop_cache_args:
+                cmd += ["--dop_args"] + dop_cache_args
 
     if c.cache_before_connector:
         cmd.append("--cache_before_connector")
@@ -1893,6 +1905,58 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"class={t.dop_class}")
         if t.dop_multiplier != 1.0:
             args_parts.append(f"multiplier={t.dop_multiplier}")
+        if t.dop_mode != "fixed":
+            args_parts.append(f"mode={t.dop_mode}")
+        if t.dop_trigger:
+            args_parts.append(f"trigger={t.dop_trigger}")
+        if t.dop_replacements:
+            args_parts.append(f"replace={t.dop_replacements}")
+        if t.dop_prompt_bank:
+            args_parts.append(f"bank={t.dop_prompt_bank}")
+        if t.dop_loss_type != "mse":
+            args_parts.append(f"loss={t.dop_loss_type}")
+        if t.dop_huber_delta != 1.0:
+            args_parts.append(f"huber_delta={t.dop_huber_delta}")
+        if t.dop_relative_eps != 1e-6:
+            args_parts.append(f"relative_eps={t.dop_relative_eps}")
+        if t.dop_temporal_weight != 0.0:
+            args_parts.append(f"temporal_weight={t.dop_temporal_weight}")
+        if t.dop_inside_weight != 1.0:
+            args_parts.append(f"inside_weight={t.dop_inside_weight}")
+        if t.dop_outside_weight != 1.0:
+            args_parts.append(f"outside_weight={t.dop_outside_weight}")
+        if t.dop_timestep_bins != 0:
+            args_parts.append(f"timestep_bins={t.dop_timestep_bins}")
+        if t.dop_timestep_min != 0.0:
+            args_parts.append(f"timestep_min={t.dop_timestep_min}")
+        if t.dop_timestep_max != 1.0:
+            args_parts.append(f"timestep_max={t.dop_timestep_max}")
+        if t.dop_timestep_weight != "none":
+            args_parts.append(f"timestep_weight={t.dop_timestep_weight}")
+        if t.dop_adaptive_target != 0.0:
+            args_parts.append(f"adaptive_target={t.dop_adaptive_target}")
+        if t.dop_adaptive_ema != 0.95:
+            args_parts.append(f"adaptive_ema={t.dop_adaptive_ema}")
+        if t.dop_adaptive_rate != 0.1:
+            args_parts.append(f"adaptive_rate={t.dop_adaptive_rate}")
+        if t.dop_adaptive_min != 0.0:
+            args_parts.append(f"adaptive_min={t.dop_adaptive_min}")
+        if t.dop_adaptive_max != 100.0:
+            args_parts.append(f"adaptive_max={t.dop_adaptive_max}")
+        if t.dop_adaptive_warmup != 0:
+            args_parts.append(f"adaptive_warmup={t.dop_adaptive_warmup}")
+        if t.dop_microbatch != 0:
+            args_parts.append(f"microbatch={t.dop_microbatch}")
+        if t.dop_anchor_size != 0:
+            args_parts.append(f"anchor_size={t.dop_anchor_size}")
+        if t.dop_anchor_interval != 0:
+            args_parts.append(f"anchor_interval={t.dop_anchor_interval}")
+        if t.dop_anchor_weight != 1.0:
+            args_parts.append(f"anchor_weight={t.dop_anchor_weight}")
+        if t.dop_anchor_path:
+            args_parts.append(f"anchor_path={t.dop_anchor_path}")
+        if not t.dop_strict_cache:
+            args_parts.append("strict_cache=false")
         if args_parts:
             cmd += ["--dop_args"] + args_parts
     if t.prior_divergence:

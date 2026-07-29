@@ -1676,7 +1676,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--dop_args",
         type=str,
         nargs="*",
-        help="Key=value args for DOP, e.g. class=woman multiplier=1.0",
+        help=(
+            "Key=value DOP configuration. Prompt routing: mode=fixed|caption_replace, class=woman|person, "
+            "trigger=sks, replace=sks=>woman;sksdog=>dog, bank=prompt1;prompt2. Loss/control: "
+            "multiplier, loss=mse|relative_mse|relative_huber, huber_delta, relative_eps, temporal_weight, "
+            "inside_weight, outside_weight, timestep_bins/min/max/weight, adaptive_target/ema/rate/min/max/warmup, "
+            "microbatch, anchor_size/interval/weight/path, strict_cache."
+        ),
     )
     parser.add_argument(
         "--prior_divergence",
@@ -1692,8 +1698,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--use_precached_preservation",
         action="store_true",
-        help="Load preservation embeddings from precached .pt file instead of loading Gemma. "
-        "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
+        help="Load fixed or contextual preservation embeddings from a precached .pt prompt bank instead of Gemma. "
+        "Required for DOP mode=caption_replace. Run ltx2_cache_text_encoder_outputs.py with matching prompt-related "
+        "--dop_args and --precache_preservation_prompts first.",
     )
     parser.add_argument(
         "--preservation_prompts_cache",

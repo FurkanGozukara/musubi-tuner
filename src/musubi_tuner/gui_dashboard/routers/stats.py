@@ -131,10 +131,8 @@ def _estimate_training_step_time_sec(config: dict) -> float | None:
             step_time *= 1.08
         if training.get("self_flow"):
             step_time *= 1.22
-        if training.get("blank_preservation"):
+        if training.get("blank_preservation") or training.get("dop"):
             step_time *= 1.12
-        if training.get("dop"):
-            step_time *= 1.10
         if training.get("audio_dop"):
             step_time *= 1.10
         if training.get("prior_divergence"):
@@ -469,9 +467,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
 
         # ── Preservation / DOP ──
         preservation_gb = 0
-        if training.get("blank_preservation"):
-            preservation_gb += activations_gb * 0.35
-        if training.get("dop"):
+        if training.get("blank_preservation") or training.get("dop"):
             preservation_gb += activations_gb * 0.35
         if training.get("audio_dop"):
             preservation_gb += activations_gb * 0.35

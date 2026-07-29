@@ -676,6 +676,54 @@
 						<FormField fieldPath="training.dop_class" value={$projectConfig?.training?.dop_class || ''} oninput={(e) => updateTraining('dop_class', e.target.value)} placeholder="woman" tooltip="Target class prompt for output preservation" />
 						<FormField type="number" fieldPath="training.dop_multiplier" value={$projectConfig?.training?.dop_multiplier ?? 1.0} oninput={(e) => updateTraining('dop_multiplier', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for DOP (default 1.0)" />
 					</div>
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormSelect fieldPath="training.dop_mode" value={$projectConfig?.training?.dop_mode || 'fixed'} onchange={(e) => updateTraining('dop_mode', e.target.value)} options={[{value:'fixed',label:'Fixed prompt'}, {value:'caption_replace',label:'Caption replacement'}]} tooltip="Use fixed class prompts or replace trigger tokens in each training caption." />
+						<FormSelect fieldPath="training.dop_loss_type" value={$projectConfig?.training?.dop_loss_type || 'mse'} onchange={(e) => updateTraining('dop_loss_type', e.target.value)} options={[{value:'mse',label:'MSE'}, {value:'relative_mse',label:'Relative MSE'}, {value:'relative_huber',label:'Relative Huber'}]} tooltip="Relative losses normalize drift by the frozen prediction energy." />
+					</div>
+					{#if ($projectConfig?.training?.dop_mode || 'fixed') === 'caption_replace'}
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField fieldPath="training.dop_trigger" value={$projectConfig?.training?.dop_trigger || ''} oninput={(e) => updateTraining('dop_trigger', e.target.value)} placeholder="sks" tooltip="Single trigger token replaced by the class prompt." />
+						<FormField fieldPath="training.dop_replacements" value={$projectConfig?.training?.dop_replacements || ''} oninput={(e) => updateTraining('dop_replacements', e.target.value)} placeholder="sks=>woman;sksdog=>dog" tooltip="Multi-concept trigger mappings. Use class1|class2 for variants." />
+					</div>
+					{/if}
+					<div class="mt-2">
+						<FormField fieldPath="training.dop_prompt_bank" value={$projectConfig?.training?.dop_prompt_bank || ''} oninput={(e) => updateTraining('dop_prompt_bank', e.target.value)} placeholder="person;woman outdoors" tooltip="Additional preservation prompts separated by semicolons." />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_huber_delta" value={$projectConfig?.training?.dop_huber_delta ?? 1.0} oninput={(e) => updateTraining('dop_huber_delta', Number(e.target.value))} step="0.1" min={0.000001} tooltip="Huber transition point." />
+						<FormField type="number" fieldPath="training.dop_relative_eps" value={$projectConfig?.training?.dop_relative_eps ?? 0.000001} oninput={(e) => updateTraining('dop_relative_eps', Number(e.target.value))} step="0.000001" min={0.000000001} tooltip="Relative-loss denominator floor." />
+						<FormField type="number" fieldPath="training.dop_temporal_weight" value={$projectConfig?.training?.dop_temporal_weight ?? 0.0} oninput={(e) => updateTraining('dop_temporal_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Weight on frame-to-frame output-delta preservation." />
+					</div>
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_inside_weight" value={$projectConfig?.training?.dop_inside_weight ?? 1.0} oninput={(e) => updateTraining('dop_inside_weight', Number(e.target.value))} step="0.1" min={0} tooltip="DOP weight inside the dataset loss mask." />
+						<FormField type="number" fieldPath="training.dop_outside_weight" value={$projectConfig?.training?.dop_outside_weight ?? 1.0} oninput={(e) => updateTraining('dop_outside_weight', Number(e.target.value))} step="0.1" min={0} tooltip="DOP weight outside the dataset loss mask." />
+					</div>
+					<div class="grid grid-cols-4 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_timestep_bins" value={$projectConfig?.training?.dop_timestep_bins ?? 0} oninput={(e) => updateTraining('dop_timestep_bins', Number(e.target.value))} step="1" min={0} tooltip="Number of deterministic sigma strata; zero reuses training timesteps." />
+						<FormField type="number" fieldPath="training.dop_timestep_min" value={$projectConfig?.training?.dop_timestep_min ?? 0.0} oninput={(e) => updateTraining('dop_timestep_min', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Minimum DOP sigma." />
+						<FormField type="number" fieldPath="training.dop_timestep_max" value={$projectConfig?.training?.dop_timestep_max ?? 1.0} oninput={(e) => updateTraining('dop_timestep_max', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Maximum DOP sigma." />
+						<FormSelect fieldPath="training.dop_timestep_weight" value={$projectConfig?.training?.dop_timestep_weight || 'none'} onchange={(e) => updateTraining('dop_timestep_weight', e.target.value)} options={[{value:'none',label:'No weighting'}, {value:'snr',label:'SNR'}, {value:'inverse_snr',label:'Inverse SNR'}, {value:'mid',label:'Mid-sigma'}]} tooltip="Optional timestep-dependent loss weighting." />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_adaptive_target" value={$projectConfig?.training?.dop_adaptive_target ?? 0.0} oninput={(e) => updateTraining('dop_adaptive_target', Number(e.target.value))} step="0.001" min={0} tooltip="Target relative drift; zero disables adaptive strength." />
+						<FormField type="number" fieldPath="training.dop_adaptive_ema" value={$projectConfig?.training?.dop_adaptive_ema ?? 0.95} oninput={(e) => updateTraining('dop_adaptive_ema', Number(e.target.value))} step="0.01" min={0} max={0.9999} tooltip="Drift EMA decay." />
+						<FormField type="number" fieldPath="training.dop_adaptive_rate" value={$projectConfig?.training?.dop_adaptive_rate ?? 0.1} oninput={(e) => updateTraining('dop_adaptive_rate', Number(e.target.value))} step="0.01" min={0} tooltip="Adaptive multiplier response rate." />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_adaptive_min" value={$projectConfig?.training?.dop_adaptive_min ?? 0.0} oninput={(e) => updateTraining('dop_adaptive_min', Number(e.target.value))} step="0.1" min={0} tooltip="Minimum adaptive multiplier." />
+						<FormField type="number" fieldPath="training.dop_adaptive_max" value={$projectConfig?.training?.dop_adaptive_max ?? 100.0} oninput={(e) => updateTraining('dop_adaptive_max', Number(e.target.value))} step="1" min={0} tooltip="Maximum adaptive multiplier." />
+						<FormField type="number" fieldPath="training.dop_adaptive_warmup" value={$projectConfig?.training?.dop_adaptive_warmup ?? 0} oninput={(e) => updateTraining('dop_adaptive_warmup', Number(e.target.value))} step="1" min={0} tooltip="Steps before adaptive updates begin." />
+					</div>
+					<div class="grid grid-cols-4 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.dop_microbatch" value={$projectConfig?.training?.dop_microbatch ?? 0} oninput={(e) => updateTraining('dop_microbatch', Number(e.target.value))} step="1" min={0} tooltip="Preservation microbatch size; zero batches all conditions." />
+						<FormField type="number" fieldPath="training.dop_anchor_size" value={$projectConfig?.training?.dop_anchor_size ?? 0} oninput={(e) => updateTraining('dop_anchor_size', Number(e.target.value))} step="1" min={0} tooltip="Number of exact input/output tuples retained for replay." />
+						<FormField type="number" fieldPath="training.dop_anchor_interval" value={$projectConfig?.training?.dop_anchor_interval ?? 0} oninput={(e) => updateTraining('dop_anchor_interval', Number(e.target.value))} step="1" min={0} tooltip="Replay one cached teacher output every N steps." />
+						<FormField type="number" fieldPath="training.dop_anchor_weight" value={$projectConfig?.training?.dop_anchor_weight ?? 1.0} oninput={(e) => updateTraining('dop_anchor_weight', Number(e.target.value))} step="0.1" min={0} tooltip="Anchor replay loss weight." />
+					</div>
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<PathInput fieldPath="training.dop_anchor_path" value={$projectConfig?.training?.dop_anchor_path || ''} oninput={(e) => updateTraining('dop_anchor_path', e.target.value)} showFiles tooltip="Optional persistent deterministic teacher-output bank." />
+						<FormToggle fieldPath="training.dop_strict_cache" checked={$projectConfig?.training?.dop_strict_cache ?? true} onchange={(e) => updateTraining('dop_strict_cache', e.target.checked)} tooltip="Reject prompt or text-encoder cache mismatches." />
+					</div>
 					<div class="mt-2">
 						<FormField fieldPath="training.dop_args" value={$projectConfig?.training?.dop_args || ''} oninput={(e) => updateTraining('dop_args', e.target.value)} placeholder="class=person multiplier=1.0" tooltip="Additional values passed after --dop_args." />
 					</div>

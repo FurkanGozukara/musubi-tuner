@@ -13,6 +13,7 @@ import os
 import logging
 from contextlib import nullcontext
 import torch
+from safetensors.torch import save_file
 
 import musubi_tuner.cache_latents as cache_latents
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
@@ -26,6 +27,15 @@ from musubi_tuner.dataset.image_video_dataset import (
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
+from musubi_tuner.preservation import (
+    DOP_CACHE_VERSION,
+    PreservationConfig,
+    build_dop_prompt_variants,
+    build_text_encoder_identity,
+    configure_dop,
+    dop_prompt_hash,
+    parse_preservation_args,
+)
 from musubi_tuner.utils.safetensors_utils import atomic_torch_save
 
 
@@ -295,10 +305,15 @@ def _precache_preservation_prompts(
     autocast_dtype: torch.dtype | None,
     device: torch.device,
 ) -> None:
-    """Encode blank/class prompts for preservation techniques and save to disk."""
+    """Encode blank and deduplicated fixed/contextual DOP prompts."""
     blank = getattr(args, "blank_preservation", False)
     dop = getattr(args, "dop", False)
-    dop_class = getattr(args, "dop_class_prompt", "") or ""
+    dop_options = parse_preservation_args(getattr(args, "dop_args", None))
+    if "class" not in dop_options and getattr(args, "dop_class_prompt", ""):
+        dop_options["class"] = getattr(args, "dop_class_prompt")
+    dop_cfg = PreservationConfig(dop=dop)
+    if dop:
+        configure_dop(dop_cfg, dop_options)
 
     if not blank and not dop:
         logger.warning("--precache_preservation_prompts set but neither --blank_preservation nor --dop enabled, skipping.")
@@ -313,7 +328,7 @@ def _precache_preservation_prompts(
             raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
         cache_path = os.path.join(cache_dir, DEFAULT_PRESERVATION_CACHE)
 
-    payload: dict = {"version": 1, "audio_video": audio_video}
+    payload: dict = {"version": DOP_CACHE_VERSION, "audio_video": audio_video}
 
     # Always encode as video-only for preservation (even in AV mode)
     def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -334,13 +349,79 @@ def _precache_preservation_prompts(
         logger.info("Preservation cache: encoded blank prompt  embed=%s", tuple(embed.shape))
 
     if dop:
-        if not dop_class:
-            logger.warning("--dop set but no --dop_class_prompt provided, encoding empty string.")
-        embed, mask = _encode_video_only(dop_class)
-        payload["dop_embed"] = embed
-        payload["dop_mask"] = mask
-        payload["dop_class_prompt"] = dop_class
-        logger.info("Preservation cache: encoded DOP class prompt %r  embed=%s", dop_class, tuple(embed.shape))
+        unique_prompts: dict[str, str] = {}
+        caption_index: dict[str, list[str]] = {}
+        if dop_cfg.dop_mode == "fixed":
+            prompts = build_dop_prompt_variants(
+                "",
+                mode=dop_cfg.dop_mode,
+                class_prompts=dop_cfg.dop_class_prompts,
+                replacements=dop_cfg.dop_replacements,
+                prompt_bank=dop_cfg.dop_prompt_bank_prompts,
+            )
+            unique_prompts.update((dop_prompt_hash(prompt), prompt) for prompt in prompts)
+        else:
+            for dataset in datasets:
+                for batch in dataset.retrieve_text_encoder_output_cache_batches(1):
+                    for item in batch:
+                        prompts = build_dop_prompt_variants(
+                            item.caption,
+                            mode=dop_cfg.dop_mode,
+                            class_prompts=dop_cfg.dop_class_prompts,
+                            replacements=dop_cfg.dop_replacements,
+                            prompt_bank=dop_cfg.dop_prompt_bank_prompts,
+                        )
+                        prompt_hashes = [dop_prompt_hash(prompt) for prompt in prompts]
+                        unique_prompts.update((prompt_hash, prompt) for prompt_hash, prompt in zip(prompt_hashes, prompts))
+                        caption_index[dop_prompt_hash(item.caption)] = prompt_hashes
+        if not unique_prompts:
+            raise ValueError("DOP caching found no preservation prompts")
+
+        cache_base_dir = os.path.dirname(os.path.abspath(cache_path))
+        cache_stem = os.path.splitext(os.path.basename(cache_path))[0]
+        bank_dir_name = f"{cache_stem}_dop_bank"
+        bank_dir = os.path.join(cache_base_dir, bank_dir_name)
+        prompt_bank: dict[str, dict[str, object]] = {}
+        first_embed: torch.Tensor | None = None
+        first_mask: torch.Tensor | None = None
+        for prompt_hash, prompt in sorted(unique_prompts.items()):
+            embed, mask = _encode_video_only(prompt)
+            shard_dir = os.path.join(bank_dir, prompt_hash[:2])
+            os.makedirs(shard_dir, exist_ok=True)
+            shard_path = os.path.join(shard_dir, f"{prompt_hash}.safetensors")
+            shard_payload = {"embed": embed.contiguous(), "mask": mask.contiguous()}
+            if bool(getattr(args, "atomic_cache_writes", False)):
+                temp_path = shard_path + ".tmp"
+                save_file(shard_payload, temp_path, metadata={"prompt_sha256": prompt_hash})
+                os.replace(temp_path, shard_path)
+            else:
+                save_file(shard_payload, shard_path, metadata={"prompt_sha256": prompt_hash})
+            prompt_bank[prompt_hash] = {
+                "prompt_hash": prompt_hash,
+                "path": os.path.relpath(shard_path, cache_base_dir).replace("\\", "/"),
+            }
+            if first_embed is None:
+                first_embed = embed
+                first_mask = mask
+        payload["dop_prompt_bank"] = prompt_bank
+        payload["dop_caption_index"] = caption_index
+        payload["dop_prompt_config_hash"] = dop_cfg.dop_prompt_config_hash
+        payload["dop_text_encoder_identity"] = build_text_encoder_identity(args)
+        payload["dop_mode"] = dop_cfg.dop_mode
+        payload["dop_class_prompt"] = dop_cfg.dop_class_prompt
+        assert first_embed is not None and first_mask is not None
+        payload["dop_cache_dimensions"] = {
+            "embed": list(first_embed.shape),
+            "mask": list(first_mask.shape),
+        }
+        if dop_cfg.dop_mode == "fixed":
+            payload["dop_embed"] = first_embed
+            payload["dop_mask"] = first_mask
+        logger.info(
+            "Preservation cache: encoded %d unique DOP prompts (mode=%s)",
+            len(prompt_bank),
+            dop_cfg.dop_mode,
+        )
 
     if bool(getattr(args, "atomic_cache_writes", False)):
         atomic_torch_save(payload, cache_path)
@@ -698,6 +779,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="",
         help="Class prompt for DOP preservation, e.g. 'woman' (without trigger word).",
+    )
+    parser.add_argument(
+        "--dop_args",
+        type=str,
+        nargs="*",
+        help=(
+            "DOP prompt-cache configuration. Use the same prompt-related values as training, for example "
+            "mode=caption_replace trigger=sks class=woman or replace=sks=>woman;sksdog=>dog."
+        ),
     )
     parser.add_argument(
         "--preservation_prompts_cache",

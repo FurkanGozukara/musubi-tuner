@@ -580,6 +580,13 @@
 								<FormToggle fieldPath="caching.dop" checked={caching.dop ?? false} onchange={(e) => updateCaching('dop', e.target.checked)} tooltip="Differential Output Preservation" />
 								{#if caching.dop}
 									<FormField fieldPath="caching.dop_class_prompt" value={caching.dop_class_prompt || ''} oninput={(e) => updateCaching('dop_class_prompt', e.target.value)} placeholder="e.g. woman" tooltip="Class word for DOP" />
+									<FormSelect fieldPath="caching.dop_mode" value={caching.dop_mode || 'fixed'} onchange={(e) => updateCaching('dop_mode', e.target.value)} options={[{value:'fixed',label:'Fixed prompt'}, {value:'caption_replace',label:'Caption replacement'}]} tooltip="Must match the DOP mode used during training." />
+									{#if (caching.dop_mode || 'fixed') === 'caption_replace'}
+										<FormField fieldPath="caching.dop_trigger" value={caching.dop_trigger || ''} oninput={(e) => updateCaching('dop_trigger', e.target.value)} placeholder="sks" tooltip="Single trigger token replaced with the class prompt." />
+										<FormField fieldPath="caching.dop_replacements" value={caching.dop_replacements || ''} oninput={(e) => updateCaching('dop_replacements', e.target.value)} placeholder="sks=>woman;sksdog=>dog" tooltip="Multi-concept mappings; must match training." />
+									{/if}
+									<FormField fieldPath="caching.dop_prompt_bank" value={caching.dop_prompt_bank || ''} oninput={(e) => updateCaching('dop_prompt_bank', e.target.value)} placeholder="person;woman outdoors" tooltip="Additional prompts separated by semicolons." />
+									<FormField fieldPath="caching.dop_args" value={caching.dop_args || ''} oninput={(e) => updateCaching('dop_args', e.target.value)} placeholder="mode=caption_replace trigger=sks class=woman" tooltip="Additional prompt-related DOP cache values." />
 								{/if}
 							{/if}
 						</div>
