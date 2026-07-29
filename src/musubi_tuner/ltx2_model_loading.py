@@ -31,16 +31,22 @@ from musubi_tuner.modules.int8_convrot_utils import (
     write_quality_report,
 )
 from musubi_tuner.modules.int4_convrot_utils import (
+    INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX,
+    INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX,
     INT4_CONVROT_STABILIZER_L1_SUFFIX,
     INT4_CONVROT_STABILIZER_L2_SUFFIX,
     apply_int4_convrot_monkey_patch,
     best_int4_convrot_groupsize,
+    compare_int4_convrot_group_scales,
     compute_int4_convrot_stabilizer,
     parse_comfy_quant_tensor as parse_int4_comfy_quant_tensor,
     parse_int4_convrot_groupsizes,
+    parse_int4_convrot_scale_group_candidates,
     quantize_int4_convrot_weight,
+    quantize_int4_convrot_weight_grouped,
     register_int4_convrot_buffers,
     summarize_quality as summarize_int4_quality,
+    validate_int4_convrot_scale_group_size,
     write_quality_report as write_int4_quality_report,
 )
 from musubi_tuner.modules.int4_convrot_awq import (
@@ -52,6 +58,7 @@ from musubi_tuner.modules.int4_convrot_awq import (
     save_int4_convrot_awq_scales,
     summarize_int4_convrot_awq_scales,
 )
+from musubi_tuner.modules.convrot_policy import ConvRotPolicy, load_convrot_policy, resolve_int4_policy_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -693,6 +700,7 @@ def load_safetensors_dynamic_int8_convrot(
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
     key_filter: Optional[Callable[[str], bool]] = None,
+    policy: ConvRotPolicy | None = None,
 ) -> dict[str, torch.Tensor]:
     """Stream a standard checkpoint and quantize targeted Linear weights to INT8 ConvRot."""
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
@@ -704,6 +712,7 @@ def load_safetensors_dynamic_int8_convrot(
     quality_layers = []
     quantized = 0
     skipped_groupsize = 0
+    policy_kept = 0
 
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file) as f:
@@ -738,6 +747,10 @@ def load_safetensors_dynamic_int8_convrot(
                     and not any(e in mkey for e in exclude_keys)
                 )
                 group_size = best_int8_convrot_groupsize(value.shape[1], group_candidates) if is_candidate else None
+                decision = policy.resolve(mkey) if policy is not None and is_candidate else None
+                if decision is not None and not decision.quantize:
+                    is_candidate = False
+                    policy_kept += 1
                 if is_candidate and group_size is None:
                     skipped_groupsize += 1
                     is_candidate = False
@@ -766,8 +779,10 @@ def load_safetensors_dynamic_int8_convrot(
                     sd[mkey] = value
 
     logger.info(
-        "INT8 ConvRot dynamic: quantized %d Linear weights (%d skipped: no valid group size), %d tensors total",
+        "INT8 ConvRot dynamic: quantized %d Linear weights, kept %d policy-selected weights in floating point "
+        "(%d skipped: no valid group size), %d tensors total",
         quantized,
+        policy_kept,
         skipped_groupsize,
         len(sd),
     )
@@ -867,6 +882,21 @@ def load_comfy_int4_convrot_state_dict(
                     if key_filter is not None and not key_filter(weight_key):
                         continue
                     sd[key] = f.get_tensor(key).to(torch.float32)
+                    continue
+                if key.endswith(INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX):
+                    base = key[: -len(INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX)]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    ratio = f.get_tensor(key)
+                    sd[key] = ratio if ratio.dtype == torch.int16 else ratio.to(torch.float32)
+                    continue
+                if key.endswith(INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX):
+                    base = key[: -len(INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX)]
+                    weight_key = base + ".weight"
+                    if key_filter is not None and not key_filter(weight_key):
+                        continue
+                    sd[key] = f.get_tensor(key).to(torch.int32)
                     continue
                 if key.endswith(INT4_CONVROT_STABILIZER_L1_SUFFIX) or key.endswith(INT4_CONVROT_STABILIZER_L2_SUFFIX):
                     suffix = (
@@ -970,6 +1000,11 @@ def load_safetensors_dynamic_int4_convrot(
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
     key_filter: Optional[Callable[[str], bool]] = None,
+    policy: ConvRotPolicy | None = None,
+    scale_refine_steps: int = 0,
+    group_scales: int = 0,
+    group_ratio_q8: bool = False,
+    compare_group_scales: str | Iterable[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Stream a standard checkpoint and quantize targeted Linear weights to packed INT4 ConvRot.
 
@@ -981,14 +1016,23 @@ def load_safetensors_dynamic_int4_convrot(
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 
     calc_device = torch.device(calc_device)
+    group_scales = validate_int4_convrot_scale_group_size(group_scales)
+    if group_ratio_q8 and not group_scales:
+        raise ValueError("group_ratio_q8 requires group_scales")
+    comparison_candidates = parse_int4_convrot_scale_group_candidates(compare_group_scales)
+    if comparison_candidates and not quality_report:
+        raise ValueError("compare_group_scales requires quality_report")
     group_candidates = parse_int4_convrot_groupsizes(groupsizes)
     collect_quality = bool(quality_report)
     sd: dict[str, torch.Tensor] = {}
     quality_layers = []
+    group_scale_comparisons = []
+    applied_int4_parameters = []
     generated_awq_scales: dict[str, torch.Tensor] = {}
     applied_awq_scales: dict[str, torch.Tensor] = {}
     awq_applied = 0
     quantized = 0
+    policy_kept = 0
 
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file) as f:
@@ -1022,8 +1066,19 @@ def load_safetensors_dynamic_int4_convrot(
                     and any(t in mkey for t in target_keys)
                     and not any(e in mkey for e in exclude_keys)
                 )
+                decision = policy.resolve(mkey) if policy is not None and is_candidate else None
+                if decision is not None and not decision.quantize:
+                    is_candidate = False
+                    policy_kept += 1
 
                 if is_candidate:
+                    layer_parameters = resolve_int4_policy_parameters(
+                        decision,
+                        group_scales=group_scales,
+                        group_ratio_q8=group_ratio_q8,
+                        scale_refine_steps=scale_refine_steps,
+                        name=mkey,
+                    )
                     awq_scale = None
                     if awq_calibration:
                         awq_scale = compute_int4_convrot_awq_scale(value, alpha=float(awq_alpha))
@@ -1049,20 +1104,63 @@ def load_safetensors_dynamic_int4_convrot(
                             calc_device=calc_device,
                             rotate=True,
                         )
-                    q, scale, shape, quality = quantize_int4_convrot_weight(
-                        value,
-                        group_size=int(group_size),
-                        calc_device=calc_device,
-                        mse_clip=mse_clip,
-                        collect_quality=collect_quality,
-                        key=mkey,
-                        stabilizer=stabilizer,
-                    )
+                    quant_kwargs = {
+                        "group_size": int(group_size),
+                        "calc_device": calc_device,
+                        "mse_clip": mse_clip,
+                        "collect_quality": collect_quality,
+                        "key": mkey,
+                        "stabilizer": stabilizer,
+                        "scale_refine_steps": layer_parameters.scale_refine_steps,
+                    }
+                    group_scale_state = None
+                    if layer_parameters.group_scales:
+                        q, scale, shape, quality, group_scale_state = quantize_int4_convrot_weight_grouped(
+                            value,
+                            scale_group_size=layer_parameters.group_scales,
+                            ratio_q8=layer_parameters.group_ratio_q8,
+                            **quant_kwargs,
+                        )
+                    else:
+                        q, scale, shape, quality = quantize_int4_convrot_weight(value, **quant_kwargs)
+                    if quality_report:
+                        applied_int4_parameters.append(
+                            {
+                                "key": mkey,
+                                "group_scales_requested": layer_parameters.group_scales,
+                                "group_scales_resolved": (
+                                    int(group_scale_state.group_size.detach().reshape(-1)[0].item())
+                                    if group_scale_state is not None
+                                    else 0
+                                ),
+                                "group_ratio_q8": bool(layer_parameters.group_ratio_q8 and group_scale_state is not None),
+                                "scale_refine_steps": layer_parameters.scale_refine_steps,
+                            }
+                        )
+                    if comparison_candidates:
+                        group_scale_comparisons.append(
+                            compare_int4_convrot_group_scales(
+                                value,
+                                candidates=comparison_candidates,
+                                selected_group_scales=layer_parameters.group_scales,
+                                selected_quality=quality,
+                                selected_group_ratio=group_scale_state.ratio if group_scale_state is not None else None,
+                                group_size=group_size,
+                                calc_device=calc_device,
+                                mse_clip=mse_clip,
+                                key=mkey,
+                                stabilizer=stabilizer,
+                                scale_refine_steps=layer_parameters.scale_refine_steps,
+                            )
+                        )
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
                     sd[base + ".scale_weight"] = scale
                     sd[base + ".int4_shape"] = shape
                     sd[base + ".int4_convrot_groupsize"] = torch.tensor(int(group_size), dtype=torch.int32, device=q.device)
+                    if group_scale_state is not None:
+                        sd[base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX] = group_scale_state.ratio
+                        sd[base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX] = group_scale_state.group_size
                     if awq_scale is not None:
                         sd[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.to(device=q.device, dtype=torch.float32)
                     if stabilizer is not None:
@@ -1091,7 +1189,16 @@ def load_safetensors_dynamic_int4_convrot(
             summary.get("mean", 0.0),
         )
 
-    logger.info("INT4 ConvRot dynamic: quantized %d Linear weights to packed INT4 (%d tensors total)", quantized, len(sd))
+    logger.info(
+        "INT4 ConvRot dynamic: quantized %d Linear weights to packed INT4, kept %d policy-selected weights "
+        "in floating point (%d tensors total)",
+        quantized,
+        policy_kept,
+        len(sd),
+    )
+    if group_scales:
+        logger.info("INT4 ConvRot dynamic: per-group weight scales enabled (requested group size %d)", int(group_scales))
+        logger.info("INT4 ConvRot dynamic: group-ratio storage is %s", "Q8.8 int16" if group_ratio_q8 else "float32")
     if quality_layers:
         summary = summarize_int4_quality(quality_layers)
         logger.info(
@@ -1116,8 +1223,15 @@ def load_safetensors_dynamic_int4_convrot(
                     "awq_calibration": bool(awq_calibration),
                     "awq_alpha": float(awq_alpha),
                     "awq_scales": awq_save_path,
+                    "scale_refine_steps": int(scale_refine_steps),
+                    "group_scales": int(group_scales),
+                    "group_ratio_q8": bool(group_ratio_q8),
+                    "policy_int4_parameters": bool(policy is not None and policy.has_int4_quantization_parameters()),
+                    "compare_group_scales": list(comparison_candidates),
                 },
                 layers=quality_layers,
+                group_scale_comparisons=group_scale_comparisons,
+                applied_parameters=applied_int4_parameters,
             )
             logger.info("INT4 ConvRot quality report written to %s", quality_report)
     elif quality_report:
@@ -1164,6 +1278,11 @@ def load_ltx2_model(
     int4_convrot_groupsize: str | int | Iterable[int] | None = None,
     int4_convrot_mse_clip: bool = True,
     int4_convrot_quality_report: Optional[str] = None,
+    int4_convrot_scale_refine_steps: int = 0,
+    int4_convrot_group_scales: int = 0,
+    int4_convrot_group_ratio_q8: bool = False,
+    int4_convrot_compare_group_scales: str | Iterable[int] | None = None,
+    convrot_policy: Optional[str] = None,
     int4_convrot_awq_calibration: bool = False,
     int4_convrot_awq_alpha: float = 0.25,
     int4_convrot_awq_scales: Optional[str] = None,
@@ -1221,6 +1340,7 @@ def load_ltx2_model(
 
     target_device = torch.device(device)
     load_device = torch.device(load_device)
+    resolved_convrot_policy = load_convrot_policy(convrot_policy)
 
     # Resolve quantization device: CLI flag > env var > default (cuda)
     _qdev_raw = quantize_device or os.getenv("LTX2_NF4_CALC_DEVICE") or os.getenv("LTX2_FP8_CALC_DEVICE") or "cuda"
@@ -1653,6 +1773,7 @@ def load_ltx2_model(
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
+            policy=resolved_convrot_policy,
         )
     elif int4_convrot_base:
         logger.info("LTX-2 INT4 ConvRot: loading pre-quantized packed INT4 checkpoint")
@@ -1678,10 +1799,15 @@ def load_ltx2_model(
             awq_scales=_int4_awq_scales,
             awq_save_path=_int4_awq_save_path,
             stabilizer_rank=int(int4_convrot_stabilizer_rank),
+            scale_refine_steps=int(int4_convrot_scale_refine_steps),
+            group_scales=int(int4_convrot_group_scales),
+            group_ratio_q8=bool(int4_convrot_group_ratio_q8),
+            compare_group_scales=int4_convrot_compare_group_scales,
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
             key_filter=state_dict_key_filter,
+            policy=resolved_convrot_policy,
         )
     elif nvfp4_training_base:
         from musubi_tuner.modules.nvfp4_training import (
@@ -1783,10 +1909,10 @@ def load_ltx2_model(
         apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd, w8a8_backend=w8a8_backend)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
     if int8_base or int8_dynamic or int8_convrot_base or int8_convrot_dynamic:
-        apply_quanto_int8_monkey_patch(base_model, w8a8_backend=w8a8_backend)
+        apply_quanto_int8_monkey_patch(base_model, w8a8_backend=w8a8_backend, policy=resolved_convrot_policy)
         _trace_vram_ltx2("AFTER quanto int8 monkey patch")
     if int4_convrot_base or int4_convrot_dynamic:
-        apply_int4_convrot_monkey_patch(base_model)
+        apply_int4_convrot_monkey_patch(base_model, policy=resolved_convrot_policy)
         _trace_vram_ltx2("AFTER int4 ConvRot monkey patch")
     if nvfp4_training_base:
         from musubi_tuner.modules.nvfp4_training import apply_nvfp4_training_monkey_patch

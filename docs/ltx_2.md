@@ -1926,6 +1926,7 @@ Options:
 - `--int8_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16` and uses the largest divisor of each weight input dimension.
 - `--int8_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
 - `--int8_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
+- `--convrot_policy`: apply a shared per-layer INT8/INT4 ConvRot storage/compute policy. `quantize=false` keeps a matching weight in floating point during dynamic quantization; `compute=dequantize` keeps compressed storage but uses a transient dense floating-point matmul.
 - `ltx2_quantize_int8_convrot.py --quality_report PATH`: write the same metrics while pre-quantizing. If omitted, the converter writes `<output>.quality.json`; use `--no_quality_report` to skip it.
 
 Quality reports include per-layer cosine similarity, MSE, MAE, max absolute error, and SQNR for the reconstructed weight (`dequantize + inverse rotate`) versus the source weight. Inspect `summary.min_cosine`, `summary.weighted_sqnr_db`, and the worst layers by `mse` or `max_abs_error`.
@@ -2001,6 +2002,11 @@ Options:
 - `--int4_convrot_groupsize`: group size or comma list; default `auto` tries `256,64,16`. Unlike the INT8 ConvRot path, W4A4 pads the rotated input dimension internally, so the weight input dimension does not need to be divisible by the group size.
 - `--int4_convrot_no_mse_clip`: use plain absmax row scales instead of MSE-optimal per-row clipping.
 - `--int4_convrot_quality_report`: write per-layer reconstruction metrics during dynamic quantization.
+- `--int4_convrot_scale_refine_steps`: alternating least-squares refinement of each row scale after the clipping search. `0` (default) preserves the existing quantizer exactly; `2` enables the opt-in refined calibration. It applies only while quantizing a standard checkpoint or in the standalone converter.
+- `--int4_convrot_group_scales SIZE`: enable per-group INT4 weight scales using `SIZE` as the maximum K-group width. `0` (default) preserves the row-scale checkpoint and runtime exactly. Each layer halves the explicitly requested power-of-two size when needed to divide its padded input width. The packed INT4 codes remain unchanged in layout, while optional ratio/size buffers map each K-group onto the existing per-row INT8 accumulation grid.
+- `--int4_convrot_group_ratio_q8`: with group scales enabled, store each positive group ratio as an int16 Q8.8 value selected from the same signed-INT4 rounding interval. This halves ratio checkpoint/VRAM storage while preserving `round(code * ratio)` for every code from -8 through 7. Existing float32-ratio checkpoints remain supported.
+- `--int4_convrot_compare_group_scales SIZES`: measure an explicit comma-separated list such as `0,128,64` in the INT4 quality report. Every listed candidate is evaluated for every quantized layer, but none is selected or applied. The report records reconstruction metrics plus float32/Q8 ratio bytes for manual comparison. Requires `--int4_convrot_quality_report`; the standalone converter exposes the same option.
+- `--convrot_policy`: shared ordered per-layer policy for INT8 and INT4 ConvRot. In addition to `quantize` and `compute`, INT4 dynamic quantization and the standalone converter accept explicit `group_scales`, `group_ratio_q8`, and `scale_refine_steps` fields.
 - `--int4_convrot_awq_calibration`: compute dataset-independent AWQ-style per-input-channel scales before dynamic INT4 ConvRot quantization. The scales are based on weight-column importance with uniform synthetic activation assumptions, so they are reusable across LoRA datasets for the same checkpoint/config.
 - `--int4_convrot_awq_scales`: with `--int4_convrot_awq_calibration`, save reusable scales to this safetensors path; if omitted, a checkpoint-adjacent `*.int4_convrot_awq_scales.safetensors` path is used. Without calibration, load and apply an existing scales file before dynamic quantization.
 - `--int4_convrot_awq_alpha`: scaling strength for INT4 ConvRot AWQ (`0` = no effect, `1` = full column-importance scaling; default `0.25`).
@@ -2023,13 +2029,69 @@ Notes:
 - `LTX2_INT4_CONVROT_BACKEND`: tensor-core backend routing. `--w4a4g4` implies `cutlass`; `--w4a8` uses `auto`. Set explicitly to override (values: `auto`, `torch`, `wmma`, `wmma_hybrid`, `cutlass`, `cutlass_int8`, `scalar`).
 - `LTX2_INT4_CONVROT_FUSE_CUDA` / `LTX2_INT4_CONVROT_FUSE_LORA`: the fused native-CUTLASS W4A4 activation/epilogue path and the fused triple-branch LoRA path. `--w4a4g4` implies both `1`; `--w4a8` implies neither (they are W4A4-only, so the fused LoRA path stays on the eager down/up path under W4A8 even if enabled). Set either explicitly to override.
 - `LTX2_INT4_CONVROT_FUSE=1` requests fused Triton kernels for the W4A8 rotation/quantization and rescale/inverse-rotation helpers. It requires Triton and CUDA, is off by default, and applies only to W4A8. The fused and eager implementations can differ numerically; no tolerance or training-equivalence guarantee is made here.
+- `LTX2_INT4_CONVROT_FUSED_GEMV=0` disables the default grouped-checkpoint inference kernel for activation matrices with at most 16 rows. When enabled (the default), Triton reads packed INT4 weights directly, applies group ratios in registers, performs the INT8 tensor-core dot, and writes the scaled output without a full INT8 weight tensor. It uses fast Triton activation quantization and is not bit-exact with the eager PyTorch activation quantizer; set this variable to `0` for eager numerical parity or when diagnosing small-M output differences.
 - No Blackwell performance claim is made for the native INT4 kernels.
 - Reconstruction reports measure weight or observed activation/backend error; they do not establish generation quality or convergence.
+- Group-scaled checkpoints remain backward-compatible with this trainer's `int4cr` loader but require its group-ratio-aware runtime. They are intentionally rejected by `--export_format comfy_convrot_w4a4`. The CUDA runtime decodes eight packed INT4 codes per load, applies one group ratio, writes one INT8 word, and then uses the tensor-core integer matmul. It does not use the native packed W4A4 fused-LoRA kernel. If the optional CUDA extension cannot be built, an exact chunked PyTorch expansion remains available but is a compatibility path rather than the production-performance backend.
+- Group scales are primarily a reconstruction-quality/storage trade-off. On 84 real LTX-2.3 22B layers sampled across blocks 0, 24, and 47, group size 128 reduced weighted deployed reconstruction MSE by 15.1% versus refined row scales and improved every sampled layer. Float32 ratio buffers add about 579 MB (6.2%) to the roughly 9.28 GB packed target-layer payload; `--int4_convrot_group_ratio_q8` halves that ratio overhead to about 289 MB. The Q8.8 encoder preserved all signed-INT4 mappings across the 144,703,488 ratios in the matched full group128 checkpoint, and native CUDA unpack plus fused GEMV were bit-exact with their float32-ratio outputs on a real 4096x4096 layer. Group size 64 reduced MSE by 24.4% but doubled the uncompressed ratio overhead. These weight-only measurements motivate 128 as the starting point but are not a generation-quality or convergence result. On H100, a warm end-to-end group128 kernel comparison against the exact ai-toolkit ConvRot backend measured this runtime 1.66x faster for `M=512,N=2048,K=2048`, 1.70x for `512,4096,4096`, and 1.22x for `128,16384,4096`. The direct packed small-M GEMV was 1.24x, 1.53x, 1.29x, and 1.40x faster at `M=1,4,8,16` with `N=K=4096`. These are isolated kernel measurements on one software/hardware stack, not whole-training throughput guarantees.
+- Standalone generation accepts `--int4_convrot_base` for a converter-produced `int4cr` checkpoint and `--int4_convrot_dynamic` for on-load quantization of a standard checkpoint. The dynamic inference path also accepts `--int4_convrot_groupsize`, `--int4_convrot_no_mse_clip`, `--int4_convrot_scale_refine_steps`, `--int4_convrot_group_scales`, `--int4_convrot_group_ratio_q8`, and `--quantize_device`. Prepacked grouped checkpoints carry their group ratios and ratio dtype, so load them with `--int4_convrot_base` without repeating either group option.
 - For diagnosis, set `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` with `--w4a4g4`/`--w4a8`/`--w4a4g8` to dequantize the packed INT4 weights and run normal `F.linear` without INT4 activation quantization. This is not the fast W4A4 path; it separates packed-weight quality from activation-quantization quality when init samples look degraded.
 - INT4 ConvRot AWQ scales multiply weight columns before packing and divide activations by the reciprocal factors at runtime. Before rounding this rescaling is algebraically cancelling; INT4 quantization still changes the layer output.
 - AWQ scale files are tied to the base checkpoint, target layer set, group-size policy, and model mode. They are not tied to the LoRA dataset identity.
 - For layer ranking, use both reports: `--int4_convrot_quality_report` estimates static packed-weight reconstruction error, while `--int4_convrot_activation_calibration_report` measures runtime activation/backend error on the observed training activation distribution.
 - Activation calibration performs extra reference matmuls during the measured forward pass. Keep the batch count small, and use `--int4_convrot_activation_calibration_regex` or `--int4_convrot_activation_calibration_max_layers` when memory is tight.
+
+**Per-layer ConvRot policy.** A policy is an ordered JSON rule set; later matching rules override earlier fields. Patterns match module names without the trailing `.weight`. Omitted INT4 fields inherit the corresponding CLI value; there is no automatic parameter selection:
+
+```json
+{
+  "format": "ltx2_convrot_policy_v1",
+  "defaults": {
+    "quantize": true,
+    "compute": "quantized",
+    "group_scales": 128,
+    "group_ratio_q8": true,
+    "scale_refine_steps": 2
+  },
+  "rules": [
+    {"pattern": "transformer_blocks.*.ff.net.0.proj", "group_scales": 64},
+    {
+      "pattern": "transformer_blocks.*.attn.to_out.0",
+      "compute": "dequantize",
+      "group_scales": 0,
+      "group_ratio_q8": false
+    },
+    {"pattern": "transformer_blocks.0.*", "quantize": false}
+  ]
+}
+```
+
+`group_scales` must be `0` or a power of two of at least 16. `group_ratio_q8=true` requires the effective `group_scales` value to be nonzero. `scale_refine_steps` must be zero or greater. These three fields affect only conversion from a floating-point source; a prepacked checkpoint already carries its per-layer codes, scales, and ratio dtype. INT8 paths ignore the INT4-only fields. The converter records a mixed checkpoint through per-layer buffers rather than replacing explicit rules with a preset.
+
+For a report-only matrix without changing the selected global or policy values:
+
+```bat
+python ltx2_quantize_int4_convrot.py ^
+  --input_model path\to\ltx-2.3-22b-dev.safetensors ^
+  --output_model path\to\ltx-2.3-22b-dev-int4-convrot.safetensors ^
+  --convrot_policy path\to\int4-convrot-policy.json ^
+  --int4_convrot_compare_group_scales 0,128,64 ^
+  --quality_report output\int4-convrot-quality.json
+```
+
+The JSON section `group_scale_comparisons` contains `selection: "none"`, aggregate rows for each requested size, per-layer candidate measurements, both ratio-storage byte counts, and whether every measured ratio has an exact Q8.8 mapping. Candidate order is preserved. The separate `applied_parameters` array records the effective requested/resolved group size, ratio dtype choice, and refinement steps for each checkpoint layer, so the measured candidates cannot be confused with the values that were actually written.
+
+Generate exact layer overrides from an existing INT8 or INT4 reconstruction report:
+
+```bat
+python ltx2_build_convrot_policy.py ^
+  --quality_report output\int4-convrot-quality.json ^
+  --output output\int4-convrot-policy.json ^
+  --min_cosine 0.99 --min_sqnr_db 20 ^
+  --action keep_bf16
+```
+
+Use `--action dequantize` to retain packed storage while removing activation/gradient low-bit matmul error on selected layers. Use `--action keep_bf16` before dynamic quantization (or pass the generated policy to a converter) to keep selected source weights in floating point. With an already pre-quantized checkpoint, `quantize=false` cannot restore the original weight; the loader retains compressed storage and applies `compute=dequantize`.
 
 **Low-rank stabilizer branch.** A rank-`N` SVD component can be split off each weight before INT4 quantization and stored as two bfloat16 factors per layer (`.int4_stabilizer_l1`/`.int4_stabilizer_l2`). At runtime the factors are added back as a frozen high-precision branch in the forward pass and the gradient-input path, so the INT4 residual has a narrower value range while the low-rank component stays in bf16. Two ways to produce it: `ltx2_quantize_int4_convrot.py --stabilizer_rank N` bakes it into a reusable pre-quantized checkpoint (loaded automatically — no training flag), and `--w4a4g4`/`--w4a4g8` `--w4a4g4_stabilizer_rank N` computes the same factors on the on-the-fly (bf16 checkpoint) path. `--w4a8` and pre-quantized checkpoints ignore `--w4a4g4_stabilizer_rank` (the checkpoint carries its own stabilizer). The branch also applies to `LTX2_INT4_CONVROT_WEIGHT_ONLY=1` diagnostics; checkpoints without these tensors are unchanged. The tensors stay resident under `--blocks_to_swap` and add a small per-layer overhead proportional to the rank.
 

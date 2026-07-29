@@ -507,6 +507,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp8_upcast_seed", type=int, default=0)
     parser.add_argument("--nf4_base", action="store_true", help="Use NF4 quantization for DiT")
     parser.add_argument("--nf4_block_size", type=int, default=64)
+    int4_convrot_mode = parser.add_mutually_exclusive_group()
+    int4_convrot_mode.add_argument(
+        "--int4_convrot_base",
+        action="store_true",
+        help="Load a converter-produced packed int4cr checkpoint for W4A8 inference.",
+    )
+    int4_convrot_mode.add_argument(
+        "--int4_convrot_dynamic",
+        action="store_true",
+        help="Quantize a bf16/fp16 checkpoint to INT4 ConvRot on load for W4A8 inference.",
+    )
+    parser.add_argument(
+        "--int4_convrot_groupsize",
+        default="auto",
+        help="Dynamic INT4 ConvRot rotation group size or comma list (default: auto).",
+    )
+    parser.add_argument("--int4_convrot_no_mse_clip", action="store_true")
+    parser.add_argument("--int4_convrot_scale_refine_steps", type=int, default=0)
+    parser.add_argument(
+        "--int4_convrot_group_scales",
+        type=int,
+        default=0,
+        metavar="SIZE",
+        help="Dynamic per-group INT4 weight scales (for example 128; 0/off by default).",
+    )
+    parser.add_argument(
+        "--int4_convrot_group_ratio_q8",
+        action="store_true",
+        help="Use exact-mapping int16 Q8.8 storage for dynamic group ratios (requires group scales).",
+    )
+    parser.add_argument("--quantize_device", type=str, default=None, help="Device used for dynamic weight quantization.")
     parser.add_argument("--loftq_init", action="store_true")
     parser.add_argument("--loftq_iters", type=int, default=2)
     parser.add_argument("--awq_calibration", action="store_true")
@@ -760,6 +791,22 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
     if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
         raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+    if (args.int4_convrot_base or args.int4_convrot_dynamic) and (args.fp8_base or args.fp8_scaled or args.nf4_base):
+        raise ValueError("INT4 ConvRot inference is mutually exclusive with FP8 and NF4 base modes")
+    from musubi_tuner.modules.int4_convrot_utils import validate_int4_convrot_scale_group_size
+
+    validate_int4_convrot_scale_group_size(args.int4_convrot_group_scales)
+    if args.int4_convrot_scale_refine_steps < 0:
+        raise ValueError("--int4_convrot_scale_refine_steps must be >= 0")
+    if (
+        args.int4_convrot_scale_refine_steps or args.int4_convrot_group_scales or args.int4_convrot_group_ratio_q8
+    ) and not args.int4_convrot_dynamic:
+        raise ValueError(
+            "--int4_convrot_scale_refine_steps/--int4_convrot_group_scales/--int4_convrot_group_ratio_q8 apply only with "
+            "--int4_convrot_dynamic; prepacked checkpoints already carry their scales"
+        )
+    if args.int4_convrot_group_ratio_q8 and not args.int4_convrot_group_scales:
+        raise ValueError("--int4_convrot_group_ratio_q8 requires --int4_convrot_group_scales")
     if args.ltx2_causal_temporal_attention:
         if args.ltx_mode == "audio":
             raise ValueError("--ltx2_causal_temporal_attention requires a video generation path")

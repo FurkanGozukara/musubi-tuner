@@ -3757,6 +3757,39 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             awq_alpha = float(getattr(args, "int4_convrot_awq_alpha", 0.25))
             if not (0.0 <= awq_alpha <= 1.0):
                 raise ValueError("--int4_convrot_awq_alpha must be in [0, 1]")
+        _int4_scale_refine_steps = int(getattr(args, "int4_convrot_scale_refine_steps", 0) or 0)
+        if _int4_scale_refine_steps < 0:
+            raise ValueError("--int4_convrot_scale_refine_steps must be >= 0")
+        if _int4_scale_refine_steps and not _int4_convrot_dynamic:
+            raise ValueError(
+                "--int4_convrot_scale_refine_steps requires --w4a4g4/--w4a4g8/--w4a8 with a standard "
+                "bf16/fp16 checkpoint; pre-quantized checkpoints already carry their calibrated scales"
+            )
+        _int4_group_scales = int(getattr(args, "int4_convrot_group_scales", 0) or 0)
+        from musubi_tuner.modules.int4_convrot_utils import (
+            parse_int4_convrot_scale_group_candidates,
+            validate_int4_convrot_scale_group_size,
+        )
+
+        validate_int4_convrot_scale_group_size(_int4_group_scales)
+        if _int4_group_scales and not _int4_convrot_dynamic:
+            raise ValueError(
+                "--int4_convrot_group_scales requires --w4a4g4/--w4a4g8/--w4a8 with a standard "
+                "bf16/fp16 checkpoint; pre-quantized checkpoints carry their own group-scale buffers"
+            )
+        if bool(getattr(args, "int4_convrot_group_ratio_q8", False)) and not _int4_group_scales:
+            raise ValueError("--int4_convrot_group_ratio_q8 requires --int4_convrot_group_scales")
+        _int4_compare_group_scales = parse_int4_convrot_scale_group_candidates(
+            getattr(args, "int4_convrot_compare_group_scales", "")
+        )
+        if _int4_compare_group_scales and not _int4_convrot_dynamic:
+            raise ValueError("--int4_convrot_compare_group_scales requires dynamic INT4 ConvRot quantization")
+        if _int4_compare_group_scales and not getattr(args, "int4_convrot_quality_report", None):
+            raise ValueError("--int4_convrot_compare_group_scales requires --int4_convrot_quality_report")
+        if getattr(args, "convrot_policy", None) and not (
+            _int8_convrot_base or _int8_convrot_dynamic or _w4a4g4 or _w4a8 or _w4a4g8
+        ):
+            raise ValueError("--convrot_policy requires an INT8 or INT4 ConvRot base mode")
         if getattr(args, "int8_fused_quant", False):
             os.environ["LTX2_INT8_FUSED_QUANT"] = "1"
 
@@ -4342,6 +4375,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             int4_convrot_groupsize=getattr(args, "int4_convrot_groupsize", "auto"),
             int4_convrot_mse_clip=not bool(getattr(args, "int4_convrot_no_mse_clip", False)),
             int4_convrot_quality_report=getattr(args, "int4_convrot_quality_report", None),
+            int4_convrot_scale_refine_steps=int(getattr(args, "int4_convrot_scale_refine_steps", 0) or 0),
+            int4_convrot_group_scales=int(getattr(args, "int4_convrot_group_scales", 0) or 0),
+            int4_convrot_group_ratio_q8=bool(getattr(args, "int4_convrot_group_ratio_q8", False)),
+            int4_convrot_compare_group_scales=getattr(args, "int4_convrot_compare_group_scales", ""),
+            convrot_policy=getattr(args, "convrot_policy", None),
             int4_convrot_awq_calibration=bool(getattr(args, "int4_convrot_awq_calibration", False)),
             int4_convrot_awq_alpha=float(getattr(args, "int4_convrot_awq_alpha", 0.25)),
             int4_convrot_awq_scales=getattr(args, "int4_convrot_awq_scales", None),

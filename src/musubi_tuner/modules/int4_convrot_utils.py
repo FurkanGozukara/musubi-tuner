@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from musubi_tuner.modules.int8_convrot_utils import build_hadamard, rotate_activation, rotate_weight
 from musubi_tuner.modules.int4_convrot_awq import INT4_CONVROT_AWQ_SCALE_SUFFIX
+from musubi_tuner.modules.convrot_policy import ConvRotPolicy
 
 DEFAULT_INT4_CONVROT_GROUP_SIZES = (256, 64, 16)
 DEFAULT_INT4_CONVROT_CLIP_MIN = 0.35
@@ -30,6 +31,9 @@ DEFAULT_INT4_CONVROT_CLIP_STEPS = 80
 DEFAULT_INT4_CONVROT_CHUNK_ELEMENTS = 4 * 1024 * 1024
 INT4_CONVROT_STABILIZER_L1_SUFFIX = ".int4_stabilizer_l1"
 INT4_CONVROT_STABILIZER_L2_SUFFIX = ".int4_stabilizer_l2"
+INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX = ".int4_group_scale_ratio"
+INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX = ".int4_group_scale_size"
+INT4_CONVROT_GROUP_RATIO_Q8_SCALE = 256.0
 INT4_CONVROT_METADATA_MARKER = "int4_convrot_quantized"
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,14 @@ class Int4ConvRotLayerQuality:
     scale_min: float
     scale_max: float
     stabilizer_rank: int = 0
+    scale_refine_steps: int = 0
+    scale_group_size: int = 0
+
+
+@dataclass
+class Int4ConvRotGroupScaleState:
+    ratio: torch.Tensor
+    group_size: torch.Tensor
 
 
 def _is_power_of_four(value: int) -> bool:
@@ -116,6 +128,87 @@ def padded_features_for_group(in_features: int, group_size: int) -> int:
     if group_size <= 0:
         return in_features
     return int(math.ceil(in_features / group_size) * group_size)
+
+
+def validate_int4_convrot_scale_group_size(value: int) -> int:
+    value = int(value)
+    if value == 0:
+        return 0
+    if value < 16 or value & (value - 1):
+        raise ValueError(f"INT4 ConvRot group scales must be 0 or a power of two >= 16, got {value}")
+    return value
+
+
+def parse_int4_convrot_scale_group_candidates(value: str | Iterable[int] | None) -> tuple[int, ...]:
+    """Parse an explicit, ordered list of group-scale sizes for report-only comparisons."""
+
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        candidates = tuple(int(part.strip()) for part in text.replace(";", ",").split(",") if part.strip())
+    else:
+        candidates = tuple(int(item) for item in value)
+    if not candidates:
+        return ()
+    return tuple(dict.fromkeys(validate_int4_convrot_scale_group_size(candidate) for candidate in candidates))
+
+
+def decode_int4_group_scale_ratio(ratio: torch.Tensor) -> torch.Tensor:
+    """Return group ratios as float32, decoding exact Q8.8 storage when used."""
+
+    if ratio.dtype == torch.int16:
+        return ratio.float() / INT4_CONVROT_GROUP_RATIO_Q8_SCALE
+    if ratio.is_floating_point():
+        return ratio.float()
+    raise TypeError(f"INT4 ConvRot group-scale ratio must be floating point or int16 Q8.8, got {ratio.dtype}")
+
+
+@torch.no_grad()
+def encode_int4_group_scale_ratio_q8(ratio: torch.Tensor) -> torch.Tensor:
+    """Encode positive ratios as Q8.8 while preserving every signed-INT4 mapping.
+
+    Ratios are observed only through ``round(code * ratio)`` for signed INT4
+    codes -8..7. A nearby fixed-point value in the same rounding interval is
+    selected instead of blindly rounding the ratio itself.
+    """
+
+    ratio_f32 = ratio.float()
+    if not torch.isfinite(ratio_f32).all() or (ratio_f32 <= 0).any():
+        raise ValueError("INT4 ConvRot group-scale ratios must be positive finite values")
+    q8_max = torch.iinfo(torch.int16).max
+    max_ratio = q8_max / INT4_CONVROT_GROUP_RATIO_Q8_SCALE
+    if (ratio_f32 > max_ratio).any():
+        raise ValueError(f"INT4 ConvRot Q8.8 ratio exceeds the representable maximum {max_ratio}")
+
+    codes = torch.arange(1, 9, device=ratio.device, dtype=torch.float32)
+    target = torch.round(ratio_f32.unsqueeze(-1) * codes)
+    center = torch.round(ratio_f32 * INT4_CONVROT_GROUP_RATIO_Q8_SCALE).clamp(1, q8_max)
+    selected = center.clone()
+    unresolved = torch.ones_like(ratio_f32, dtype=torch.bool)
+    for delta in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+        candidate = (center + delta).clamp(1, q8_max)
+        decoded = candidate / INT4_CONVROT_GROUP_RATIO_Q8_SCALE
+        matches = (torch.round(decoded.unsqueeze(-1) * codes) == target).all(dim=-1)
+        take = unresolved & matches
+        selected[take] = candidate[take]
+        unresolved &= ~matches
+    if unresolved.any():
+        raise ValueError(f"Could not encode {int(unresolved.sum().item())} INT4 ConvRot group ratios as exact Q8.8 mappings")
+    return selected.to(torch.int16)
+
+
+def resolve_int4_convrot_scale_group_size(padded_features: int, requested: int) -> int:
+    group_size = validate_int4_convrot_scale_group_size(requested)
+    if group_size == 0:
+        return 0
+    while group_size > padded_features or padded_features % group_size:
+        group_size //= 2
+        if group_size < 16:
+            raise ValueError(f"INT4 ConvRot group-scale size {requested} cannot be resolved for padded width {padded_features}")
+    return group_size
 
 
 def pad_last_dim(x: torch.Tensor, padded_features: int) -> torch.Tensor:
@@ -170,15 +263,26 @@ def pack_int4(q: torch.Tensor) -> torch.Tensor:
     return low | (high << 4)
 
 
+def _unpack_int4_into(packed: torch.Tensor, out: torch.Tensor, num_values: int) -> torch.Tensor:
+    """Unpack into caller-owned storage without full-width integer temporaries."""
+
+    expected = (*packed.shape[:-1], packed.shape[-1] * 2)
+    if out.dtype != torch.int8 or out.device != packed.device or tuple(out.shape) != expected:
+        raise ValueError(f"INT4 unpack output must be int8 {expected} on {packed.device}, got {out.dtype} {tuple(out.shape)}")
+    low = out[..., 0::2]
+    high = out[..., 1::2]
+    low.copy_(packed)
+    low.bitwise_and_(0x0F).bitwise_xor_(0x08).sub_(0x08)
+    high.copy_(packed)
+    high.bitwise_right_shift_(4).bitwise_and_(0x0F).bitwise_xor_(0x08).sub_(0x08)
+    return out[..., :num_values]
+
+
 def unpack_int4(packed: torch.Tensor, num_values: int) -> torch.Tensor:
     """Unpack uint8 nibbles into signed int8 values."""
 
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
     out = torch.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=torch.int8, device=packed.device)
-    out[..., 0::2] = ((low.to(torch.int16) ^ 0x08) - 0x08).to(torch.int8)
-    out[..., 1::2] = ((high.to(torch.int16) ^ 0x08) - 0x08).to(torch.int8)
-    return out[..., :num_values]
+    return _unpack_int4_into(packed, out, num_values)
 
 
 def quantize_int4_rowwise(
@@ -187,11 +291,15 @@ def quantize_int4_rowwise(
     mse_clip: bool = True,
     clip_min: float = DEFAULT_INT4_CONVROT_CLIP_MIN,
     clip_steps: int = DEFAULT_INT4_CONVROT_CLIP_STEPS,
+    scale_refine_steps: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale_refine_steps < 0:
+        raise ValueError(f"INT4 scale_refine_steps must be >= 0, got {scale_refine_steps}")
     absmax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-30)
     if not mse_clip or clip_steps <= 1:
         scale = (absmax / 7.0).clamp(min=1e-30)
         q = (x / scale).round().clamp(-7, 7).to(torch.int8)
+        scale, q = _refine_int4_rowwise_scale(x, scale, q, steps=scale_refine_steps)
         return pack_int4(q), scale.float()
 
     best_mse = torch.full_like(absmax, float("inf"), dtype=torch.float32)
@@ -206,7 +314,90 @@ def quantize_int4_rowwise(
         best_scale = torch.where(better, scale, best_scale)
         best_q = q if best_q is None else torch.where(better.expand_as(q), q, best_q)
     assert best_q is not None
+    best_scale, best_q = _refine_int4_rowwise_scale(x, best_scale, best_q, steps=scale_refine_steps)
     return pack_int4(best_q), best_scale.float()
+
+
+def _refine_int4_rowwise_scale(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    q: torch.Tensor,
+    *,
+    steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Alternating least-squares scale fit and nearest-code assignment."""
+
+    if steps <= 0:
+        return scale, q
+    xf = x.float()
+    sf = scale.float()
+    qf = q.float()
+    for _ in range(int(steps)):
+        numerator = (xf * qf).sum(dim=1, keepdim=True)
+        denominator = (qf * qf).sum(dim=1, keepdim=True)
+        fitted = numerator / denominator.clamp_min(1e-30)
+        sf = torch.where((denominator > 0) & (fitted > 0) & torch.isfinite(fitted), fitted, sf)
+        q = (xf / sf).round().clamp(-7, 7).to(torch.int8)
+        qf = q.float()
+    return sf.clamp_min(1e-30), q
+
+
+def quantize_int4_groupwise(
+    x: torch.Tensor,
+    *,
+    group_size: int,
+    mse_clip: bool = True,
+    scale_refine_steps: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize K-groups independently and re-express them on a row INT8 grid."""
+
+    if x.ndim != 2:
+        raise ValueError(f"INT4 group-scale quantization expects a 2D tensor, got {tuple(x.shape)}")
+    rows, features = x.shape
+    group_size = resolve_int4_convrot_scale_group_size(features, group_size)
+    groups = features // group_size
+    grouped = x.reshape(rows * groups, group_size)
+    packed_groups, group_scales = quantize_int4_rowwise(
+        grouped,
+        mse_clip=mse_clip,
+        scale_refine_steps=scale_refine_steps,
+    )
+    group_scales = group_scales.reshape(rows, groups)
+    row_scales = (group_scales.amax(dim=1, keepdim=True) * (7.0 / 127.0)).clamp_min(1e-30)
+    ratios = (group_scales / row_scales).float()
+    return packed_groups.reshape(rows, features // 2), row_scales.float(), ratios
+
+
+def unpack_int4_group_scaled(
+    packed: torch.Tensor,
+    ratio: torch.Tensor,
+    group_size: int,
+    num_values: int,
+    *,
+    max_chunk_elements: int = DEFAULT_INT4_CONVROT_CHUNK_ELEMENTS,
+) -> torch.Tensor:
+    """Unpack INT4 codes and map each weight group onto its row's INT8 grid."""
+
+    group_size = int(group_size)
+    if group_size <= 0 or num_values % group_size:
+        raise ValueError(f"Invalid INT4 group-scale size {group_size} for width {num_values}")
+    rows = packed.shape[0]
+    groups = num_values // group_size
+    ratio = ratio.reshape(rows, groups).to(device=packed.device)
+    if packed.is_cuda:
+        cuda_int4 = _get_cuda_int4()
+        if cuda_int4 is not None:
+            return cuda_int4.unpack_group_scaled_to_int8(packed, ratio, group_size, num_values)
+    ratio_f32 = decode_int4_group_scale_ratio(ratio)
+    codes = unpack_int4(packed, num_values).reshape(rows, groups, group_size)
+    mapped = torch.empty_like(codes)
+    rows_per_chunk = max(1, int(max_chunk_elements) // max(int(num_values), 1))
+    for start in range(0, rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, rows)
+        mapped[start:stop].copy_(
+            (codes[start:stop].float() * ratio_f32[start:stop].unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        )
+    return mapped.reshape(rows, num_values)
 
 
 def dequantize_int4_convrot_weight(
@@ -219,8 +410,13 @@ def dequantize_int4_convrot_weight(
     dtype: torch.dtype = torch.float32,
     stabilizer: tuple[torch.Tensor, torch.Tensor] | None = None,
     rotate: bool = True,
+    group_scale_ratio: torch.Tensor | None = None,
+    scale_group_size: int = 0,
 ) -> torch.Tensor:
-    q = unpack_int4(packed, padded_features).float()
+    if group_scale_ratio is not None:
+        q = unpack_int4_group_scaled(packed, group_scale_ratio, scale_group_size, padded_features).float()
+    else:
+        q = unpack_int4(packed, padded_features).float()
     deq_rot = q * scale.float()
     if stabilizer is not None:
         stab_l1, stab_l2 = stabilizer
@@ -304,6 +500,8 @@ def _quality_from_accumulators(
     scale_min: float,
     scale_max: float,
     stabilizer_rank: int = 0,
+    scale_refine_steps: int = 0,
+    scale_group_size: int = 0,
 ) -> Int4ConvRotLayerQuality:
     numel = max(shape[0] * shape[1], 1)
     denom = math.sqrt(max(ref_norm_sq, 0.0) * max(deq_norm_sq, 0.0))
@@ -326,6 +524,8 @@ def _quality_from_accumulators(
         scale_min=float(scale_min),
         scale_max=float(scale_max),
         stabilizer_rank=int(stabilizer_rank),
+        scale_refine_steps=int(scale_refine_steps),
+        scale_group_size=int(scale_group_size),
     )
 
 
@@ -341,6 +541,9 @@ def quantize_int4_convrot_weight(
     max_chunk_elements: int | None = None,
     stabilizer: tuple[torch.Tensor, torch.Tensor] | None = None,
     rotate: bool = True,
+    scale_refine_steps: int = 0,
+    scale_group_size: int = 0,
+    _group_scale_state: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Int4ConvRotLayerQuality | None]:
     if weight.ndim != 2:
         raise ValueError(f"INT4 ConvRot expects a 2D weight, got shape {tuple(weight.shape)}")
@@ -349,9 +552,21 @@ def quantize_int4_convrot_weight(
     if max_chunk_elements is None:
         max_chunk_elements = DEFAULT_INT4_CONVROT_CHUNK_ELEMENTS
     calc_device = torch.device(calc_device)
+    resolved_scale_group_size = resolve_int4_convrot_scale_group_size(padded_features, scale_group_size)
+    if resolved_scale_group_size and _group_scale_state is None:
+        raise ValueError("Grouped INT4 quantization requires quantize_int4_convrot_weight_grouped")
 
     packed_out = torch.empty((out_features, padded_features // 2), device=calc_device, dtype=torch.uint8)
     scale_out = torch.empty((out_features, 1), device=calc_device, dtype=torch.float32)
+    ratio_out = (
+        torch.empty(
+            (out_features, padded_features // resolved_scale_group_size),
+            device=calc_device,
+            dtype=torch.float32,
+        )
+        if resolved_scale_group_size
+        else None
+    )
     shape = torch.tensor([out_features, in_features, padded_features], device=calc_device, dtype=torch.int32)
     h = build_hadamard(group_size, device=calc_device, dtype=torch.float32) if rotate else None
 
@@ -383,12 +598,29 @@ def quantize_int4_convrot_weight(
         if stab_l1_f32 is not None:
             stab_chunk = stab_l1_f32[row_slice] @ stab_l2_f32
             rotated = rotated - stab_chunk
-        q_packed, scale_chunk = quantize_int4_rowwise(rotated, mse_clip=mse_clip)
+        if resolved_scale_group_size:
+            q_packed, scale_chunk, ratio_chunk = quantize_int4_groupwise(
+                rotated,
+                group_size=resolved_scale_group_size,
+                mse_clip=mse_clip,
+                scale_refine_steps=scale_refine_steps,
+            )
+            ratio_out[row_slice].copy_(ratio_chunk)
+        else:
+            q_packed, scale_chunk = quantize_int4_rowwise(
+                rotated,
+                mse_clip=mse_clip,
+                scale_refine_steps=scale_refine_steps,
+            )
         packed_out[row_slice].copy_(q_packed)
         scale_out[row_slice].copy_(scale_chunk)
 
         if collect_quality:
-            q_unpacked = unpack_int4(q_packed, padded_features).float()
+            q_unpacked = (
+                unpack_int4_group_scaled(q_packed, ratio_chunk, resolved_scale_group_size, padded_features).float()
+                if resolved_scale_group_size
+                else unpack_int4(q_packed, padded_features).float()
+            )
             deq_rot = q_unpacked * scale_chunk
             if stab_chunk is not None:
                 deq_rot = deq_rot + stab_chunk
@@ -422,8 +654,122 @@ def quantize_int4_convrot_weight(
             scale_min=scale_min if scale_min != float("inf") else 0.0,
             scale_max=scale_max,
             stabilizer_rank=stabilizer_rank,
+            scale_refine_steps=scale_refine_steps,
+            scale_group_size=resolved_scale_group_size,
+        )
+    if resolved_scale_group_size:
+        _group_scale_state["ratio"] = ratio_out
+        _group_scale_state["group_size"] = torch.tensor(
+            resolved_scale_group_size,
+            device=calc_device,
+            dtype=torch.int32,
         )
     return packed_out, scale_out, shape, quality
+
+
+@torch.no_grad()
+def quantize_int4_convrot_weight_grouped(
+    weight: torch.Tensor,
+    *,
+    scale_group_size: int,
+    ratio_q8: bool = False,
+    **kwargs,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Int4ConvRotLayerQuality | None,
+    Int4ConvRotGroupScaleState,
+]:
+    state: dict[str, torch.Tensor] = {}
+    packed, scale, shape, quality = quantize_int4_convrot_weight(
+        weight,
+        scale_group_size=scale_group_size,
+        _group_scale_state=state,
+        **kwargs,
+    )
+    ratio = encode_int4_group_scale_ratio_q8(state["ratio"]) if ratio_q8 else state["ratio"]
+    return (
+        packed,
+        scale,
+        shape,
+        quality,
+        Int4ConvRotGroupScaleState(ratio=ratio, group_size=state["group_size"]),
+    )
+
+
+@torch.no_grad()
+def compare_int4_convrot_group_scales(
+    weight: torch.Tensor,
+    *,
+    candidates: Iterable[int],
+    selected_group_scales: int,
+    selected_quality: Int4ConvRotLayerQuality | None,
+    selected_group_ratio: torch.Tensor | None,
+    group_size: int,
+    calc_device: str | torch.device,
+    mse_clip: bool,
+    key: str,
+    stabilizer: tuple[torch.Tensor, torch.Tensor] | None = None,
+    rotate: bool = True,
+    scale_refine_steps: int = 0,
+) -> dict[str, Any]:
+    """Measure explicitly requested group-scale candidates without selecting or applying one."""
+
+    requested_candidates = parse_int4_convrot_scale_group_candidates(candidates)
+    candidate_items: list[dict[str, Any]] = []
+    for requested_group_scales in requested_candidates:
+        quality = selected_quality if requested_group_scales == int(selected_group_scales) else None
+        group_ratio = selected_group_ratio if requested_group_scales == int(selected_group_scales) else None
+        if quality is None:
+            quant_kwargs = {
+                "group_size": int(group_size),
+                "calc_device": calc_device,
+                "mse_clip": bool(mse_clip),
+                "collect_quality": True,
+                "key": key,
+                "stabilizer": stabilizer,
+                "rotate": bool(rotate),
+                "scale_refine_steps": int(scale_refine_steps),
+            }
+            if requested_group_scales:
+                _, _, _, quality, candidate_group_state = quantize_int4_convrot_weight_grouped(
+                    weight,
+                    scale_group_size=requested_group_scales,
+                    ratio_q8=False,
+                    **quant_kwargs,
+                )
+                group_ratio = candidate_group_state.ratio
+            else:
+                _, _, _, quality = quantize_int4_convrot_weight(weight, **quant_kwargs)
+        assert quality is not None
+        ratio_values = (
+            quality.padded_shape[0] * (quality.padded_shape[1] // quality.scale_group_size) if quality.scale_group_size else 0
+        )
+        q8_exact_mapping = None
+        if group_ratio is not None:
+            try:
+                if group_ratio.dtype != torch.int16:
+                    encode_int4_group_scale_ratio_q8(group_ratio)
+                q8_exact_mapping = True
+            except ValueError:
+                q8_exact_mapping = False
+        candidate_items.append(
+            {
+                "requested_group_scales": requested_group_scales,
+                "resolved_group_scales": int(quality.scale_group_size),
+                "ratio_values": int(ratio_values),
+                "ratio_bytes_float32": int(ratio_values * 4),
+                "ratio_bytes_q8": int(ratio_values * 2),
+                "q8_exact_mapping": q8_exact_mapping,
+                "quality": asdict(quality),
+            }
+        )
+    return {
+        "key": key,
+        "selected_group_scales": int(selected_group_scales),
+        "candidates": candidate_items,
+    }
 
 
 def comfy_quant_tensor(
@@ -478,6 +824,52 @@ def summarize_quality(layers: Iterable[Int4ConvRotLayerQuality]) -> dict[str, An
     }
 
 
+def summarize_int4_group_scale_comparisons(comparisons: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate each requested candidate independently for a report-only comparison table."""
+
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for layer in comparisons:
+        for candidate in layer.get("candidates", []):
+            buckets.setdefault(int(candidate["requested_group_scales"]), []).append(candidate)
+
+    summaries: list[dict[str, Any]] = []
+    for requested_group_scales, items in buckets.items():
+        total_numel = sum(int(item["quality"]["shape"][0]) * int(item["quality"]["shape"][1]) for item in items)
+        total_error = sum(
+            float(item["quality"]["mse"]) * int(item["quality"]["shape"][0]) * int(item["quality"]["shape"][1]) for item in items
+        )
+        total_signal = sum(
+            float(item["quality"]["signal_mean_square"]) * int(item["quality"]["shape"][0]) * int(item["quality"]["shape"][1])
+            for item in items
+        )
+        weighted_mse = total_error / max(total_numel, 1)
+        weighted_signal = total_signal / max(total_numel, 1)
+        weighted_sqnr_db = (
+            float(10.0 * math.log10(weighted_signal / weighted_mse)) if weighted_mse > 0 and weighted_signal > 0 else float("inf")
+        )
+        summaries.append(
+            {
+                "requested_group_scales": requested_group_scales,
+                "num_layers": len(items),
+                "numel": total_numel,
+                "weighted_mse": weighted_mse,
+                "weighted_sqnr_db": weighted_sqnr_db,
+                "min_cosine": min(float(item["quality"]["cosine"]) for item in items),
+                "mean_cosine": sum(float(item["quality"]["cosine"]) for item in items) / len(items),
+                "max_abs_error": max(float(item["quality"]["max_abs_error"]) for item in items),
+                "ratio_values": sum(int(item["ratio_values"]) for item in items),
+                "ratio_bytes_float32": sum(int(item["ratio_bytes_float32"]) for item in items),
+                "ratio_bytes_q8": sum(int(item["ratio_bytes_q8"]) for item in items),
+                "q8_exact_mapping": (
+                    all(item["q8_exact_mapping"] is True for item in items)
+                    if any(item["q8_exact_mapping"] is not None for item in items)
+                    else None
+                ),
+            }
+        )
+    return summaries
+
+
 def write_quality_report(
     path: str,
     *,
@@ -485,8 +877,12 @@ def write_quality_report(
     output: str | None = None,
     options: dict[str, Any] | None = None,
     layers: Iterable[Int4ConvRotLayerQuality],
+    group_scale_comparisons: Iterable[dict[str, Any]] | None = None,
+    applied_parameters: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     layer_items = list(layers)
+    comparison_items = list(group_scale_comparisons or ())
+    applied_parameter_items = list(applied_parameters or ())
     report = {
         "format": "ltx2_int4_convrot_quality_v1",
         "source": source,
@@ -495,6 +891,14 @@ def write_quality_report(
         "summary": summarize_quality(layer_items),
         "layers": [asdict(layer) for layer in layer_items],
     }
+    if applied_parameter_items:
+        report["applied_parameters"] = applied_parameter_items
+    if comparison_items:
+        report["group_scale_comparisons"] = {
+            "selection": "none",
+            "summary": summarize_int4_group_scale_comparisons(comparison_items),
+            "layers": comparison_items,
+        }
     output_dir = os.path.dirname(path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -522,6 +926,29 @@ def _module_int4_group(module: nn.Module) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.detach().reshape(-1)[0].item()) if value.numel() else 0
     return int(value or 0)
+
+
+def _module_int4_group_scales(
+    module: nn.Module,
+    out_features: int,
+    padded_features: int,
+) -> tuple[torch.Tensor, int] | None:
+    ratio = getattr(module, "int4_group_scale_ratio", None)
+    size_value = getattr(module, "int4_group_scale_size", None)
+    if ratio is None and size_value is None:
+        return None
+    if not isinstance(ratio, torch.Tensor) or size_value is None:
+        raise ValueError("INT4 ConvRot group-scale ratio and size must be present together")
+    scale_group_size = int(size_value.detach().reshape(-1)[0].item()) if isinstance(size_value, torch.Tensor) else int(size_value)
+    if scale_group_size <= 0 or padded_features % scale_group_size:
+        raise ValueError(f"Invalid INT4 ConvRot group-scale size {scale_group_size} for width {padded_features}")
+    expected = (int(out_features), int(padded_features // scale_group_size))
+    if tuple(ratio.shape) != expected:
+        raise ValueError(f"INT4 ConvRot group-scale ratio shape {tuple(ratio.shape)} does not match {expected}")
+    ratio_f32 = decode_int4_group_scale_ratio(ratio)
+    if not torch.isfinite(ratio_f32).all() or (ratio_f32 <= 0).any():
+        raise ValueError("INT4 ConvRot group-scale ratios must be positive finite values")
+    return ratio, scale_group_size
 
 
 def _module_int4_rotate(module: nn.Module) -> bool:
@@ -587,11 +1014,16 @@ def _get_cuda_int4():
 
 
 def _int_mm_allow_small_m(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """torch._int_mm may reject tiny M on some CUDA builds; pad those cases."""
+    """torch._int_mm may reject tiny M on some CUDA builds; pad those cases.
 
-    if a.size(0) > 16:
+    Padding to 17 rows was sufficient for older torch bridges, but cuBLASLt on
+    Hopper can still reject that shape.  A 32-row tile is accepted by both
+    paths and the padded rows are discarded immediately.
+    """
+
+    if a.size(0) >= 32:
         return torch._int_mm(a, b)
-    pad_rows = 17 - a.size(0)
+    pad_rows = 32 - a.size(0)
     padded = F.pad(a, (0, 0, 0, pad_rows))
     return torch._int_mm(padded, b)[: a.size(0)]
 
@@ -975,9 +1407,7 @@ def _linear_w4a8_tensorcore(
     if not qx.is_cuda or not _supports_torch_int_mm(qx.device):
         return None
     cuda_int4 = _get_cuda_int4()
-    if cuda_int4 is None:
-        return None
-    w_int8 = cuda_int4.unpack_to_int8(packed_weight, k_values)
+    w_int8 = cuda_int4.unpack_to_int8(packed_weight, k_values) if cuda_int4 is not None else unpack_int4(packed_weight, k_values)
     acc = _int_mm_allow_small_m(qx.contiguous(), w_int8.t())
     out = acc.float() * x_scale.float() * weight_scale.reshape(1, -1).float()
     if bias is not None:
@@ -996,9 +1426,11 @@ def _grad_input_w4a8_tensorcore(
     if not qg.is_cuda or not _supports_torch_int_mm(qg.device):
         return None
     cuda_int4 = _get_cuda_int4()
-    if cuda_int4 is None:
-        return None
-    w_int8 = cuda_int4.unpack_to_int8(packed_weight, padded_features)
+    w_int8 = (
+        cuda_int4.unpack_to_int8(packed_weight, padded_features)
+        if cuda_int4 is not None
+        else unpack_int4(packed_weight, padded_features)
+    )
     acc = _int_mm_allow_small_m(qg.contiguous(), w_int8)
     return (acc.float() * grad_scale.float()).to(out_dtype)
 
@@ -1048,6 +1480,7 @@ def _grad_input_w4a8_fallback(
 
 _INT4_FUSE: bool | None = None
 _INT4_TRITON_FUSED_BROKEN = False
+_INT4_GROUP_GEMV_BROKEN = False
 _INT4_FUSED_GROUP_SIZES = (4, 16, 64, 256)
 
 # Independent CUDA fusion for the native-CUTLASS W4A4 path (LTX2_INT4_CONVROT_FUSE_CUDA).
@@ -1741,12 +2174,216 @@ class _Int4ConvRotLinearFunction(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None, None, None
 
 
+def _group_scale_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    if lhs.is_cuda and _supports_torch_int_mm(lhs.device):
+        return _int_mm_allow_small_m(lhs.contiguous(), rhs)
+    return lhs.float() @ rhs.float()
+
+
+def _group_scale_fused_gemv(
+    x_2d: torch.Tensor,
+    packed_weight: torch.Tensor,
+    group_scale_ratio: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    scale_group_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    global _INT4_GROUP_GEMV_BROKEN
+    if _INT4_GROUP_GEMV_BROKEN:
+        return None
+    try:
+        from musubi_tuner.modules.triton_int4_group_gemv import MAX_FUSED_GEMV_ROWS, int4_group_gemv
+
+        if os.environ.get("LTX2_INT4_CONVROT_FUSED_GEMV", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        if x_2d.shape[0] > MAX_FUSED_GEMV_ROWS:
+            return None
+        return int4_group_gemv(
+            x_2d,
+            packed_weight,
+            group_scale_ratio,
+            weight_scale,
+            bias,
+            scale_group_size=scale_group_size,
+            out_dtype=out_dtype,
+        )
+    except Exception as exc:
+        _INT4_GROUP_GEMV_BROKEN = True
+        logger.warning(
+            "INT4 ConvRot grouped fused GEMV failed; using the exact eager backend for the rest of this process: %s",
+            exc,
+        )
+        return None
+
+
+class _Int4ConvRotGroupScaleLinearFunction(torch.autograd.Function):
+    """INT4 group-scale path using INT8-grid code re-expression."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        packed_weight,
+        weight_scale,
+        group_scale_ratio,
+        bias,
+        int4_shape,
+        convrot_groupsize,
+        scale_group_size,
+        stab_l1=None,
+        stab_l2=None,
+        rotate=True,
+    ):
+        out_features, in_features, padded_features = (int(v) for v in int4_shape.detach().cpu().reshape(-1).tolist())
+        convrot_group = (
+            int(convrot_groupsize.detach().reshape(-1)[0].item())
+            if isinstance(convrot_groupsize, torch.Tensor)
+            else int(convrot_groupsize)
+        )
+        weight_group = (
+            int(scale_group_size.detach().reshape(-1)[0].item())
+            if isinstance(scale_group_size, torch.Tensor)
+            else int(scale_group_size)
+        )
+        original_shape = x.shape
+        output_dtype = _autocast_output_dtype(x)
+        has_stabilizer = stab_l1 is not None and stab_l2 is not None
+
+        if rotate:
+            x_2d = rotate_activation_padded(x, convrot_group, padded_features).reshape(-1, padded_features)
+        else:
+            x_2d = pad_last_dim(x, padded_features).reshape(-1, padded_features).contiguous()
+        activation_bits = _int4_activation_bits()
+        output = None
+        if activation_bits == 8 and not x.requires_grad:
+            output = _group_scale_fused_gemv(
+                x_2d,
+                packed_weight,
+                group_scale_ratio,
+                weight_scale,
+                bias,
+                scale_group_size=weight_group,
+                out_dtype=output_dtype,
+            )
+        if output is None:
+            if activation_bits == 8:
+                qx, x_scale = _quantize_activation_int8(x_2d)
+            else:
+                qx_packed, x_scale = _quantize_activation_int4(x_2d)
+                qx = unpack_int4(qx_packed, padded_features)
+
+            weight_int8 = unpack_int4_group_scaled(
+                packed_weight,
+                group_scale_ratio,
+                weight_group,
+                padded_features,
+            )
+            acc = _group_scale_int8_mm(qx, weight_int8.t())
+            output = acc.float() * x_scale.float() * weight_scale.reshape(1, out_features).float()
+            if bias is not None:
+                output = output + bias.float()
+            output = output.to(output_dtype)
+
+        if has_stabilizer:
+            compute_dtype = x_2d.dtype if x_2d.is_floating_point() else torch.float32
+            y_stab = (x_2d.to(compute_dtype) @ stab_l2.t().to(compute_dtype)) @ stab_l1.t().to(compute_dtype)
+            output = output + y_stab.to(output.dtype)
+            ctx.save_for_backward(
+                packed_weight,
+                weight_scale,
+                group_scale_ratio,
+                int4_shape,
+                torch.tensor(convrot_group, device=x.device, dtype=torch.int32),
+                torch.tensor(weight_group, device=x.device, dtype=torch.int32),
+                stab_l1,
+                stab_l2,
+            )
+        else:
+            ctx.save_for_backward(
+                packed_weight,
+                weight_scale,
+                group_scale_ratio,
+                int4_shape,
+                torch.tensor(convrot_group, device=x.device, dtype=torch.int32),
+                torch.tensor(weight_group, device=x.device, dtype=torch.int32),
+            )
+        ctx.has_stabilizer = has_stabilizer
+        ctx.input_dtype = x.dtype
+        ctx.gradient_bits = _int4_gradient_bits()
+        ctx.rotate = bool(rotate)
+        ctx.original_shape = original_shape
+        return output.reshape(*original_shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]:
+            raise RuntimeError("INT4 ConvRot base weights and group scales are frozen; full fine-tuning is not supported.")
+        if ctx.has_stabilizer:
+            (
+                packed_weight,
+                weight_scale,
+                group_scale_ratio,
+                int4_shape,
+                convrot_group_tensor,
+                weight_group_tensor,
+                stab_l1,
+                stab_l2,
+            ) = ctx.saved_tensors
+        else:
+            (
+                packed_weight,
+                weight_scale,
+                group_scale_ratio,
+                int4_shape,
+                convrot_group_tensor,
+                weight_group_tensor,
+            ) = ctx.saved_tensors
+            stab_l1 = stab_l2 = None
+
+        out_features, in_features, padded_features = (int(v) for v in int4_shape.detach().cpu().reshape(-1).tolist())
+        convrot_group = int(convrot_group_tensor.detach().reshape(-1)[0].item())
+        weight_group = int(weight_group_tensor.detach().reshape(-1)[0].item())
+        go = grad_output.reshape(-1, out_features)
+        go_scaled = go.float() * weight_scale.reshape(1, out_features).float()
+        if ctx.gradient_bits == 8:
+            qg, grad_scale = _quantize_activation_int8(go_scaled.to(grad_output.dtype))
+        else:
+            qg_packed, grad_scale = _quantize_activation_int4(go_scaled.to(grad_output.dtype))
+            qg = unpack_int4(qg_packed, out_features)
+
+        weight_int8 = unpack_int4_group_scaled(
+            packed_weight,
+            group_scale_ratio,
+            weight_group,
+            padded_features,
+        )
+        acc = _group_scale_int8_mm(qg, weight_int8)
+        grad_rot = (acc.float() * grad_scale.float()).to(ctx.input_dtype)
+        if stab_l1 is not None:
+            compute_dtype = go.dtype if go.is_floating_point() else torch.float32
+            grad_stab = (go.to(compute_dtype) @ stab_l1.to(compute_dtype)) @ stab_l2.to(compute_dtype)
+            grad_rot = grad_rot + grad_stab.to(grad_rot.dtype)
+        if ctx.rotate:
+            grad_input = rotate_activation_padded(
+                grad_rot,
+                convrot_group,
+                padded_features,
+                inverse=True,
+            )[..., :in_features]
+        else:
+            grad_input = grad_rot[..., :in_features]
+        return grad_input.reshape(*ctx.original_shape), None, None, None, None, None, None, None, None, None, None
+
+
 def int4_convrot_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     out_features, in_features, padded_features = _module_int4_shape(self)
     x = _apply_int4_awq_activation_scale(self, x, in_features)
     stabilizer = _module_int4_stabilizer(self, out_features, padded_features)
+    group_scales = _module_int4_group_scales(self, out_features, padded_features)
     rotate = _module_int4_rotate(self)
-    if _use_weight_only_diagnostic():
+    if _use_weight_only_diagnostic() or getattr(self, "_convrot_compute_mode", "quantized") == "dequantize":
         weight = dequantize_int4_convrot_weight(
             self.weight,
             self.scale_weight,
@@ -1756,8 +2393,32 @@ def int4_convrot_linear_forward(self: nn.Linear, x: torch.Tensor) -> torch.Tenso
             dtype=x.dtype if x.is_floating_point() else torch.float32,
             stabilizer=stabilizer,
             rotate=rotate,
+            group_scale_ratio=group_scales[0] if group_scales is not None else None,
+            scale_group_size=group_scales[1] if group_scales is not None else 0,
         )
-        return F.linear(x, weight, self.bias)
+        bias = self.bias
+        if bias is not None and bias.dtype != weight.dtype:
+            bias = bias.to(weight.dtype)
+        return F.linear(x, weight, bias)
+    if group_scales is not None:
+        ratio, scale_group_size = group_scales
+        group_size = _module_int4_group(self)
+        shape = getattr(self, "int4_shape")
+        group = getattr(self, "int4_convrot_groupsize")
+        stab_l1, stab_l2 = stabilizer if stabilizer is not None else (None, None)
+        return _Int4ConvRotGroupScaleLinearFunction.apply(
+            x,
+            self.weight,
+            self.scale_weight,
+            ratio,
+            self.bias,
+            shape,
+            group_size if group is None else group,
+            scale_group_size,
+            stab_l1,
+            stab_l2,
+            rotate,
+        )
     group_size = _module_int4_group(self)
     shape = getattr(self, "int4_shape")
     group = getattr(self, "int4_convrot_groupsize")
@@ -1784,6 +2445,8 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
         shape_key = name + ".int4_shape"
         scale_key = name + ".scale_weight"
         group_key = name + ".int4_convrot_groupsize"
+        group_ratio_key = name + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX
+        group_size_key = name + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX
         awq_key = name + INT4_CONVROT_AWQ_SCALE_SUFFIX
         if weight_key not in state_dict or shape_key not in state_dict or scale_key not in state_dict:
             continue
@@ -1801,6 +2464,19 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
             torch.zeros_like(state_dict.get(group_key, torch.tensor(0, dtype=torch.int32)).to(torch.int32)),
             persistent=True,
         )
+        if (group_ratio_key in state_dict) != (group_size_key in state_dict):
+            raise ValueError(f"INT4 ConvRot group-scale ratio and size must both exist for {name}")
+        if group_ratio_key in state_dict:
+            module.register_buffer(
+                "int4_group_scale_ratio",
+                torch.zeros_like(state_dict[group_ratio_key]),
+                persistent=True,
+            )
+            module.register_buffer(
+                "int4_group_scale_size",
+                torch.zeros_like(state_dict[group_size_key].to(torch.int32)),
+                persistent=True,
+            )
         if awq_key in state_dict:
             module.register_buffer("int4_awq_scales", torch.zeros_like(state_dict[awq_key].float()), persistent=True)
         rotation_key = name + ".int4_rotation"
@@ -1815,9 +2491,12 @@ def register_int4_convrot_buffers(model: nn.Module, state_dict: dict[str, torch.
     return registered
 
 
-def apply_int4_convrot_monkey_patch(model: nn.Module) -> nn.Module:
+def apply_int4_convrot_monkey_patch(model: nn.Module, policy: ConvRotPolicy | None = None) -> nn.Module:
     patched = 0
-    for module in model.modules():
+    dequantized_compute = 0
+    ignored_keep_bf16 = 0
+    group_scaled = 0
+    for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         if not (hasattr(module, "scale_weight") and hasattr(module, "int4_shape") and module.weight.dtype == torch.uint8):
@@ -1838,6 +2517,10 @@ def apply_int4_convrot_monkey_patch(model: nn.Module) -> nn.Module:
         if module.bias is not None:
             module.bias.requires_grad_(False)
         module.scale_weight = module.scale_weight.reshape(out_features, 1).to(device=module.weight.device, dtype=torch.float32)
+        group_scales = _module_int4_group_scales(module, out_features, padded_features)
+        if group_scales is not None:
+            module.int4_group_scale_ratio = group_scales[0].to(device=module.weight.device).contiguous()
+            group_scaled += 1
         awq_scales = _module_int4_awq_scales(module, in_features)
         if awq_scales is not None:
             module.int4_awq_scales = awq_scales.to(device=module.weight.device, dtype=torch.float32)
@@ -1845,12 +2528,32 @@ def apply_int4_convrot_monkey_patch(model: nn.Module) -> nn.Module:
         if stabilizer is not None:
             module.int4_stabilizer_l1 = stabilizer[0].to(device=module.weight.device).contiguous()
             module.int4_stabilizer_l2 = stabilizer[1].to(device=module.weight.device).contiguous()
+        decision = policy.resolve(name) if policy is not None else None
+        module._convrot_compute_mode = decision.compute if decision is not None else "quantized"
+        if decision is not None and not decision.quantize:
+            # The source floating-point weight no longer exists in a packed
+            # checkpoint.  Honor the storage request as closely as possible by
+            # bypassing the low-bit activation/gradient path.
+            module._convrot_compute_mode = "dequantize"
+            ignored_keep_bf16 += 1
+        if module._convrot_compute_mode == "dequantize":
+            dequantized_compute += 1
         module.forward = int4_convrot_linear_forward.__get__(module, type(module))
         patched += 1
     logger = __import__("logging").getLogger(__name__)
     backend = "cuda-lazy" if torch.cuda.is_available() else "torch-fallback"
     act_bits = _int4_activation_bits()
     logger.info("INT4 ConvRot (%s): patched %d linear layers, activation mode W4A%d", backend, patched, act_bits)
+    if dequantized_compute:
+        logger.info("INT4 ConvRot policy: %d packed layers use transient dequantized compute", dequantized_compute)
+    if group_scaled:
+        logger.info("INT4 ConvRot: %d packed layers use per-group weight scales", group_scaled)
+    if ignored_keep_bf16:
+        logger.warning(
+            "INT4 ConvRot policy requested quantize=false for %d already-packed layers; "
+            "their storage remains INT4 and compute=dequantize is applied",
+            ignored_keep_bf16,
+        )
     return model
 
 
@@ -1992,6 +2695,8 @@ def _fused_lora_eligible(lora_module) -> tuple[bool, str]:
     out_features, in_features, padded_features = _module_int4_shape(org)
     if _module_int4_awq_scales(org, in_features) is not None:
         return False, "AWQ-scaled int4cr layers are not fused (v1)"
+    if _module_int4_group_scales(org, out_features, padded_features) is not None:
+        return False, "group-scaled int4cr layers use the INT8-grid runtime path"
     return True, ""
 
 

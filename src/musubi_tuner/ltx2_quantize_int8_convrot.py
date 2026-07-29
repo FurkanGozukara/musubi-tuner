@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+from musubi_tuner.modules.convrot_policy import load_convrot_policy
 from musubi_tuner.modules.int8_convrot_utils import (
     best_int8_convrot_groupsize,
     comfy_quant_tensor,
@@ -55,6 +56,7 @@ def quantize_model(
     groupsize: str,
     mse_clip: bool,
     quality_report: str | None,
+    policy_path: str | None = None,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -64,6 +66,7 @@ def quantize_model(
 
     groupsizes = parse_int8_convrot_groupsizes(groupsize)
     device = torch.device(calc_device)
+    policy = load_convrot_policy(policy_path)
     logger.info("INT8 ConvRot quantization device: %s", device)
     logger.info("INT8 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT8 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
@@ -96,6 +99,9 @@ def quantize_model(
                     )
                 value = value.to(torch.bfloat16) * f.get_tensor(scale_key).to(value.device)
             quantizable, group_size, model_key = _is_quantizable(key, value, groupsizes)
+            decision = policy.resolve(model_key) if policy is not None and quantizable else None
+            if decision is not None and not decision.quantize:
+                quantizable = False
             if not quantizable:
                 if key.endswith(".weight") and value.ndim == 2 and any(t in model_key for t in _INT8_CONVROT_TARGET_PATTERNS):
                     skipped_count += 1
@@ -195,6 +201,11 @@ def main() -> None:
     )
     parser.add_argument("--no_mse_clip", action="store_true", help="Use plain absmax scales instead of MSE clipping")
     parser.add_argument(
+        "--convrot_policy",
+        default=None,
+        help="Optional ltx2_convrot_policy_v1 JSON; quantize=false rules keep matching weights in floating point",
+    )
+    parser.add_argument(
         "--quality_report",
         default=None,
         help="Quality JSON path. Defaults to <output_model_without_ext>.quality.json unless --no_quality_report is set.",
@@ -212,6 +223,7 @@ def main() -> None:
         groupsize=args.groupsize,
         mse_clip=not args.no_mse_clip,
         quality_report=quality_report,
+        policy_path=args.convrot_policy,
     )
 
 

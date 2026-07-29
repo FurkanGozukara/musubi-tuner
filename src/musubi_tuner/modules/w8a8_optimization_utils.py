@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from musubi_tuner.modules.convrot_policy import ConvRotPolicy
 from musubi_tuner.modules.int8_convrot_utils import rotate_activation_by_groupsize
 
 logger = logging.getLogger(__name__)
@@ -688,7 +689,10 @@ class _W8A8TransientDequantFunction(torch.autograd.Function):
         convrot_groupsize = int(convrot_groupsize or 0)
         weight_deq = _dequantize_weight(weight, scale_weight).to(x.dtype)
         x_linear = rotate_activation_by_groupsize(x, convrot_groupsize) if convrot_groupsize > 0 else x
-        output = F.linear(x_linear, weight_deq, bias)
+        compute_bias = bias
+        if compute_bias is not None and compute_bias.dtype != weight_deq.dtype:
+            compute_bias = compute_bias.to(weight_deq.dtype)
+        output = F.linear(x_linear, weight_deq, compute_bias)
         # weight_deq is NOT saved; it is freed when this scope ends.
         ctx.save_for_backward(weight, scale_weight)
         ctx.input_dtype = x.dtype
@@ -756,6 +760,8 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_s
 
         def forward(self, x):
             convrot_groupsize = _module_int8_convrot_groupsize(self)
+            if getattr(self, "_convrot_compute_mode", "quantized") == "dequantize":
+                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
             if not _supports_int_mm(x.device):
                 return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
             if cutlass_mm is not None and hasattr(self, "weight_int8_t"):
@@ -787,6 +793,8 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm=None, use_triton_s
         # _int_mm unavailable: still save VRAM via custom autograd
         def forward(self, x):
             convrot_groupsize = _module_int8_convrot_groupsize(self)
+            if getattr(self, "_convrot_compute_mode", "quantized") == "dequantize":
+                return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias, convrot_groupsize)
             num_tokens = x.reshape(-1, x.shape[-1]).shape[0]
             if num_tokens <= SMALL_BATCH_THRESHOLD:
                 return _linear_dequant_fallback(self, x, convrot_groupsize)
@@ -921,7 +929,11 @@ def register_quanto_int8_scale_buffers(model, state_dict):
     return registered
 
 
-def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
+def apply_quanto_int8_monkey_patch(
+    model,
+    w8a8_backend: str | None = None,
+    policy: ConvRotPolicy | None = None,
+):
     """Bind the int8 W8A8 forward to Linear layers that already hold an int8
     weight + scale_weight buffer (Optimum-Quanto qint8 checkpoints).
 
@@ -951,7 +963,9 @@ def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
     new_forward = _make_w8a8_int8_forward(use_int_mm, triton_mm, cutlass_mm, use_triton_scaled_forward=use_triton_scaled_forward)
 
     patched = 0
-    for module in model.modules():
+    dequantized_compute = 0
+    ignored_keep_bf16 = 0
+    for name, module in model.named_modules():
         if not isinstance(module, nn.Linear) or not hasattr(module, "scale_weight"):
             continue
         if module.weight.dtype != torch.int8:
@@ -971,6 +985,15 @@ def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
                 module.weight_int8_t = weight_int8_t
             else:
                 module.register_buffer("weight_int8_t", weight_int8_t, persistent=False)
+        decision = policy.resolve(name) if policy is not None else None
+        module._convrot_compute_mode = decision.compute if decision is not None else "quantized"
+        if decision is not None and not decision.quantize:
+            # A pre-quantized checkpoint has no source floating-point weight to
+            # restore, so use the closest safe fallback.
+            module._convrot_compute_mode = "dequantize"
+            ignored_keep_bf16 += 1
+        if module._convrot_compute_mode == "dequantize":
+            dequantized_compute += 1
         module.forward = new_forward.__get__(module, type(module))
         patched += 1
 
@@ -982,4 +1005,12 @@ def apply_quanto_int8_monkey_patch(model, w8a8_backend: str | None = None):
         else ("torch._int_mm" if use_int_mm else "dequant-fallback")
     )
     logger.info("Quanto int8 (%s): patched %d linear layers", backend, patched)
+    if dequantized_compute:
+        logger.info("INT8 ConvRot policy: %d quantized layers use transient dequantized compute", dequantized_compute)
+    if ignored_keep_bf16:
+        logger.warning(
+            "INT8 ConvRot policy requested quantize=false for %d already-quantized layers; "
+            "their storage remains INT8 and compute=dequantize is applied",
+            ignored_keep_bf16,
+        )
     return model

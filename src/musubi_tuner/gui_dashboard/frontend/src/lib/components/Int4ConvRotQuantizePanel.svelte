@@ -10,6 +10,11 @@
 	let mseClip = $state(true);
 	let qualityReport = $state(true);
 	let stabilizerRank = $state(0);
+	let scaleRefineSteps = $state(0);
+	let groupScales = $state(0);
+	let groupRatioQ8 = $state(false);
+	let compareGroupScales = $state('');
+	let convrotPolicy = $state('');
 	let jobId = $state('');
 	let jobState = $state('');
 	let status = $state('');
@@ -78,7 +83,12 @@
 					mse_clip: mseClip,
 					calc_device: calcDevice,
 					quality_report: qualityReport,
-					stabilizer_rank: Math.max(0, Number(stabilizerRank) || 0)
+					stabilizer_rank: Math.max(0, Number(stabilizerRank) || 0),
+					scale_refine_steps: Math.max(0, Number(scaleRefineSteps) || 0),
+					int4_convrot_group_scales: Math.max(0, Number(groupScales) || 0),
+					int4_convrot_group_ratio_q8: groupRatioQ8,
+					int4_convrot_compare_group_scales: compareGroupScales.trim(),
+					convrot_policy: convrotPolicy.trim()
 				})
 			});
 			const data = await res.json().catch(() => ({}));
@@ -159,6 +169,59 @@
 		<span class="block text-[10px]" style="color: var(--text-muted);">0 disables the stabilizer branch; 32 is a typical rank.</span>
 	</label>
 
+	<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+		<label class="space-y-1.5">
+			<span class="block text-[11px] font-medium" style="color: var(--text-secondary); font-family: var(--font-label);">Scale refine steps</span>
+			<input
+				type="number"
+				min="0"
+				step="1"
+				bind:value={scaleRefineSteps}
+				disabled={active}
+				placeholder="0"
+				title="Alternating least-squares row-scale refinement after MSE clipping. 0 preserves the existing quantizer; 2 enables refinement."
+				class="w-full h-8 px-2 text-[12px]"
+				style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+			/>
+		</label>
+		<label class="space-y-1.5">
+			<span class="block text-[11px] font-medium" style="color: var(--text-secondary); font-family: var(--font-label);">Weight group scales</span>
+			<input
+				type="number"
+				min="0"
+				step="16"
+				bind:value={groupScales}
+				disabled={active}
+				placeholder="0"
+				title="Maximum K-group size for per-group INT4 weight scales. 0 disables; for example, use 128 or 64."
+				class="w-full h-8 px-2 text-[12px]"
+				style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+			/>
+		</label>
+		<PathInput
+			label="ConvRot policy"
+			value={convrotPolicy}
+			oninput={(e) => convrotPolicy = e.target.value}
+			showFiles
+			placeholder="Optional policy JSON"
+			disabled={active}
+			tooltip="Optional per-layer policy. Rules can explicitly set quantize, compute, group_scales, group_ratio_q8, and scale_refine_steps."
+		/>
+	</div>
+
+	<label class="space-y-1.5">
+		<span class="block text-[11px] font-medium" style="color: var(--text-secondary); font-family: var(--font-label);">Compare group scales</span>
+		<input
+			bind:value={compareGroupScales}
+			disabled={active || !qualityReport}
+			placeholder="e.g. 0,128,64"
+			title="Explicit group-scale sizes to measure in the quality report. This never changes the selected checkpoint parameters."
+			class="w-full h-8 px-2 text-[12px]"
+			style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+		/>
+		<span class="block text-[10px]" style="color: var(--text-muted);">Report-only; values are measured in the order entered.</span>
+	</label>
+
 	<div class="flex flex-wrap items-center gap-4">
 		<label class="flex items-center gap-2 text-[12px]" style="color: var(--text-secondary);">
 			<input type="checkbox" bind:checked={mseClip} disabled={active} />
@@ -167,6 +230,10 @@
 		<label class="flex items-center gap-2 text-[12px]" style="color: var(--text-secondary);">
 			<input type="checkbox" bind:checked={qualityReport} disabled={active} />
 			Write quality report
+		</label>
+		<label class="flex items-center gap-2 text-[12px]" style="color: var(--text-secondary);">
+			<input type="checkbox" bind:checked={groupRatioQ8} disabled={active || Number(groupScales) <= 0} />
+			Exact Q8.8 group ratios
 		</label>
 	</div>
 

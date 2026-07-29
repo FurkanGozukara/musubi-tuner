@@ -262,6 +262,11 @@ class TrainingConfig(BaseModel):
     int4_convrot_groupsize: str = "auto"
     int4_convrot_no_mse_clip: bool = False
     int4_convrot_quality_report: str = ""
+    int4_convrot_scale_refine_steps: int = 0
+    int4_convrot_group_scales: int = 0
+    int4_convrot_group_ratio_q8: bool = False
+    int4_convrot_compare_group_scales: str = ""
+    convrot_policy: str = ""
     int4_convrot_awq_calibration: bool = False
     int4_convrot_awq_scales: str = ""
     int4_convrot_awq_alpha: float = 0.25

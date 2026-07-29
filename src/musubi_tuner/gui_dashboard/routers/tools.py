@@ -634,6 +634,7 @@ class QuantizeInt8ConvRotRequest(BaseModel):
     mse_clip: bool = True
     calc_device: str = "cpu"
     quality_report: bool = True
+    convrot_policy: str = ""
 
 
 @dataclasses.dataclass
@@ -645,6 +646,7 @@ class QuantizeInt8ConvRotJob:
     mse_clip: bool = True
     calc_device: str = "cpu"
     quality_report: bool = True
+    convrot_policy: str = ""
     state: str = "queued"
     message: str = "Queued"
     error: str = ""
@@ -687,6 +689,8 @@ def _run_quantize_int8cr_job(job: QuantizeInt8ConvRotJob, config: ProjectConfig)
             cmd.append("--no_mse_clip")
         if not job.quality_report:
             cmd.append("--no_quality_report")
+        if job.convrot_policy:
+            cmd += ["--convrot_policy", job.convrot_policy]
 
         result = subprocess.run(
             cmd,
@@ -742,6 +746,15 @@ async def start_quantize_int8cr(req: QuantizeInt8ConvRotRequest, request: Reques
     device = (req.calc_device or "cpu").strip().lower()
     if device not in {"cpu", "cuda"}:
         raise HTTPException(status_code=400, detail="calc_device must be 'cpu' or 'cuda'")
+    convrot_policy = ""
+    if req.convrot_policy.strip():
+        try:
+            policy_path = _resolve_project_path(config, req.convrot_policy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not policy_path.is_file():
+            raise HTTPException(status_code=404, detail=f"ConvRot policy not found: {policy_path}")
+        convrot_policy = str(policy_path)
 
     jobs = _get_quantize_int8cr_jobs(request)
     _prune_finished_jobs(jobs)
@@ -753,6 +766,7 @@ async def start_quantize_int8cr(req: QuantizeInt8ConvRotRequest, request: Reques
         mse_clip=bool(req.mse_clip),
         calc_device=device,
         quality_report=bool(req.quality_report),
+        convrot_policy=convrot_policy,
     )
     jobs[job.job_id] = job
     thread = threading.Thread(target=_run_quantize_int8cr_job, args=(job, config), daemon=True)
@@ -777,6 +791,11 @@ class QuantizeInt4ConvRotRequest(BaseModel):
     calc_device: str = "cpu"
     quality_report: bool = True
     stabilizer_rank: int = 0
+    scale_refine_steps: int = 0
+    int4_convrot_group_scales: int = 0
+    int4_convrot_group_ratio_q8: bool = False
+    int4_convrot_compare_group_scales: str = ""
+    convrot_policy: str = ""
 
 
 @dataclasses.dataclass
@@ -789,6 +808,11 @@ class QuantizeInt4ConvRotJob:
     calc_device: str = "cpu"
     quality_report: bool = True
     stabilizer_rank: int = 0
+    scale_refine_steps: int = 0
+    int4_convrot_group_scales: int = 0
+    int4_convrot_group_ratio_q8: bool = False
+    int4_convrot_compare_group_scales: str = ""
+    convrot_policy: str = ""
     state: str = "queued"
     message: str = "Queued"
     error: str = ""
@@ -833,6 +857,16 @@ def _run_quantize_int4cr_job(job: QuantizeInt4ConvRotJob, config: ProjectConfig)
             cmd.append("--no_quality_report")
         if job.stabilizer_rank > 0:
             cmd += ["--stabilizer_rank", str(job.stabilizer_rank)]
+        if job.scale_refine_steps > 0:
+            cmd += ["--scale_refine_steps", str(job.scale_refine_steps)]
+        if job.int4_convrot_group_scales > 0:
+            cmd += ["--int4_convrot_group_scales", str(job.int4_convrot_group_scales)]
+        if job.int4_convrot_group_ratio_q8:
+            cmd.append("--int4_convrot_group_ratio_q8")
+        if job.int4_convrot_compare_group_scales:
+            cmd += ["--int4_convrot_compare_group_scales", job.int4_convrot_compare_group_scales]
+        if job.convrot_policy:
+            cmd += ["--convrot_policy", job.convrot_policy]
 
         result = subprocess.run(
             cmd,
@@ -892,6 +926,45 @@ async def start_quantize_int4cr(req: QuantizeInt4ConvRotRequest, request: Reques
     stabilizer_rank = int(req.stabilizer_rank or 0)
     if stabilizer_rank < 0:
         raise HTTPException(status_code=400, detail="stabilizer_rank must be >= 0")
+    scale_refine_steps = int(req.scale_refine_steps or 0)
+    if scale_refine_steps < 0:
+        raise HTTPException(status_code=400, detail="scale_refine_steps must be >= 0")
+    group_scales = int(req.int4_convrot_group_scales or 0)
+    if group_scales < 0 or (group_scales and (group_scales < 16 or group_scales & (group_scales - 1))):
+        raise HTTPException(
+            status_code=400,
+            detail="int4_convrot_group_scales must be 0 or a power of two >= 16",
+        )
+    if req.int4_convrot_group_ratio_q8 and not group_scales:
+        raise HTTPException(
+            status_code=400,
+            detail="int4_convrot_group_ratio_q8 requires int4_convrot_group_scales",
+        )
+    compare_group_scales = (req.int4_convrot_compare_group_scales or "").strip()
+    if compare_group_scales:
+        try:
+            compare_values = [int(part.strip()) for part in compare_group_scales.replace(";", ",").split(",") if part.strip()]
+        except ValueError:
+            compare_values = []
+        if not compare_values or any(value < 0 or (value and (value < 16 or value & (value - 1))) for value in compare_values):
+            raise HTTPException(
+                status_code=400,
+                detail="int4_convrot_compare_group_scales must be a comma-separated list of 0 or powers of two >= 16",
+            )
+        if not req.quality_report:
+            raise HTTPException(
+                status_code=400,
+                detail="int4_convrot_compare_group_scales requires quality_report",
+            )
+    convrot_policy = ""
+    if req.convrot_policy.strip():
+        try:
+            policy_path = _resolve_project_path(config, req.convrot_policy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not policy_path.is_file():
+            raise HTTPException(status_code=404, detail=f"ConvRot policy not found: {policy_path}")
+        convrot_policy = str(policy_path)
 
     jobs = _get_quantize_int4cr_jobs(request)
     _prune_finished_jobs(jobs)
@@ -904,6 +977,11 @@ async def start_quantize_int4cr(req: QuantizeInt4ConvRotRequest, request: Reques
         calc_device=device,
         quality_report=bool(req.quality_report),
         stabilizer_rank=stabilizer_rank,
+        scale_refine_steps=scale_refine_steps,
+        int4_convrot_group_scales=group_scales,
+        int4_convrot_group_ratio_q8=bool(req.int4_convrot_group_ratio_q8),
+        int4_convrot_compare_group_scales=compare_group_scales,
+        convrot_policy=convrot_policy,
     )
     jobs[job.job_id] = job
     thread = threading.Thread(target=_run_quantize_int4cr_job, args=(job, config), daemon=True)

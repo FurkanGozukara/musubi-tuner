@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from musubi_tuner.modules.int4_convrot_utils import (
+    _module_int4_rotate,
+    _module_int4_stabilizer,
     dequantize_int4_convrot_weight,
     padded_features_for_group,
     rotate_activation_padded,
@@ -224,6 +226,14 @@ class Int4ConvRotActivationCalibrator:
             in_features,
             padded_features,
             dtype=x_sample.dtype,
+            group_scale_ratio=getattr(module, "int4_group_scale_ratio", None),
+            scale_group_size=(
+                int(module.int4_group_scale_size.detach().reshape(-1)[0].item())
+                if isinstance(getattr(module, "int4_group_scale_size", None), torch.Tensor)
+                else 0
+            ),
+            stabilizer=_module_int4_stabilizer(module, out_features, padded_features),
+            rotate=_module_int4_rotate(module),
         )
         awq_scales = getattr(module, "int4_awq_scales", None)
         if isinstance(awq_scales, torch.Tensor):

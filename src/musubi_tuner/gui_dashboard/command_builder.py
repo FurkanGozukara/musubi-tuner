@@ -1211,6 +1211,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--int4_convrot_no_mse_clip")
     if getattr(t, "int4_convrot_quality_report", ""):
         cmd += ["--int4_convrot_quality_report", str(t.int4_convrot_quality_report)]
+    if int(getattr(t, "int4_convrot_scale_refine_steps", 0) or 0) > 0:
+        cmd += ["--int4_convrot_scale_refine_steps", str(int(t.int4_convrot_scale_refine_steps))]
+    if int(getattr(t, "int4_convrot_group_scales", 0) or 0) > 0:
+        cmd += ["--int4_convrot_group_scales", str(int(t.int4_convrot_group_scales))]
+    if getattr(t, "int4_convrot_group_ratio_q8", False):
+        cmd.append("--int4_convrot_group_ratio_q8")
+    if str(getattr(t, "int4_convrot_compare_group_scales", "") or "").strip():
+        cmd += ["--int4_convrot_compare_group_scales", str(t.int4_convrot_compare_group_scales).strip()]
+    if getattr(t, "convrot_policy", ""):
+        cmd += ["--convrot_policy", str(t.convrot_policy)]
     if getattr(t, "int8_fused_quant", False):
         cmd.append("--int8_fused_quant")
     if t.awq_calibration:

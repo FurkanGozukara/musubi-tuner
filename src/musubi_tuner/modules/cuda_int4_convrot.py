@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -27,6 +28,10 @@ def _load_extension():
         raise
 
     source_dir = Path(__file__).resolve().parent / "cuda_int4_convrot_ext"
+    original_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if original_arch_list is None and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
     try:
         _EXTENSION = load(
             name="ltx2_cuda_int4_convrot",
@@ -46,6 +51,9 @@ def _load_extension():
     except Exception as exc:  # pragma: no cover - build environment dependent
         _LOAD_ERROR = exc
         raise
+    finally:
+        if original_arch_list is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
     return _EXTENSION
 
 
@@ -81,6 +89,22 @@ def unpack_to_int8(packed: torch.Tensor, num_values: int) -> torch.Tensor:
     """Unpack signed-int4 nibbles to an int8 CUDA matrix."""
 
     return _load_extension().unpack_to_int8(packed.contiguous(), int(num_values))
+
+
+def unpack_group_scaled_to_int8(
+    packed: torch.Tensor,
+    ratio: torch.Tensor,
+    group_size: int,
+    num_values: int,
+) -> torch.Tensor:
+    """Unpack INT4 and re-express group grids on the row INT8 grid in one kernel."""
+
+    return _load_extension().unpack_group_scaled_to_int8(
+        packed.contiguous(),
+        ratio.contiguous(),
+        int(group_size),
+        int(num_values),
+    )
 
 
 def transpose_packed(packed: torch.Tensor, logical_cols: int) -> torch.Tensor:

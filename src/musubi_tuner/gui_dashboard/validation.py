@@ -429,6 +429,115 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 message = f"{_quantized_label} is mutually exclusive with {_conf_label}."
                 errors.append(_make_issue("error", _quantized_field, message, label=_quantized_label, page="training"))
                 errors.append(_make_issue("error", _conf_field, message, label=_conf_label, page="training"))
+    _int4_scale_refine_steps = int(getattr(t, "int4_convrot_scale_refine_steps", 0) or 0)
+    if _int4_scale_refine_steps < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.int4_convrot_scale_refine_steps",
+                "INT4 scale refinement steps must be zero or greater.",
+                label="INT4 Scale Refine Steps",
+                page="training",
+            )
+        )
+    elif _int4_scale_refine_steps and not (getattr(t, "w4a4g4", False) or getattr(t, "w4a8", False) or getattr(t, "w4a4g8", False)):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.int4_convrot_scale_refine_steps",
+                "INT4 scale refinement requires a dynamic W4A4G4, W4A8, or W4A4G8 base mode.",
+                label="INT4 Scale Refine Steps",
+                page="training",
+            )
+        )
+    _int4_group_scales = int(getattr(t, "int4_convrot_group_scales", 0) or 0)
+    if _int4_group_scales < 0 or (
+        _int4_group_scales and (_int4_group_scales < 16 or _int4_group_scales & (_int4_group_scales - 1))
+    ):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.int4_convrot_group_scales",
+                "INT4 group scales must be 0/off or a power of two of at least 16.",
+                label="INT4 Group Scales",
+                page="training",
+            )
+        )
+    elif _int4_group_scales and not (getattr(t, "w4a4g4", False) or getattr(t, "w4a8", False) or getattr(t, "w4a4g8", False)):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.int4_convrot_group_scales",
+                "INT4 group scales require a dynamic W4A4G4, W4A8, or W4A4G8 base mode.",
+                label="INT4 Group Scales",
+                page="training",
+            )
+        )
+    if getattr(t, "int4_convrot_group_ratio_q8", False) and not _int4_group_scales:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.int4_convrot_group_ratio_q8",
+                "INT4 Q8.8 group-ratio storage requires INT4 group scales.",
+                label="INT4 Q8.8 Group Ratios",
+                page="training",
+            )
+        )
+    _int4_compare_raw = str(getattr(t, "int4_convrot_compare_group_scales", "") or "").strip()
+    if _int4_compare_raw:
+        try:
+            _int4_compare_values = [int(part.strip()) for part in _int4_compare_raw.replace(";", ",").split(",") if part.strip()]
+        except ValueError:
+            _int4_compare_values = []
+        _int4_compare_invalid = not _int4_compare_values or any(
+            value < 0 or (value and (value < 16 or value & (value - 1))) for value in _int4_compare_values
+        )
+        if _int4_compare_invalid:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.int4_convrot_compare_group_scales",
+                    "INT4 comparison sizes must be a comma-separated list of 0 or powers of two of at least 16.",
+                    label="INT4 Group-Scale Comparison",
+                    page="training",
+                )
+            )
+        if not (getattr(t, "w4a4g4", False) or getattr(t, "w4a8", False) or getattr(t, "w4a4g8", False)):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.int4_convrot_compare_group_scales",
+                    "INT4 group-scale comparison requires a dynamic W4A4G4, W4A8, or W4A4G8 base mode.",
+                    label="INT4 Group-Scale Comparison",
+                    page="training",
+                )
+            )
+        if not getattr(t, "int4_convrot_quality_report", ""):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.int4_convrot_compare_group_scales",
+                    "INT4 group-scale comparison requires an INT4 quality report path.",
+                    label="INT4 Group-Scale Comparison",
+                    page="training",
+                )
+            )
+    if getattr(t, "convrot_policy", "") and not (
+        getattr(t, "int8_convrot_base", False)
+        or getattr(t, "int8_convrot_dynamic", False)
+        or getattr(t, "w4a4g4", False)
+        or getattr(t, "w4a8", False)
+        or getattr(t, "w4a4g8", False)
+    ):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.convrot_policy",
+                "ConvRot Policy requires an INT8 or INT4 ConvRot base mode.",
+                label="ConvRot Policy",
+                page="training",
+            )
+        )
 
     network_module = t.network_module or get_ltx2_training_network_module_default()
     lycoris_requested = (

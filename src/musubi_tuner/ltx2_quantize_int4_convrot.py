@@ -17,16 +17,23 @@ from tqdm import tqdm
 
 from musubi_tuner.ltx2_model_loading import KEEP_FP8_HIGH_PRECISION_TOKENS
 from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+from musubi_tuner.modules.convrot_policy import load_convrot_policy, resolve_int4_policy_parameters
 from musubi_tuner.modules.int4_convrot_utils import (
+    INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX,
+    INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX,
     INT4_CONVROT_METADATA_MARKER,
     INT4_CONVROT_STABILIZER_L1_SUFFIX,
     INT4_CONVROT_STABILIZER_L2_SUFFIX,
     best_int4_convrot_groupsize,
     comfy_quant_tensor,
+    compare_int4_convrot_group_scales,
     compute_int4_convrot_stabilizer,
     parse_int4_convrot_groupsizes,
+    parse_int4_convrot_scale_group_candidates,
     quantize_int4_convrot_weight,
+    quantize_int4_convrot_weight_grouped,
     summarize_quality,
+    validate_int4_convrot_scale_group_size,
     write_quality_report,
 )
 from musubi_tuner.modules.int4_convrot_awq import (
@@ -74,6 +81,11 @@ def quantize_model(
     awq_scales: str | None,
     stabilizer_rank: int = 0,
     no_rotation: bool = False,
+    policy_path: str | None = None,
+    scale_refine_steps: int = 0,
+    group_scales: int = 0,
+    group_ratio_q8: bool = False,
+    compare_group_scales: str | tuple[int, ...] | None = None,
 ) -> None:
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"Input model not found: {input_model}")
@@ -82,11 +94,26 @@ def quantize_model(
         original_metadata = f.metadata() or {}
 
     groupsizes = parse_int4_convrot_groupsizes(groupsize)
+    group_scales = validate_int4_convrot_scale_group_size(group_scales)
+    if group_ratio_q8 and not group_scales:
+        raise ValueError("group_ratio_q8 requires group_scales")
+    comparison_candidates = parse_int4_convrot_scale_group_candidates(compare_group_scales)
+    if comparison_candidates and quality_report is None:
+        raise ValueError("compare_group_scales requires a quality report")
     device = torch.device(calc_device)
     rotate = not no_rotation
+    policy = load_convrot_policy(policy_path)
     logger.info("INT4 ConvRot quantization device: %s", device)
     logger.info("INT4 ConvRot group candidates: %s", ", ".join(str(g) for g in groupsizes))
     logger.info("INT4 ConvRot MSE clipping: %s", "on" if mse_clip else "off")
+    logger.info("INT4 ConvRot least-squares scale refinement steps: %d", int(scale_refine_steps))
+    logger.info("INT4 ConvRot group scales: %s", int(group_scales) if group_scales else "off")
+    logger.info("INT4 ConvRot group-ratio storage: %s", "Q8.8 int16" if group_ratio_q8 else "float32")
+    if comparison_candidates:
+        logger.info(
+            "INT4 ConvRot report-only group-scale candidates: %s (no selection is performed)",
+            ", ".join(str(candidate) for candidate in comparison_candidates),
+        )
     logger.info("INT4 ConvRot rotation: %s", "hadamard" if rotate else "none (stabilizer-only)")
     if stabilizer_rank < 0:
         raise ValueError(f"INT4 ConvRot stabilizer rank must be >= 0, got {stabilizer_rank}")
@@ -116,6 +143,8 @@ def quantize_model(
 
     state_dict: dict[str, torch.Tensor] = {}
     quality_layers = []
+    group_scale_comparisons = []
+    applied_int4_parameters = []
     quantized_count = 0
     skipped_count = 0
     passthrough_count = 0
@@ -142,6 +171,9 @@ def quantize_model(
                     )
                 value = value.to(torch.bfloat16) * f.get_tensor(scale_key).to(value.device)
             quantizable, group_size, model_key = _is_quantizable(key, value, groupsizes)
+            decision = policy.resolve(model_key) if policy is not None and quantizable else None
+            if decision is not None and not decision.quantize:
+                quantizable = False
             if not quantizable:
                 if key.endswith(".weight") and value.ndim == 2 and any(t in model_key for t in _INT4_CONVROT_TARGET_PATTERNS):
                     skipped_count += 1
@@ -151,6 +183,13 @@ def quantize_model(
                 continue
 
             assert group_size is not None
+            layer_parameters = resolve_int4_policy_parameters(
+                decision,
+                group_scales=group_scales,
+                group_ratio_q8=group_ratio_q8,
+                scale_refine_steps=scale_refine_steps,
+                name=model_key,
+            )
             awq_scale = None
             if awq_calibration:
                 awq_scale = compute_int4_convrot_awq_scale(value, alpha=float(awq_alpha))
@@ -174,30 +213,76 @@ def quantize_model(
                     calc_device=device,
                     rotate=rotate,
                 )
-            q, scale, shape, quality = quantize_int4_convrot_weight(
-                value,
-                group_size=group_size,
-                calc_device=device,
-                mse_clip=mse_clip,
-                collect_quality=quality_report is not None,
-                key=model_key,
-                stabilizer=stabilizer,
-                rotate=rotate,
-            )
+            quant_kwargs = {
+                "group_size": group_size,
+                "calc_device": device,
+                "mse_clip": mse_clip,
+                "collect_quality": quality_report is not None,
+                "key": model_key,
+                "stabilizer": stabilizer,
+                "rotate": rotate,
+                "scale_refine_steps": layer_parameters.scale_refine_steps,
+            }
+            group_scale_state = None
+            if layer_parameters.group_scales:
+                q, scale, shape, quality, group_scale_state = quantize_int4_convrot_weight_grouped(
+                    value,
+                    scale_group_size=layer_parameters.group_scales,
+                    ratio_q8=layer_parameters.group_ratio_q8,
+                    **quant_kwargs,
+                )
+            else:
+                q, scale, shape, quality = quantize_int4_convrot_weight(value, **quant_kwargs)
+            if quality_report is not None:
+                applied_int4_parameters.append(
+                    {
+                        "key": model_key,
+                        "group_scales_requested": layer_parameters.group_scales,
+                        "group_scales_resolved": (
+                            int(group_scale_state.group_size.detach().reshape(-1)[0].item()) if group_scale_state is not None else 0
+                        ),
+                        "group_ratio_q8": bool(layer_parameters.group_ratio_q8 and group_scale_state is not None),
+                        "scale_refine_steps": layer_parameters.scale_refine_steps,
+                    }
+                )
+            if comparison_candidates:
+                group_scale_comparisons.append(
+                    compare_int4_convrot_group_scales(
+                        value,
+                        candidates=comparison_candidates,
+                        selected_group_scales=layer_parameters.group_scales,
+                        selected_quality=quality,
+                        selected_group_ratio=group_scale_state.ratio if group_scale_state is not None else None,
+                        group_size=group_size,
+                        calc_device=device,
+                        mse_clip=mse_clip,
+                        key=model_key,
+                        stabilizer=stabilizer,
+                        rotate=rotate,
+                        scale_refine_steps=layer_parameters.scale_refine_steps,
+                    )
+                )
             base = key[: -len(".weight")]
             in_features = int(shape.detach().cpu().reshape(-1)[1].item())
             padded_features = int(shape.detach().cpu().reshape(-1)[2].item())
             state_dict[key] = q.cpu()
             state_dict[base + ".weight_scale"] = scale.cpu()
             state_dict[base + ".int4_shape"] = shape.cpu()
-            state_dict[base + ".comfy_quant"] = comfy_quant_tensor(
-                group_size,
-                in_features,
-                padded_features,
-                convrot=rotate,
-                awq=awq_scale is not None,
-                stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
-            )
+            if group_scale_state is not None:
+                state_dict[base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX] = group_scale_state.ratio.cpu()
+                state_dict[base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX] = group_scale_state.group_size.cpu()
+                state_dict[base + ".int4_convrot_groupsize"] = torch.tensor(group_size, dtype=torch.int32)
+                if not rotate:
+                    state_dict[base + ".int4_rotation"] = torch.tensor(0, dtype=torch.int32)
+            else:
+                state_dict[base + ".comfy_quant"] = comfy_quant_tensor(
+                    group_size,
+                    in_features,
+                    padded_features,
+                    convrot=rotate,
+                    awq=awq_scale is not None,
+                    stabilizer_rank=int(stabilizer[0].shape[1]) if stabilizer is not None else 0,
+                )
             if awq_scale is not None:
                 state_dict[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.cpu().float()
             if stabilizer is not None:
@@ -213,6 +298,11 @@ def quantize_model(
     output_metadata[INT4_CONVROT_METADATA_MARKER] = "true"
     output_metadata["int4_convrot_groupsizes"] = ",".join(str(g) for g in groupsizes)
     output_metadata["int4_convrot_mse_clip"] = "true" if mse_clip else "false"
+    output_metadata["int4_convrot_scale_refine_steps"] = str(int(scale_refine_steps))
+    output_metadata["int4_convrot_group_scales"] = str(int(group_scales))
+    output_metadata["int4_convrot_group_ratio_q8"] = "true" if group_ratio_q8 else "false"
+    if policy is not None and policy.has_int4_quantization_parameters():
+        output_metadata["int4_convrot_per_layer_quantization"] = "true"
     output_metadata["int4_convrot_storage"] = "packed_signed_int4_low_high"
     output_metadata["int4_convrot_rotation"] = "hadamard" if rotate else "none"
     output_metadata["int4_convrot_awq"] = "true" if (awq_calibration or loaded_awq_scales is not None) else "false"
@@ -270,8 +360,15 @@ def quantize_model(
                 "awq_alpha": float(awq_alpha),
                 "awq_scales": awq_save_path or awq_scales,
                 "stabilizer_rank": int(stabilizer_rank),
+                "scale_refine_steps": int(scale_refine_steps),
+                "group_scales": int(group_scales),
+                "group_ratio_q8": bool(group_ratio_q8),
+                "policy_int4_parameters": bool(policy is not None and policy.has_int4_quantization_parameters()),
+                "compare_group_scales": list(comparison_candidates),
             },
             layers=quality_layers,
+            group_scale_comparisons=group_scale_comparisons,
+            applied_parameters=applied_int4_parameters,
         )
         summary = report["summary"]
         if summary.get("num_layers", 0):
@@ -490,6 +587,38 @@ def main() -> None:
     )
     parser.add_argument("--no_mse_clip", action="store_true", help="Use plain absmax scales instead of MSE clipping")
     parser.add_argument(
+        "--scale_refine_steps",
+        type=int,
+        default=0,
+        help="Alternating least-squares row-scale refinement steps after clipping search (default: 0)",
+    )
+    parser.add_argument(
+        "--int4_convrot_group_scales",
+        type=int,
+        default=0,
+        metavar="SIZE",
+        help="Enable per-group INT4 weight scales with this maximum K-group size (for example 128; default: 0/off)",
+    )
+    parser.add_argument(
+        "--int4_convrot_group_ratio_q8",
+        action="store_true",
+        help="Store grouped INT4 scale ratios as exact-mapping int16 Q8.8 instead of float32 (requires group scales).",
+    )
+    parser.add_argument(
+        "--int4_convrot_compare_group_scales",
+        default="",
+        metavar="SIZES",
+        help=(
+            "Comma-separated group-scale sizes to measure in the quality report, for example 0,128,64. "
+            "This is report-only and never changes the selected quantization parameters."
+        ),
+    )
+    parser.add_argument(
+        "--convrot_policy",
+        default=None,
+        help="Optional ltx2_convrot_policy_v1 JSON; quantize=false rules keep matching weights in floating point",
+    )
+    parser.add_argument(
         "--no_rotation",
         action="store_true",
         help=(
@@ -541,6 +670,9 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.scale_refine_steps < 0:
+        raise ValueError("--scale_refine_steps must be >= 0")
+    validate_int4_convrot_scale_group_size(args.int4_convrot_group_scales)
 
     if args.export_format == "comfy_convrot_w4a4":
         for opt, flag in (
@@ -548,6 +680,11 @@ def main() -> None:
             (bool(args.int4_convrot_awq_calibration), "--int4_convrot_awq_calibration"),
             (bool(args.int4_convrot_awq_scales), "--int4_convrot_awq_scales"),
             (bool(args.no_rotation), "--no_rotation"),
+            (bool(args.convrot_policy), "--convrot_policy"),
+            (int(args.scale_refine_steps), "--scale_refine_steps"),
+            (int(args.int4_convrot_group_scales), "--int4_convrot_group_scales"),
+            (bool(args.int4_convrot_group_ratio_q8), "--int4_convrot_group_ratio_q8"),
+            (bool(args.int4_convrot_compare_group_scales), "--int4_convrot_compare_group_scales"),
         ):
             if opt:
                 raise ValueError(
@@ -563,6 +700,8 @@ def main() -> None:
         return
 
     quality_report = None if args.no_quality_report else (args.quality_report or default_quality_report_path(args.output_model))
+    if args.int4_convrot_group_ratio_q8 and not args.int4_convrot_group_scales:
+        raise ValueError("--int4_convrot_group_ratio_q8 requires --int4_convrot_group_scales")
     quantize_model(
         input_model=args.input_model,
         output_model=args.output_model,
@@ -575,6 +714,11 @@ def main() -> None:
         awq_scales=args.int4_convrot_awq_scales,
         stabilizer_rank=int(args.stabilizer_rank),
         no_rotation=bool(args.no_rotation),
+        policy_path=args.convrot_policy,
+        scale_refine_steps=int(args.scale_refine_steps),
+        group_scales=int(args.int4_convrot_group_scales),
+        group_ratio_q8=bool(args.int4_convrot_group_ratio_q8),
+        compare_group_scales=args.int4_convrot_compare_group_scales,
     )
 
 

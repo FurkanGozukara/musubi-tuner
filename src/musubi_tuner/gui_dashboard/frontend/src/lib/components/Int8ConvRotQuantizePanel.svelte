@@ -9,6 +9,7 @@
 	let calcDevice = $state('cpu');
 	let mseClip = $state(true);
 	let qualityReport = $state(true);
+	let convrotPolicy = $state('');
 	let jobId = $state('');
 	let jobState = $state('');
 	let status = $state('');
@@ -76,7 +77,8 @@
 					groupsize: groupsize.trim() || 'auto',
 					mse_clip: mseClip,
 					calc_device: calcDevice,
-					quality_report: qualityReport
+					quality_report: qualityReport,
+					convrot_policy: convrotPolicy.trim()
 				})
 			});
 			const data = await res.json().catch(() => ({}));
@@ -151,6 +153,16 @@
 			Write quality report
 		</label>
 	</div>
+
+	<PathInput
+		label="ConvRot policy"
+		value={convrotPolicy}
+		oninput={(e) => convrotPolicy = e.target.value}
+		showFiles
+		placeholder="Optional policy JSON"
+		disabled={active}
+		tooltip="Optional per-layer policy. quantize=false rules keep matching weights in floating point."
+	/>
 
 	<PathInput
 		label="Output"

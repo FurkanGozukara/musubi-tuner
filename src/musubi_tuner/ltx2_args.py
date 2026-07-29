@@ -1141,6 +1141,52 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Optional JSON path for per-layer INT4 ConvRot reconstruction metrics during dynamic quantization.",
     )
     parser.add_argument(
+        "--int4_convrot_scale_refine_steps",
+        type=int,
+        default=0,
+        help=(
+            "Alternating least-squares row-scale refinement steps after the INT4 clipping search. "
+            "0 preserves the existing quantizer exactly; 2 is a useful opt-in calibration setting."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_group_scales",
+        type=int,
+        default=0,
+        metavar="SIZE",
+        help=(
+            "Enable per-group INT4 weight scales using this maximum K-group size. "
+            "0 disables the feature; 128 is the recommended starting point."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_group_ratio_q8",
+        action="store_true",
+        help=(
+            "Store dynamic grouped INT4 scale ratios as int16 Q8.8 while preserving the deployed signed-INT4 "
+            "mapping exactly. Requires --int4_convrot_group_scales."
+        ),
+    )
+    parser.add_argument(
+        "--int4_convrot_compare_group_scales",
+        type=str,
+        default="",
+        metavar="SIZES",
+        help=(
+            "Comma-separated group-scale sizes to measure in --int4_convrot_quality_report, for example 0,128,64. "
+            "The comparison is report-only and never changes any layer's selected parameters."
+        ),
+    )
+    parser.add_argument(
+        "--convrot_policy",
+        type=str,
+        default=None,
+        help=(
+            "Optional ltx2_convrot_policy_v1 JSON for INT8/INT4 ConvRot. Rules independently control whether "
+            "dynamic weights are quantized and whether packed weights use low-bit or transient dequantized compute."
+        ),
+    )
+    parser.add_argument(
         "--int4_convrot_awq_calibration",
         action="store_true",
         help=(

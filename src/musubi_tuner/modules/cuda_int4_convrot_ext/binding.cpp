@@ -5,6 +5,8 @@
 std::tuple<torch::Tensor, torch::Tensor> quantize_rowwise(torch::Tensor x);
 std::tuple<torch::Tensor, torch::Tensor> quantize_rowwise_convrot(torch::Tensor x, int64_t padded_features, int64_t group);
 torch::Tensor unpack_to_int8(torch::Tensor packed, int64_t num_values);
+torch::Tensor unpack_group_scaled_to_int8(
+    torch::Tensor packed, torch::Tensor ratio, int64_t group_size, int64_t num_values);
 torch::Tensor transpose_packed(torch::Tensor packed, int64_t logical_cols);
 torch::Tensor wmma_int4_mm(torch::Tensor a, torch::Tensor b_t, int64_t logical_k);
 torch::Tensor dequant_epilogue(
@@ -32,6 +34,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quantize_rowwise_convrot", &quantize_rowwise_convrot,
         "CUDA fused ConvRot Hadamard rotation + packed INT4 row-wise activation quantization");
   m.def("unpack_to_int8", &unpack_to_int8, "CUDA packed INT4 to INT8 unpack");
+  m.def("unpack_group_scaled_to_int8", &unpack_group_scaled_to_int8,
+        "CUDA packed INT4 group-scale re-expression to INT8");
   m.def("transpose_packed", &transpose_packed, "CUDA packed signed-INT4 transpose");
   m.def("wmma_int4_mm", &wmma_int4_mm, "CUDA WMMA signed-INT4 tensor-core GEMM returning int32");
   m.def("dequant_epilogue", &dequant_epilogue, "CUDA INT4 tensor-core bridge dequantization epilogue");

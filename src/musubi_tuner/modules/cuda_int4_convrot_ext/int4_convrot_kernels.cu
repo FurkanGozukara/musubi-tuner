@@ -1,6 +1,6 @@
 #include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
 #include <cuda_bf16.h>
@@ -255,6 +255,51 @@ __global__ void unpack_to_int8_kernel(
     const int row = static_cast<int>(idx / num_values);
     const uint8_t byte = packed[static_cast<int64_t>(row) * packed_values + (col >> 1)];
     out[idx] = static_cast<int8_t>(unpack_i4(byte, col & 1));
+  }
+}
+
+template <typename ratio_t>
+__device__ __forceinline__ float group_ratio_to_float(ratio_t value) {
+  return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float group_ratio_to_float<int16_t>(int16_t value) {
+  return static_cast<float>(value) * (1.0f / 256.0f);
+}
+
+template <typename ratio_t>
+__global__ void unpack_group_scaled_to_int8_kernel(
+    const uint8_t* __restrict__ packed,
+    const ratio_t* __restrict__ ratio,
+    int8_t* __restrict__ out,
+    int64_t total_words,
+    int num_values,
+    int packed_values,
+    int group_size,
+    int groups_per_row) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int words_per_row = num_values / 8;
+  for (; idx < total_words; idx += stride) {
+    const int word_col = static_cast<int>(idx % words_per_row);
+    const int row = static_cast<int>(idx / words_per_row);
+    const int col = word_col * 8;
+    const auto* packed_word_ptr =
+        reinterpret_cast<const uint32_t*>(packed + static_cast<int64_t>(row) * packed_values + word_col * 4);
+    const uint32_t word = *packed_word_ptr;
+    const float group_ratio =
+        group_ratio_to_float(ratio[static_cast<int64_t>(row) * groups_per_row + col / group_size]);
+    uint64_t mapped_word = 0;
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) {
+      const int nibble = static_cast<int>((word >> (lane * 4)) & 0x0f);
+      const int code = (nibble ^ 0x08) - 0x08;
+      const int mapped = __float2int_rn(static_cast<float>(code) * group_ratio);
+      const int clipped = mapped < -127 ? -127 : (mapped > 127 ? 127 : mapped);
+      mapped_word |= static_cast<uint64_t>(static_cast<uint8_t>(clipped)) << (lane * 8);
+    }
+    reinterpret_cast<uint64_t*>(out)[idx] = mapped_word;
   }
 }
 
@@ -601,6 +646,65 @@ torch::Tensor unpack_to_int8(torch::Tensor packed, int64_t num_values) {
       total,
       static_cast<int>(num_values),
       static_cast<int>(packed.size(1)));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor unpack_group_scaled_to_int8(
+    torch::Tensor packed,
+    torch::Tensor ratio,
+    int64_t group_size,
+    int64_t num_values) {
+  ltx2_cuda_int4_convrot::check_uint8_matrix(packed, "packed");
+  TORCH_CHECK(ratio.is_cuda(), "ratio must be a CUDA tensor");
+  TORCH_CHECK(
+      ratio.scalar_type() == torch::kFloat32 || ratio.scalar_type() == torch::kInt16,
+      "ratio must be float32 or int16 Q8.8");
+  TORCH_CHECK(ratio.dim() == 2, "ratio must be a 2D tensor");
+  TORCH_CHECK(ratio.is_contiguous(), "ratio must be contiguous");
+  TORCH_CHECK(ratio.device() == packed.device(), "ratio and packed must be on the same CUDA device");
+  TORCH_CHECK(num_values >= 0, "num_values must be non-negative");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(num_values % group_size == 0, "num_values must be divisible by group_size");
+  TORCH_CHECK(num_values % 8 == 0, "num_values must be divisible by 8");
+  TORCH_CHECK(group_size % 8 == 0, "group_size must be divisible by 8");
+  TORCH_CHECK((num_values + 1) / 2 <= packed.size(1), "num_values exceeds packed tensor width");
+  TORCH_CHECK(num_values <= std::numeric_limits<int>::max(), "num_values is too large");
+  TORCH_CHECK(group_size <= std::numeric_limits<int>::max(), "group_size is too large");
+  const auto M = packed.size(0);
+  const auto groups_per_row = num_values / group_size;
+  TORCH_CHECK(ratio.size(0) == M && ratio.size(1) == groups_per_row, "ratio shape does not match packed rows/groups");
+  auto out = torch::empty({M, num_values}, packed.options().dtype(torch::kInt8));
+  if (M == 0 || num_values == 0) {
+    return out;
+  }
+
+  c10::cuda::CUDAGuard device_guard(packed.device());
+  auto stream = at::cuda::getCurrentCUDAStream(packed.get_device());
+  constexpr int threads = 256;
+  const int64_t total_words = M * (num_values / 8);
+  const int blocks = static_cast<int>(std::min<int64_t>((total_words + threads - 1) / threads, 65535));
+  if (ratio.scalar_type() == torch::kInt16) {
+    ltx2_cuda_int4_convrot::unpack_group_scaled_to_int8_kernel<int16_t><<<blocks, threads, 0, stream.stream()>>>(
+        packed.data_ptr<uint8_t>(),
+        ratio.data_ptr<int16_t>(),
+        out.data_ptr<int8_t>(),
+        total_words,
+        static_cast<int>(num_values),
+        static_cast<int>(packed.size(1)),
+        static_cast<int>(group_size),
+        static_cast<int>(groups_per_row));
+  } else {
+    ltx2_cuda_int4_convrot::unpack_group_scaled_to_int8_kernel<float><<<blocks, threads, 0, stream.stream()>>>(
+        packed.data_ptr<uint8_t>(),
+        ratio.data_ptr<float>(),
+        out.data_ptr<int8_t>(),
+        total_words,
+        static_cast<int>(num_values),
+        static_cast<int>(packed.size(1)),
+        static_cast<int>(group_size),
+        static_cast<int>(groups_per_row));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
