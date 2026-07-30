@@ -1926,7 +1926,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for audio metrics, e.g. mel_metrics=true clap_similarity=true "
-        "clap_reference_similarity=true "
+        "clap_reference_similarity=true clap_fad=true "
+        "av_desync=true av_desync_checkpoint=/path/to/synchformer.pth "
         "latent_fd_compute_every=50 mel_compute_every=100",
     )
 

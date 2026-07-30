@@ -347,11 +347,80 @@ def _effective_cache_preview_input(config: ProjectConfig) -> str:
     return config.caching.cache_preview_input or _default_dataset_cache_directory(config)
 
 
+def _validate_generated_av_metrics(
+    training,
+    *,
+    page: str,
+    errors: list[dict[str, Any]],
+) -> None:
+    fad_enabled = bool(getattr(training, "audio_metrics_clap_fad", False))
+    desync_enabled = bool(getattr(training, "audio_metrics_av_desync", False))
+    if not (fad_enabled or desync_enabled):
+        return
+
+    if not training.audio_metrics:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{page}.audio_metrics",
+                "Audio Metrics must be enabled for generated AV validation.",
+                label="Audio Metrics",
+                page=page,
+            )
+        )
+    has_sample_manifest = _has_text(getattr(training, "sample_prompts", "")) or _has_text(
+        getattr(training, "sample_prompts_text", "")
+    )
+    if not has_sample_manifest:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{page}.sample_prompts",
+                "A deterministic sample manifest is required for generated AV validation.",
+                label="Sample Prompts",
+                page=page,
+            )
+        )
+    if fad_enabled and int(getattr(training, "audio_metrics_clap_fad_min_samples", 513)) < 2:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{page}.audio_metrics_clap_fad_min_samples",
+                "FAD-CLAP minimum samples must be at least 2; the runtime also enforces embedding_dimension + 1.",
+                label="FAD-CLAP Minimum Samples",
+                page=page,
+            )
+        )
+    if desync_enabled:
+        checkpoint = str(getattr(training, "audio_metrics_av_desync_checkpoint", "") or "").strip()
+        if not checkpoint or not Path(checkpoint).is_file():
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{page}.audio_metrics_av_desync_checkpoint",
+                    "AV DeSync requires a readable Synchformer checkpoint.",
+                    label="AV DeSync Checkpoint",
+                    page=page,
+                )
+            )
+        if float(getattr(training, "audio_metrics_av_desync_max_length_s", 8.0)) <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{page}.audio_metrics_av_desync_max_length_s",
+                    "AV DeSync maximum duration must be greater than 0.",
+                    label="AV DeSync Maximum Duration",
+                    page=page,
+                )
+            )
+
+
 def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     """Validate GUI training config before launch."""
     t = config.training
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    _validate_generated_av_metrics(t, page="training", errors=errors)
     effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors, t.gemma_root)
 
     if not _has_training_checkpoint(config):

@@ -2702,13 +2702,16 @@ Enable with `--audio_metrics`. All logic is in `audio_metrics.py`. When disabled
 | `sample_audio/clap_similarity_ci95_low`, `sample_audio/clap_similarity_ci95_high` | Normal-approximation 95% confidence interval over manifest scores | transformers (already a dep) |
 | `sample_audio/clap_reference_similarity` | CLAP audio-embedding cosine similarity between generated and held-out reference audio | transformers (already a dep) |
 | `sample_audio/clap_reference_similarity_mean` | Mean generated/reference similarity over the complete manifest pass | transformers (already a dep) |
-| `sample_audio/av_onset_alignment` | Correlation between audio energy onsets and video motion | None |
+| `sample_audio/fad_clap` | Fréchet distance between generated and held-out reference CLAP distributions; lower is better | transformers (already a dep) |
+| `sample_audio/av_onset_alignment` | Correlation between audio energy onsets and decoded-video motion | None |
+| `sample_av/av_desync_seconds_mean` | Mean absolute AV offset predicted by Synchformer; lower is better | Synchformer checkpoint |
+| `sample_av/av_sync_score_mean` | Mean `1 / (1 + desync_seconds)`; higher is better | Synchformer checkpoint |
 
 CLAP model is lazy-loaded on the first sample and offloaded to CPU between uses.
 Every manifest entry must specify an explicit seed when CLAP validation is
 enabled. One `sample/av_validation_<step>.json` report is written per manifest
 pass with aggregate metrics, runtime, prompt/seed metadata, and paths to the
-generated WAV artifacts. CLAP input is resampled to its required 48 kHz.
+generated audio/video artifacts. CLAP input is resampled to its required 48 kHz.
 Generated/reference comparison is separately opt-in:
 
 ```bash
@@ -2720,7 +2723,38 @@ Every entry must then provide held-out audio through
 `--vra path/to/reference.wav` in a TXT prompt manifest. This field is used only
 by validation metrics. Do not substitute `--ra`, which conditions generation
 on the supplied audio and would invalidate a held-out comparison.
-FAD-CLAP is not currently implemented or exposed.
+
+FAD-CLAP uses the same paired manifest:
+
+```bash
+--audio_metrics --audio_metrics_args clap_fad=true clap_fad_min_samples=513
+```
+
+The metric is emitted only when generated and reference embedding counts match,
+the sample count is at least both `clap_fad_min_samples` and
+`embedding_dimension + 1`, and both empirical covariance matrices have full
+rank. Otherwise the JSON report records why the result is invalid and no
+FAD-CLAP scalar is logged. The default minimum of 513 matches the default
+512-dimensional CLAP backend. Treat FAD-CLAP as a comparative validation signal
+and confirm its ranking against held-out human judgments before using it as a
+quality gate.
+
+Synchformer DeSync validation is separately opt-in:
+
+```bash
+--audio_metrics --audio_metrics_args \
+  av_desync=true \
+  av_desync_checkpoint=path/to/synchformer_state_dict.pth \
+  av_desync_device=cpu
+```
+
+It scores the generated MP4 and WAV sidecar after the complete manifest pass.
+`av_desync_device=cpu` is the VRAM-safe default; use `cuda` when the validation
+environment has enough free VRAM. `av_desync_max_length_s` controls the scored
+duration and defaults to 8 seconds. Every entry must be a video sample with an
+explicit seed. The per-sample offsets, derived sync scores, failures, backend
+configuration, and aggregate confidence intervals are retained in the same
+validation JSON report.
 
 ### Timestep Sampling
 <sub>[↑ contents](#table-of-contents)</sub>

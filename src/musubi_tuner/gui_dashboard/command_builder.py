@@ -334,6 +334,35 @@ def _append_key_value_args(args_parts: list[str], raw: str) -> None:
     args_parts.extend(_split_cli_args(raw))
 
 
+def _append_audio_metrics_args(cmd: list[str], training) -> None:
+    if not training.audio_metrics:
+        return
+    cmd.append("--audio_metrics")
+    args_parts: list[str] = []
+    _append_key_value_args(args_parts, training.audio_metrics_args)
+    if training.audio_metrics_mel_metrics:
+        args_parts.append("mel_metrics=true")
+        if training.audio_metrics_mel_compute_every != 100:
+            args_parts.append(f"mel_compute_every={training.audio_metrics_mel_compute_every}")
+    if training.audio_metrics_clap_similarity:
+        args_parts.append("clap_similarity=true")
+    if training.audio_metrics_clap_fad:
+        args_parts.append("clap_fad=true")
+        if training.audio_metrics_clap_fad_min_samples != 513:
+            args_parts.append(f"clap_fad_min_samples={training.audio_metrics_clap_fad_min_samples}")
+    if training.audio_metrics_av_onset_alignment:
+        args_parts.append("av_onset_alignment=true")
+    if training.audio_metrics_av_desync:
+        args_parts.append("av_desync=true")
+        args_parts.append(f"av_desync_checkpoint={training.audio_metrics_av_desync_checkpoint}")
+        if training.audio_metrics_av_desync_device != "cpu":
+            args_parts.append(f"av_desync_device={training.audio_metrics_av_desync_device}")
+        if training.audio_metrics_av_desync_max_length_s != 8.0:
+            args_parts.append(f"av_desync_max_length_s={training.audio_metrics_av_desync_max_length_s}")
+    if args_parts:
+        cmd += ["--audio_metrics_args"] + args_parts
+
+
 def _compile_dynamic_value(value) -> str | None:
     if value in (None, False, ""):
         return None
@@ -2007,20 +2036,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--av_attention_loss_warmup_steps", str(t.av_attention_loss_warmup_steps)]
 
     # Audio Metrics
-    if t.audio_metrics:
-        cmd.append("--audio_metrics")
-        args_parts = []
-        _append_key_value_args(args_parts, t.audio_metrics_args)
-        if t.audio_metrics_mel_metrics:
-            args_parts.append("mel_metrics=true")
-            if t.audio_metrics_mel_compute_every != 100:
-                args_parts.append(f"mel_compute_every={t.audio_metrics_mel_compute_every}")
-        if t.audio_metrics_clap_similarity:
-            args_parts.append("clap_similarity=true")
-        if t.audio_metrics_av_onset_alignment:
-            args_parts.append("av_onset_alignment=true")
-        if args_parts:
-            cmd += ["--audio_metrics_args"] + args_parts
+    _append_audio_metrics_args(cmd, t)
 
     # TREAD token routing
     if t.tread:

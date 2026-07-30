@@ -45,13 +45,16 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
             "clap_reference_similarity",
             False,
         )
-        clap_any_enabled = clap_enabled or clap_reference_enabled
+        clap_fad_enabled = getattr(getattr(audio_metrics, "config", None), "clap_fad", False)
+        av_desync_enabled = getattr(getattr(audio_metrics, "config", None), "av_desync", False)
+        clap_any_enabled = clap_enabled or clap_reference_enabled or clap_fad_enabled
+        generated_av_validation_enabled = clap_any_enabled or av_desync_enabled
         missing_seed_indices = [
             int(parameter.get("enum", index)) for index, parameter in enumerate(sample_parameters) if parameter.get("seed") is None
         ]
-        if clap_any_enabled and missing_seed_indices:
+        if generated_av_validation_enabled and missing_seed_indices:
             raise ValueError(
-                "Generated-sample CLAP validation requires an explicit seed for every manifest entry; "
+                "Generated AV validation requires an explicit seed for every manifest entry; "
                 f"missing seeds for sample indices {missing_seed_indices}."
             )
         missing_reference_indices = [
@@ -59,7 +62,7 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
             for index, parameter in enumerate(sample_parameters)
             if not parameter.get("validation_reference_audio_path")
         ]
-        if clap_reference_enabled and missing_reference_indices:
+        if (clap_reference_enabled or clap_fad_enabled) and missing_reference_indices:
             raise ValueError(
                 "Generated-sample CLAP reference validation requires validation_reference_audio_path "
                 f"for every manifest entry; missing paths for sample indices {missing_reference_indices}."
@@ -69,14 +72,34 @@ def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, trans
             for parameter in sample_parameters
             if parameter.get("validation_reference_audio_path") and not os.path.isfile(parameter["validation_reference_audio_path"])
         ]
-        if clap_reference_enabled and invalid_reference_paths:
+        if (clap_reference_enabled or clap_fad_enabled) and invalid_reference_paths:
             raise ValueError(
                 "Generated-sample CLAP reference validation paths must be readable files; "
                 f"invalid paths: {invalid_reference_paths}."
             )
-        if clap_any_enabled and distributed_state.num_processes > 1:
+        if clap_fad_enabled:
+            configured_min_samples = int(getattr(audio_metrics.config, "clap_fad_min_samples", 513))
+            if len(sample_parameters) < configured_min_samples:
+                raise ValueError(
+                    "FAD-CLAP validation requires at least "
+                    f"{configured_min_samples} paired manifest entries; received {len(sample_parameters)}."
+                )
+        if av_desync_enabled:
+            checkpoint_path = str(getattr(audio_metrics.config, "av_desync_checkpoint", "") or "")
+            if not checkpoint_path or not os.path.isfile(checkpoint_path):
+                raise ValueError(
+                    "AV DeSync validation requires audio_metrics_args av_desync_checkpoint=<readable Synchformer checkpoint>."
+                )
+            non_video_indices = [
+                int(parameter.get("enum", index))
+                for index, parameter in enumerate(sample_parameters)
+                if int(parameter.get("frame_count", 1)) <= 1
+            ]
+            if non_video_indices:
+                raise ValueError(f"AV DeSync validation requires video samples; non-video sample indices: {non_video_indices}.")
+        if generated_av_validation_enabled and distributed_state.num_processes > 1:
             raise ValueError(
-                "Generated-sample CLAP validation currently requires single-process sampling so the "
+                "Generated AV validation currently requires single-process sampling so the "
                 "dataset summary cannot silently omit samples from other ranks."
             )
         audio_metrics.begin_validation_sample_run()

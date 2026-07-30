@@ -676,7 +676,13 @@ class TrainingConfig(BaseModel):
     audio_metrics_mel_metrics: bool = False
     audio_metrics_mel_compute_every: int = 100
     audio_metrics_clap_similarity: bool = False
+    audio_metrics_clap_fad: bool = False
+    audio_metrics_clap_fad_min_samples: int = 513
     audio_metrics_av_onset_alignment: bool = False
+    audio_metrics_av_desync: bool = False
+    audio_metrics_av_desync_checkpoint: str = ""
+    audio_metrics_av_desync_device: Literal["cpu", "cuda", "auto"] = "cpu"
+    audio_metrics_av_desync_max_length_s: float = 8.0
 
     # Token routing
     tread: bool = False

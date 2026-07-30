@@ -2478,7 +2478,9 @@ class LTX2SamplingMixin:
                     sample_rate=sample_rate,
                     sample_metadata=sample_parameter,
                     artifact_path=wav_path,
+                    video_artifact_path=video_path,
                     reference_audio_path=sample_parameter.get("validation_reference_audio_path"),
+                    video_latent=video[0] if video is not None and video.ndim == 5 else None,
                 )
                 if sample_metrics and len(accelerator.trackers) > 0:
                     accelerator.log(sample_metrics, step=steps)

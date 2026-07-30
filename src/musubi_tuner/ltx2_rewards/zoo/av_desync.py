@@ -367,6 +367,16 @@ class AVDesyncReward(BaseReward):
 
         return float(np.mean(sync_scores)) if len(sync_scores) > 0 else 2.0
 
+    def measure_desync(self, video_path: str, audio_path: str) -> float:
+        """Measure the mean absolute predicted AV offset in seconds."""
+        if self._synchformer is None:
+            raise RuntimeError("av_desync: setup() must run before measure_desync()")
+        return self._single_desync_score(
+            video_path,
+            audio_path,
+            max_length_s=self._max_length_s,
+        )
+
     def score(self, samples: List[dict]) -> Tuple[List[float], dict]:
         if self._synchformer is None:
             raise RuntimeError("av_desync reward: setup() must run before score()")
@@ -385,7 +395,7 @@ class AVDesyncReward(BaseReward):
                         raise ValueError(f"av_desync: 'video_file' must be a path str, got {type(video_path)}")
                     if not isinstance(audio_path, str):
                         raise ValueError(f"av_desync: paired wav not found for video: {video_path}")
-                    d = self._single_desync_score(video_path, audio_path, max_length_s=self._max_length_s)
+                    d = self.measure_desync(video_path, audio_path)
                     # desync d smaller is better -> reward larger is better
                     s = 1.0 / (1.0 + d)
                     if np.isnan(s) or np.isinf(s):

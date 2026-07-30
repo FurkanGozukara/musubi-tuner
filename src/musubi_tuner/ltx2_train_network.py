@@ -1744,12 +1744,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._audio_metrics_checkpoint = getattr(args, "ltx2_checkpoint", None)
         self._audio_metrics_decoder = None  # lazy-loaded
         logger.info(
-            "Audio metrics enabled: latent_fd=%s temporal_coherence=%s av_latent_sync=%s mel=%s clap=%s",
+            "Audio metrics enabled: latent_fd=%s temporal_coherence=%s av_latent_sync=%s mel=%s clap=%s fad_clap=%s av_desync=%s",
             config.latent_fd,
             config.temporal_coherence,
             config.av_latent_sync,
             config.mel_metrics,
             config.clap_similarity,
+            config.clap_fad,
+            config.av_desync,
         )
 
     def _get_audio_decoder_for_metrics(self) -> torch.nn.Module | None:

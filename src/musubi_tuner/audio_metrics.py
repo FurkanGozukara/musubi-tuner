@@ -46,8 +46,14 @@ class AudioMetricsConfig:
     # Sampling-time (embedding-space)
     clap_similarity: bool = False
     clap_reference_similarity: bool = False
+    clap_fad: bool = False
+    clap_fad_min_samples: int = 513
     clap_model: str = "laion/clap-htsat-unfused"
     av_onset_alignment: bool = False
+    av_desync: bool = False
+    av_desync_checkpoint: str = ""
+    av_desync_device: str = "cpu"
+    av_desync_max_length_s: float = 8.0
 
 
 def parse_audio_metrics_args(raw_args: list[str] | None) -> dict[str, str]:
@@ -74,15 +80,23 @@ def _config_from_kwargs(kw: dict[str, str]) -> AudioMetricsConfig:
         "log_spectral_distance",
         "clap_similarity",
         "clap_reference_similarity",
+        "clap_fad",
         "av_onset_alignment",
+        "av_desync",
     }
     int_keys = {
         "latent_fd_window",
         "latent_fd_compute_every",
         "mel_compute_every",
         "mcd_coefficients",
+        "clap_fad_min_samples",
     }
-    str_keys = {"clap_model"}
+    float_keys = {"av_desync_max_length_s"}
+    str_keys = {
+        "clap_model",
+        "av_desync_checkpoint",
+        "av_desync_device",
+    }
 
     typed: dict[str, Any] = {}
     for k, v in kw.items():
@@ -90,11 +104,20 @@ def _config_from_kwargs(kw: dict[str, str]) -> AudioMetricsConfig:
             typed[k] = v.lower() in ("true", "1", "yes")
         elif k in int_keys:
             typed[k] = int(v)
+        elif k in float_keys:
+            typed[k] = float(v)
         elif k in str_keys:
             typed[k] = v
         else:
             logger.warning("Unknown audio_metrics arg: %s=%s", k, v)
-    return AudioMetricsConfig(**typed)
+    config = AudioMetricsConfig(**typed)
+    if config.clap_fad_min_samples < 2:
+        raise ValueError("clap_fad_min_samples must be at least 2")
+    if config.av_desync_device not in {"cpu", "cuda", "auto"}:
+        raise ValueError("av_desync_device must be one of: cpu, cuda, auto")
+    if config.av_desync_max_length_s <= 0:
+        raise ValueError("av_desync_max_length_s must be greater than 0")
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +204,46 @@ def _frechet_distance(
     trace_term = sigma1.trace() + sigma2.trace() - 2 * sqrt_inner.trace()
     fd = float((diff @ diff) + trace_term)
     return max(fd, 0.0)
+
+
+def _embedding_distribution(
+    embeddings: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Return mean, covariance, sample count, and centered-data rank."""
+    if not embeddings:
+        raise ValueError("embedding collection is empty")
+    rows = [embedding.detach().double().cpu().reshape(-1, embedding.shape[-1]) for embedding in embeddings]
+    values = torch.cat(rows, dim=0)
+    if values.ndim != 2 or values.shape[0] < 2:
+        raise ValueError("embedding collection must contain at least two vectors")
+    mean = values.mean(dim=0)
+    centered = values - mean
+    covariance = centered.T @ centered / (values.shape[0] - 1)
+    rank = int(torch.linalg.matrix_rank(centered).item())
+    return mean, covariance, int(values.shape[0]), rank
+
+
+def _append_distribution_summary(
+    summary: dict[str, float],
+    prefix: str,
+    values: list[float],
+) -> None:
+    """Append count, range, dispersion, and confidence interval."""
+    if not values:
+        return
+    scores = torch.tensor(values, dtype=torch.float64)
+    count = int(scores.numel())
+    mean = float(scores.mean())
+    summary[f"{prefix}_mean"] = mean
+    summary[f"{prefix}_count"] = float(count)
+    summary[f"{prefix}_min"] = float(scores.min())
+    summary[f"{prefix}_max"] = float(scores.max())
+    if count >= 2:
+        std = float(scores.std(unbiased=True))
+        half_width = 1.96 * std / math.sqrt(count)
+        summary[f"{prefix}_std"] = std
+        summary[f"{prefix}_ci95_low"] = mean - half_width
+        summary[f"{prefix}_ci95_high"] = mean + half_width
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +513,8 @@ def _av_onset_alignment(
     audio_waveform: [samples] or [1, samples].
     video_latent: [C, T, H, W] or [C, T, S] (single sample).
     """
+    audio_waveform = audio_waveform.detach().float().cpu()
+    video_latent = video_latent.detach().float().cpu()
     if audio_waveform.dim() == 2:
         audio_waveform = audio_waveform[0]
     if audio_waveform.numel() < 2:
@@ -517,12 +582,16 @@ class AudioMetricsModule:
 
         # Sampling-time: lazy-loaded computers
         self._clap: _CLAPComputer | None = None
-        if config.clap_similarity or config.clap_reference_similarity:
+        if config.clap_similarity or config.clap_reference_similarity or config.clap_fad:
             self._clap = _CLAPComputer(config.clap_model)
         self._sample_run_started_at: float | None = None
         self._sample_records: list[dict[str, Any]] = []
         self._generated_clap_embeddings: list[torch.Tensor] = []
         self._reference_clap_embeddings: list[torch.Tensor] = []
+        self._sampling_device: torch.device | None = None
+        self._validation_summary_cache: dict[str, float] | None = None
+        self._clap_fad_report: dict[str, Any] = {"enabled": bool(config.clap_fad)}
+        self._av_desync_report: dict[str, Any] = {"enabled": bool(config.av_desync)}
 
     def on_step(self, global_step: int) -> None:
         self._step = global_step
@@ -683,6 +752,7 @@ class AudioMetricsModule:
         sample_rate: int = 24000,
         sample_metadata: dict[str, Any] | None = None,
         artifact_path: str | None = None,
+        video_artifact_path: str | None = None,
         reference_audio_path: str | None = None,
     ) -> dict[str, float]:
         """Compute sampling-time metrics for one generated sample.
@@ -693,6 +763,8 @@ class AudioMetricsModule:
         """
         if device is None:
             device = torch.device("cpu")
+        self._sampling_device = torch.device(device)
+        self._validation_summary_cache = None
         metrics: dict[str, float] = {}
         record: dict[str, Any] = {
             "prompt": text_prompt or "",
@@ -705,6 +777,8 @@ class AudioMetricsModule:
                     record[key] = value
         if artifact_path is not None:
             record["artifact_path"] = artifact_path
+        if video_artifact_path is not None:
+            record["video_artifact_path"] = video_artifact_path
         if reference_audio_path is not None:
             record["reference_audio_path"] = reference_audio_path
 
@@ -721,7 +795,7 @@ class AudioMetricsModule:
                 else:
                     generated_embedding = self._clap.audio_embedding(waveform, device, sample_rate).detach().float().cpu()
                 self._generated_clap_embeddings.append(generated_embedding)
-                if self.config.clap_reference_similarity and reference_audio_path:
+                if (self.config.clap_reference_similarity or self.config.clap_fad) and reference_audio_path:
                     import torchaudio
 
                     reference_waveform, reference_sample_rate = torchaudio.load(reference_audio_path)
@@ -735,9 +809,10 @@ class AudioMetricsModule:
                         .float()
                         .cpu()
                     )
-                    reference_score = float(F.cosine_similarity(generated_embedding, reference_embedding, dim=-1).mean())
-                    metrics["sample_audio/clap_reference_similarity"] = reference_score
-                    record["clap_reference_similarity"] = reference_score
+                    if self.config.clap_reference_similarity:
+                        reference_score = float(F.cosine_similarity(generated_embedding, reference_embedding, dim=-1).mean())
+                        metrics["sample_audio/clap_reference_similarity"] = reference_score
+                        record["clap_reference_similarity"] = reference_score
                     self._reference_clap_embeddings.append(reference_embedding)
                 self._clap.offload()
             except Exception as e:
@@ -760,55 +835,188 @@ class AudioMetricsModule:
         self._sample_records.clear()
         self._generated_clap_embeddings.clear()
         self._reference_clap_embeddings.clear()
+        self._sampling_device = None
+        self._validation_summary_cache = None
+        self._clap_fad_report = {"enabled": bool(self.config.clap_fad)}
+        self._av_desync_report = {"enabled": bool(self.config.av_desync)}
         self._sample_run_started_at = time.perf_counter()
         if self._clap is not None:
             self._clap.reset()
 
+    def _compute_clap_fad(self, summary: dict[str, float]) -> None:
+        if not self.config.clap_fad:
+            return
+
+        report: dict[str, Any] = {
+            "enabled": True,
+            "valid": False,
+            "configured_min_samples": int(self.config.clap_fad_min_samples),
+        }
+        self._clap_fad_report = report
+        generated = self._generated_clap_embeddings
+        reference = self._reference_clap_embeddings
+        if not generated or not reference:
+            report["reason"] = "generated and reference CLAP embeddings are required"
+            return
+
+        generated_dims = {int(embedding.shape[-1]) for embedding in generated}
+        reference_dims = {int(embedding.shape[-1]) for embedding in reference}
+        if len(generated_dims) != 1 or generated_dims != reference_dims:
+            report["reason"] = "generated and reference CLAP embedding dimensions do not match"
+            return
+        dimension = generated_dims.pop()
+        generated_count = sum(int(embedding.numel() // dimension) for embedding in generated)
+        reference_count = sum(int(embedding.numel() // dimension) for embedding in reference)
+        required_samples = max(int(self.config.clap_fad_min_samples), dimension + 1)
+        report.update(
+            {
+                "embedding_dimension": dimension,
+                "generated_count": generated_count,
+                "reference_count": reference_count,
+                "required_samples": required_samples,
+            }
+        )
+        if generated_count != reference_count:
+            report["reason"] = "generated and reference CLAP embedding counts do not match"
+            return
+        if generated_count < required_samples:
+            report["reason"] = (
+                f"at least {required_samples} paired samples are required for full-rank {dimension}-dimensional covariance"
+            )
+            return
+
+        try:
+            generated_mean, generated_covariance, _, generated_rank = _embedding_distribution(generated)
+            reference_mean, reference_covariance, _, reference_rank = _embedding_distribution(reference)
+        except (RuntimeError, ValueError) as exc:
+            report["reason"] = str(exc)
+            return
+        report["generated_covariance_rank"] = generated_rank
+        report["reference_covariance_rank"] = reference_rank
+        if generated_rank < dimension or reference_rank < dimension:
+            report["reason"] = (
+                f"CLAP covariance is rank-deficient (generated={generated_rank}, reference={reference_rank}, required={dimension})"
+            )
+            return
+
+        try:
+            score = _frechet_distance(
+                generated_mean,
+                generated_covariance,
+                reference_mean,
+                reference_covariance,
+            )
+        except RuntimeError as exc:
+            report["reason"] = f"Fréchet calculation failed: {exc}"
+            return
+        if not math.isfinite(score):
+            report["reason"] = "Fréchet calculation produced a non-finite value"
+            return
+
+        report["valid"] = True
+        report["score"] = score
+        summary["sample_audio/fad_clap"] = score
+        summary["sample_audio/fad_clap_count"] = float(generated_count)
+        summary["sample_audio/fad_clap_embedding_dimension"] = float(dimension)
+
+    def _compute_av_desync(self, summary: dict[str, float]) -> None:
+        if not self.config.av_desync:
+            return
+
+        pairs = [
+            record
+            for record in self._sample_records
+            if isinstance(record.get("video_artifact_path"), str) and isinstance(record.get("artifact_path"), str)
+        ]
+        report: dict[str, Any] = {
+            "enabled": True,
+            "valid": False,
+            "backend": "Synchformer",
+            "checkpoint_path": self.config.av_desync_checkpoint,
+            "paired_artifact_count": len(pairs),
+            "device": self.config.av_desync_device,
+            "max_length_s": float(self.config.av_desync_max_length_s),
+        }
+        self._av_desync_report = report
+        if not pairs:
+            report["reason"] = "generated video and audio artifacts are required"
+            return
+        if not self.config.av_desync_checkpoint:
+            report["reason"] = "av_desync_checkpoint is required"
+            return
+
+        from musubi_tuner.ltx2_rewards.zoo.av_desync import AVDesyncReward
+
+        if self.config.av_desync_device == "auto":
+            metric_device = self._sampling_device or torch.device("cpu")
+        else:
+            metric_device = torch.device(self.config.av_desync_device)
+        metric = AVDesyncReward()
+        desync_seconds: list[float] = []
+        sync_scores: list[float] = []
+        try:
+            metric.setup(
+                metric_device,
+                checkpoint_path=self.config.av_desync_checkpoint,
+                max_length_s=self.config.av_desync_max_length_s,
+            )
+            for record in pairs:
+                try:
+                    desync = metric.measure_desync(
+                        str(record["video_artifact_path"]),
+                        str(record["artifact_path"]),
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve remaining manifest results
+                    logger.warning("AV DeSync validation failed for one sample: %s", exc)
+                    record["av_desync_error"] = str(exc)
+                    continue
+                sync_score = 1.0 / (1.0 + desync)
+                record["av_desync_seconds"] = desync
+                record["av_sync_score"] = sync_score
+                desync_seconds.append(desync)
+                sync_scores.append(sync_score)
+        except Exception as exc:  # noqa: BLE001 - report backend/setup failure
+            report["reason"] = str(exc)
+            return
+        finally:
+            metric.teardown()
+
+        if not desync_seconds:
+            report["reason"] = "AV DeSync failed for every paired sample"
+            return
+        report["valid"] = True
+        report["scored_sample_count"] = len(desync_seconds)
+        _append_distribution_summary(summary, "sample_av/av_desync_seconds", desync_seconds)
+        _append_distribution_summary(summary, "sample_av/av_sync_score", sync_scores)
+
     def compute_validation_summary(self) -> dict[str, float]:
         """Aggregate generated-sample metrics over the current manifest pass."""
+        if self._validation_summary_cache is not None:
+            return dict(self._validation_summary_cache)
+
         summary: dict[str, float] = {}
         clap_scores = [
             float(record["clap_similarity"])
             for record in self._sample_records
             if isinstance(record.get("clap_similarity"), (int, float))
         ]
-        if clap_scores:
-            scores = torch.tensor(clap_scores, dtype=torch.float64)
-            count = int(scores.numel())
-            mean = float(scores.mean())
-            summary["sample_audio/clap_similarity_mean"] = mean
-            summary["sample_audio/clap_similarity_count"] = float(count)
-            summary["sample_audio/clap_similarity_min"] = float(scores.min())
-            summary["sample_audio/clap_similarity_max"] = float(scores.max())
-            if count >= 2:
-                std = float(scores.std(unbiased=True))
-                half_width = 1.96 * std / math.sqrt(count)
-                summary["sample_audio/clap_similarity_std"] = std
-                summary["sample_audio/clap_similarity_ci95_low"] = mean - half_width
-                summary["sample_audio/clap_similarity_ci95_high"] = mean + half_width
+        _append_distribution_summary(summary, "sample_audio/clap_similarity", clap_scores)
         reference_scores = [
             float(record["clap_reference_similarity"])
             for record in self._sample_records
             if isinstance(record.get("clap_reference_similarity"), (int, float))
         ]
-        if reference_scores:
-            scores = torch.tensor(reference_scores, dtype=torch.float64)
-            count = int(scores.numel())
-            mean = float(scores.mean())
-            summary["sample_audio/clap_reference_similarity_mean"] = mean
-            summary["sample_audio/clap_reference_similarity_count"] = float(count)
-            if count >= 2:
-                std = float(scores.std(unbiased=True))
-                half_width = 1.96 * std / math.sqrt(count)
-                summary["sample_audio/clap_reference_similarity_std"] = std
-                summary["sample_audio/clap_reference_similarity_ci95_low"] = mean - half_width
-                summary["sample_audio/clap_reference_similarity_ci95_high"] = mean + half_width
+        _append_distribution_summary(summary, "sample_audio/clap_reference_similarity", reference_scores)
+        self._compute_clap_fad(summary)
+        self._compute_av_desync(summary)
         if self._sample_run_started_at is not None:
             summary["sample_audio/validation_runtime_seconds"] = time.perf_counter() - self._sample_run_started_at
+        self._validation_summary_cache = dict(summary)
         return summary
 
     def validation_sample_report(self) -> dict[str, Any]:
         """Return a JSON-serializable report with aggregate metrics and artifact provenance."""
+        summary = self.compute_validation_summary()
         return {
             "schema_version": 1,
             "metric_backend": {
@@ -817,8 +1025,10 @@ class AudioMetricsModule:
                 "clap_reference_similarity_enabled": self.config.clap_reference_similarity,
                 "generated_embedding_count": len(self._generated_clap_embeddings),
                 "reference_embedding_count": len(self._reference_clap_embeddings),
+                "clap_fad": dict(self._clap_fad_report),
+                "av_desync": dict(self._av_desync_report),
             },
-            "summary": self.compute_validation_summary(),
+            "summary": summary,
             "samples": list(self._sample_records),
         }
 
@@ -830,3 +1040,4 @@ class AudioMetricsModule:
             self._target_stats.reset()
         if self._clap is not None:
             self._clap.reset()
+        self._validation_summary_cache = None
