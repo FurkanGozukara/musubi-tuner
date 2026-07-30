@@ -2079,6 +2079,18 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--differential_guidance_adaptive_max", str(t.differential_guidance_adaptive_max)]
 
     # Audio features
+    if t.av_curriculum_mode != "none":
+        cmd += ["--av_curriculum_mode", t.av_curriculum_mode]
+        if t.av_curriculum_mode == "alternating":
+            cmd += ["--av_curriculum_interval_steps", str(t.av_curriculum_interval_steps)]
+            if t.av_curriculum_start_modality != "video":
+                cmd += ["--av_curriculum_start_modality", t.av_curriculum_start_modality]
+        elif t.av_curriculum_mode == "two_stage":
+            cmd += ["--av_curriculum_stage1_steps", str(t.av_curriculum_stage1_steps)]
+            if t.av_curriculum_stage1_policy != "video":
+                cmd += ["--av_curriculum_stage1_policy", t.av_curriculum_stage1_policy]
+            if t.av_curriculum_stage2_policy != "joint":
+                cmd += ["--av_curriculum_stage2_policy", t.av_curriculum_stage2_policy]
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]
         if t.audio_loss_balance_mode == "inv_freq":

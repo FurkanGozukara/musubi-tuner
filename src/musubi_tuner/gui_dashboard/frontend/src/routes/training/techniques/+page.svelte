@@ -524,6 +524,28 @@
 			</div>
 
 			<div class="p-5 space-y-3">
+				{#if ($projectConfig?.training?.ltx2_mode || 'video') === 'av'}
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">AV Curriculum</div>
+					<FormSelect fieldPath="training.av_curriculum_mode" value={$projectConfig?.training?.av_curriculum_mode || 'none'} onchange={(e) => updateTraining('av_curriculum_mode', e.target.value)} options={[{value: 'none', label: 'Off (flat joint)'}, {value: 'alternating', label: 'Alternating'}, {value: 'two_stage', label: 'Two Stage'}]} tooltip="Optimizer-step-based video/audio loss curriculum. Validation remains joint." />
+					{#if ($projectConfig?.training?.av_curriculum_mode || 'none') === 'alternating'}
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.av_curriculum_interval_steps" value={$projectConfig?.training?.av_curriculum_interval_steps ?? 1} oninput={(e) => updateTraining('av_curriculum_interval_steps', Number(e.target.value))} min={1} tooltip="Successful optimizer steps per modality before switching." />
+						<FormSelect fieldPath="training.av_curriculum_start_modality" value={$projectConfig?.training?.av_curriculum_start_modality || 'video'} onchange={(e) => updateTraining('av_curriculum_start_modality', e.target.value)} options={[{value: 'video', label: 'Video First'}, {value: 'audio', label: 'Audio First'}]} tooltip="Active modality in the first alternating phase." />
+					</div>
+					{:else if ($projectConfig?.training?.av_curriculum_mode || 'none') === 'two_stage'}
+					<div class="grid grid-cols-3 gap-2 mt-2">
+						<FormField type="number" fieldPath="training.av_curriculum_stage1_steps" value={$projectConfig?.training?.av_curriculum_stage1_steps ?? 0} oninput={(e) => updateTraining('av_curriculum_stage1_steps', Number(e.target.value))} min={1} tooltip="Successful optimizer steps before switching to stage 2." />
+						<FormSelect fieldPath="training.av_curriculum_stage1_policy" value={$projectConfig?.training?.av_curriculum_stage1_policy || 'video'} onchange={(e) => updateTraining('av_curriculum_stage1_policy', e.target.value)} options={[{value: 'video', label: 'Video'}, {value: 'audio', label: 'Audio'}, {value: 'joint', label: 'Joint'}]} tooltip="Losses active during stage 1." />
+						<FormSelect fieldPath="training.av_curriculum_stage2_policy" value={$projectConfig?.training?.av_curriculum_stage2_policy || 'joint'} onchange={(e) => updateTraining('av_curriculum_stage2_policy', e.target.value)} options={[{value: 'video', label: 'Video'}, {value: 'audio', label: 'Audio'}, {value: 'joint', label: 'Joint'}]} tooltip="Losses active after stage 1." />
+					</div>
+					{/if}
+					{#if ($projectConfig?.training?.av_curriculum_mode || 'none') !== 'none'}
+					<p class="text-[10px] leading-relaxed mt-2" style="color: var(--text-muted);">Requires paired AV batches, static positive loss weights, joint training, and no independent auxiliary AV objective.</p>
+					{/if}
+				</div>
+				{/if}
+
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Loss Balance</div>
 					<FormSelect fieldPath="training.audio_loss_balance_mode" value={$projectConfig?.training?.audio_loss_balance_mode || 'none'} onchange={(e) => updateTraining('audio_loss_balance_mode', e.target.value)} options={[{value: 'none', label: 'None (static weights)'}, {value: 'inv_freq', label: 'Inverse Frequency'}, {value: 'ema_mag', label: 'EMA Magnitude'}, {value: 'uncertainty', label: 'Uncertainty'}, {value: 'ogm_ge', label: 'OGM-GE'}]} tooltip="Dynamic audio loss balancing mode" />

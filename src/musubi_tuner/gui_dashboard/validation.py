@@ -1274,6 +1274,108 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.av_curriculum_mode != "none":
+        if t.ltx2_mode != "av" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_curriculum_mode",
+                    "AV Curriculum requires LTX2 Mode = av and a joint video+audio transformer.",
+                    label="AV Curriculum",
+                    page="techniques",
+                )
+            )
+        if t.av_curriculum_interval_steps <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_curriculum_interval_steps",
+                    "AV Curriculum Interval Steps must be greater than 0.",
+                    label="AV Curriculum Interval",
+                    page="techniques",
+                )
+            )
+        if t.av_curriculum_mode == "two_stage":
+            if t.av_curriculum_stage1_steps <= 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.av_curriculum_stage1_steps",
+                        "Two-stage AV Curriculum requires Stage 1 Steps greater than 0.",
+                        label="AV Curriculum Stage 1 Steps",
+                        page="techniques",
+                    )
+                )
+            if t.av_curriculum_stage1_policy == t.av_curriculum_stage2_policy:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.av_curriculum_stage2_policy",
+                        "Two-stage AV Curriculum requires different stage policies.",
+                        label="AV Curriculum Stage 2 Policy",
+                        page="techniques",
+                    )
+                )
+            covered_policies = {t.av_curriculum_stage1_policy, t.av_curriculum_stage2_policy}
+            if not (
+                ("video" in covered_policies or "joint" in covered_policies)
+                and ("audio" in covered_policies or "joint" in covered_policies)
+            ):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.av_curriculum_stage2_policy",
+                        "Two-stage AV Curriculum policies must collectively train video and audio.",
+                        label="AV Curriculum Stage 2 Policy",
+                        page="techniques",
+                    )
+                )
+        conflicts = []
+        inferred_ic_strategy = t.ic_lora_strategy
+        if inferred_ic_strategy == "auto" and t.lora_target_preset in {
+            "v2v",
+            "audio_ref_ic",
+            "av_ic",
+            "video_ref_only_av",
+        }:
+            inferred_ic_strategy = t.lora_target_preset
+        if inferred_ic_strategy not in {"auto", "none"}:
+            conflicts.append("IC-LoRA")
+        if t.ltx2_train_direction != "joint":
+            conflicts.append("Directional Training")
+        if t.audio_loss_balance_mode != "none":
+            conflicts.append("Audio Loss Balance")
+        if t.modality_freeze_check_interval > 0:
+            conflicts.append("Modality Freeze")
+        if t.audio_silence_regularizer:
+            conflicts.append("Audio Silence Regularizer")
+        if t.self_flow:
+            conflicts.append("Self-Flow")
+        if t.crepa:
+            conflicts.append("CREPA")
+        if t.cts_lambda_video_driven > 0 or t.cts_lambda_audio_driven > 0:
+            conflicts.append("Cross-Task Synergy")
+        if conflicts:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_curriculum_mode",
+                    f"AV Curriculum cannot be combined with: {', '.join(conflicts)}.",
+                    label="AV Curriculum",
+                    page="techniques",
+                )
+            )
+        if t.video_loss_weight <= 0 or t.audio_loss_weight <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_curriculum_mode",
+                    "AV Curriculum requires positive Video Loss Weight and Audio Loss Weight.",
+                    label="AV Curriculum",
+                    page="techniques",
+                )
+            )
+
     if t.tread:
         tread_args_parts = _split_cli_args(t.tread_args)
         if t.tread_target != "video":

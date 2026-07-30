@@ -70,6 +70,11 @@ from musubi_tuner.ltx2_av_cross_grad_surgery import (
     install_av_cross_grad_surgery,
     parse_av_cross_grad_surgery_args,
 )
+from musubi_tuner.ltx2_av_curriculum import (
+    apply_av_curriculum_weights,
+    config_from_args as av_curriculum_config_from_args,
+    validate_av_curriculum_setup,
+)
 from musubi_tuner.ltx2_intrinsic_cond import is_spatial_crop_enabled, validate_intrinsic_cond_setup
 from musubi_tuner.ltx2_inpaint_mask import build_inpaint_token_mask, is_inpaint_mask_enabled, validate_inpaint_mask_setup
 from musubi_tuner.ltx2_extend import build_extend_token_mask, is_extend_enabled, validate_extend_setup
@@ -135,6 +140,7 @@ def validate_ltx2_conditioning_setup(args, accelerator=None):
     validate_audio_extend_setup(args, accelerator)
     validate_audio_inpaint_mask_setup(args, accelerator)
     validate_train_direction_setup(args, accelerator)
+    validate_av_curriculum_setup(args)
 
 
 # IC-LoRA reference strategies that concatenate reference tokens (any of them makes the run conditioning).
@@ -4273,6 +4279,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_av_attention_loss_weighting"] = True
             md["ss_av_attention_loss_max"] = float(getattr(args, "av_attention_loss_max", 1.5))
             md["ss_av_attention_loss_warmup_steps"] = int(getattr(args, "av_attention_loss_warmup_steps", 400))
+        av_curriculum = av_curriculum_config_from_args(args)
+        if av_curriculum.enabled:
+            md["ss_av_curriculum_mode"] = av_curriculum.mode
+            md["ss_av_curriculum_interval_steps"] = av_curriculum.interval_steps
+            md["ss_av_curriculum_start_modality"] = av_curriculum.start_modality
+            md["ss_av_curriculum_stage1_steps"] = av_curriculum.stage1_steps
+            md["ss_av_curriculum_stage1_policy"] = av_curriculum.stage1_policy
+            md["ss_av_curriculum_stage2_policy"] = av_curriculum.stage2_policy
         if is_ltx2_remote_stage_enabled(args):
             md["ss_ltx2_remote_stage_codec"] = getattr(args, "ltx2_remote_stage_codec", "none")
             md["ss_ltx2_remote_stage_grad_codec"] = getattr(args, "ltx2_remote_stage_grad_codec", "none")
@@ -7821,6 +7835,27 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             latent_paths = batch.get("latent_cache_paths")
             if isinstance(latent_paths, list) and latent_paths:
                 logger.info("DIAG latent_cache_paths: %s", latent_paths[:3])
+
+        av_curriculum = av_curriculum_config_from_args(args)
+        if av_curriculum.enabled:
+            if "audio_loss_weight" not in out:
+                raise ValueError(
+                    "AV curriculum requires an audio-bearing batch at every optimizer step; the current batch has no audio loss"
+                )
+            base_video_weight = float(out["video_loss_weight"])
+            base_audio_weight = float(out["audio_loss_weight"])
+            video_weight, audio_weight, curriculum_state = apply_av_curriculum_weights(
+                av_curriculum,
+                global_step=int(getattr(self, "_current_train_global_step", 0) or 0),
+                video_weight=base_video_weight,
+                audio_weight=base_audio_weight,
+            )
+            out["video_loss_weight"] = video_weight
+            out["audio_loss_weight"] = audio_weight
+            out["_av_curriculum"] = curriculum_state.metrics(
+                base_video_weight=base_video_weight,
+                base_audio_weight=base_audio_weight,
+            )
 
         # --- directional training (A2V / V2A): drop the frozen modality from the loss ---
         # Use loss-WEIGHT 0.0, NOT an all-False loss mask (an all-False mask hits apply_loss_mask's

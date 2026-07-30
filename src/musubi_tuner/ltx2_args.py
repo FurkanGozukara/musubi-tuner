@@ -660,6 +660,50 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Weight applied to the audio diffusion loss.",
     )
     parser.add_argument(
+        "--av_curriculum_mode",
+        type=str,
+        default="none",
+        choices=["none", "alternating", "two_stage"],
+        help=(
+            "Opt-in LTX AV loss curriculum. 'alternating' trains one modality for K optimizer steps "
+            "before switching; 'two_stage' switches once between configurable policies. Validation "
+            "remains joint and the default 'none' preserves flat joint training."
+        ),
+    )
+    parser.add_argument(
+        "--av_curriculum_interval_steps",
+        type=int,
+        default=1,
+        help="Optimizer steps per video/audio phase for --av_curriculum_mode alternating.",
+    )
+    parser.add_argument(
+        "--av_curriculum_start_modality",
+        type=str,
+        default="video",
+        choices=["video", "audio"],
+        help="First active modality for --av_curriculum_mode alternating.",
+    )
+    parser.add_argument(
+        "--av_curriculum_stage1_steps",
+        type=int,
+        default=0,
+        help="Optimizer steps in stage 1 for --av_curriculum_mode two_stage.",
+    )
+    parser.add_argument(
+        "--av_curriculum_stage1_policy",
+        type=str,
+        default="video",
+        choices=["video", "audio", "joint"],
+        help="Active loss policy during stage 1 of a two-stage AV curriculum.",
+    )
+    parser.add_argument(
+        "--av_curriculum_stage2_policy",
+        type=str,
+        default="joint",
+        choices=["video", "audio", "joint"],
+        help="Active loss policy after stage 1 of a two-stage AV curriculum.",
+    )
+    parser.add_argument(
         "--audio_loss_balance_mode",
         type=str,
         default="none",

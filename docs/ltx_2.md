@@ -1349,6 +1349,59 @@ Logged metrics include `modality_freeze/state`, `modality_freeze/video_loss_ema`
 - `loss_a` dropping means audio is learning; absent/zero usually means no audio batches are forming; degradation over time can indicate forgetting.
 - Track `grad_norm/video`, `grad_norm/audio`, and `grad_norm/audio_video_ratio` during AV runs.
 
+### AV Loss Curricula
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--av_curriculum_mode` is an opt-in alternative to flat joint AV loss weighting.
+It changes which primary diffusion loss contributes gradients while both
+modality streams still run in every forward:
+
+- `alternating`: train video for K successful optimizer steps, then audio for K
+  steps, and repeat;
+- `two_stage`: use one `video`, `audio`, or `joint` policy for a fixed number of
+  successful optimizer steps, then switch to another policy;
+- `none` (default): preserve ordinary flat joint AV training.
+
+The phase is derived from the optimizer `global_step`. All microbatches in one
+gradient-accumulation window therefore use the same policy. A skipped optimizer
+update does not advance the phase, and checkpoint resume reconstructs the same
+phase without separate curriculum state. Validation always evaluates the joint
+video+audio objective.
+
+Alternating example:
+
+```bash
+--ltx2_mode av ^
+--av_curriculum_mode alternating ^
+--av_curriculum_interval_steps 100 ^
+--av_curriculum_start_modality video
+```
+
+Two-stage video warm-up followed by joint training:
+
+```bash
+--ltx2_mode av ^
+--av_curriculum_mode two_stage ^
+--av_curriculum_stage1_steps 1000 ^
+--av_curriculum_stage1_policy video ^
+--av_curriculum_stage2_policy joint
+```
+
+Requirements:
+
+- every training batch must contain paired video and audio;
+- `--video_loss_weight` and `--audio_loss_weight` must both be positive;
+- use joint training, no IC-LoRA strategy, and
+  `--audio_loss_balance_mode none`;
+- do not combine the curriculum with the modality freezer, synthetic-silence
+  fallback, CREPA, Self-Flow, or Cross-Task Synergy auxiliary losses.
+
+Static video/audio loss weights remain the base weights for whichever policy is
+active. Tracker metrics include the current phase, effective weights, raw
+video/audio losses, and the existing per-branch gradient norms under
+`loss/av_curriculum/*`. `policy_id` is `0` for joint, `1` for video, and `2`
+for audio.
+
 ### Technical Notes
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -5504,6 +5557,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
 - [ViBe / HFATO / Relay LoRA (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326) — Basis for `--hfato` and the Relay LoRA workflow
 - [G2D (arXiv 2506.21514)](https://arxiv.org/abs/2506.21514) — Sequential Modality Prioritization inspiration for modality freezing
+- [Omni-Customizer (arXiv 2605.17488)](https://arxiv.org/abs/2605.17488) — Interleaved modality-decoupled training inspiration for the AV curriculum controls; the configurable loss-policy implementation in this trainer is an independent generalization
 - [UniAVGen (arXiv 2511.03334)](https://arxiv.org/abs/2511.03334) — Joint audio-video generation reference for lower-LR AV training guidance
 - [Harmony (arXiv 2511.21579)](https://arxiv.org/abs/2511.21579) — Cross-Task Synergy; basis for `--cts_lambda_video_driven` and `--cts_lambda_audio_driven`
 - [OmniNFT](https://github.com/zghhui/OmniNFT) — DiffusionNFT-based audio-video RL project; initial reference for the NFT update lineage and several reward checkpoints

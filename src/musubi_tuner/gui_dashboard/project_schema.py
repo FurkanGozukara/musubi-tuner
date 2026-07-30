@@ -788,6 +788,12 @@ class TrainingConfig(BaseModel):
     latent_delta_loss_huber_delta: float = 1.0
 
     # Audio features
+    av_curriculum_mode: Literal["none", "alternating", "two_stage"] = "none"
+    av_curriculum_interval_steps: int = 1
+    av_curriculum_start_modality: Literal["video", "audio"] = "video"
+    av_curriculum_stage1_steps: int = 0
+    av_curriculum_stage1_policy: Literal["video", "audio", "joint"] = "video"
+    av_curriculum_stage2_policy: Literal["video", "audio", "joint"] = "joint"
     audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty", "ogm_ge"] = "none"
     audio_loss_balance_beta: float = 0.01
     audio_loss_balance_eps: float = 0.05

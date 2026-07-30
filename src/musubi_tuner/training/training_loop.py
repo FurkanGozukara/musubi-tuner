@@ -1579,6 +1579,7 @@ def train(self, args):
         validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
         plain_validation_args = copy.copy(args)
         plain_validation_args.self_flow = False
+        plain_validation_args.av_curriculum_mode = "none"
 
         try:
             with torch.no_grad():
@@ -2314,6 +2315,10 @@ def train(self, args):
                     audio_target = out.get("audio_target")
                     audio_loss_mask = out.get("audio_loss_mask")
                     has_audio_loss = audio_pred is not None and audio_target is not None
+                    av_curriculum_metrics = out.get("_av_curriculum")
+                    if isinstance(av_curriculum_metrics, dict):
+                        mask_metrics.update(av_curriculum_metrics)
+                        mask_metrics["av_curriculum/raw_video_loss"] = float(video_loss.detach().item())
 
                     if audio_loss_balance_mode == "uncertainty" and has_audio_loss:
                         # Uncertainty weighting: learnable log-variance scalars replace manual weights
@@ -2361,6 +2366,8 @@ def train(self, args):
                             audio_presence_ema_value = audio_presence_ema
                         if has_audio_loss:
                             audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
+                            if isinstance(av_curriculum_metrics, dict):
+                                mask_metrics["av_curriculum/raw_audio_loss"] = float(audio_loss.detach().item())
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             if audio_loss_balance_mode == "inv_freq":
                                 audio_weight = compute_inverse_frequency_audio_weight(
