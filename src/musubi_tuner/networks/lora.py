@@ -199,7 +199,7 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
 
         # module dropout
         if self.module_dropout is not None and self.training and self.dropout_enabled:
-            if torch.rand(1) < self.module_dropout:
+            if torch.rand(1, device=x.device) < self.module_dropout:
                 return org_forwarded
 
         lora_input = self._lora_input(x)
@@ -795,6 +795,25 @@ def create_network(
     module_dropout = kwargs.get("module_dropout", None)
     if module_dropout is not None:
         module_dropout = float(module_dropout)
+    audio_rank_dropout = _parse_optional_float_network_arg(kwargs.get("audio_rank_dropout", None), None)
+    video_rank_dropout = _parse_optional_float_network_arg(kwargs.get("video_rank_dropout", None), None)
+    cross_modal_rank_dropout = _parse_optional_float_network_arg(kwargs.get("cross_modal_rank_dropout", None), None)
+    audio_module_dropout = _parse_optional_float_network_arg(kwargs.get("audio_module_dropout", None), None)
+    video_module_dropout = _parse_optional_float_network_arg(kwargs.get("video_module_dropout", None), None)
+    cross_modal_module_dropout = _parse_optional_float_network_arg(kwargs.get("cross_modal_module_dropout", None), None)
+    dropout_values = {
+        "rank_dropout": rank_dropout,
+        "module_dropout": module_dropout,
+        "audio_rank_dropout": audio_rank_dropout,
+        "video_rank_dropout": video_rank_dropout,
+        "cross_modal_rank_dropout": cross_modal_rank_dropout,
+        "audio_module_dropout": audio_module_dropout,
+        "video_module_dropout": video_module_dropout,
+        "cross_modal_module_dropout": cross_modal_module_dropout,
+    }
+    for dropout_name, dropout_value in dropout_values.items():
+        if dropout_value is not None and not 0.0 <= dropout_value < 1.0:
+            raise ValueError(f"{dropout_name} must be in [0, 1), got {dropout_value}")
 
     # verbose
     verbose = kwargs.get("verbose", False)
@@ -868,9 +887,15 @@ def create_network(
         audio_alpha=audio_alpha,
         audio_dropout=audio_dropout,
         video_dropout=video_dropout,
+        audio_rank_dropout=audio_rank_dropout,
+        video_rank_dropout=video_rank_dropout,
+        audio_module_dropout=audio_module_dropout,
+        video_module_dropout=video_module_dropout,
         cross_modal_dim=cross_modal_dim,
         cross_modal_alpha=cross_modal_alpha,
         cross_modal_dropout=cross_modal_dropout,
+        cross_modal_rank_dropout=cross_modal_rank_dropout,
+        cross_modal_module_dropout=cross_modal_module_dropout,
         adaptive_rank_config=adaptive_rank_kwargs,
     )
 
@@ -914,9 +939,15 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         audio_alpha: Optional[float] = None,
         audio_dropout: Optional[float] = None,
         video_dropout: Optional[float] = None,
+        audio_rank_dropout: Optional[float] = None,
+        video_rank_dropout: Optional[float] = None,
+        audio_module_dropout: Optional[float] = None,
+        video_module_dropout: Optional[float] = None,
         cross_modal_dim: Optional[int] = None,
         cross_modal_alpha: Optional[float] = None,
         cross_modal_dropout: Optional[float] = None,
+        cross_modal_rank_dropout: Optional[float] = None,
+        cross_modal_module_dropout: Optional[float] = None,
         adaptive_rank_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
@@ -940,9 +971,15 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         self.audio_alpha = audio_alpha
         self.audio_dropout = audio_dropout
         self.video_dropout = video_dropout
+        self.audio_rank_dropout = audio_rank_dropout
+        self.video_rank_dropout = video_rank_dropout
+        self.audio_module_dropout = audio_module_dropout
+        self.video_module_dropout = video_module_dropout
         self.cross_modal_dim = cross_modal_dim
         self.cross_modal_alpha = cross_modal_alpha
         self.cross_modal_dropout = cross_modal_dropout
+        self.cross_modal_rank_dropout = cross_modal_rank_dropout
+        self.cross_modal_module_dropout = cross_modal_module_dropout
         normalized_adaptive_rank_config = parse_adaptive_rank_network_kwargs(adaptive_rank_config or {})
         self._init_adaptive_rank_network_state(**normalized_adaptive_rank_config)
 
@@ -973,6 +1010,28 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
             if self.audio_dropout is not None or self.video_dropout is not None or self.cross_modal_dropout is not None:
                 logger.info(
                     f"per-modality dropout overrides: video={self.video_dropout}, audio={self.audio_dropout}, cross-modal={self.cross_modal_dropout}"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.video_rank_dropout,
+                    self.audio_rank_dropout,
+                    self.cross_modal_rank_dropout,
+                    self.video_module_dropout,
+                    self.audio_module_dropout,
+                    self.cross_modal_module_dropout,
+                )
+            ):
+                logger.info(
+                    "per-modality rank/module dropout overrides: "
+                    "video=(rank=%s,module=%s), audio=(rank=%s,module=%s), "
+                    "cross-modal=(rank=%s,module=%s)",
+                    self.video_rank_dropout,
+                    self.video_module_dropout,
+                    self.audio_rank_dropout,
+                    self.audio_module_dropout,
+                    self.cross_modal_rank_dropout,
+                    self.cross_modal_module_dropout,
                 )
             if self.dora_scale_lr_ratio is not None:
                 logger.info(f"DoRA scale LR ratio: {self.dora_scale_lr_ratio}")
@@ -1025,14 +1084,34 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 return self._is_cross_modal_module(module_name)
 
             def resolve_module_dropout(module_name: str) -> Optional[float]:
-                if is_cross_modal_module(module_name) and self.cross_modal_dropout is not None:
-                    return self.cross_modal_dropout
+                if is_cross_modal_module(module_name):
+                    return self.cross_modal_dropout if self.cross_modal_dropout is not None else self.dropout
                 if is_audio_module(module_name):
                     if self.audio_dropout is not None:
                         return self.audio_dropout
                 elif self.video_dropout is not None:
                     return self.video_dropout
                 return self.dropout
+
+            def resolve_rank_dropout(module_name: str) -> Optional[float]:
+                if is_cross_modal_module(module_name):
+                    return self.cross_modal_rank_dropout if self.cross_modal_rank_dropout is not None else self.rank_dropout
+                if is_audio_module(module_name):
+                    if self.audio_rank_dropout is not None:
+                        return self.audio_rank_dropout
+                elif self.video_rank_dropout is not None:
+                    return self.video_rank_dropout
+                return self.rank_dropout
+
+            def resolve_whole_module_dropout(module_name: str) -> Optional[float]:
+                if is_cross_modal_module(module_name):
+                    return self.cross_modal_module_dropout if self.cross_modal_module_dropout is not None else self.module_dropout
+                if is_audio_module(module_name):
+                    if self.audio_module_dropout is not None:
+                        return self.audio_module_dropout
+                elif self.video_module_dropout is not None:
+                    return self.video_module_dropout
+                return self.module_dropout
 
             def resolve_adaptive_rank_target(module_name: str) -> Optional[int]:
                 return self.resolve_module_adaptive_rank_target(module_name)
@@ -1083,6 +1162,8 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                             dim = None
                             alpha = None
                             module_dropout_value = resolve_module_dropout(original_name)
+                            rank_dropout_value = resolve_rank_dropout(original_name)
+                            whole_module_dropout_value = resolve_whole_module_dropout(original_name)
 
                             if modules_dim is not None:
                                 # モジュール指定あり
@@ -1138,8 +1219,8 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                                 dim,
                                 alpha,
                                 dropout=module_dropout_value,
-                                rank_dropout=rank_dropout,
-                                module_dropout=module_dropout,
+                                rank_dropout=rank_dropout_value,
+                                module_dropout=whole_module_dropout_value,
                                 module_path=original_name,
                                 adaptive_rank=self.adaptive_rank,
                                 adaptive_rank_target=adaptive_rank_target_value,
@@ -1349,6 +1430,10 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         audio_lr=None,
         lr_args=None,
         lr_group_scheduler_args=None,
+        modality_group_controls=False,
+        video_weight_decay=None,
+        audio_weight_decay=None,
+        cross_modal_weight_decay=None,
         **kwargs,
     ):
         self.requires_grad_(True)
@@ -1363,7 +1448,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 pattern, lr_str = entry.split("=", 1)
                 lr_patterns[pattern] = float(lr_str)
 
-        split_modality_groups = bool(lr_group_scheduler_args)
+        split_modality_groups = bool(lr_group_scheduler_args) or bool(modality_group_controls)
 
         # If no custom LR or scheduling config, use original fast path
         if not lr_patterns and audio_lr is None and not split_modality_groups:
@@ -1377,13 +1462,14 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
 
         for lora in self.unet_loras:
             resolved_lr = unet_lr  # default
+            if self._is_cross_modal_module(lora.lora_name):
+                modality = "cross_modal"
+            elif self._is_audio_module(lora.lora_name):
+                modality = "audio"
+            else:
+                modality = "video"
             if split_modality_groups:
-                if self._is_cross_modal_module(lora.lora_name):
-                    desc = "cross_modal"
-                elif "audio_" in lora.lora_name:
-                    desc = "audio"
-                else:
-                    desc = "video"
+                desc = modality
             else:
                 desc = "video"
 
@@ -1414,7 +1500,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                     param_desc = f"{desc}_dora_scale"
                     if param_lr == 0:
                         continue
-                group_key = (param_lr, param_desc) if split_modality_groups else (param_lr, "")
+                group_key = (param_lr, param_desc, modality) if split_modality_groups else (param_lr, "", "")
                 group = grouped_params.setdefault(
                     group_key,
                     {"lora": {}, "plus": {}},
@@ -1430,6 +1516,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         lr_descriptions = []
         for group_key in sorted(grouped_params):
             lr_val = group_key[0]
+            modality = group_key[2]
             desc = group_descriptions[group_key]
             groups = grouped_params[group_key]
             for key in ("lora", "plus"):
@@ -1440,13 +1527,29 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 if key == "plus" and self.loraplus_lr_ratio:
                     param_data["lr"] = lr_val * self.loraplus_lr_ratio
                 param_data["group_name"] = f"unet_{desc}{suffix}".replace(" ", "_")
+                if split_modality_groups:
+                    param_data["modality"] = modality
+                    modality_weight_decay = {
+                        "video": video_weight_decay,
+                        "audio": audio_weight_decay,
+                        "cross_modal": cross_modal_weight_decay,
+                    }[modality]
+                    if modality_weight_decay is not None:
+                        param_data["weight_decay"] = float(modality_weight_decay)
                 all_params.append(param_data)
                 lr_descriptions.append(f"unet_{desc}{suffix}")
 
         # Log group breakdown
         logger.info(f"LR groups: {len(all_params)} groups created")
         for param_data, desc in zip(all_params, lr_descriptions):
-            logger.info(f"  {desc}: lr={param_data['lr']}, {len(param_data['params'])} params")
+            logger.info(
+                "  %s: lr=%s, modality=%s, weight_decay=%s, %d params",
+                desc,
+                param_data["lr"],
+                param_data.get("modality", "unsplit"),
+                param_data.get("weight_decay", "optimizer default"),
+                len(param_data["params"]),
+            )
 
         return all_params, lr_descriptions
 
@@ -1827,6 +1930,36 @@ def create_network_from_weights(
     module_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> LoRANetwork:
+    dropout = _parse_optional_float_network_arg(kwargs.get("neuron_dropout", None), None)
+    rank_dropout = _parse_optional_float_network_arg(kwargs.get("rank_dropout", None), None)
+    module_dropout = _parse_optional_float_network_arg(kwargs.get("module_dropout", None), None)
+    audio_dropout = _parse_optional_float_network_arg(kwargs.get("audio_dropout", None), None)
+    video_dropout = _parse_optional_float_network_arg(kwargs.get("video_dropout", None), None)
+    cross_modal_dropout = _parse_optional_float_network_arg(kwargs.get("cross_modal_dropout", None), None)
+    audio_rank_dropout = _parse_optional_float_network_arg(kwargs.get("audio_rank_dropout", None), None)
+    video_rank_dropout = _parse_optional_float_network_arg(kwargs.get("video_rank_dropout", None), None)
+    cross_modal_rank_dropout = _parse_optional_float_network_arg(kwargs.get("cross_modal_rank_dropout", None), None)
+    audio_module_dropout = _parse_optional_float_network_arg(kwargs.get("audio_module_dropout", None), None)
+    video_module_dropout = _parse_optional_float_network_arg(kwargs.get("video_module_dropout", None), None)
+    cross_modal_module_dropout = _parse_optional_float_network_arg(kwargs.get("cross_modal_module_dropout", None), None)
+    dropout_values = {
+        "neuron_dropout": dropout,
+        "rank_dropout": rank_dropout,
+        "module_dropout": module_dropout,
+        "audio_dropout": audio_dropout,
+        "video_dropout": video_dropout,
+        "cross_modal_dropout": cross_modal_dropout,
+        "audio_rank_dropout": audio_rank_dropout,
+        "video_rank_dropout": video_rank_dropout,
+        "cross_modal_rank_dropout": cross_modal_rank_dropout,
+        "audio_module_dropout": audio_module_dropout,
+        "video_module_dropout": video_module_dropout,
+        "cross_modal_module_dropout": cross_modal_module_dropout,
+    }
+    for dropout_name, dropout_value in dropout_values.items():
+        if dropout_value is not None and not 0.0 <= dropout_value < 1.0:
+            raise ValueError(f"{dropout_name} must be in [0, 1), got {dropout_value}")
+
     # get dim/alpha mapping
     modules_dim = {}
     modules_alpha = {}
@@ -1898,9 +2031,21 @@ def create_network_from_weights(
         text_encoders,
         unet,
         multiplier=multiplier,
+        dropout=dropout,
+        rank_dropout=rank_dropout,
+        module_dropout=module_dropout,
         modules_dim=modules_dim,
         modules_alpha=modules_alpha,
         module_class=module_class,
         module_kwargs=effective_module_kwargs,
+        audio_dropout=audio_dropout,
+        video_dropout=video_dropout,
+        audio_rank_dropout=audio_rank_dropout,
+        video_rank_dropout=video_rank_dropout,
+        audio_module_dropout=audio_module_dropout,
+        video_module_dropout=video_module_dropout,
+        cross_modal_dropout=cross_modal_dropout,
+        cross_modal_rank_dropout=cross_modal_rank_dropout,
+        cross_modal_module_dropout=cross_modal_module_dropout,
     )
     return network

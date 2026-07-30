@@ -380,6 +380,18 @@ class TrainingConfig(BaseModel):
     lr_group_scheduler_args: str = ""
     audio_dim: Optional[int] = None
     audio_alpha: Optional[float] = None
+    video_rank_dropout: Optional[float] = None
+    audio_rank_dropout: Optional[float] = None
+    cross_modal_rank_dropout: Optional[float] = None
+    video_module_dropout: Optional[float] = None
+    audio_module_dropout: Optional[float] = None
+    cross_modal_module_dropout: Optional[float] = None
+    video_max_grad_norm: Optional[float] = None
+    audio_max_grad_norm: Optional[float] = None
+    cross_modal_max_grad_norm: Optional[float] = None
+    video_weight_decay: Optional[float] = None
+    audio_weight_decay: Optional[float] = None
+    cross_modal_weight_decay: Optional[float] = None
 
     # Schedule
     max_train_steps: int = 1600

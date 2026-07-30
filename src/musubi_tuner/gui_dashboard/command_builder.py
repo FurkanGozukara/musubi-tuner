@@ -1388,6 +1388,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--audio_dim", str(t.audio_dim)]
     if t.audio_alpha is not None:
         cmd += ["--audio_alpha", str(t.audio_alpha)]
+    for modality in ("video", "audio", "cross_modal"):
+        for suffix in ("rank_dropout", "module_dropout", "max_grad_norm", "weight_decay"):
+            name = f"{modality}_{suffix}"
+            value = getattr(t, name, None)
+            if value is not None:
+                cmd += [f"--{name}", str(value)]
 
     # Schedule
     if t.max_train_epochs is not None:

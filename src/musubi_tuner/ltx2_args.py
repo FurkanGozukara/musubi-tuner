@@ -1,6 +1,7 @@
 """LTX-2 argument parser and training entry point."""
 
 import argparse
+import math
 import os
 import sys
 import logging
@@ -2075,6 +2076,35 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="LoRA alpha for audio modules. Defaults to --network_alpha. "
         "Typically set equal to --audio_dim for consistent scaling.",
     )
+    for modality, label in (
+        ("video", "video-only"),
+        ("audio", "audio-only"),
+        ("cross_modal", "cross-modal"),
+    ):
+        parser.add_argument(
+            f"--{modality}_rank_dropout",
+            type=float,
+            default=None,
+            help=f"Optional rank dropout override for {label} LoRA modules. Falls back to network_args rank_dropout.",
+        )
+        parser.add_argument(
+            f"--{modality}_module_dropout",
+            type=float,
+            default=None,
+            help=f"Optional whole-module dropout override for {label} LoRA modules. Falls back to network_args module_dropout.",
+        )
+        parser.add_argument(
+            f"--{modality}_max_grad_norm",
+            type=float,
+            default=None,
+            help=f"Optional independent gradient clipping norm for {label} adapter groups. Falls back to --max_grad_norm.",
+        )
+        parser.add_argument(
+            f"--{modality}_weight_decay",
+            type=float,
+            default=None,
+            help=f"Optional optimizer weight-decay override for {label} adapter groups.",
+        )
 
     # -- Caption dropout --
     parser.add_argument(
@@ -2373,6 +2403,50 @@ def main() -> None:
             if audio_alpha is not None and not any(arg.startswith("audio_alpha=") for arg in args.network_args):
                 args.network_args.append(f"audio_alpha={audio_alpha}")
             logger.info(f"Per-modality LoRA rank: audio_dim={audio_dim}, audio_alpha={audio_alpha}")
+
+        modality_dropout_args = {}
+        for modality in ("video", "audio", "cross_modal"):
+            for dropout_kind in ("rank_dropout", "module_dropout"):
+                arg_name = f"{modality}_{dropout_kind}"
+                value = getattr(args, arg_name, None)
+                if value is None:
+                    continue
+                if not 0.0 <= value < 1.0:
+                    raise ValueError(f"--{arg_name} must be in [0, 1), got {value}")
+                modality_dropout_args[arg_name] = value
+        if modality_dropout_args:
+            if args.network_args is None:
+                args.network_args = []
+            for key, value in modality_dropout_args.items():
+                if not any(arg.startswith(f"{key}=") for arg in args.network_args):
+                    args.network_args.append(f"{key}={value}")
+            logger.info("Per-modality LoRA rank/module dropout: %s", modality_dropout_args)
+
+    modality_optimizer_args = {}
+    for modality in ("video", "audio", "cross_modal"):
+        for suffix in ("max_grad_norm", "weight_decay"):
+            arg_name = f"{modality}_{suffix}"
+            value = getattr(args, arg_name, None)
+            if value is not None:
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"--{arg_name} must be finite and non-negative, got {value}")
+                modality_optimizer_args[arg_name] = value
+    modality_dropout_requested = any(
+        getattr(args, f"{modality}_{kind}", None) is not None
+        for modality in ("video", "audio", "cross_modal")
+        for kind in ("rank_dropout", "module_dropout")
+    )
+    if uses_lycoris_module and (modality_dropout_requested or modality_optimizer_args):
+        raise ValueError("Per-modality dropout, clipping, and weight decay require the built-in LTX LoRA network")
+    modality_clip_requested = any(
+        getattr(args, f"{modality}_max_grad_norm", None) is not None for modality in ("video", "audio", "cross_modal")
+    )
+    if modality_clip_requested and getattr(args, "ltx2_model_parallel", False):
+        raise ValueError("Per-modality gradient clipping is not supported with model parallel training")
+    if modality_optimizer_args and getattr(args, "ltx2_remote_stage", False):
+        raise ValueError("Per-modality clipping and weight decay are not supported with remote-stage training")
+    if modality_optimizer_args:
+        logger.info("Per-modality optimizer controls: %s", modality_optimizer_args)
 
     process_lycoris_config(args, logger)
     apply_lycoris_preset_before_network_creation(args, logger)

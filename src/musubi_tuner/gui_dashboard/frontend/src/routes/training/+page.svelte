@@ -600,6 +600,16 @@
 							<FormField type="number" fieldPath="training.audio_dim" value={t.audio_dim ?? ''} oninput={(e) => update('audio_dim', e.target.value ? Number(e.target.value) : null)} placeholder="Match main dim" tooltip="Optional separate audio LoRA rank." />
 							<FormField type="number" fieldPath="training.audio_alpha" value={t.audio_alpha ?? ''} oninput={(e) => update('audio_alpha', e.target.value ? Number(e.target.value) : null)} placeholder="Match main alpha" step="0.1" tooltip="Optional separate audio LoRA alpha." />
 						</div>
+						<div class="grid grid-cols-3 gap-2">
+							<FormField type="number" fieldPath="training.video_rank_dropout" value={t.video_rank_dropout ?? ''} oninput={(e) => update('video_rank_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Video LoRA rank dropout override." />
+							<FormField type="number" fieldPath="training.audio_rank_dropout" value={t.audio_rank_dropout ?? ''} oninput={(e) => update('audio_rank_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Audio LoRA rank dropout override." />
+							<FormField type="number" fieldPath="training.cross_modal_rank_dropout" value={t.cross_modal_rank_dropout ?? ''} oninput={(e) => update('cross_modal_rank_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Cross-modal LoRA rank dropout override." />
+						</div>
+						<div class="grid grid-cols-3 gap-2">
+							<FormField type="number" fieldPath="training.video_module_dropout" value={t.video_module_dropout ?? ''} oninput={(e) => update('video_module_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Video whole-module dropout override." />
+							<FormField type="number" fieldPath="training.audio_module_dropout" value={t.audio_module_dropout ?? ''} oninput={(e) => update('audio_module_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Audio whole-module dropout override." />
+							<FormField type="number" fieldPath="training.cross_modal_module_dropout" value={t.cross_modal_module_dropout ?? ''} oninput={(e) => update('cross_modal_module_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} max={0.999} step="0.05" tooltip="Cross-modal whole-module dropout override." />
+						</div>
 						<PathInput fieldPath="training.network_weights" value={t.network_weights || ''} oninput={(e) => update('network_weights', e.target.value)} showFiles tooltip="Warm-start from existing LoRA weights" />
 						<FormToggle fieldPath="training.network_freeze_surplus_modules" checked={t.network_freeze_surplus_modules ?? false} onchange={(e) => update('network_freeze_surplus_modules', e.target.checked)} tooltip="Keep compatible warm-start modules outside the selected target preset as frozen adapters." />
 						<FormField fieldPath="training.frozen_network_weights" value={t.frozen_network_weights || ''} oninput={(e) => update('frozen_network_weights', e.target.value)} placeholder="path1 path2 ..." tooltip="Attach frozen LoRA weights during training without saving them into the new adapter." />
@@ -770,6 +780,16 @@
 							<FormField fieldPath="training.lr_args" value={t.lr_args || ''} oninput={(e) => update('lr_args', e.target.value)} placeholder="pattern=lr ..." tooltip="Per-module LR overrides (e.g. audio_attn=1e-6)" />
 							<FormField fieldPath="training.lr_group_warmup_args" value={t.lr_group_warmup_args || ''} oninput={(e) => update('lr_group_warmup_args', e.target.value)} placeholder="audio=500 video=1500" tooltip="Per-module learning-rate warmup args passed as --lr_group_warmup_args." />
 							<FormField fieldPath="training.lr_group_scheduler_args" value={t.lr_group_scheduler_args || ''} oninput={(e) => update('lr_group_scheduler_args', e.target.value)} placeholder="cross_modal=scheduler=cosine,warmup_steps=100,min_lr_ratio=0.1" tooltip="Ordered regex rules for independent optimizer-group schedules. First matching rule wins." />
+							<div class="grid grid-cols-3 gap-2">
+								<FormField type="number" fieldPath="training.video_max_grad_norm" value={t.video_max_grad_norm ?? ''} oninput={(e) => update('video_max_grad_norm', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} step="0.1" tooltip="Independent video adapter gradient clipping norm." />
+								<FormField type="number" fieldPath="training.audio_max_grad_norm" value={t.audio_max_grad_norm ?? ''} oninput={(e) => update('audio_max_grad_norm', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} step="0.1" tooltip="Independent audio adapter gradient clipping norm." />
+								<FormField type="number" fieldPath="training.cross_modal_max_grad_norm" value={t.cross_modal_max_grad_norm ?? ''} oninput={(e) => update('cross_modal_max_grad_norm', e.target.value ? Number(e.target.value) : null)} placeholder="Global" min={0} step="0.1" tooltip="Independent cross-modal adapter gradient clipping norm." />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<FormField type="number" fieldPath="training.video_weight_decay" value={t.video_weight_decay ?? ''} oninput={(e) => update('video_weight_decay', e.target.value ? Number(e.target.value) : null)} placeholder="Optimizer" min={0} step="0.001" tooltip="Video adapter weight-decay override." />
+								<FormField type="number" fieldPath="training.audio_weight_decay" value={t.audio_weight_decay ?? ''} oninput={(e) => update('audio_weight_decay', e.target.value ? Number(e.target.value) : null)} placeholder="Optimizer" min={0} step="0.001" tooltip="Audio adapter weight-decay override." />
+								<FormField type="number" fieldPath="training.cross_modal_weight_decay" value={t.cross_modal_weight_decay ?? ''} oninput={(e) => update('cross_modal_weight_decay', e.target.value ? Number(e.target.value) : null)} placeholder="Optimizer" min={0} step="0.001" tooltip="Cross-modal adapter weight-decay override." />
+							</div>
 						{/if}
 					</div>
 				</FormGroup>

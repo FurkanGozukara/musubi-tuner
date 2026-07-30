@@ -457,6 +457,59 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+    modality_control_names = [
+        f"{modality}_{suffix}"
+        for modality in ("video", "audio", "cross_modal")
+        for suffix in ("rank_dropout", "module_dropout", "max_grad_norm", "weight_decay")
+    ]
+    active_modality_controls = [name for name in modality_control_names if getattr(t, name, None) is not None]
+    for name in active_modality_controls:
+        value = float(getattr(t, name))
+        is_dropout = name.endswith(("rank_dropout", "module_dropout"))
+        valid = math.isfinite(value) and (0.0 <= value < 1.0 if is_dropout else value >= 0.0)
+        if not valid:
+            expected = "finite and in [0, 1)" if is_dropout else "finite and non-negative"
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"training.{name}",
+                    f"{name.replace('_', ' ').title()} must be {expected}.",
+                    label=name.replace("_", " ").title(),
+                    page="training",
+                )
+            )
+    if active_modality_controls and "lycoris" in str(getattr(t, "network_module", "") or "").lower():
+        errors.append(
+            _make_issue(
+                "error",
+                f"training.{active_modality_controls[0]}",
+                "Per-modality dropout and optimizer controls require the built-in LTX LoRA network.",
+                label="Per-Modality Optimization",
+                page="training",
+            )
+        )
+    active_modality_clip = [name for name in active_modality_controls if name.endswith("max_grad_norm")]
+    if active_modality_clip and bool(getattr(t, "ltx2_model_parallel", False)):
+        errors.append(
+            _make_issue(
+                "error",
+                f"training.{active_modality_clip[0]}",
+                "Per-modality gradient clipping is not supported with model parallel training.",
+                label="Per-Modality Gradient Clipping",
+                page="training",
+            )
+        )
+    active_modality_optimizer = [name for name in active_modality_controls if name.endswith(("max_grad_norm", "weight_decay"))]
+    if active_modality_optimizer and bool(getattr(t, "ltx2_remote_stage", False)):
+        errors.append(
+            _make_issue(
+                "error",
+                f"training.{active_modality_optimizer[0]}",
+                "Per-modality clipping and weight decay are not supported with remote-stage training.",
+                label="Per-Modality Optimizer Controls",
+                page="training",
+            )
+        )
     effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors, t.gemma_root)
 
     if not _has_training_checkpoint(config):

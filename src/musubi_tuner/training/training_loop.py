@@ -37,6 +37,10 @@ from musubi_tuner.dataset.audio_quota_sampler import (
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modality_freezer import ModalityFreezer
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.modality_optimization import (
+    clip_modality_optimizer_groups,
+    has_modality_clip_overrides,
+)
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
 from musubi_tuner.training.accelerator_setup import (
@@ -464,7 +468,13 @@ def train(self, args):
     if args.dim_from_weights:
         logger.info(f"Loading network from weights: {args.dim_from_weights}")
         weights_sd = self.load_network_weights(args.dim_from_weights, network_module)
-        network, _ = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
+        network = network_module.create_arch_network_from_weights(
+            1,
+            weights_sd,
+            unet=transformer,
+            neuron_dropout=args.network_dropout,
+            **_loftq_net_kwargs,
+        )
     else:
         # We use the name create_arch_network for compatibility with LyCORIS
         if hasattr(network_module, "create_arch_network"):
@@ -1208,6 +1218,18 @@ def train(self, args):
     if args.network_args:
         # metadata["ss_network_args"] = json.dumps(net_kwargs)
         metadata[SS_METADATA_KEY_NETWORK_ARGS] = json.dumps(net_kwargs)
+    modality_optimization_metadata = {}
+    for modality in ("video", "audio", "cross_modal"):
+        for suffix in ("max_grad_norm", "weight_decay"):
+            name = f"{modality}_{suffix}"
+            value = getattr(args, name, None)
+            if value is not None:
+                modality_optimization_metadata[name] = value
+    if modality_optimization_metadata:
+        metadata["ss_ltx_modality_optimization"] = json.dumps(
+            modality_optimization_metadata,
+            sort_keys=True,
+        )
 
     # model name and hash
     # calculate hash takes time, so we omit it for now
@@ -2726,7 +2748,11 @@ def train(self, args):
                             grad_norm_video_value = video_grad_sq.sqrt().item()
                             grad_norm_audio_value = audio_grad_sq.sqrt().item()
 
-                    if args.max_grad_norm != 0.0:
+                    if has_modality_clip_overrides(args):
+                        if model_parallel:
+                            raise ValueError("Per-modality gradient clipping is not supported with model parallel training")
+                        clip_modality_optimizer_groups(args, accelerator, optimizer)
+                    elif args.max_grad_norm != 0.0:
                         if model_parallel:
                             self.clip_grad_norm_for_model_parallel(args, accelerator, params_to_clip, optimizer)
                         else:

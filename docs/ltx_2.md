@@ -2612,17 +2612,27 @@ Notes:
 ### Per-Module LoRA Dropout
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Keep the existing global LoRA dropout as the default, but optionally override it per modality through `--network_args`.
+LTX LoRA supports three distinct dropout mechanisms:
+
+- neuron dropout masks adapter activations;
+- rank dropout masks rank components;
+- module dropout skips the complete adapter update for a module.
+
+All three keep their existing global value as the fallback and can be overridden independently for video-only, audio-only, and cross-modal modules.
 
 - `--network_dropout <float>`: Base dropout for all LoRA modules.
 - `--network_args "audio_dropout=<float>"`: Optional dropout override for audio-only modules.
 - `--network_args "video_dropout=<float>"`: Optional dropout override for non-audio video modules.
 - `--network_args "cross_modal_dropout=<float>"`: Optional dropout override for cross-modal modules (`audio_to_video`, `video_to_audio`, `av_ca_*`).
+- `--video_rank_dropout`, `--audio_rank_dropout`, `--cross_modal_rank_dropout`: Optional rank-dropout overrides. Unset values fall back to `--network_args rank_dropout=...`.
+- `--video_module_dropout`, `--audio_module_dropout`, `--cross_modal_module_dropout`: Optional whole-module dropout overrides. Unset values fall back to `--network_args module_dropout=...`.
 
 Example:
 ```bash
 --network_dropout 0.10 ^
---network_args "audio_dropout=0.15" "video_dropout=0.05" "cross_modal_dropout=0.20"
+--network_args "audio_dropout=0.15" "video_dropout=0.05" "cross_modal_dropout=0.20" "rank_dropout=0.05" ^
+--video_rank_dropout 0.02 --audio_rank_dropout 0.10 --cross_modal_rank_dropout 0.05 ^
+--video_module_dropout 0.00 --audio_module_dropout 0.05 --cross_modal_module_dropout 0.02
 ```
 
 Result:
@@ -2632,6 +2642,24 @@ Result:
 - If no per-modality override is provided, modules keep the global `--network_dropout`
 
 Precedence is: `cross_modal_dropout` override > `audio_dropout` override for audio-only modules > `video_dropout` override for video-only modules > global `--network_dropout`.
+
+The same precedence applies independently to rank and module dropout. All dropout probabilities must be in `[0, 1)`. These controls affect training only and require the built-in LTX LoRA network.
+
+### Per-Modality Optimizer Controls
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Video, audio, and cross-modal adapter groups can use independent clipping norms and weight decay:
+
+```bash
+--max_grad_norm 1.0 ^
+--video_max_grad_norm 1.0 --audio_max_grad_norm 0.5 --cross_modal_max_grad_norm 0.25 ^
+--video_weight_decay 0.01 --audio_weight_decay 0.02 --cross_modal_weight_decay 0.00
+```
+
+- `--video_max_grad_norm`, `--audio_max_grad_norm`, `--cross_modal_max_grad_norm`: independently clip each adapter group. An unset group inherits `--max_grad_norm`; `0` disables clipping for that group.
+- `--video_weight_decay`, `--audio_weight_decay`, `--cross_modal_weight_decay`: override the optimizer's weight decay for the selected adapter group. An unset group retains the optimizer default.
+
+Providing any optimizer override splits adapter parameters into stable modality-tagged optimizer groups even when their learning rates are equal. The group tags coexist with independent LR schedules, and weight-decay values are stored in optimizer state for full-state resume. These controls are opt-in and require the built-in LTX LoRA network. Per-modality optimizer controls are not available with remote-stage training; per-modality clipping is also not available with model-parallel training.
 
 ### Standalone Inference
 <sub>[↑ contents](#table-of-contents)</sub>

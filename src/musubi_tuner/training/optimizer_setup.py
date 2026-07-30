@@ -25,6 +25,7 @@ from musubi_tuner.modules.group_lr_scheduler import (
     parse_group_lr_warmup_args,
 )
 from musubi_tuner.modules.lr_schedulers import RexLR
+from musubi_tuner.modules.modality_optimization import has_modality_group_controls
 from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,10 @@ def prepare_network_optimizer_params(self, args: argparse.Namespace, network: An
         audio_lr=getattr(args, "audio_lr", None),
         lr_args=getattr(args, "lr_args", None),
         lr_group_scheduler_args=getattr(args, "lr_group_scheduler_args", None),
+        modality_group_controls=has_modality_group_controls(args),
+        video_weight_decay=getattr(args, "video_weight_decay", None),
+        audio_weight_decay=getattr(args, "audio_weight_decay", None),
+        cross_modal_weight_decay=getattr(args, "cross_modal_weight_decay", None),
     )
 
 
