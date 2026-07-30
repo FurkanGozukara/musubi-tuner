@@ -1,5 +1,6 @@
 import argparse
 import gc
+import os
 from typing import Optional
 
 
@@ -396,10 +397,29 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
-        if self.is_edit and "edit" not in dit_path or not self.is_edit and "edit" in dit_path:
+        # Sanity check on the checkpoint file name only. The actual training mode comes from --model_version,
+        # so this never changes what is loaded; it just catches an obviously mismatched checkpoint.
+        # Matched case-insensitively on the base name so files like "Qwen_Image_Edit_2511_BF16.safetensors"
+        # (capital "Edit", parent dirs containing "edit") are recognized correctly.
+        dit_name = os.path.basename(dit_path).lower()
+        name_is_edit = "edit" in dit_name
+        if self.is_edit != name_is_edit:
             logger.warning(
-                f"The provided DiT model {dit_path} may not match the training mode {'edit' if self.is_edit else 'text-to-image'}"
+                f"The provided DiT model {dit_path} may not match the training mode "
+                f"{'edit' if self.is_edit else 'text-to-image'} (guessed from the file name). "
+                f"--model_version={args.model_version} decides the actual mode; ignore this if that is correct."
             )
+        elif name_is_edit:
+            # Both agree it is an Edit checkpoint: check the version token too, since picking edit-2509 for a
+            # 2511 checkpoint (or vice versa) silently changes conditioning and does degrade the trained LoRA.
+            for token, expected_version in (("2511", "edit-2511"), ("2509", "edit-2509")):
+                if token in dit_name and args.model_version != expected_version:
+                    logger.warning(
+                        f"The provided DiT model {dit_path} looks like a {token} checkpoint, "
+                        f"but --model_version is '{args.model_version}'. Set --model_version={expected_version} "
+                        f"unless you know this is intentional."
+                    )
+                    break
         model = qwen_image_model.load_qwen_image_model(
             accelerator.device,
             dit_path,

@@ -141,16 +141,19 @@ def attention(
 
     # trim the sequence length to the actual length instead of attn_mask
     if split_attn:
-        trimmed_len = q.shape[1] - total_len
+        # Materialize the lengths once. Indexing a tensor inside the comprehensions below forces a separate
+        # implicit .item() per element (a device sync, and a torch.compile graph break); callers that already
+        # pass plain ints skip the sync entirely.
+        if torch.is_tensor(total_len):
+            total_len = total_len.tolist()
+        trimmed_len = [q.shape[1] - n for n in total_len]  # re-padded back to the full length after attention
         q = [q[i : i + 1, : total_len[i]] for i in range(len(q))]
         k = [k[i : i + 1, : total_len[i]] for i in range(len(k))]
         v = [v[i : i + 1, : total_len[i]] for i in range(len(v))]
         q = [pre_attn_layout(q_i) for q_i in q]
         k = [pre_attn_layout(k_i) for k_i in k]
         v = [pre_attn_layout(v_i) for v_i in v]
-        # print(
-        #     f"Trimming the sequence length to {total_len},trimmed_len: {trimmed_len}, q.shape: {[q_i.shape for q_i in q]}, mode: {mode}"
-        # )
+        # print(f"Trimming the sequence length to {total_len}, q.shape: {[q_i.shape for q_i in q]}, mode: {mode}")
     else:
         q = pre_attn_layout(q)
         k = pre_attn_layout(k)

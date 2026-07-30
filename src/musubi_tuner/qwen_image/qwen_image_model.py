@@ -828,13 +828,17 @@ class Attention(nn.Module):
                 attention_mask = None
 
         # joint_query: [B, S, H, D], joint_key: [B, S, H, D], joint_value: [B, S, H, D]
-        total_len = seq_img + txt_seq_lens
+        total_len = None
+        if self.split_attn:
+            assert txt_seq_lens is not None, "split_attn requires txt_seq_lens"
+            if torch.is_tensor(txt_seq_lens):
+                txt_seq_lens = txt_seq_lens.tolist()
+            # Plain ints (SymInts under torch.compile) so attention can slice without a device sync.
+            total_len = [seq_img + n for n in txt_seq_lens]
         qkv = [joint_query, joint_key, joint_value]
         org_dtype = joint_query.dtype
         del joint_query, joint_key, joint_value
-        joint_hidden_states = hunyuan_attention(
-            qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
-        )
+        joint_hidden_states = hunyuan_attention(qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len)
         # joint_hidden_states: [B, S, H*D]
 
         joint_hidden_states = joint_hidden_states.to(org_dtype)
@@ -1309,8 +1313,11 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
-        # block expects tensor instead of list
-        txt_seq_lens = torch.tensor(txt_seq_lens, device=hidden_states.device) if txt_seq_lens is not None else None
+        # Keep txt_seq_lens as a plain list of ints. The split-attn path uses them as slice bounds inside
+        # attention, so moving them to the GPU only forces an implicit .item() back out in every block
+        # (a device sync per q/k/v, and a torch.compile graph break). Normalize in case a caller passes a tensor.
+        if txt_seq_lens is not None and torch.is_tensor(txt_seq_lens):
+            txt_seq_lens = txt_seq_lens.tolist()
 
         input_device = hidden_states.device
         for index_block, block in enumerate(self.transformer_blocks):
