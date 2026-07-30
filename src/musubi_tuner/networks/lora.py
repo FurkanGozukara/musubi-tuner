@@ -839,6 +839,8 @@ def create_network(
     effective_module_kwargs = dict(module_kwargs or {})
     if use_rslora:
         effective_module_kwargs["use_rslora"] = True
+    if kwargs.get("dora_scale_lr_ratio", None) is not None:
+        effective_module_kwargs["dora_scale_lr_ratio"] = kwargs.get("dora_scale_lr_ratio")
     if use_oft:
         if use_dora_oft:
             effective_module_kwargs["scaled_oft"] = True
@@ -850,7 +852,6 @@ def create_network(
             "oft_dropout",
             "scaled_oft",
             "freeze_dora_scale",
-            "dora_scale_lr_ratio",
             "dora_scale_min_ratio",
             "dora_scale_max_ratio",
         ):
@@ -1495,7 +1496,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 param_lr = resolved_lr
                 param_desc = desc
                 param_group_key = "lora"
-                if name == "dora_scale" and self.dora_scale_lr_ratio is not None:
+                if getattr(param, "_is_dora_scale", False) and self.dora_scale_lr_ratio is not None:
                     param_lr = resolved_lr * self.dora_scale_lr_ratio
                     param_desc = f"{desc}_dora_scale"
                     if param_lr == 0:
@@ -1565,7 +1566,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 for name, param in lora.named_parameters():
                     if not param.requires_grad:
                         continue
-                    if name == "dora_scale" and self.dora_scale_lr_ratio is not None:
+                    if getattr(param, "_is_dora_scale", False) and self.dora_scale_lr_ratio is not None:
                         dora_scale_params[f"{lora.lora_name}.{name}"] = param
                         continue
                     if loraplus_ratio is not None and "lora_up" in name:

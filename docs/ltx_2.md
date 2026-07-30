@@ -1521,6 +1521,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 Training-time ComfyUI export is supported for DoRA LoRA. The native Musubi checkpoint stores `lora_magnitude_vector.weight`; the generated `*.comfy.safetensors` file stores the equivalent ComfyUI `dora_scale` tensors.
 
+Set `dora_scale_lr_ratio=N` in `--network_args` to train the DoRA/DoKr magnitude parameters at `N` times the adapter learning rate. This applies to native DoRA, DoKr, DoRA-OFT, and DoKr-OFT; `0` keeps the magnitude parameters out of the optimizer. When omitted, magnitude and direction parameters use the same learning rate.
+
 ### Rank-Stabilized LoRA (rsLoRA)
 <sub>[↑ contents](#table-of-contents)</sub>
 
