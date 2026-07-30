@@ -2516,6 +2516,27 @@ Example:
 
 This keeps audio groups on a shorter warmup and video groups on a longer warmup without changing existing behavior unless `--lr_group_warmup_args` is provided.
 
+Independent per-group schedules are also opt-in:
+
+- `--lr_group_scheduler_args <pattern=scheduler=...,key=value> ...`: assign complete schedules to regex-matched optimizer groups.
+- Supported schedulers are `constant`, `constant_with_warmup`, `linear`, `cosine`, `cosine_with_restarts`, and `polynomial`.
+- Optional settings are `warmup_steps`, `stable_steps`, `decay_steps`, `min_lr_ratio`, `num_cycles`, and `power`.
+- Rules are evaluated in command-line order and the first match wins. Groups not matched by a rule retain the global scheduler.
+
+Enabling this option splits LTX LoRA parameters into stable `unet_video`, `unet_audio`, and `unet_cross_modal` optimizer groups even when their initial learning rates are equal. More specific groups created by `--lr_args` keep their regex-derived names.
+
+```bash
+--learning_rate 1e-4 ^
+--lr_scheduler cosine ^
+--lr_warmup_steps 200 ^
+--lr_group_scheduler_args ^
+  cross_modal=scheduler=cosine,warmup_steps=100,stable_steps=200,decay_steps=1200,min_lr_ratio=0.10,num_cycles=0.5 ^
+  audio=scheduler=linear,warmup_steps=50,decay_steps=800,min_lr_ratio=0.05 ^
+  video=scheduler=cosine,warmup_steps=300,min_lr_ratio=0.02,num_cycles=0.5
+```
+
+Each rule starts from that optimizer group's configured learning rate, including `--audio_lr` or `--lr_args` overrides. The full rule set and current schedule position are included in training state, so full-state resume continues the same curves. Schedule-free optimizers and remote-stage training do not support independent group schedules.
+
 When audio learns faster than video, a lower `--audio_lr` such as `3e-5` with a `1e-4` base LR can be combined with `--audio_loss_balance_mode ema_mag` and lower audio LoRA rank.
 
 ### Per-Module LoRA Rank

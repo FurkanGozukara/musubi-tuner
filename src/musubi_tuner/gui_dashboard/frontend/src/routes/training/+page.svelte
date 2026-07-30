@@ -769,6 +769,7 @@
 							<FormField type="number" fieldPath="training.audio_lr" value={t.audio_lr ?? ''} oninput={(e) => update('audio_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for audio LoRA modules" />
 							<FormField fieldPath="training.lr_args" value={t.lr_args || ''} oninput={(e) => update('lr_args', e.target.value)} placeholder="pattern=lr ..." tooltip="Per-module LR overrides (e.g. audio_attn=1e-6)" />
 							<FormField fieldPath="training.lr_group_warmup_args" value={t.lr_group_warmup_args || ''} oninput={(e) => update('lr_group_warmup_args', e.target.value)} placeholder="audio=500 video=1500" tooltip="Per-module learning-rate warmup args passed as --lr_group_warmup_args." />
+							<FormField fieldPath="training.lr_group_scheduler_args" value={t.lr_group_scheduler_args || ''} oninput={(e) => update('lr_group_scheduler_args', e.target.value)} placeholder="cross_modal=scheduler=cosine,warmup_steps=100,min_lr_ratio=0.1" tooltip="Ordered regex rules for independent optimizer-group schedules. First matching rule wins." />
 						{/if}
 					</div>
 				</FormGroup>

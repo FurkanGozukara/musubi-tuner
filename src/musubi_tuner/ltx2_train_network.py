@@ -39,6 +39,7 @@ from musubi_tuner.modules.nf4_optimization_utils import (
     is_nf4_module,
     DEFAULT_NF4_BLOCK_SIZE,
 )
+from musubi_tuner.modules.group_lr_scheduler import parse_group_lr_scheduler_args
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_text_conditioning import (
     select_audio_text_embeds_for_audio_mode,
@@ -3890,6 +3891,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._audio_video = self._ltx_mode in {"av", "audio"}
         self._train_connectors = bool(getattr(args, "train_connectors", False))
         self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
+        group_lr_scheduler_rules = parse_group_lr_scheduler_args(getattr(args, "lr_group_scheduler_args", None))
+        if group_lr_scheduler_rules and is_ltx2_remote_stage_enabled(args):
+            raise ValueError("--lr_group_scheduler_args is not supported with --ltx2_remote_stage")
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
             raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
         self._causal_temporal_attention = bool(getattr(args, "ltx2_causal_temporal_attention", False))

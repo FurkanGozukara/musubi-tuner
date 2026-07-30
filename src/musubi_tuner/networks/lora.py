@@ -1343,7 +1343,14 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         logger.info(f"LoRA+ UNet LR Ratio: {self.loraplus_lr_ratio}")
         # logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
-    def prepare_optimizer_params(self, unet_lr: float = 1e-4, audio_lr=None, lr_args=None, **kwargs):
+    def prepare_optimizer_params(
+        self,
+        unet_lr: float = 1e-4,
+        audio_lr=None,
+        lr_args=None,
+        lr_group_scheduler_args=None,
+        **kwargs,
+    ):
         self.requires_grad_(True)
         self._apply_trainable_param_overrides()
 
@@ -1356,17 +1363,29 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 pattern, lr_str = entry.split("=", 1)
                 lr_patterns[pattern] = float(lr_str)
 
-        # If no custom LR config, use original fast path
-        if not lr_patterns and audio_lr is None:
+        split_modality_groups = bool(lr_group_scheduler_args)
+
+        # If no custom LR or scheduling config, use original fast path
+        if not lr_patterns and audio_lr is None and not split_modality_groups:
             return self._prepare_optimizer_params_simple(unet_lr)
 
-        # Group LoRA modules by resolved LR
-        lr_to_params = {}  # lr_value → {"lora": {name: param}, "plus": {name: param}}
-        lr_to_desc = {}  # lr_value → description string
+        # Keep distinct scheduler groups even when their initial learning rates
+        # are equal. This is required for independent video/audio/cross-modal
+        # schedules and also makes regex-derived groups unambiguous.
+        grouped_params = {}
+        group_descriptions = {}
 
         for lora in self.unet_loras:
             resolved_lr = unet_lr  # default
-            desc = "video"
+            if split_modality_groups:
+                if self._is_cross_modal_module(lora.lora_name):
+                    desc = "cross_modal"
+                elif "audio_" in lora.lora_name:
+                    desc = "audio"
+                else:
+                    desc = "video"
+            else:
+                desc = "video"
 
             # Check lr_args patterns first (highest priority)
             matched_pattern = False
@@ -1381,7 +1400,8 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
             if not matched_pattern and audio_lr is not None:
                 if "audio_" in lora.lora_name:
                     resolved_lr = audio_lr
-                    desc = "audio"
+                    if not split_modality_groups:
+                        desc = "audio"
 
             for name, param in lora.named_parameters():
                 if not param.requires_grad:
@@ -1394,8 +1414,12 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                     param_desc = f"{desc}_dora_scale"
                     if param_lr == 0:
                         continue
-                group = lr_to_params.setdefault(param_lr, {"lora": {}, "plus": {}})
-                lr_to_desc.setdefault(param_lr, param_desc)
+                group_key = (param_lr, param_desc) if split_modality_groups else (param_lr, "")
+                group = grouped_params.setdefault(
+                    group_key,
+                    {"lora": {}, "plus": {}},
+                )
+                group_descriptions.setdefault(group_key, param_desc)
                 key = f"{lora.lora_name}.{name}"
                 if self.loraplus_lr_ratio is not None and "lora_up" in name:
                     param_group_key = "plus"
@@ -1404,9 +1428,10 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         # Build final param groups
         all_params = []
         lr_descriptions = []
-        for lr_val in sorted(lr_to_params.keys()):
-            groups = lr_to_params[lr_val]
-            desc = lr_to_desc[lr_val]
+        for group_key in sorted(grouped_params):
+            lr_val = group_key[0]
+            desc = group_descriptions[group_key]
+            groups = grouped_params[group_key]
             for key in ("lora", "plus"):
                 if not groups[key]:
                     continue

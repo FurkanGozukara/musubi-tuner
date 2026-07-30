@@ -111,6 +111,7 @@ def prepare_optimizer_params_compat(
         "unet_lr": args.learning_rate,
         "audio_lr": getattr(args, "audio_lr", None),
         "lr_args": getattr(args, "lr_args", None),
+        "lr_group_scheduler_args": getattr(args, "lr_group_scheduler_args", None),
     }
     prepare_kwargs, skipped_kwargs = _filter_supported_kwargs(prepare_fn, requested_kwargs)
     if skipped_kwargs:
@@ -142,6 +143,5 @@ def prepare_optimizer_params_compat(
         return fallback_params, lr_descriptions
 
     raise ValueError(
-        "No trainable parameters were found for the network. "
-        "Check LoRA/LyCORIS target selection and network configuration."
+        "No trainable parameters were found for the network. Check LoRA/LyCORIS target selection and network configuration."
     )

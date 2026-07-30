@@ -2046,6 +2046,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "scheduler family. Patterns match optimizer group names such as unet_audio, "
         "unet_video, or unet_audio_attn. Example: --lr_group_warmup_args audio=500 video=1500",
     )
+    parser.add_argument(
+        "--lr_group_scheduler_args",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Opt-in independent schedules for regex-matched optimizer groups. Each ordered rule is "
+            "pattern=scheduler=<constant|constant_with_warmup|linear|cosine|cosine_with_restarts|polynomial>"
+            "[,warmup_steps=N][,stable_steps=N][,decay_steps=N][,min_lr_ratio=R]"
+            "[,num_cycles=C][,power=P]. First matching rule wins. Enabling this option splits LTX LoRA "
+            "parameters into unet_video, unet_audio, and unet_cross_modal groups."
+        ),
+    )
 
     # -- Per-module rank (dim) overrides --
     parser.add_argument(

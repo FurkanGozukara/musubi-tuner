@@ -1382,6 +1382,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--lr_args"] + _split_cli_args(t.lr_args)
     if t.lr_group_warmup_args:
         cmd += ["--lr_group_warmup_args"] + _split_cli_args(t.lr_group_warmup_args)
+    if t.lr_group_scheduler_args:
+        cmd += ["--lr_group_scheduler_args"] + _split_cli_args(t.lr_group_scheduler_args)
     if t.audio_dim is not None:
         cmd += ["--audio_dim", str(t.audio_dim)]
     if t.audio_alpha is not None:

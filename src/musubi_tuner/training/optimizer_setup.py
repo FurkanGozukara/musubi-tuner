@@ -18,7 +18,12 @@ from diffusers.optimization import (
 )
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 
-from musubi_tuner.modules.group_lr_scheduler import GroupWarmupScheduler, parse_group_lr_warmup_args
+from musubi_tuner.modules.group_lr_scheduler import (
+    GroupLRScheduler,
+    GroupLRScheduleRule,
+    parse_group_lr_scheduler_args,
+    parse_group_lr_warmup_args,
+)
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 
@@ -400,15 +405,25 @@ def maybe_wrap_group_warmup_scheduler(
     optimizer: torch.optim.Optimizer,
     num_warmup_steps: Optional[int],
     warmup_overrides: dict[str, int],
+    schedule_rules: Optional[list[GroupLRScheduleRule]] = None,
+    num_training_steps: int = 1,
 ):
-    if not warmup_overrides:
+    if not warmup_overrides and not schedule_rules:
         return lr_scheduler
-    logger.info("Per-group LR warmup overrides enabled: %s", warmup_overrides)
-    return GroupWarmupScheduler(
+    if warmup_overrides:
+        logger.info("Per-group LR warmup overrides enabled: %s", warmup_overrides)
+    if schedule_rules:
+        logger.info(
+            "Independent per-group LR schedules enabled: %s",
+            [rule.pattern for rule in schedule_rules],
+        )
+    return GroupLRScheduler(
         lr_scheduler,
         optimizer,
+        num_training_steps=num_training_steps,
         default_warmup_steps=int(num_warmup_steps or 0),
         warmup_overrides=warmup_overrides,
+        schedule_rules=schedule_rules,
     )
 
 
@@ -421,6 +436,7 @@ def prepare_network_optimizer_params(self, args: argparse.Namespace, network: An
         unet_lr=args.learning_rate,
         audio_lr=getattr(args, "audio_lr", None),
         lr_args=getattr(args, "lr_args", None),
+        lr_group_scheduler_args=getattr(args, "lr_group_scheduler_args", None),
     )
 
 
@@ -650,8 +666,11 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
     """
     Unified API to get any scheduler from its name.
     """
+    raw_group_scheduler_args = getattr(args, "lr_group_scheduler_args", None)
     # if schedulefree optimizer, return dummy scheduler
     if self.is_schedulefree_optimizer(optimizer, args):
+        if raw_group_scheduler_args:
+            raise ValueError("--lr_group_scheduler_args cannot be used with a schedule-free optimizer")
         return self.get_dummy_scheduler(optimizer)
 
     name = args.lr_scheduler
@@ -668,6 +687,17 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
     timescale = args.lr_scheduler_timescale
     min_lr_ratio = args.lr_scheduler_min_lr_ratio
     group_lr_warmup_overrides = parse_group_lr_warmup_args(getattr(args, "lr_group_warmup_args", None))
+    group_lr_schedule_rules = parse_group_lr_scheduler_args(raw_group_scheduler_args)
+
+    def wrap_group_scheduler(lr_scheduler):
+        return self._maybe_wrap_group_warmup_scheduler(
+            lr_scheduler,
+            optimizer,
+            num_warmup_steps,
+            group_lr_warmup_overrides,
+            group_lr_schedule_rules,
+            num_training_steps,
+        )
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
@@ -695,7 +725,7 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
             lr_scheduler_type = values[-1]
         lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
         lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-        return self._maybe_wrap_group_warmup_scheduler(lr_scheduler, optimizer, num_warmup_steps, group_lr_warmup_overrides)
+        return wrap_group_scheduler(lr_scheduler)
 
     if name.startswith("adafactor"):
         assert type(optimizer) == transformers.optimization.Adafactor, (
@@ -703,15 +733,12 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
         )
         initial_lr = float(name.split(":")[1])
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
-        return self._maybe_wrap_group_warmup_scheduler(
-            wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr)),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
+        return wrap_group_scheduler(
+            wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
         )
 
     if name.lower() == "rex":
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             RexLR(
                 optimizer,
                 max_lr=args.learning_rate,
@@ -722,50 +749,33 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
                 num_warmup_steps=num_warmup_steps,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            warmup_overrides=group_lr_warmup_overrides,
         )
 
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
         name = DiffusersSchedulerType(name)
         schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(optimizer, **lr_scheduler_kwargs),  # step_rules and last_epoch are given as kwargs
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
     if name == SchedulerType.CONSTANT:
-        return self._maybe_wrap_group_warmup_scheduler(
-            wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
-        )
+        return wrap_group_scheduler(wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)))
 
     # All other schedulers require `num_warmup_steps`
     if num_warmup_steps is None:
         raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
     if name == SchedulerType.CONSTANT_WITH_WARMUP:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     if name == SchedulerType.INVERSE_SQRT:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     # All other schedulers require `num_training_steps`
@@ -773,7 +783,7 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
         raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
     if name == SchedulerType.COSINE_WITH_RESTARTS:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
@@ -781,13 +791,10 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
                 num_cycles=num_cycles,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     if name == SchedulerType.POLYNOMIAL:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
@@ -795,13 +802,10 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
                 power=power,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     if name == SchedulerType.COSINE_WITH_MIN_LR:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
@@ -810,30 +814,24 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
                 min_lr_rate=min_lr_ratio,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     # these schedulers do not require `num_decay_steps`
     if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=num_training_steps,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
     # All other schedulers require `num_decay_steps`
     if num_decay_steps is None:
         raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
     if name == SchedulerType.WARMUP_STABLE_DECAY:
-        return self._maybe_wrap_group_warmup_scheduler(
+        return wrap_group_scheduler(
             schedule_func(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
@@ -843,12 +841,9 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
                 min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
                 **lr_scheduler_kwargs,
             ),
-            optimizer,
-            num_warmup_steps,
-            group_lr_warmup_overrides,
         )
 
-    return self._maybe_wrap_group_warmup_scheduler(
+    return wrap_group_scheduler(
         schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
@@ -856,7 +851,4 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
             num_decay_steps=num_decay_steps,
             **lr_scheduler_kwargs,
         ),
-        optimizer,
-        num_warmup_steps,
-        group_lr_warmup_overrides,
     )

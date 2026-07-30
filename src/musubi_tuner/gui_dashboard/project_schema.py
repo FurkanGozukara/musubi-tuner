@@ -377,6 +377,7 @@ class TrainingConfig(BaseModel):
     audio_lr: Optional[float] = None
     lr_args: str = ""
     lr_group_warmup_args: str = ""
+    lr_group_scheduler_args: str = ""
     audio_dim: Optional[int] = None
     audio_alpha: Optional[float] = None
 

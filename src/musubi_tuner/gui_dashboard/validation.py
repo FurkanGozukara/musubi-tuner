@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import shlex
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
 from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_args
+from musubi_tuner.modules.group_lr_scheduler import parse_group_lr_scheduler_args
 from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
 
@@ -421,6 +423,40 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     _validate_generated_av_metrics(t, page="training", errors=errors)
+    if _has_text(getattr(t, "lr_group_scheduler_args", "")):
+        try:
+            parse_group_lr_scheduler_args(_split_cli_args(t.lr_group_scheduler_args))
+        except (TypeError, ValueError, re.error) as exc:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.lr_group_scheduler_args",
+                    f"Per-group LR scheduler rules are invalid: {exc}",
+                    label="Per-Group LR Schedulers",
+                    page="training",
+                )
+            )
+        optimizer_type = str(t.optimizer_type or "").lower()
+        if optimizer_type.endswith("schedulefree") or optimizer_type == "automagic":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.lr_group_scheduler_args",
+                    "Per-group LR schedulers cannot be combined with a schedule-free optimizer.",
+                    label="Per-Group LR Schedulers",
+                    page="training",
+                )
+            )
+        if bool(getattr(t, "ltx2_remote_stage", False)):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.lr_group_scheduler_args",
+                    "Per-group LR schedulers are not supported with remote-stage training.",
+                    label="Per-Group LR Schedulers",
+                    page="training",
+                )
+            )
     effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors, t.gemma_root)
 
     if not _has_training_checkpoint(config):
