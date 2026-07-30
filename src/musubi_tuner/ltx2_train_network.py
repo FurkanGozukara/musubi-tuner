@@ -4253,6 +4253,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_lora_target_preset"] = preset
         if bool(getattr(args, "ltx2_causal_temporal_attention", False)):
             md["ss_ltx2_causal_temporal_attention"] = True
+        if bool(getattr(args, "ltx2_bounded_activation_offload", False)):
+            md["ss_ltx2_bounded_activation_offload"] = True
+            md["ss_ltx2_activation_offload_max_inflight"] = int(getattr(args, "ltx2_activation_offload_max_inflight", None) or 2)
+            md["ss_ltx2_activation_offload_keep_trailing"] = int(getattr(args, "ltx2_activation_offload_keep_trailing", None) or 2)
+            min_mb = getattr(args, "ltx2_activation_offload_min_mb", None)
+            md["ss_ltx2_activation_offload_min_mb"] = float(1.0 if min_mb is None else min_mb)
         if bool(getattr(args, "ltx2_soft_av_alignment", False)):
             md["ss_ltx2_soft_av_alignment"] = True
             md["ss_ltx2_soft_av_alignment_sigma"] = float(getattr(args, "ltx2_soft_av_alignment_sigma", 1.0))
@@ -4503,6 +4509,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             logger.info("Connector LoRA: attached connectors to transformer wrapper")
 
         self._setup_tread(args, accelerator, transformer)
+        from musubi_tuner.ltx2_activation_offload import (
+            configure_ltx2_bounded_activation_offload,
+        )
+
+        configure_ltx2_bounded_activation_offload(transformer, args)
 
         return transformer
 

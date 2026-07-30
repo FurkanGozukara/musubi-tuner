@@ -431,6 +431,10 @@ class TrainingConfig(BaseModel):
     ltx2_padded_prompt_trim: bool = False
     ltx2_partial_gradient_checkpointing: bool = False
     ltx2_compile_inner_blocks: bool = False
+    ltx2_bounded_activation_offload: bool = False
+    ltx2_activation_offload_max_inflight: Optional[int] = None
+    ltx2_activation_offload_keep_trailing: Optional[int] = None
+    ltx2_activation_offload_min_mb: Optional[float] = None
     ltx2_block_swap_async_backward: bool = False
     ltx2_block_swap_trainable_ring: bool = False
     ltx2_validate_training_tensors: bool = False

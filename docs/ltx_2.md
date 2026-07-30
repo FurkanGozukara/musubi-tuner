@@ -92,6 +92,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Memory Optimization](#memory-optimization)
       - [Quantization Options](#quantization-options)
       - [Other Memory Options](#other-memory-options)
+    - [Bounded Activation Offload](#bounded-activation-offload)
     - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [Low Main-RAM Training](#low-main-ram-training)
@@ -1682,6 +1683,10 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--block_swap_ring_size N` | H2D-only GPU ring size. `2` (default) uses double buffering; `1` allocates one streaming buffer and cannot overlap prefetch with compute |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
+| `--ltx2_bounded_activation_offload` | Experimentally offload only evolving LTX checkpoint-boundary activations through bounded asynchronous pinned-memory transfers. Requires ordinary gradient checkpointing and is disabled by default. |
+| `--ltx2_activation_offload_max_inflight N` | Maximum queued layer calls before CPU scheduling waits for CUDA work (default 2). |
+| `--ltx2_activation_offload_keep_trailing N` | Keep the final N block-boundary activations resident because backward consumes them first (default 2). |
+| `--ltx2_activation_offload_min_mb MB` | Offload only boundary activations at least this large (default 1 MiB). |
 | `--blockwise_checkpointing` | Checkpoint transformer blocks individually and reload block state around backward. Lowest peak VRAM, but heavy CPU↔GPU traffic and recompute. |
 | `--blocks_to_checkpoint N` | Number of final transformer blocks selected for blockwise checkpointing. With `--ltx2_partial_gradient_checkpointing` and no offload/swap, only these final N blocks use ordinary activation checkpointing. |
 | `--offload_optimizer_during_validation` | Offload CUDA optimizer state to CPU during validation and sample previews (off by default) |
@@ -1713,6 +1718,15 @@ All quantized-base paths are opt-in; a run that omits their flags retains the no
 | `--flash3` | Use the separately installed FlashAttention 3 interface. A reducible key-padding mask uses its variable-length function when present; if that function is absent, or the mask is query-specific, the code warns once and falls back to PyTorch SDPA. Package and hardware requirements depend on the installed FlashAttention build. |
 
 The LTX-2 performance switches are disabled by default.
+
+### Bounded Activation Offload
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--ltx2_bounded_activation_offload` is an LTX-only alternative to the existing broad checkpoint CPU-offload path. It selects only the evolving video/audio `x` tensors saved at block boundaries. Shared prompt, mask, timestep, and positional tensors stay on their existing path because copying them once per block would add traffic without releasing their original storage.
+
+The selected tensors are copied to pinned host memory without mutating their source. Dense storage is transferred as a flat byte span, and the original shape and stride are restored during reload. Forward scheduling is capped by `--ltx2_activation_offload_max_inflight`; backward starts the previous block's reload before its checkpoint recomputation; and `--ltx2_activation_offload_keep_trailing` avoids needless round trips for the boundaries consumed first.
+
+This path requires `--gradient_checkpointing`. It cannot currently be combined with `--gradient_checkpointing_cpu_offload`, `--blockwise_checkpointing`, `--ltx2_partial_gradient_checkpointing`, `--compile`, model parallelism, or remote stages. Ordinary LTX block swap remains supported. The feature is experimental: measure peak VRAM, host RAM, and step time on the target workload rather than assuming it is better than ordinary checkpointing.
 
 **H2D-only block swap is opt-in:** it removes the redundant Device→Host copy
 for frozen-base LoRA/LoHa/LoKr training. It requires CUDA, active block swap,
@@ -3112,7 +3126,12 @@ Prompt-related values (`mode`, `class`, `trigger`, `replace`, and `bank`) must m
 ### Self-Flow (Self-Supervised Flow Matching)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. `teacher_mode=ema` is the default and canonical implementation. `partial_ema` is a lower-memory approximation that tracks only the selected teacher block. `teacher_mode=base` remains available for adapter training as a related frozen-base consistency variant: it disables the adapter for the teacher pass. The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is LTX-specific.
+**Self-Flow is representation learning integrated directly into flow training.** It extends the representation-alignment idea used by REPA, replacing the external representation model with an EMA teacher derived from the flow model itself. For each training example it samples two noise levels. The student sees a mixture in which different tokens use different noise levels, while the teacher sees the same example uniformly at the cleaner of the two levels. The student performs the ordinary flow-prediction task and simultaneously learns to match a deeper teacher representation from an earlier student block. This encourages it to use cleaner context tokens to understand noisier regions and learn stronger global relationships.
+
+The representation loss uses cosine similarity. `teacher_mode=ema` is the default and canonical implementation. `partial_ema` is a lower-memory approximation that tracks only the selected teacher block. `teacher_mode=base` remains available for adapter training as a related frozen-base consistency variant: it disables the adapter for the teacher pass. The optional **temporal/motion extension** (frame-neighbor and motion-delta terms) is LTX-specific.
+
+> [!CAUTION]
+> The practical value of Self-Flow for low-scale LoRA or full-parameter post-training has not yet been established by controlled quality comparisons in this trainer. Treat it as an experimental research option and compare it against an otherwise matched run with Self-Flow disabled.
 
 Enable with `--self_flow`. Supported in `--ltx2_mode video`, `--ltx2_mode av`, and `--ltx2_mode audio`. In AV mode the video alignment runs by default and audio alignment is enabled with `lambda_audio > 0`. Audio-only mode requires `lambda_audio > 0` and the video/temporal lambdas set to zero. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 

@@ -84,6 +84,10 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
             "Compile LTX block compute while keeping checkpoint wrappers eager.",
         ),
         (
+            "--ltx2_bounded_activation_offload",
+            "Offload only LTX checkpoint-boundary activations with bounded asynchronous transfers.",
+        ),
+        (
             "--ltx2_block_swap_async_backward",
             "Prefetch the next pinned block while the current backward block computes.",
         ),
@@ -107,6 +111,27 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
         default=None,
         metavar="MB",
         help="Maximum prompt K/V payload in MiB (default: 1024).",
+    )
+    group.add_argument(
+        "--ltx2_activation_offload_max_inflight",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum queued LTX layer calls for bounded activation offload (default: 2).",
+    )
+    group.add_argument(
+        "--ltx2_activation_offload_keep_trailing",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of final LTX block activations kept on GPU (default: 2).",
+    )
+    group.add_argument(
+        "--ltx2_activation_offload_min_mb",
+        type=float,
+        default=None,
+        metavar="MB",
+        help="Minimum boundary activation size to offload in MiB (default: 1).",
     )
     group.add_argument(
         "--ltx2_validate_training_tensors",

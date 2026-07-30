@@ -1024,6 +1024,16 @@ class LTXModel(torch.nn.Module):
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             gpu_device = audio.x.device
 
+        activation_offloader = getattr(
+            self,
+            "_ltx2_bounded_activation_offloader",
+            None,
+        )
+        if activation_offloader is not None and torch.is_grad_enabled():
+            if gpu_device is None:
+                raise RuntimeError("LTX bounded activation offload requires a tensor model input")
+            activation_offloader.start_forward(gpu_device)
+
         cpu_device = torch.device("cpu")
 
         # If offloading is enabled for all blocks, move initial inputs to CPU so the first block's checkpoint saves CPU tensors

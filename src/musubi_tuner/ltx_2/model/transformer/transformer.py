@@ -6,6 +6,7 @@ import os
 import torch
 import torch.utils.checkpoint as checkpoint
 
+from musubi_tuner.ltx2_activation_offload import activation_view_key
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import weighs_to_device
 from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
@@ -650,7 +651,61 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 return _repack_block_checkpoint_outputs(video, audio, outputs)
             else:
                 # Standard gradient checkpointing
-                return checkpoint.checkpoint(checkpoint_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none")
+                activation_offloader = getattr(self, "_ltx2_bounded_activation_offloader", None)
+                offload_state = getattr(activation_offloader, "current_state", None) if activation_offloader is not None else None
+                if offload_state is None:
+                    return checkpoint.checkpoint(
+                        checkpoint_wrapper,
+                        *flat_inputs,
+                        use_reentrant=False,
+                        determinism_check="none",
+                    )
+
+                activation_offloader.before_block()
+                targets = {
+                    activation_view_key(args.x) for args in (video, audio) if args is not None and isinstance(args.x, torch.Tensor)
+                }
+
+                def pack_hook(tensor: torch.Tensor):
+                    if activation_view_key(tensor) in targets:
+                        return activation_offloader.pack_activation(
+                            offload_state,
+                            self.idx,
+                            tensor,
+                        )
+                    return tensor
+
+                with torch.autograd.graph.saved_tensors_hooks(
+                    pack_hook,
+                    activation_offloader.unpack_activation,
+                ):
+                    outputs = checkpoint.checkpoint(
+                        checkpoint_wrapper,
+                        *flat_inputs,
+                        use_reentrant=False,
+                        determinism_check="none",
+                    )
+
+                output_device = None
+                for args in outputs:
+                    if args is not None and isinstance(args.x, torch.Tensor):
+                        output_device = args.x.device
+                        break
+                if output_device is None:
+                    raise RuntimeError("LTX bounded activation offload requires a tensor block output")
+                activation_offloader.after_block(output_device)
+
+                output_tensors = [args.x for args in outputs if args is not None and isinstance(args.x, torch.Tensor)]
+                wrapped_tensors = activation_offloader.wrap_outputs(
+                    offload_state,
+                    self.idx,
+                    output_tensors,
+                )
+                wrapped_iter = iter(wrapped_tensors)
+                return tuple(
+                    replace(args, x=next(wrapped_iter)) if args is not None and isinstance(args.x, torch.Tensor) else args
+                    for args in outputs
+                )
 
         return self._forward(video, audio, perturbations)
 

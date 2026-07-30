@@ -741,6 +741,66 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if getattr(t, "ltx2_bounded_activation_offload", False):
+        conflicts = []
+        if not t.gradient_checkpointing:
+            conflicts.append("Gradient Checkpointing must be enabled")
+        if t.gradient_checkpointing_cpu_offload:
+            conflicts.append("Checkpoint CPU Offload")
+        if t.blockwise_checkpointing:
+            conflicts.append("Blockwise Checkpointing")
+        if t.ltx2_partial_gradient_checkpointing:
+            conflicts.append("Partial Gradient Checkpointing")
+        if t.compile:
+            conflicts.append("torch.compile")
+        if t.ltx2_model_parallel:
+            conflicts.append("Model Parallel")
+        if t.ltx2_remote_stage:
+            conflicts.append("Remote Stage")
+        if conflicts:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_bounded_activation_offload",
+                    "Bounded Activation Offload configuration conflict: " + ", ".join(conflicts) + ".",
+                    label="Bounded Activation Offload",
+                    page="training",
+                )
+            )
+        max_inflight = t.ltx2_activation_offload_max_inflight
+        keep_trailing = t.ltx2_activation_offload_keep_trailing
+        min_mb = t.ltx2_activation_offload_min_mb
+        if max_inflight is not None and max_inflight < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_activation_offload_max_inflight",
+                    "Activation offload maximum in-flight calls must be at least 1.",
+                    label="Activation Offload In-Flight Limit",
+                    page="training",
+                )
+            )
+        if keep_trailing is not None and keep_trailing < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_activation_offload_keep_trailing",
+                    "Activation offload trailing block count cannot be negative.",
+                    label="Activation Offload Trailing Blocks",
+                    page="training",
+                )
+            )
+        if min_mb is not None and min_mb < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_activation_offload_min_mb",
+                    "Activation offload minimum size cannot be negative.",
+                    label="Activation Offload Minimum Size",
+                    page="training",
+                )
+            )
+
     try:
         video_anchor_strength = float(t.video_anchor_strength)
     except (TypeError, ValueError):
@@ -1765,6 +1825,66 @@ def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
                     "full_finetune.ltx2_compile_inner_blocks",
                     "Compile inner LTX blocks requires resident weights and activations.",
                     label="Compile Inner LTX Blocks",
+                    page="full_finetune",
+                )
+            )
+
+    if getattr(t, "ltx2_bounded_activation_offload", False):
+        conflicts = []
+        if not t.gradient_checkpointing:
+            conflicts.append("Gradient Checkpointing must be enabled")
+        if t.gradient_checkpointing_cpu_offload:
+            conflicts.append("Checkpoint CPU Offload")
+        if t.blockwise_checkpointing:
+            conflicts.append("Blockwise Checkpointing")
+        if t.ltx2_partial_gradient_checkpointing:
+            conflicts.append("Partial Gradient Checkpointing")
+        if t.compile:
+            conflicts.append("torch.compile")
+        if t.ltx2_model_parallel:
+            conflicts.append("Model Parallel")
+        if t.ltx2_remote_stage:
+            conflicts.append("Remote Stage")
+        if conflicts:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_bounded_activation_offload",
+                    "Bounded Activation Offload configuration conflict: " + ", ".join(conflicts) + ".",
+                    label="Bounded Activation Offload",
+                    page="full_finetune",
+                )
+            )
+        max_inflight = t.ltx2_activation_offload_max_inflight
+        keep_trailing = t.ltx2_activation_offload_keep_trailing
+        min_mb = t.ltx2_activation_offload_min_mb
+        if max_inflight is not None and max_inflight < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_activation_offload_max_inflight",
+                    "Activation offload maximum in-flight calls must be at least 1.",
+                    label="Activation Offload In-Flight Limit",
+                    page="full_finetune",
+                )
+            )
+        if keep_trailing is not None and keep_trailing < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_activation_offload_keep_trailing",
+                    "Activation offload trailing block count cannot be negative.",
+                    label="Activation Offload Trailing Blocks",
+                    page="full_finetune",
+                )
+            )
+        if min_mb is not None and min_mb < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.ltx2_activation_offload_min_mb",
+                    "Activation offload minimum size cannot be negative.",
+                    label="Activation Offload Minimum Size",
                     page="full_finetune",
                 )
             )
