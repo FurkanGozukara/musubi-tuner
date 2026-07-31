@@ -33,6 +33,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 SOURCE_PATH_METADATA_KEY = "source_path"
+SOURCE_PATH_FORMAT_METADATA_KEY = "source_path_format"
+SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE = "relative_to_cache"
+SOURCE_PATH_FORMAT_FILENAME_ONLY = "filename_only"
 SOURCE_SIZE_METADATA_KEY = "source_size"
 SOURCE_MTIME_NS_METADATA_KEY = "source_mtime_ns"
 
@@ -56,8 +59,24 @@ def build_source_freshness_metadata(item_info: ItemInfo, source_path: Optional[s
         return {}
     if not os.path.isfile(source_path):
         return {}
+
+    cache_path = getattr(item_info, "latent_cache_path", None)
+    source_path_format = SOURCE_PATH_FORMAT_FILENAME_ONLY
+    portable_source_path = os.path.basename(source_path)
+    if cache_path:
+        cache_directory = os.path.dirname(os.path.abspath(os.path.expanduser(str(cache_path))))
+        try:
+            portable_source_path = os.path.relpath(source_path, cache_directory).replace("\\", "/")
+            source_path_format = SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE
+        except ValueError:
+            # Windows paths on different drives have no meaningful relative
+            # representation. Keep a non-identifying filename for diagnostics
+            # instead of embedding a machine-specific absolute path.
+            pass
+
     metadata = {
-        SOURCE_PATH_METADATA_KEY: source_path,
+        SOURCE_PATH_METADATA_KEY: portable_source_path,
+        SOURCE_PATH_FORMAT_METADATA_KEY: source_path_format,
         SOURCE_SIZE_METADATA_KEY: str(source_stat.st_size),
         SOURCE_MTIME_NS_METADATA_KEY: str(source_stat.st_mtime_ns),
     }

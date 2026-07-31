@@ -67,6 +67,12 @@ class LTX2Scheduler(SchedulerProtocol):
         terminal: float = 0.1,
         **_kwargs,
     ) -> torch.FloatTensor:
+        steps = int(steps)
+        if steps < 1:
+            raise ValueError(f"steps must be at least 1, got {steps}")
+        if steps == 1:
+            return torch.tensor([1.0, 0.0], dtype=torch.float32)
+
         tokens = math.prod(latent.shape[2:]) if latent is not None else MAX_SHIFT_ANCHOR
         sigmas = torch.linspace(1.0, 0.0, steps + 1)
 

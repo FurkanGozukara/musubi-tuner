@@ -186,6 +186,9 @@ class NetworkTrainer(UpstreamNetworkTrainer):
     ) -> None:
         pass
 
+    def validate_loss_before_backward(self, loss: torch.Tensor) -> None:
+        pass
+
     def on_post_save(
         self,
         args: argparse.Namespace,

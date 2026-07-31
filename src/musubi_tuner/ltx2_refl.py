@@ -21,6 +21,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _require_finite(name: str, tensor: torch.Tensor) -> None:
+    """Abort ReFL before backward/save when an intermediate becomes non-finite."""
+    if not bool(torch.isfinite(tensor.detach()).all()):
+        raise FloatingPointError(f"ReFL {name} became non-finite")
+
+
+def _require_finite_gradients(parameters) -> None:
+    gradients = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    finite = torch.stack([torch.isfinite(gradient).all() for gradient in gradients]) if gradients else None
+    if finite is not None and not bool(finite.all()):
+        raise FloatingPointError("ReFL adapter gradients became non-finite")
+
+
+def _require_finite_parameters(parameters) -> None:
+    finite = torch.stack([torch.isfinite(parameter.detach()).all() for parameter in parameters])
+    if not bool(finite.all()):
+        raise FloatingPointError("ReFL adapter parameters became non-finite")
+
+
 def compute_refl_loss(
     reward: torch.Tensor,
     fwd_x0: torch.Tensor,
@@ -237,9 +256,11 @@ def run_refl(
         # 1) generate clean rollout latents under no_grad (the differentiable-reward starting point)
         samples = gen_fn(prompt, seeds)
         x0 = torch.stack([s["video_x0"] for s in samples], dim=0).to(device=device, dtype=dit_dtype)  # [K,C,F,H,W]
+        _require_finite("video rollout latent", x0)
         audio_x0 = None
         if is_av:
             audio_x0 = torch.stack([s["audio_x0"] for s in samples], dim=0).to(device=device, dtype=dit_dtype)
+            _require_finite("audio rollout latent", audio_x0)
         v_ctx = samples[0]["v_ctx"].to(device=device, dtype=dit_dtype)
         if v_ctx.dim() == 2:
             v_ctx = v_ctx.unsqueeze(0)
@@ -307,9 +328,12 @@ def run_refl(
                 if is_av:
                     ref_x0 = to_denoised(xt, ref_out[0], sigma_b).detach()
                     ref_audio_x0 = to_denoised(xt_audio, ref_out[1], sigma_audio_b).detach()
+                    _require_finite("reference video prediction", ref_x0)
+                    _require_finite("reference audio prediction", ref_audio_x0)
                 else:
                     ref_x0 = to_denoised(xt, ref_out, sigma_b).detach()
                     ref_audio_x0 = None
+                    _require_finite("reference video prediction", ref_x0)
                 net.set_enabled(True)
             if blocks_to_swap > 0:
                 unwrapped.switch_block_swap_for_training()
@@ -320,9 +344,12 @@ def run_refl(
             if is_av:
                 fwd_x0 = to_denoised(xt, fwd_out[0], sigma_b)
                 fwd_audio_x0 = to_denoised(xt_audio, fwd_out[1], sigma_audio_b)
+                _require_finite("policy video prediction", fwd_x0)
+                _require_finite("policy audio prediction", fwd_audio_x0)
             else:
                 fwd_x0 = to_denoised(xt, fwd_out, sigma_b)
                 fwd_audio_x0 = None
+                _require_finite("policy video prediction", fwd_x0)
 
             # build per-sample media dicts for the reward: latent always; pixels if any reward needs them
             media: List[Dict[str, Any]] = [{"video_x0": fwd_x0[j], "prompt": prompt} for j in range(k)]
@@ -331,14 +358,17 @@ def run_refl(
                     media[j]["audio_x0"] = fwd_audio_x0[j]
             if needs_pixels:
                 pixels = decode_latent_for_reward(net_trainer, vae, fwd_x0)  # [K,C,T,H,W] grad (GPU-verify)
+                _require_finite("decoded video", pixels)
                 for j in range(k):
                     media[j]["video"] = pixels[j]
             if needs_audio_waveform:
                 waveforms = decode_audio_latent_for_reward(audio_decoder, vocoder, fwd_audio_x0)
+                _require_finite("decoded audio", waveforms)
                 for j in range(k):
                     media[j]["audio_waveform"] = waveforms[j]
 
             reward, r_info = reward_stack.score_grad(media)  # [K] grad
+            _require_finite("reward", reward)
             additional_anchors = [(fwd_audio_x0, ref_audio_x0)] if is_av else None
             loss, info = compute_refl_loss(
                 reward,
@@ -353,10 +383,14 @@ def run_refl(
                 acc_info[key] += float(info[key])
 
         acc_loss = acc_loss / max(1, renoise_samples)
+        _require_finite("loss", acc_loss)
         accelerator.backward(acc_loss)
+        trainable_params = list(net.trainable_lora_params())
         if args.max_grad_norm:
-            accelerator.clip_grad_norm_(net.trainable_lora_params(), args.max_grad_norm)
+            accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+        _require_finite_gradients(trainable_params)
         optimizer.step()
+        _require_finite_parameters(trainable_params)
         lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 

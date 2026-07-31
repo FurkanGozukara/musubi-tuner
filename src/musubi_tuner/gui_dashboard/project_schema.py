@@ -749,8 +749,8 @@ class TrainingConfig(BaseModel):
     self_flow_teacher_mode: Literal["base", "ema", "partial_ema"] = "ema"
     self_flow_student_block_idx: int = 16
     self_flow_teacher_block_idx: int = 32
-    self_flow_student_block_ratio: float = 0.3
-    self_flow_teacher_block_ratio: float = 0.7
+    self_flow_student_block_ratio: Optional[float] = None
+    self_flow_teacher_block_ratio: Optional[float] = None
     self_flow_student_block_stochastic_range: int = 0
     self_flow_lambda: float = 0.1
     self_flow_lambda_audio: float = 0.0
@@ -1360,7 +1360,7 @@ class RLConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    version: int = 2
+    version: int = 3
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
@@ -1379,11 +1379,12 @@ class ProjectConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_sampling_key(cls, data):
-        """Backward compat: rename old 'sampling' key to 'inference'."""
+    def _migrate_project_config(cls, data):
+        """Migrate project configuration fields from earlier schema versions."""
         if isinstance(data, dict) and "sampling" in data and "inference" not in data:
             data["inference"] = data.pop("sampling")
         if isinstance(data, dict):
+            source_version = int(data.get("version") or 1)
             training = data.get("training")
             if training is None:
                 data["training"] = {
@@ -1420,6 +1421,38 @@ class ProjectConfig(BaseModel):
                 else:
                     section = dict(section)
 
+                if section_name in ("training", "full_finetune"):
+                    legacy_int4_base = bool(section.pop("int4_convrot_base", False))
+                    legacy_int4_dynamic = bool(section.pop("int4_convrot_dynamic", False))
+                    if legacy_int4_base and legacy_int4_dynamic:
+                        raise ValueError(
+                            f"{section_name}.int4_convrot_base and {section_name}.int4_convrot_dynamic are mutually exclusive"
+                        )
+                    if section_name == "full_finetune" and (legacy_int4_base or legacy_int4_dynamic):
+                        raise ValueError(
+                            "full_finetune legacy INT4 ConvRot fields are unsupported because W4A8 requires LoRA training; "
+                            "move this configuration to the training section"
+                        )
+                    if (legacy_int4_base or legacy_int4_dynamic) and (bool(section.get("w4a4g4")) or bool(section.get("w4a4g8"))):
+                        raise ValueError(
+                            f"{section_name} legacy INT4 ConvRot fields select W4A8 and cannot be combined with w4a4g4 or w4a4g8"
+                        )
+                    if legacy_int4_base or legacy_int4_dynamic:
+                        section["w4a8"] = True
+
+                if section_name == "training" and source_version < 3:
+                    for key, historical_default in (
+                        ("self_flow_student_block_ratio", 0.3),
+                        ("self_flow_teacher_block_ratio", 0.7),
+                    ):
+                        value = section.get(key)
+                        try:
+                            is_historical_default = value is not None and float(value) == historical_default
+                        except (TypeError, ValueError):
+                            is_historical_default = False
+                        if is_historical_default:
+                            section.pop(key, None)
+
                 if section_name in ("training", "full_finetune") and not section.get("output_dir"):
                     section["output_dir"] = get_ltx2_training_output_dir_default()
                 if not section.get("ltx2_checkpoint"):
@@ -1444,7 +1477,7 @@ class ProjectConfig(BaseModel):
                     if has_old_generation_values and "sampling_preset" not in section:
                         section["sampling_preset"] = "legacy"
                 data[section_name] = section
-            data["version"] = max(int(data.get("version") or 1), 2)
+            data["version"] = max(source_version, 3)
         return data
 
     def save(self, path: Optional[Path] = None):

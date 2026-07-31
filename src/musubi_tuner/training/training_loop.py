@@ -2629,6 +2629,7 @@ def train(self, args):
                 if _is_first_step:
                     _log_vram("FIRST_ITER: BEFORE backward", logger)
                 grad_metrics = {}
+                self.validate_loss_before_backward(loss)
                 accelerator.backward(loss)
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER backward", logger)

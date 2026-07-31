@@ -43,7 +43,7 @@ providers (``_quantize_microblocks_core`` / ``quantize_nvfp4_weight_tiles``).
 
 Backends (env ``LTX2_NVFP4_BACKEND`` = ``auto`` | ``emulate`` | ``triton``)
 --------------------------------------------------------------------------
-  * ``emulate`` (default off Blackwell): dequantizes ``R`` and round-trips ``X``/``G``
+  * ``emulate`` (default): dequantizes ``R`` and round-trips ``X``/``G``
     through the exact NVFP4 quantization above, then runs a bf16/fp32 GEMM. The
     quantization matches what a Blackwell scaled-MMA would consume (accumulation order
     aside), so it runs on any CUDA GPU or CPU for correctness testing.
@@ -52,7 +52,8 @@ Backends (env ``LTX2_NVFP4_BACKEND`` = ``auto`` | ``emulate`` | ``triton``)
     on a Blackwell device from this repo; it is gated so it imports everywhere and raises a
     clear ``RuntimeError`` if selected without support. Every Triton API use is feature
     detected (``hasattr(tl, "dot_scaled")``).
-  * ``auto``: ``triton`` when importable and sm >= 10, else ``emulate``.
+  * ``auto``: resolves to ``emulate``. The unvalidated Triton provider requires an explicit
+    ``LTX2_NVFP4_BACKEND=triton`` selection.
 
 Backward mode (env ``LTX2_NVFP4_BACKWARD`` = ``quantized`` | ``bf16``)
 ----------------------------------------------------------------------
@@ -472,10 +473,10 @@ def _triton_supported(device: torch.device | None) -> bool:
 
 
 def resolve_nvfp4_backend(device: torch.device | None) -> str:
-    """Resolve the active backend from ``LTX2_NVFP4_BACKEND`` and device capability."""
+    """Resolve the active backend without automatically selecting an unvalidated provider."""
     requested = os.getenv("LTX2_NVFP4_BACKEND", "auto").strip().lower()
     if requested in ("", "auto"):
-        return "triton" if _triton_supported(device) else "emulate"
+        return "emulate"
     if requested == "emulate":
         return "emulate"
     if requested == "triton":

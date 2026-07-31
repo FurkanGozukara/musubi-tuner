@@ -1173,6 +1173,32 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     return _ltx2_setup_parser(parser)
 
 
+def normalize_legacy_int4_convrot_args(args: argparse.Namespace) -> None:
+    """Map deprecated INT4 ConvRot training flags onto W4A8 without changing checkpoint semantics."""
+    if bool(getattr(args, "_legacy_int4_convrot_args_normalized", False)):
+        return
+
+    legacy_base = bool(getattr(args, "int4_convrot_base", False))
+    legacy_dynamic = bool(getattr(args, "int4_convrot_dynamic", False))
+    if legacy_base and legacy_dynamic:
+        raise ValueError("--int4_convrot_base and --int4_convrot_dynamic are mutually exclusive")
+    if (legacy_base or legacy_dynamic) and (bool(getattr(args, "w4a4g4", False)) or bool(getattr(args, "w4a4g8", False))):
+        raise ValueError(
+            "--int4_convrot_base/--int4_convrot_dynamic select legacy W4A8 behavior and cannot be combined "
+            "with --w4a4g4 or --w4a4g8"
+        )
+
+    args.int4_convrot_base = False
+    args.int4_convrot_dynamic = False
+    if legacy_base or legacy_dynamic:
+        args.w4a8 = True
+        args._legacy_int4_convrot_checkpoint_mode = "base" if legacy_base else "dynamic"
+        legacy_flag = "--int4_convrot_base" if legacy_base else "--int4_convrot_dynamic"
+        logger.warning("%s is deprecated; use --w4a8 for new commands.", legacy_flag)
+
+    args._legacy_int4_convrot_args_normalized = True
+
+
 def main() -> None:
     """Lazy re-export to avoid a circular import with musubi_tuner.ltx2_args."""
     from musubi_tuner.ltx2_args import main as _main
@@ -1309,6 +1335,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_delta_loss_config = None
 
     def train(self, args: argparse.Namespace):
+        normalize_legacy_int4_convrot_args(args)
         warn_if_h2d_only_ignored(args)
         validate_ltx2_low_ram_load(args)
         if getattr(args, "debug_dataset", False):
@@ -1710,6 +1737,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
     def modify_audio_loss_per_element(self, args, per_elem: torch.Tensor, out: Dict[str, Any], network_dtype):
         return self._apply_av_attention_loss_weighting(per_elem, modality="audio")
+
+    def validate_loss_before_backward(self, loss: torch.Tensor) -> None:
+        torch._assert_async(
+            torch.isfinite(loss.detach()),
+            "LTX-2 training loss became non-finite before backward",
+        )
 
     def compute_video_extra_loss(self, args, out: Dict[str, Any], network_dtype):
         if self._latent_delta_loss_config is None:
@@ -3706,6 +3739,16 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             _is_int4_prequant = detect_int4_convrot_checkpoint(args.ltx2_checkpoint)
             _is_nvfp4_prequant = detect_nvfp4_training_checkpoint(args.ltx2_checkpoint)
+            _legacy_checkpoint_mode = getattr(args, "_legacy_int4_convrot_checkpoint_mode", None)
+            if _legacy_checkpoint_mode == "base" and not _is_int4_prequant:
+                raise ValueError(
+                    "--int4_convrot_base requires a pre-quantized int4cr checkpoint. Use --w4a8 to auto-detect the checkpoint type."
+                )
+            if _legacy_checkpoint_mode == "dynamic" and (_is_int4_prequant or _is_nvfp4_prequant):
+                raise ValueError(
+                    "--int4_convrot_dynamic requires a standard bf16/fp16 checkpoint. "
+                    "Use --w4a8 to auto-detect the checkpoint type."
+                )
             # Resolve the container: --w4a8/--w4a4g8 are int4-only; an explicit choice must agree with a
             # pre-quantized checkpoint's format; auto follows the checkpoint (bf16 -> int4).
             if _w4a8 or _w4a4g8:

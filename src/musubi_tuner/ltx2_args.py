@@ -22,7 +22,7 @@ from musubi_tuner.ltx2_lycoris_runtime import (
     is_lycoris_requested,
     process_lycoris_config,
 )
-from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES
+from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES, normalize_legacy_int4_convrot_args
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 logger = logging.getLogger(__name__)
@@ -1218,6 +1218,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--int4_convrot_base",
+        action="store_true",
+        help=("Deprecated alias for --w4a8 with a pre-quantized int4cr checkpoint. Use --w4a8 for new commands."),
+    )
+    parser.add_argument(
+        "--int4_convrot_dynamic",
+        action="store_true",
+        help=(
+            "Deprecated alias for --w4a8 with a standard bf16/fp16 checkpoint that is quantized on load. "
+            "Use --w4a8 for new commands."
+        ),
+    )
+    parser.add_argument(
         "--w4a4g8",
         action="store_true",
         help=(
@@ -1252,8 +1265,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'auto' (default) detects it from --ltx2_checkpoint: a converter-produced int4cr checkpoint -> int4, "
             "a converter-produced NVFP4 checkpoint -> nvfp4, a plain bf16/fp16 checkpoint -> int4. "
             "'int4' uses ConvRot Hadamard rotation; W4A4 modes select the CUTLASS extension and require its headers. "
-            "'nvfp4' uses NVFP4 E2M1 with no rotation. Auto may select the experimental, hardware-unvalidated "
-            "Triton scaled-MMA path on compute capability >= 10.0; other devices use functional emulation. "
+            "'nvfp4' uses NVFP4 E2M1 with no rotation and defaults to functional emulation. "
+            "The experimental Triton scaled-MMA provider requires an explicit LTX2_NVFP4_BACKEND=triton override. "
             "Only meaningful with a W4 mode; --w4a8 and --w4a4g8 are int4-only."
         ),
     )
@@ -2246,6 +2259,7 @@ def main() -> None:
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    normalize_legacy_int4_convrot_args(args)
     if hasattr(args, "ltx_mode"):
         short_map = {"v": "video", "a": "audio", "va": "av"}
         if args.ltx_mode in short_map:

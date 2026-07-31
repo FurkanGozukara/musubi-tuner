@@ -40,6 +40,9 @@ SEGMENT_SUFFIX_RE = re.compile(r"_\d{5}-\d+$")
 VIDEO_CACHE_RESOLUTION_RE = re.compile(r"_(?P<width>\d{4})x(?P<height>\d{4})_ltx2\.safetensors$")
 COMPANION_ROLES = frozenset({"video", "audio", "text"})
 SOURCE_PATH_METADATA_KEY = "source_path"
+SOURCE_PATH_FORMAT_METADATA_KEY = "source_path_format"
+SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE = "relative_to_cache"
+SOURCE_PATH_FORMAT_FILENAME_ONLY = "filename_only"
 SOURCE_SIZE_METADATA_KEY = "source_size"
 SOURCE_MTIME_NS_METADATA_KEY = "source_mtime_ns"
 
@@ -176,13 +179,23 @@ def _validate_companions(
 
 def _validate_source_freshness(summary: FileSummary) -> None:
     source_path_value = summary.metadata.get(SOURCE_PATH_METADATA_KEY)
+    source_path_format = summary.metadata.get(SOURCE_PATH_FORMAT_METADATA_KEY)
     source_size_value = summary.metadata.get(SOURCE_SIZE_METADATA_KEY)
     source_mtime_value = summary.metadata.get(SOURCE_MTIME_NS_METADATA_KEY)
     if not all((source_path_value, source_size_value, source_mtime_value)):
         summary.warnings.append("Source freshness metadata is unavailable; cache freshness was not verified.")
         return
 
-    source_path = Path(source_path_value).expanduser()
+    if source_path_format == SOURCE_PATH_FORMAT_FILENAME_ONLY:
+        summary.warnings.append(
+            f"Source freshness could not be verified because only the source filename is available: {source_path_value}"
+        )
+        return
+    if source_path_format == SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE or not Path(source_path_value).is_absolute():
+        source_path = Path(summary.path).parent / Path(source_path_value)
+    else:
+        # Legacy caches stored an absolute source path without a format marker.
+        source_path = Path(source_path_value).expanduser()
     try:
         source_stat = source_path.stat()
     except OSError as exc:

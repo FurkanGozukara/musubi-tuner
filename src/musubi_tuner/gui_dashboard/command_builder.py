@@ -1803,9 +1803,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"student_block_idx={t.self_flow_student_block_idx}")
         if t.self_flow_teacher_block_idx != 32:
             args_parts.append(f"teacher_block_idx={t.self_flow_teacher_block_idx}")
-        if t.self_flow_student_block_ratio != 0.3:
+        if t.self_flow_student_block_ratio is not None:
             args_parts.append(f"student_block_ratio={t.self_flow_student_block_ratio}")
-        if t.self_flow_teacher_block_ratio != 0.7:
+        if t.self_flow_teacher_block_ratio is not None:
             args_parts.append(f"teacher_block_ratio={t.self_flow_teacher_block_ratio}")
         if t.self_flow_student_block_stochastic_range != 0:
             args_parts.append(f"student_block_stochastic_range={t.self_flow_student_block_stochastic_range}")

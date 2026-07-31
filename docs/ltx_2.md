@@ -246,6 +246,14 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https
 
 RTX 50xx (Blackwell) requires cu128 on Windows; cu126 is not supported on those GPUs. Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
 
+After installing the project, verify the PyTorch package trio, compiled operators, audio transforms, and CUDA runtime:
+
+```bash
+python -m musubi_tuner.verify_environment --require-cuda --expected-cuda cu128
+```
+
+Replace `cu128` with the CUDA extra you installed. Add `--json` for machine-readable output. The command exits unsuccessfully when the Torch, TorchVision, and TorchAudio release lines or CUDA builds do not match.
+
 ### Downloading Required Models
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -2023,7 +2031,7 @@ W4A4G4 training is an experimental LoRA path over a frozen 4-bit base. Its froze
 `--w4a4g4_container` selects the numeric format ("container") of the frozen base:
 
 - `int4` — packed signed-INT4 weights with ConvRot Hadamard rotation. `auto` resolves a plain bf16/fp16 checkpoint to this container. W4A4G4/W4A4G8 selects the local CUTLASS backend and therefore requires CUTLASS headers (`LTX2_CUTLASS_INCLUDE_DIR`) plus a working CUDA extension toolchain.
-- `nvfp4` — packed NVFP4 E2M1 weights with no rotation. The emulated provider dequantizes for floating-point matrix multiplication. The optional Triton `tl.dot_scaled` provider is gated to compute capability `>= 10.0` but has not been validated on Blackwell hardware in this repository.
+- `nvfp4` — packed NVFP4 E2M1 weights with no rotation. The default emulated provider dequantizes for floating-point matrix multiplication. The optional Triton `tl.dot_scaled` provider is gated to compute capability `>= 10.0`, requires explicit selection, and has not been validated on Blackwell hardware in this repository.
 
 Both containers expose the three-branch model, but they differ in numeric format, scaling, rotation, backend dispatch, and default stabilizer rank. `--w4a4g4_container auto` (the default) picks the container from `--ltx2_checkpoint`: a converter-produced int4cr checkpoint → `int4`, a converter-produced NVFP4 checkpoint → `nvfp4`, a plain bf16/fp16 checkpoint → `int4`. An explicit `int4`/`nvfp4` that contradicts a detected pre-quantized checkpoint format is rejected.
 
@@ -2241,7 +2249,7 @@ Notes:
 - `LTX2_NVFP4_BACKWARD=bf16`: opt into a hybrid input-gradient path that reconstructs the frozen residual in bf16 and runs a bf16 GEMM. The default `quantized` mode preserves the W4A4G4 gradient path. The bf16 mode avoids transposing and repacking the packed weight for a scaled-MMA backward, but temporarily materializes the dense bf16 residual and changes gradient numerics; benchmark both step time and peak VRAM on the target system.
 - Targets the same layer set as the INT4 ConvRot converter (transformer-block attention/FFN Linear weights); norms, embeddings, patch/projection heads, AdaLN, gates, and other precision-sensitive tensors stay in bf16.
 - Weight scales are shared across each `16x16` tile so the transposed weight layout used in the backward pass reuses the same scale tiles without requantization. Activations and grad-outputs are quantized dynamically per NVFP4 `1x16` micro-block.
-- `LTX2_NVFP4_BACKEND=auto` (default) selects the Triton `tl.dot_scaled` provider when it is importable and compute capability is `>= 10.0`; otherwise it selects `emulate`. The Triton provider has not been run on Blackwell hardware in this repository, so `auto` on such hardware is experimental and can fall back to emulation after a runtime failure. `emulate` round-trips activations/grad-output through the same quantizer, dequantizes the base, and performs a floating-point matrix multiply; it is a functional implementation, not a performance or bitwise substitute for scaled MMA. Explicit `triton` rejects unsupported hardware/builds instead of silently selecting emulation.
+- `LTX2_NVFP4_BACKEND=auto` (default) selects `emulate` on every device. `emulate` round-trips activations/grad-output through the same quantizer, dequantizes the base, and performs a floating-point matrix multiply; it is a functional implementation, not a performance or bitwise substitute for scaled MMA. `LTX2_NVFP4_BACKEND=triton` explicitly selects the experimental `tl.dot_scaled` provider and rejects unsupported hardware/builds instead of silently selecting emulation.
 
 ### Model Version
 <sub>[↑ contents](#table-of-contents)</sub>
