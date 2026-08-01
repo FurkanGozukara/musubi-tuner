@@ -1,4 +1,5 @@
 import argparse
+from musubi_tuner.training.parser_common import add_argument_if_absent
 import json
 import math
 import os
@@ -75,7 +76,7 @@ class TrainingProgress:
 
 
 def add_full_finetune_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--full_bf16", action="store_true", help="enable full bfloat16 training")
+    add_argument_if_absent(parser, "--full_bf16", action="store_true", help="enable full bfloat16 training")
     parser.add_argument("--fused_backward_pass", action="store_true", help="use fused backward pass for Adafactor")
     parser.add_argument("--mem_eff_save", action="store_true", help="enable memory-efficient model saving")
     parser.add_argument(

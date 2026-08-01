@@ -35,7 +35,7 @@ from musubi_tuner.training.metadata import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
     SS_METADATA_MINIMUM_KEYS,
 )
-from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common, add_argument_if_absent
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 import logging
@@ -684,7 +684,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
 
 def zimage_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Z-Image fine-tuning specific parser setup"""
-    parser.add_argument("--full_bf16", action="store_true", help="Enable full bfloat16 training for Z-Image")
+    add_argument_if_absent(parser, "--full_bf16", action="store_true", help="Enable full bfloat16 training for Z-Image")
     parser.add_argument("--fused_backward_pass", action="store_true", help="Use fused backward pass for Adafactor optimizer")
     parser.add_argument(
         "--mem_eff_save",

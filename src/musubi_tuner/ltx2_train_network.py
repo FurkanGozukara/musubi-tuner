@@ -4578,7 +4578,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if getattr(args, "blockwise_checkpointing", False) or getattr(args, "gradient_checkpointing_cpu_offload", False):
                 raise ValueError("--ltx2_compile_inner_blocks is incompatible with checkpoint CPU offload")
             return model_utils.compile_transformer_inner_forwards(args, transformer, target_blocks, disable_linear=False)
-        return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
+        # LTX-2 uses its own block-swap offloader which does not expose the
+        # compile_safe_block_indices() selector; compile_transformer falls back
+        # to whole-model policies when resident-only compilation is requested.
+        return model_utils.compile_transformer(
+            args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0, offloaders=None
+        )
 
     def _load_vae_impl(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         """Load VAE for LTX2"""

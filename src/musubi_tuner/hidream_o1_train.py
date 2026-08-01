@@ -1,4 +1,5 @@
 import argparse
+from musubi_tuner.training.parser_common import add_argument_if_absent
 import json
 import math
 from multiprocessing import Value
@@ -636,7 +637,7 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
 
 
 def hidream_o1_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--full_bf16", action="store_true", help="Enable full bfloat16 training for HiDream-O1")
+    add_argument_if_absent(parser, "--full_bf16", action="store_true", help="Enable full bfloat16 training for HiDream-O1")
     parser.add_argument("--fused_backward_pass", action="store_true", help="Use fused backward pass for Adafactor optimizer")
     parser.add_argument(
         "--mem_eff_save",

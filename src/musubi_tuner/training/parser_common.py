@@ -1025,6 +1025,19 @@ def setup_parser_common() -> argparse.ArgumentParser:
     return parser
 
 
+def add_argument_if_absent(parser: argparse.ArgumentParser, *args, **kwargs):
+    """Register an argument unless another parser layer already provides it.
+
+    setup_parser_common() now supplies shared flags like --full_bf16 for every
+    trainer; model-specific parsers keep their historical registrations guarded
+    by this helper so both layers stay compatible.
+    """
+    option = args[0]
+    if option in parser._option_string_actions:
+        return parser._option_string_actions[option]
+    return parser.add_argument(*args, **kwargs)
+
+
 def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser):
     if not args.config_file:
         return args

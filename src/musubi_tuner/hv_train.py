@@ -4,6 +4,7 @@ from datetime import timedelta
 import gc
 import importlib
 import argparse
+from musubi_tuner.training.parser_common import add_argument_if_absent
 import math
 import os
 import pathlib
@@ -1511,8 +1512,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder2", type=str, help="Text Encoder 2 directory / テキストエンコーダ2のディレクトリ")
     parser.add_argument("--text_encoder_dtype", type=str, default=None, help="data type for Text Encoder, default is float16")
     parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for LLM / LLMにfp8を使う")
-    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
-    parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
+    add_argument_if_absent(parser, "--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
+    add_argument_if_absent(parser, "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
 
     parser.add_argument(
         "--blocks_to_swap",
