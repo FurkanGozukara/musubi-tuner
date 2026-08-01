@@ -3,12 +3,14 @@
 from datetime import timedelta
 import argparse
 import gc
+import inspect
+import logging
 import os
 import time
 
 import torch
 from packaging.version import Version
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, DataLoaderConfiguration
 from accelerate.utils import TorchDynamoPlugin, DynamoBackend
 
 from musubi_tuner.training.compile_setup import (
@@ -16,6 +18,8 @@ from musubi_tuner.training.compile_setup import (
     ensure_training_compile_environment,
     native_compile_toolchain_requested,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def clean_memory_on_device(device: torch.device):
@@ -50,6 +54,17 @@ class collator_class:
         # set epoch for validation
         dataset.set_current_epoch(self.current_epoch.value)
         return examples[0]  # batch size is always 1, so we unwrap it here
+
+
+def dataloader_extra_kwargs(args: argparse.Namespace, n_workers: int) -> dict:
+    """Opt-in DataLoader kwargs derived from CLI args."""
+    extra = {}
+    if getattr(args, "dataloader_pin_memory", False):
+        extra["pin_memory"] = True
+    prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
+    if prefetch_factor is not None and n_workers > 0:
+        extra["prefetch_factor"] = prefetch_factor
+    return extra
 
 
 def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
@@ -103,9 +118,11 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         ),
         (
             DistributedDataParallelKwargs(
-                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
+                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+                static_graph=args.ddp_static_graph,
+                find_unused_parameters=bool(getattr(args, "ddp_find_unused_parameters", False)),
             )
-            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph
+            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph or bool(getattr(args, "ddp_find_unused_parameters", False))
             else None
         ),
     ]
@@ -113,14 +130,20 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
 
     dynamo_plugin = None
     if args.dynamo_backend.upper() != "NO":
-        dynamo_plugin = TorchDynamoPlugin(
+        dynamo_kwargs = dict(
             backend=DynamoBackend(args.dynamo_backend.upper()),
             mode=args.dynamo_mode,
             fullgraph=args.dynamo_fullgraph,
             dynamic=args.dynamo_dynamic,
         )
+        if getattr(args, "dynamo_use_regional_compilation", False):
+            if "use_regional_compilation" in inspect.signature(TorchDynamoPlugin).parameters:
+                dynamo_kwargs["use_regional_compilation"] = True
+            else:
+                logger.warning("--dynamo_use_regional_compilation was requested, but this Accelerate version does not support it")
+        dynamo_plugin = TorchDynamoPlugin(**dynamo_kwargs)
 
-    accelerator = Accelerator(
+    accelerator_kwargs = dict(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision if args.mixed_precision else None,
         log_with=log_with,
@@ -128,5 +151,24 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs_handlers,
     )
+    if getattr(args, "dataloader_pin_memory", False):
+        # Opt-in: enable non_blocking H2D for Accelerate's prepared DataLoader (pairs with
+        # base-loader pin_memory). Off by default -> kwargs unchanged from the prior call.
+        accelerator_kwargs["dataloader_config"] = DataLoaderConfiguration(non_blocking=True)
+    # Opt-in FSDP1/ZeRO sharding (--ltx2_fsdp).
+    from musubi_tuner.ltx2_fsdp import build_ltx2_fsdp_plugin
+
+    fsdp_plugin = build_ltx2_fsdp_plugin(args)
+    if fsdp_plugin is not None:
+        accelerator_kwargs["fsdp_plugin"] = fsdp_plugin
+    accelerator = Accelerator(**accelerator_kwargs)
     print("accelerator device:", accelerator.device)
+    if (
+        args.log_cuda_memory_every_n_steps is not None
+        and args.log_cuda_memory_every_n_steps > 0
+        and accelerator.device.type == "cuda"
+    ):
+        props = torch.cuda.get_device_properties(accelerator.device)
+        total_mb = props.total_memory / (1024**2)
+        logger.info("CUDA device: %s (%s) total=%.0fMB", accelerator.device, props.name, total_mb)
     return accelerator

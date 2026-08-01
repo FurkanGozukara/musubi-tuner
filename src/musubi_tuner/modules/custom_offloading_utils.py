@@ -59,6 +59,31 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     _synchronize_device(device)
 
 
+def compute_h2d_stream_indices(num_blocks: int, blocks_to_swap: int) -> set[int]:
+    """Block indices streamed by the H2D-only offloader: evenly spaced midpoints.
+
+    Kept as the single definition so anything that needs to know which blocks will be
+    offloaded (for example placing weights during loading) cannot drift from the
+    offloader's own choice.
+    """
+    if blocks_to_swap <= 0:
+        return set()
+    return {((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)}
+
+
+def compute_offload_block_indices(num_blocks: int, blocks_to_swap: int, h2d_only: bool) -> set[int]:
+    """Block indices that will live on CPU, for either offloader layout.
+
+    Classic and aggressive block swap offload a contiguous tail; H2D-only streams an
+    evenly spaced set. Callers must not assume the tail.
+    """
+    if num_blocks <= 0 or blocks_to_swap <= 0:
+        return set()
+    if h2d_only:
+        return compute_h2d_stream_indices(num_blocks, blocks_to_swap)
+    return set(range(max(0, num_blocks - blocks_to_swap), num_blocks))
+
+
 def weighs_to_device(layer: nn.Module, device: torch.device):
     for module in layer.modules():
         if hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear"):
@@ -97,13 +122,34 @@ class BlockSwapConfig:
         # not point at the offloader. Fail early with an actionable message instead. (Inference / forward-only
         # has no backward, so it is unaffected.)
         if h2d_only and supports_backward and not getattr(args, "gradient_checkpointing", False):
-            raise ValueError(
+            message = (
                 "--block_swap_h2d_only requires --gradient_checkpointing for training. H2D-only block swap streams"
                 " frozen weights through a reused GPU ring buffer, which advances the autograd version of weights"
                 " saved for backward; gradient checkpointing re-reads them at recompute time and avoids this."
                 " / --block_swap_h2d_only は学習時に --gradient_checkpointing が必須です（リングバッファの上書きで"
                 "backward 用に保存された重みの version が進むため。gradient checkpointing は再計算時に読み直すので回避できます）。"
             )
+            raise ValueError(message)
+
+        # H2D-only rebinds each streamed block's Linear weights to views into a small reused GPU ring
+        # buffer. Any path that moves a whole *managed* block CPU-ward rewrites those views in place and
+        # detaches them from the ring (a raw ``weight.data = weight.data.to("cpu")`` on a ring view), which
+        # corrupts the ring and crashes with an opaque device/version mismatch. These offload paths route
+        # around the ring entirely, so they are mutually exclusive with H2D-only swap during training.
+        if h2d_only and supports_backward:
+            for flag_attr, flag_name in (
+                ("blockwise_checkpointing", "--blockwise_checkpointing"),
+                ("gradient_checkpointing_cpu_offload", "--gradient_checkpointing_cpu_offload"),
+                ("sample_with_offloading", "--sample_with_offloading"),
+            ):
+                if getattr(args, flag_attr, False):
+                    message = (
+                        f"{flag_name} is incompatible with --block_swap_h2d_only: it moves whole streamed"
+                        " blocks to CPU, which rewrites the H2D ring's GPU weight views and corrupts the ring."
+                        " H2D-only block swap already streams frozen weights off the GPU, so disable"
+                        f" {flag_name} (or drop --block_swap_h2d_only)."
+                    )
+                    raise ValueError(message)
 
         ring_size = getattr(args, "block_swap_ring_size", 2)
         if ring_size < 1:
@@ -795,7 +841,7 @@ class LoRAStreamOffloader:
         assert device.type == "cuda", "LoRAStreamOffloader currently supports CUDA only"
 
         # ---- streaming placement: S evenly spaced block indices (midpoint formula -> distinct for S <= N) ----
-        stream_idx = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
+        stream_idx = sorted(compute_h2d_stream_indices(num_blocks, blocks_to_swap))
         self.stream_idx = stream_idx
         self.S = len(stream_idx)  # actual streaming count (>=1; dedup is a no-op unless S is close to N)
         self.rank = {b: k for k, b in enumerate(stream_idx)}  # block_idx -> position in stream_idx
@@ -819,9 +865,9 @@ class LoRAStreamOffloader:
             self.copier = _StagedCopier(device, num_staging=self.B, debug=self.debug)
 
         # ---- runtime state (GPU buffers allocated lazily in prepare_block_devices_before_forward) ----
-        self.cpu_master = {}  # block_idx -> [CPU (pinned) Parameter per swap weight] (views into cpu_flat)
+        self.cpu_master = {}  # block_idx -> [CPU (pinned) Parameter/Tensor per swap weight] (views into cpu_flat)
         self.cpu_flat = {}  # block_idx -> flat (pinned) uint8 CPU tensor backing the masters
-        self.ring_param = None  # [slot] -> [GPU nn.Parameter per swap weight] (views into ring_flat)
+        self.ring_param = None  # [slot] -> [GPU nn.Parameter/Tensor per swap weight] (views into ring_flat)
         self.ring_flat = None  # [slot] -> flat uint8 GPU tensor backing the ring params
         self._layout = None  # ([byte offset per swap weight], total bytes) shared by all streaming blocks
         self.in_slot = [None] * self.B  # slot -> block_idx currently bound to this slot (or None)
@@ -863,9 +909,24 @@ class LoRAStreamOffloader:
             self._module_cache[block_idx] = cached
         return cached
 
-    def _bind(self, block_idx: int, params: list[nn.Parameter]):
+    @staticmethod
+    def _assign_weight(module: nn.Module, weight: torch.Tensor | nn.Parameter) -> None:
+        if isinstance(weight, nn.Parameter):
+            if "weight" in module._buffers:
+                del module._buffers["weight"]
+            module.weight = weight
+            return
+
+        if "weight" in module._parameters:
+            del module._parameters["weight"]
+        if "weight" in module._buffers:
+            module._buffers["weight"] = weight
+        else:
+            module.register_buffer("weight", weight, persistent=True)
+
+    def _bind(self, block_idx: int, params: list[torch.Tensor | nn.Parameter]):
         for m, p in zip(self._modules(block_idx), params):
-            m.weight = p
+            self._assign_weight(m, p)
 
     @staticmethod
     def _compute_layout(weights: list[torch.Tensor]) -> tuple[list[int], int]:
@@ -961,8 +1022,12 @@ class LoRAStreamOffloader:
                 master = []
                 for m, view in zip(mods, self._flat_views(flat, weights)):
                     view.copy_(m.weight.data)  # one-time D2H into the flat master
-                    m.weight.data = view
-                    master.append(m.weight)  # keep the original Parameter object as the persistent master
+                    if "weight" in m._parameters:
+                        m.weight.data = view
+                        master.append(m.weight)  # keep the original Parameter object as the persistent master
+                    else:
+                        self._assign_weight(m, view)
+                        master.append(m.weight)  # INT4/INT8 quantized weights may be registered buffers
                 self.cpu_flat[i] = flat
                 self.cpu_master[i] = master
             else:
@@ -986,7 +1051,10 @@ class LoRAStreamOffloader:
             template_weights = [p.data for p in template]
             self.ring_flat = [torch.empty(self._layout[1], dtype=torch.uint8, device=self.device) for _ in range(self.B)]
             self.ring_param = [
-                [nn.Parameter(view, requires_grad=False) for view in self._flat_views(flat, template_weights)]
+                [
+                    nn.Parameter(view, requires_grad=False) if isinstance(template_ref, nn.Parameter) else view
+                    for template_ref, view in zip(template, self._flat_views(flat, template_weights))
+                ]
                 for flat in self.ring_flat
             ]
 

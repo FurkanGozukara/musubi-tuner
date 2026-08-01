@@ -13,6 +13,8 @@ import pathlib
 import toml
 from accelerate.utils import DynamoBackend
 
+from musubi_tuner.training.weight_noise import add_weight_noise_args
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,12 @@ def _add_general_args(parser: argparse.ArgumentParser) -> None:
         type=pathlib.Path,
         default=None,
         help="config file for dataset / データセットの設定ファイル",
+    )
+    parser.add_argument(
+        "--dataset_manifest",
+        type=pathlib.Path,
+        default=None,
+        help="cache-only dataset manifest JSON file (alternative to --dataset_config)",
     )
 
 
@@ -83,6 +91,12 @@ def _add_attention_args(parser: argparse.ArgumentParser) -> None:
         " / CrossAttentionにFlashAttention 3を使う、FlashAttention 3が必要。HunyuanVideoは未対応。",
     )
     parser.add_argument(
+        "--cudnn_attn",
+        action="store_true",
+        help="use cuDNN-prioritized SDPA attention; outside torch.compile PyTorch may fall back per shape to "
+        "flash/efficient/math, while compiled LTX-2 blocks use ordinary SDPA (LTX-2 only)",
+    )
+    parser.add_argument(
         "--split_attn",
         action="store_true",
         help="use split attention for attention calculation (split batch size=1, affects memory usage and speed)"
@@ -108,6 +122,15 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         default="default",  # 学習用のデフォルト
         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
         help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
+    )
+    parser.add_argument(
+        "--inductor_config",
+        nargs="*",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Set arbitrary torch._inductor.config / torch._dynamo.config attributes as KEY=VALUE (dotted keys "
+        "allowed, e.g. triton.enable_persistent_tma_matmul=true or coordinate_descent_tuning=true). Applied only "
+        "when --compile is set. Values parsed as bool/int/float else string.",
     )
     parser.add_argument(
         "--compile_dynamic",
@@ -137,6 +160,25 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compile_auto_cache_size_limit",
+        action="store_true",
+        help="Opt-in: raise torch._dynamo.config.cache_size_limit to at least 2x the compiled block count"
+        " / オプトイン: コンパイル対象ブロック数の2倍以上にtorch._dynamo.config.cache_size_limitを引き上げる",
+    )
+    parser.add_argument(
+        "--compile_fallback_to_eager",
+        action="store_true",
+        help="Opt-in: if torch.compile setup fails, restore eager blocks and continue without compilation"
+        " / オプトイン: torch.compileのセットアップに失敗した場合、Eagerブロックに戻してコンパイルなしで続行する",
+    )
+    parser.add_argument(
+        "--compile_cudagraph_mark_step",
+        action="store_true",
+        help="Opt-in: call torch.compiler.cudagraph_mark_step_begin() at each training step for compile modes "
+        "that use CUDAGraphs / オプトイン: CUDAGraphを使うcompileモード向けに各学習ステップで"
+        "torch.compiler.cudagraph_mark_step_begin()を呼び出す",
+    )
+    parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
         help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",
@@ -145,6 +187,12 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         "--cuda_cudnn_benchmark",
         action="store_true",
         help="Enable cudnn benchmark for possibly faster training / cudnnのベンチマークを有効にして学習の高速化を図る",
+    )
+    parser.add_argument(
+        "--cuda_memory_fraction",
+        type=float,
+        default=None,
+        help="Limit per-process CUDA memory usage (0-1). Must be set before CUDA allocations.",
     )
 
     parser.add_argument(
@@ -174,6 +222,12 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="use dynamic mode for dynamo / dynamoのdynamicモードを使う",
     )
+    parser.add_argument(
+        "--dynamo_use_regional_compilation",
+        action="store_true",
+        help="Opt-in: request Accelerate TorchDynamoPlugin regional compilation when supported"
+        " / オプトイン: 対応するAccelerate環境でTorchDynamoPluginのregional compilationを要求する",
+    )
 
 
 def _add_training_args(parser: argparse.ArgumentParser) -> None:
@@ -194,6 +248,20 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         "--persistent_data_loader_workers",
         action="store_true",
         help="persistent DataLoader workers (useful for reduce time gap between epoch, but may use more memory) / DataLoader のワーカーを持続させる (エポック間の時間差を少なくするのに有効だが、より多くのメモリを消費する可能性がある)",
+    )
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action="store_true",
+        help="opt-in: page-lock DataLoader host buffers and enable non_blocking host-to-device copies "
+        "(overlaps data transfer with compute). Off by default. Increases pinned host RAM; use with care "
+        "alongside block swap, which also pins host buffers.",
+    )
+    parser.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=None,
+        help="opt-in: DataLoader prefetch_factor (batches prefetched per worker). Only applied when set "
+        "and num_workers > 0. Off by default (uses the PyTorch default).",
     )
     parser.add_argument("--seed", type=int, default=None, help="random seed for training / 学習時の乱数のseed")
     parser.add_argument(
@@ -270,6 +338,12 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
     parser.add_argument(
+        "--log_cuda_memory_every_n_steps",
+        type=int,
+        default=None,
+        help="log CUDA memory and allocator pressure every N optimizer steps (alloc/reserved/max, inactive splits, retries, OOMs).",
+    )
+    parser.add_argument(
         "--log_grad_metrics",
         action="store_true",
         help="log gradient norm metrics (grad/norm, grad/mean_norm, grad/max, pre-clipping) to the tracker."
@@ -295,6 +369,11 @@ def _add_ddp_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action="store_true",
+        help="enable find_unused_parameters for DDP; useful when optional branches leave some trainable params unused",
+    )
 
 
 def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
@@ -318,6 +397,23 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
+    )
+    parser.add_argument(
+        "--validate_every_n_steps",
+        type=int,
+        default=None,
+        help="run validation every N steps (requires validation_datasets in dataset config)",
+    )
+    parser.add_argument(
+        "--validate_every_n_epochs",
+        type=int,
+        default=None,
+        help="run validation every N epochs (requires validation_datasets in dataset config)",
+    )
+    parser.add_argument(
+        "--offload_optimizer_during_validation",
+        action="store_true",
+        help="temporarily move CUDA optimizer state to CPU during validation and sample previews",
     )
 
 
@@ -343,6 +439,7 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         help="Max gradient norm, 0 for no clipping / 勾配正規化の最大norm、0でclippingを行わない",
     )
+    add_weight_noise_args(parser)
 
 
 def _add_lr_scheduler_args(parser: argparse.ArgumentParser) -> None:
@@ -404,12 +501,19 @@ def _add_lr_scheduler_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_memory_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    # The base NetworkTrainer reads args.fp8_scaled unguarded (trainer_base.py). Most trainers add --fp8_scaled in
-    # their own parser, but HunyuanVideo does not support it, so guarantee the attribute exists here as a safety net.
-    # Trainers that add --fp8_scaled override this default; do not remove it (it is not redundant).
+    # The base trainer reads args.fp8_scaled in shared code. Most trainers add
+    # --fp8_scaled themselves, but HunyuanVideo does not, so keep a default here.
     parser.set_defaults(fp8_scaled=False)
-    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
-    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
+    parser.add_argument(
+        "--full_fp16",
+        action="store_true",
+        help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する",
+    )
+    parser.add_argument(
+        "--full_bf16",
+        action="store_true",
+        help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する",
+    )
 
     parser.add_argument(
         "--blocks_to_swap",
@@ -471,9 +575,11 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
             "logsnr",
             "qinglong_flux",
             "qinglong_qwen",
+            "shifted_logit_normal",
         ],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and flux shift."
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
+        "or shifted_logit_normal (sequence-length-adaptive LTX-2 method)."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、flux shift。",
     )
     parser.add_argument(
@@ -512,6 +618,36 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme` / モード重み付けスキームのスケール",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "mae", "l1", "huber", "smooth_l1"],
+        help="Loss function type. 'mse' (default): mean squared error; 'mae'/'l1': mean absolute error; 'huber'/'smooth_l1': Huber loss (use --huber_delta to control transition point).",
+    )
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="Delta (beta) for Huber/smooth_l1 loss. Below this threshold the loss is ~MSE, above it ~MAE. Only used when --loss_type is huber or smooth_l1.",
+    )
+    parser.add_argument(
+        "--differential_guidance",
+        action="store_true",
+        help=(
+            "Apply prediction-relative target scaling to the video/main training target: "
+            "target = pred + differential_guidance_scale * (target - pred). Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--differential_guidance_scale",
+        type=float,
+        default=3.0,
+        help=(
+            "Multiplier for --differential_guidance. Default 3.0. 1.0 is unchanged; "
+            ">1 strengthens the target delta; values between 0 and 1 soften it."
+        ),
     )
     parser.add_argument(
         "--min_timestep",
@@ -555,6 +691,37 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
         choices=["image", "console"],
         help="show timesteps in image or console, and return to console / タイムステップを画像またはコンソールに表示し、コンソールに戻る",
     )
+    parser.set_defaults(log_timestep_distribution_tensorboard=True)
+    parser.add_argument(
+        "--log_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_true",
+        help=(
+            "Enable native TensorBoard histogram logging of the observed training timestep distribution "
+            "(enabled by default when TensorBoard logging is active)."
+            " / TensorBoard有効時、実際に使用されたタイムステップ分布をネイティブヒストグラムとして記録します"
+            "（デフォルトで有効）。"
+        ),
+    )
+    parser.add_argument(
+        "--disable_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_false",
+        help=(
+            "Disable TensorBoard histogram logging of timestep distribution."
+            " / タイムステップ分布のTensorBoardヒストグラム記録を無効にします。"
+        ),
+    )
+    parser.add_argument(
+        "--log_timestep_distribution_interval",
+        type=int,
+        default=100,
+        help=(
+            "Interval in optimizer steps for TensorBoard timestep distribution logging when "
+            "timestep distribution logging is enabled (default: 100)."
+            " / タイムステップ分布のTensorBoard記録間隔（最適化ステップ単位、デフォルト: 100）。"
+        ),
+    )
 
 
 def _add_network_args(parser: argparse.ArgumentParser) -> None:
@@ -563,6 +730,14 @@ def _add_network_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--network_weights", type=str, default=None, help="pretrained weights for network / 学習するネットワークの初期重み"
+    )
+    parser.add_argument(
+        "--network_freeze_surplus_modules",
+        action="store_true",
+        help=(
+            "when warm-starting from network_weights, attach compatible modules outside the active target set "
+            "as frozen adapters instead of only reporting them as unexpected keys"
+        ),
     )
     parser.add_argument(
         "--network_module", type=str, default=None, help="network module to train / 学習対象のネットワークのモジュール"
@@ -623,11 +798,28 @@ def _add_network_args(parser: argparse.ArgumentParser) -> None:
         nargs="*",
         help="multiplier for network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みの倍率",
     )
+    parser.add_argument(
+        "--frozen_network_weights",
+        type=str,
+        default=None,
+        nargs="*",
+        help=(
+            "network weights to attach as frozen adapters during training; they affect training forwards but are not "
+            "optimized or saved into the output network"
+        ),
+    )
+    parser.add_argument(
+        "--frozen_network_multiplier",
+        type=float,
+        default=None,
+        nargs="*",
+        help="optional multipliers for frozen_network_weights, one value per frozen network (default: 1.0)",
+    )
 
 
 def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
+        "--output_dir", type=str, default="output", help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
     )
     parser.add_argument(
         "--output_name",
@@ -636,6 +828,27 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
+    parser.add_argument(
+        "--autoresume",
+        action="store_true",
+        help="automatically resume from the latest saved state in output_dir (ignored if --resume is specified)"
+        " / output_dir内の最新のstateから自動的に学習を再開する（--resumeが指定されている場合は無視される）",
+    )
+    parser.add_argument(
+        "--reset_optimizer",
+        action="store_true",
+        help="clear optimizer state (momentum/variance) when resuming, keeping only model weights",
+    )
+    parser.add_argument(
+        "--reset_optimizer_params",
+        action="store_true",
+        help="reset optimizer param groups (lr, weight_decay, etc.) to CLI values when resuming, keeping momentum/variance",
+    )
+    parser.add_argument(
+        "--reset_dataloader",
+        action="store_true",
+        help="skip mid-epoch dataloader resume and restart from the beginning of the epoch",
+    )
 
     parser.add_argument(
         "--save_every_n_epochs",
@@ -684,6 +897,13 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="save training state (including optimizer states etc.) on train end even if --save_state is not specified"
         " / --save_stateが未指定時にもoptimizerなど学習状態も含めたstateを学習終了時に保存する",
     )
+    parser.add_argument(
+        "--save_state_mode",
+        type=str,
+        default="full",
+        choices=["full", "minimal"],
+        help="training state contents to save: full is resumable; minimal skips optimizer/scheduler/dataloader state and cannot be loaded with --resume",
+    )
 
 
 def _add_metadata_args(parser: argparse.ArgumentParser) -> None:
@@ -729,6 +949,11 @@ def _add_metadata_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="architecture for model metadata / メタデータに書き込まれるモデルアーキテクチャ",
+    )
+    parser.add_argument(
+        "--save_checkpoint_metadata",
+        action="store_true",
+        help="write checkpoint sidecar metadata JSON next to each saved checkpoint",
     )
 
 

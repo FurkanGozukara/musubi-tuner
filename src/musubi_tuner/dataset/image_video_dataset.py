@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
+from importlib.util import find_spec
+import json
+import math
 import os
 import random
 import time
-from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
@@ -13,32 +16,372 @@ SharedEpoch = Optional["Synchronized[int]"]
 
 import numpy as np
 import torch
+from safetensors.torch import save_file
 from PIL import Image
+import cv2
+import av
 
 from musubi_tuner.utils import safetensors_utils
-from musubi_tuner.utils.model_utils import remove_dtype_suffix
+from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from musubi_tuner.dataset.architectures import *  # noqa: F401,F403
-from musubi_tuner.dataset.architectures import (  # explicit imports for local use
-    ARCHITECTURE_FLUX_2_DEV,
-    ARCHITECTURE_FLUX_2_KLEIN_4B,
-    ARCHITECTURE_FLUX_2_KLEIN_9B,
-    ARCHITECTURE_FLUX_KONTEXT,
-    ARCHITECTURE_FRAMEPACK,
-    ARCHITECTURE_HIDREAM_O1,
-    ARCHITECTURE_HUNYUAN_VIDEO,
-    ARCHITECTURE_HUNYUAN_VIDEO_1_5,
-    ARCHITECTURE_KANDINSKY5,
-    ARCHITECTURE_QWEN_IMAGE_EDIT,
-    ARCHITECTURE_WAN,
-)
-from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
-from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
+
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP", ".avif", ".AVIF"]
+
+AUDIO_EXTENSIONS = [".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma"]
+
+
+if find_spec("jxlpy") is not None:  # JPEG-XL on Linux
+    from jxlpy import JXLImagePlugin  # noqa: F401 # type: ignore
+
+    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
+
+if find_spec("pillow_jxl") is not None:  # JPEG-XL on Windows
+    import pillow_jxl  # noqa: F401 # type: ignore
+
+    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
+
+VIDEO_EXTENSIONS = [
+    ".mp4",
+    ".webm",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".flv",
+    ".wmv",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".MP4",
+    ".WEBM",
+    ".AVI",
+    ".MKV",
+    ".MOV",
+    ".FLV",
+    ".WMV",
+    ".M4V",
+    ".MPG",
+    ".MPEG",
+]  # some of them are not tested
+MASK_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+MASK_METADATA_EXTENSIONS = [".json", ".JSON", ".txt", ".TXT", ".csv", ".CSV"]
+
+# Architecture short names cannot contain underscore
+ARCHITECTURE_HUNYUAN_VIDEO = "hv"
+ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
+ARCHITECTURE_WAN = "wan"
+ARCHITECTURE_WAN_FULL = "wan"
+ARCHITECTURE_LTX2 = "ltx2"
+ARCHITECTURE_LTX2_FULL = "ltx2_v1"
+ARCHITECTURE_FRAMEPACK = "fp"
+ARCHITECTURE_FRAMEPACK_FULL = "framepack"
+ARCHITECTURE_FLUX_KONTEXT = "fk"
+ARCHITECTURE_FLUX_KONTEXT_FULL = "flux_kontext"
+ARCHITECTURE_FLUX_2_DEV = "f2d"
+ARCHITECTURE_FLUX_2_DEV_FULL = "flux_2_dev"
+ARCHITECTURE_FLUX_2_KLEIN_4B = "f2k4b"
+ARCHITECTURE_FLUX_2_KLEIN_4B_FULL = "flux_2_klein_4b"
+ARCHITECTURE_FLUX_2_KLEIN_9B = "f2k9b"
+ARCHITECTURE_FLUX_2_KLEIN_9B_FULL = "flux_2_klein_9b"
+ARCHITECTURE_QWEN_IMAGE = "qi"
+ARCHITECTURE_QWEN_IMAGE_FULL = "qwen_image"
+ARCHITECTURE_QWEN_IMAGE_EDIT = "qie"
+ARCHITECTURE_QWEN_IMAGE_EDIT_FULL = "qwen_image_edit"
+ARCHITECTURE_QWEN_IMAGE_LAYERED = "qil"
+ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL = "qwen_image_layered"
+ARCHITECTURE_KANDINSKY5 = "k5"
+ARCHITECTURE_KANDINSKY5_FULL = "kandinsky5"
+ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
+ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
+ARCHITECTURE_Z_IMAGE = "zi"
+ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_HIDREAM_O1 = "ho1"
+ARCHITECTURE_HIDREAM_O1_FULL = "hidream_o1_image"
+ARCHITECTURE_IDEOGRAM4 = "i4"
+ARCHITECTURE_IDEOGRAM4_FULL = "ideogram4"
+ARCHITECTURE_KREA2 = "kr2"
+ARCHITECTURE_KREA2_FULL = "krea2"
+
+
+def glob_images(directory, base="*", caption_extension=None):
+    img_paths = []
+    for ext in IMAGE_EXTENSIONS:
+        if base == "*":
+            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    img_paths = list(set(img_paths))  # remove duplicates
+
+    # check for caption files and only keep images with captions
+    if caption_extension is not None:
+        caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
+        caption_bases = set()
+        for caption_path in caption_paths:
+            caption_name = os.path.basename(caption_path)
+            if caption_name.endswith(caption_extension):
+                caption_base = caption_name[: -len(caption_extension)]
+            else:
+                caption_base = os.path.splitext(caption_name)[0]
+            caption_bases.add(caption_base)
+        filtered_img_paths = []
+        for img_path in img_paths:
+            img_base = os.path.splitext(os.path.basename(img_path))[0]
+            if img_base in caption_bases:
+                filtered_img_paths.append(img_path)
+        img_paths = filtered_img_paths
+
+    img_paths.sort()
+    return img_paths
+
+
+def glob_audio(directory, base="*"):
+    audio_paths = []
+    for ext in AUDIO_EXTENSIONS:
+        if base == "*":
+            audio_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            audio_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    audio_paths = list(set(audio_paths))  # remove duplicates
+    audio_paths.sort()
+    return audio_paths
+
+
+def glob_videos(directory, base="*"):
+    video_paths = []
+    for ext in VIDEO_EXTENSIONS:
+        if base == "*":
+            video_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            video_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    video_paths = list(set(video_paths))  # remove duplicates
+    video_paths.sort()
+    return video_paths
+
+
+def find_stem_matched_file(directory: Optional[str], stem: str, extensions: Optional[Sequence[str]] = None) -> Optional[str]:
+    if directory is None:
+        return None
+    extensions = extensions or MASK_EXTENSIONS
+    for ext in extensions:
+        candidate = os.path.join(directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    candidate_dir = os.path.join(directory, stem)
+    if os.path.isdir(candidate_dir):
+        return candidate_dir
+    return None
+
+
+def load_loss_mask_image(mask_path: str, *, invert: bool = False) -> Image.Image:
+    mask = Image.open(mask_path)
+    if "A" in mask.getbands():
+        mask = mask.getchannel("A")
+    else:
+        mask = mask.convert("L")
+    if invert:
+        from PIL import ImageOps
+
+        mask = ImageOps.invert(mask)
+    return mask
+
+
+def alpha_channel_to_loss_mask(image: Image.Image, *, invert: bool = False) -> Optional[Image.Image]:
+    if "A" not in image.getbands():
+        return None
+    mask = image.getchannel("A")
+    if invert:
+        from PIL import ImageOps
+
+        mask = ImageOps.invert(mask)
+    return mask
+
+
+def loss_mask_to_float_array(mask: Union[Image.Image, np.ndarray], bucket_reso: tuple[int, int]) -> np.ndarray:
+    if isinstance(mask, Image.Image) and mask.mode != "L":
+        mask = mask.convert("L")
+    arr = resize_image_to_bucket(mask, bucket_reso)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32) / 255.0
+
+
+def load_loss_mask_frames(
+    mask_path: str,
+    *,
+    bucket_reso: tuple[int, int],
+    frame_count: int,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    source_fps: Optional[float] = None,
+    target_fps: Optional[float] = None,
+    invert: bool = False,
+) -> np.ndarray:
+    if frame_count <= 0:
+        raise ValueError(f"frame_count must be positive for loss mask loading, got {frame_count}")
+
+    if os.path.isfile(mask_path) and os.path.splitext(mask_path)[1] in IMAGE_EXTENSIONS:
+        mask = load_loss_mask_image(mask_path, invert=invert)
+        mask_frames = [loss_mask_to_float_array(mask, bucket_reso)] * frame_count
+    else:
+        frames = load_video(
+            mask_path,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            bucket_reso=bucket_reso,
+            source_fps=source_fps,
+            target_fps=target_fps,
+        )
+        if not frames:
+            raise ValueError(f"No frames decoded from loss mask path: {mask_path}")
+
+        mask_frames = []
+        for frame in frames:
+            if isinstance(frame, np.ndarray):
+                image = Image.fromarray(frame)
+            else:
+                image = frame
+            if image.mode != "L":
+                image = image.convert("L")
+            if invert:
+                from PIL import ImageOps
+
+                image = ImageOps.invert(image)
+            mask_frames.append(loss_mask_to_float_array(image, bucket_reso))
+
+        if len(mask_frames) < frame_count:
+            mask_frames.extend([mask_frames[-1]] * (frame_count - len(mask_frames)))
+        elif len(mask_frames) > frame_count:
+            mask_frames = mask_frames[:frame_count]
+
+    return np.stack(mask_frames, axis=0).astype(np.float32)
+
+
+def load_audio_loss_mask_intervals(mask_path: str) -> Optional[list[tuple[float, float]]]:
+    ext = os.path.splitext(mask_path)[1].lower()
+    if ext == ".json":
+        with open(mask_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("loss_mask_intervals", data.get("audio_loss_mask_intervals", data.get("intervals")))
+        return normalize_loss_mask_intervals(data)
+
+    intervals: list[tuple[float, float]] = []
+    with open(mask_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p for p in stripped.replace(",", " ").split() if p]
+            if len(parts) < 2:
+                raise ValueError(f"Audio loss mask interval line must contain start and end seconds: {line!r}")
+            intervals.append((float(parts[0]), float(parts[1])))
+    return intervals
+
+
+def load_audio_cond_mask_intervals(mask_path: str) -> Optional[list[tuple[float, float]]]:
+    """Load per-item audio CONDITIONING mask time intervals (seconds). Same JSON/txt format as the
+    audio loss-mask intervals; a separate channel because conditioning has the opposite convention."""
+    ext = os.path.splitext(mask_path)[1].lower()
+    if ext == ".json":
+        with open(mask_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("cond_mask_intervals", data.get("audio_cond_mask_intervals", data.get("intervals")))
+        return normalize_loss_mask_intervals(data)
+
+    intervals: list[tuple[float, float]] = []
+    with open(mask_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p for p in stripped.replace(",", " ").split() if p]
+            if len(parts) < 2:
+                raise ValueError(f"Audio cond mask interval line must contain start and end seconds: {line!r}")
+            intervals.append((float(parts[0]), float(parts[1])))
+    return intervals
+
+
+def normalize_loss_mask_intervals(value: Any) -> Optional[list[tuple[float, float]]]:
+    if value is None:
+        return None
+    intervals: list[tuple[float, float]] = []
+    for item in value:
+        if isinstance(item, dict):
+            start = item.get("start", item.get("start_time", item.get("from")))
+            end = item.get("end", item.get("end_time", item.get("to")))
+        else:
+            start, end = item[0], item[1]
+        start_f = float(start)
+        end_f = float(end)
+        if end_f <= start_f:
+            raise ValueError(f"Invalid loss mask interval with end <= start: {(start_f, end_f)}")
+        intervals.append((start_f, end_f))
+    return intervals
+
+
+def divisible_by(num: int, divisor: int) -> int:
+    return num - num % divisor
+
+
+def _normalize_optional_path_list(
+    primary: Optional[str] = None,
+    extras: Optional[Sequence[str]] = None,
+) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+
+    for value in ([primary] if primary is not None else []) + list(extras or []):
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+
+    return values
+
+
+def resize_image_to_bucket(image: Union[Image.Image, np.ndarray], bucket_reso: tuple[int, int]) -> np.ndarray:
+    """
+    Resize the image to the bucket resolution.
+
+    bucket_reso: **(width, height)**
+    """
+    is_pil_image = isinstance(image, Image.Image)
+    if is_pil_image:
+        image_width, image_height = image.size
+    else:
+        image_height, image_width = image.shape[:2]
+
+    if bucket_reso == (image_width, image_height):
+        return np.array(image) if is_pil_image else image
+
+    bucket_width, bucket_height = bucket_reso
+
+    # resize the image to the bucket resolution to match the short side
+    scale_width = bucket_width / image_width
+    scale_height = bucket_height / image_height
+    scale = max(scale_width, scale_height)
+    image_width = int(image_width * scale + 0.5)
+    image_height = int(image_height * scale + 0.5)
+
+    if scale > 1:
+        image = Image.fromarray(image) if not is_pil_image else image
+        image = image.resize((image_width, image_height), Image.LANCZOS)
+        image = np.array(image)
+    else:
+        image = np.array(image) if is_pil_image else image
+        image = cv2.resize(image, (image_width, image_height), interpolation=cv2.INTER_AREA)
+
+    # crop the image to the bucket resolution
+    crop_left = (image_width - bucket_width) // 2
+    crop_top = (image_height - bucket_height) // 2
+    image = image[crop_top : crop_top + bucket_height, crop_left : crop_left + bucket_width]
+    return image
 
 
 class ItemInfo:
@@ -60,9 +403,24 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.reference_latent_cache_path: Optional[str] = None
+        self.reference_audio_latent_cache_path: Optional[str] = None
+        self.reference_latent_cache_paths: Optional[list[str]] = None
+        self.reference_audio_latent_cache_paths: Optional[list[str]] = None
+        self.latent_idx_guide_cache_path: Optional[str] = None
+        self.keyframe_guide_cache_path: Optional[str] = None
+        # Multi-keyframe: list of cache paths for extra keyframes (parallel to
+        # keyframe_guide_extras). Empty when only the primary is set.
+        self.keyframe_guide_extra_cache_paths: Optional[list[str]] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
+        self.loss_mask_content: Optional[np.ndarray] = None
+        self.loss_mask_path: Optional[str] = None
+        # LTX-2 spatial-crop region: PIXEL coords (y1, x1, y2, x2). None when unset/off.
+        self.spatial_crop_region: Optional[tuple[int, int, int, int]] = None
+        self.audio_loss_mask_intervals: Optional[list[tuple[float, float]]] = None
+        self.audio_cond_mask_intervals: Optional[list[tuple[float, float]]] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -80,27 +438,1540 @@ class ItemInfo:
         )
 
 
-from musubi_tuner.dataset.cache_io import *  # noqa: F401,F403
+def select_caption_from_metadata(data: dict[str, Any], caption_field: Optional[str] = None) -> str:
+    field = caption_field or "caption"
+    if field not in data:
+        raise KeyError(f"Caption field {field!r} was not found in metadata item. Available keys: {sorted(data.keys())}")
+    caption = data[field]
+    if caption is None:
+        return ""
+    if not isinstance(caption, str):
+        raise TypeError(f"Caption field {field!r} must be a string, got {type(caption).__name__}")
+    return caption
 
 
-from musubi_tuner.dataset.bucket import BucketSelector, BucketBatchManager  # noqa: F401
+# We use simple if-else approach to support multiple architectures.
+# Maybe we can use a plugin system in the future.
+
+# the keys of the dict are `<content_type>_FxHxW_<dtype>` for latents
+# and `<content_type>_<dtype|mask>` for other tensors
 
 
-from musubi_tuner.dataset.datasources import (  # noqa: F401
-    ContentDatasource,
-    ImageDatasource,
-    ImageDirectoryDatasource,
-    ImageJsonlDatasource,
-    VideoDatasource,
-    VideoDirectoryDatasource,
-    VideoJsonlDatasource,
-)
+def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
+    """HunyuanVideo architecture. HunyuanVideo doesn't support I2V and control latents"""
+    assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_FULL)
 
 
-# The following classes have been moved to datasources.py but are kept here
-# as a comment reference. They are re-imported above for backward compatibility.
-# - ContentDatasource, ImageDatasource, ImageDirectoryDatasource, ImageJsonlDatasource
-# - VideoDatasource, VideoDirectoryDatasource, VideoJsonlDatasource
+def save_latent_cache_wan(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    clip_embed: Optional[torch.Tensor],
+    image_latent: Optional[torch.Tensor],
+    control_latent: Optional[torch.Tensor],
+    f_indices: Optional[list[int]] = None,
+):
+    """Wan architecture"""
+    assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+
+    if clip_embed is not None:
+        sd[f"clip_{dtype_str}"] = clip_embed.detach().cpu()
+
+    if image_latent is not None:
+        sd[f"latents_image_{F}x{H}x{W}_{dtype_str}"] = image_latent.detach().cpu()
+
+    if control_latent is not None:
+        sd[f"latents_control_{F}x{H}x{W}_{dtype_str}"] = control_latent.detach().cpu()
+
+    if f_indices is not None:
+        dtype_str = dtype_to_str(torch.int32)
+        sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_latent_cache_framepack(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    latent_indices: torch.Tensor,
+    clean_latents: torch.Tensor,
+    clean_latent_indices: torch.Tensor,
+    clean_latents_2x: torch.Tensor,
+    clean_latent_2x_indices: torch.Tensor,
+    clean_latents_4x: torch.Tensor,
+    clean_latent_4x_indices: torch.Tensor,
+    image_embeddings: torch.Tensor,
+):
+    """FramePack architecture"""
+    assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    # `latents_xxx` must have {F, H, W} suffix
+    indices_dtype_str = dtype_to_str(latent_indices.dtype)
+    sd[f"image_embeddings_{dtype_str}"] = image_embeddings.detach().cpu()  # image embeddings dtype is same as latents dtype
+    sd[f"latent_indices_{indices_dtype_str}"] = latent_indices.detach().cpu()
+    sd[f"clean_latent_indices_{indices_dtype_str}"] = clean_latent_indices.detach().cpu()
+    sd[f"latents_clean_{F}x{H}x{W}_{dtype_str}"] = clean_latents.detach().cpu().contiguous()
+    if clean_latent_2x_indices is not None:
+        sd[f"clean_latent_2x_indices_{indices_dtype_str}"] = clean_latent_2x_indices.detach().cpu()
+    if clean_latents_2x is not None:
+        sd[f"latents_clean_2x_{F}x{H}x{W}_{dtype_str}"] = clean_latents_2x.detach().cpu().contiguous()
+    if clean_latent_4x_indices is not None:
+        sd[f"clean_latent_4x_indices_{indices_dtype_str}"] = clean_latent_4x_indices.detach().cpu()
+    if clean_latents_4x is not None:
+        sd[f"latents_clean_4x_{F}x{H}x{W}_{dtype_str}"] = clean_latents_4x.detach().cpu().contiguous()
+
+    # for key, value in sd.items():
+    #     print(f"{key}: {value.shape}")
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_FRAMEPACK_FULL)
+
+
+def save_latent_cache_flux_kontext(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    control_latent: torch.Tensor,
+):
+    """FLUX.1 Kontext architecture"""
+    assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
+
+    _, H, W = latent.shape
+    F = 1
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    _, H, W = control_latent.shape
+    F = 1
+    sd[f"latents_control_{F}x{H}x{W}_{dtype_str}"] = control_latent.detach().cpu().contiguous()
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_FLUX_KONTEXT_FULL)
+
+
+def save_latent_cache_flux_2(
+    item_info: ItemInfo, latent: torch.Tensor, control_latent: Optional[list[torch.Tensor]], arch_full: str
+):
+    """Flux 2 architecture"""
+    assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
+    assert control_latent is None or all(cl.dim() == 3 for cl in control_latent), (
+        "control_latent should be 3D tensor (channel, height, width) or None"
+    )
+
+    _, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if control_latent is not None:
+        for i, cl in enumerate(control_latent):
+            _, H, W = cl.shape
+            sd[f"latents_control_{i}_{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
+
+    save_latent_cache_common(item_info, sd, arch_full)
+
+
+def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, control_latent: Optional[list[torch.Tensor]]):
+    """Qwen-Image architecture"""
+    assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+    assert control_latent is None or all(cl.dim() == 4 for cl in control_latent), (
+        "control_latent should be 4D tensor (frame, channel, height, width) or None"
+    )
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if control_latent is not None:
+        for i, cl in enumerate(control_latent):
+            _, F, H, W = cl.shape
+            sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
+
+
+def save_latent_cache_kandinsky5(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    image_latent: Optional[torch.Tensor] = None,
+    control_latent: Optional[torch.Tensor] = None,
+    scaling_factor: Optional[float] = None,
+):
+    """Kandinsky 5 architecture (image/video), with optional source/control latents for i2v/control."""
+    assert latent.dim() == 3 or latent.dim() == 4, "latent should be 3D (C,H,W) or 4D (F,C,H,W) tensor"
+
+    if latent.dim() == 4:
+        _, F, H, W = latent.shape
+    else:
+        F, H, W = 1, latent.shape[1], latent.shape[2]
+        latent = latent.unsqueeze(0)
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous().clone()}
+
+    if image_latent is not None:
+        _, F_img, H_img, W_img = image_latent.shape
+        sd[f"latents_image_{F_img}x{H_img}x{W_img}_{dtype_str}"] = image_latent.detach().cpu().contiguous().clone()
+
+    if control_latent is not None:
+        _, F_ctrl, H_ctrl, W_ctrl = control_latent.shape
+        sd[f"latents_control_{F_ctrl}x{H_ctrl}x{W_ctrl}_{dtype_str}"] = control_latent.detach().cpu().contiguous().clone()
+
+    if scaling_factor is not None:
+        sd["vae_scaling_factor"] = torch.tensor(float(scaling_factor))
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_KANDINSKY5_FULL)
+
+
+def save_latent_cache_hunyuan_video_1_5(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    image_latent: Optional[torch.Tensor],
+    vision_feature: Optional[torch.Tensor],
+):
+    """HunyuanVideo 1.5 architecture"""
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd: dict[str, torch.Tensor] = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+
+    if image_latent is not None:
+        dtype_str = dtype_to_str(image_latent.dtype)
+        _, F, H, W = image_latent.shape
+        sd[f"latents_image_{F}x{H}x{W}_{dtype_str}"] = image_latent.detach().cpu()
+
+    if vision_feature is not None:
+        dtype_str = dtype_to_str(vision_feature.dtype)
+        sd[f"siglip_{dtype_str}"] = vision_feature.detach().cpu()
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL)
+
+
+def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
+    """Z-Image architecture. No control latent is supported."""
+    assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
+
+    C, H, W = latent.shape
+    F = 1
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
+
+
+def save_pixel_cache_hidream_o1(
+    item_info: ItemInfo,
+    pixel_tokens: torch.Tensor,
+    control_pixel_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+):
+    """HiDream-O1 pixel-token cache."""
+    height_patches, width_patches, _ = pixel_tokens.shape
+    dtype_str = dtype_to_str(pixel_tokens.dtype)
+    sd = {f"latents_1x{height_patches}x{width_patches}_{dtype_str}": pixel_tokens.detach().cpu().contiguous()}
+
+    if control_pixel_tokens is not None:
+        if torch.is_tensor(control_pixel_tokens):
+            assert control_pixel_tokens.dim() == 4, (
+                "control_pixel_tokens should be 4D tensor (num_controls, height_patches, width_patches, patch_dim)"
+            )
+            control_iter = list(control_pixel_tokens)
+        else:
+            control_iter = control_pixel_tokens
+        for i, cl in enumerate(control_iter):
+            control_height_patches, control_width_patches, _ = cl.shape
+            control_dtype_str = dtype_to_str(cl.dtype)
+            sd[f"latents_control_{i}_{control_height_patches}x{control_width_patches}_{control_dtype_str}"] = (
+                cl.detach().cpu().contiguous()
+            )
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL)
+
+
+def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False):
+    metadata = {
+        "architecture": arch_fullname,
+        "width": f"{item_info.original_size[0]}",
+        "height": f"{item_info.original_size[1]}",
+        "format_version": "1.0.1",
+    }
+    if item_info.frame_count is not None:
+        metadata["frame_count"] = f"{item_info.frame_count}"
+
+    for key, value in sd.items():
+        # NaN check and show warning, replace NaN with 0
+        if torch.isnan(value).any():
+            logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
+            value[torch.isnan(value)] = 0
+
+    latent_dir = os.path.dirname(item_info.latent_cache_path)
+    os.makedirs(latent_dir, exist_ok=True)
+
+    if atomic:
+        safetensors_utils.save_file_atomic(sd, item_info.latent_cache_path, metadata=metadata)
+    else:
+        save_file(sd, item_info.latent_cache_path, metadata=metadata)
+
+
+def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
+    """HunyuanVideo architecture"""
+    assert embed.dim() == 1 or embed.dim() == 2, (
+        f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
+    )
+    assert mask is None or mask.dim() == 1, f"mask should be 1D tensor (feature), got {mask.shape}"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    text_encoder_type = "llm" if is_llm else "clipL"
+    sd[f"{text_encoder_type}_{dtype_str}"] = embed.detach().cpu()
+    if mask is not None:
+        sd[f"{text_encoder_type}_mask"] = mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_FULL)
+
+
+def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor):
+    """Wan architecture. Wan2.1 only has a single text encoder"""
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    text_encoder_type = "t5"
+    sd[f"varlen_{text_encoder_type}_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_text_encoder_output_cache_framepack(
+    item_info: ItemInfo, llama_vec: torch.Tensor, llama_attention_mask: torch.Tensor, clip_l_pooler: torch.Tensor
+):
+    """FramePack architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(llama_vec.dtype)
+    sd[f"llama_vec_{dtype_str}"] = llama_vec.detach().cpu()
+    sd["llama_attention_mask"] = llama_attention_mask.detach().cpu()
+    dtype_str = dtype_to_str(clip_l_pooler.dtype)
+    sd[f"clip_l_pooler_{dtype_str}"] = clip_l_pooler.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FRAMEPACK_FULL)
+
+
+def save_text_encoder_output_cache_flux_kontext(item_info: ItemInfo, t5_vec: torch.Tensor, clip_l_pooler: torch.Tensor):
+    """Flux Kontext architecture."""
+
+    sd = {}
+    dtype_str = dtype_to_str(t5_vec.dtype)
+    sd[f"t5_vec_{dtype_str}"] = t5_vec.detach().cpu()
+    dtype_str = dtype_to_str(clip_l_pooler.dtype)
+    sd[f"clip_l_pooler_{dtype_str}"] = clip_l_pooler.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FLUX_KONTEXT_FULL)
+
+
+def save_text_encoder_output_cache_flux_2(item_info: ItemInfo, ctx_vec: torch.Tensor, arch_full: str):
+    """Flux 2 architecture."""
+
+    sd = {}
+    dtype_str = dtype_to_str(ctx_vec.dtype)
+    sd[f"ctx_vec_{dtype_str}"] = ctx_vec.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, arch_full)
+
+
+def save_text_encoder_output_cache_qwen_image(item_info: ItemInfo, embed: torch.Tensor):
+    """Qwen-Image architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_vl_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
+
+
+def save_text_encoder_output_cache_kandinsky5(
+    item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
+):
+    """Kandinsky 5 architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(text_embeds.dtype)
+    sd[f"text_embeds_{dtype_str}"] = text_embeds.detach().cpu()
+    dtype_str = dtype_to_str(pooled_embed.dtype)
+    sd[f"pooled_embed_{dtype_str}"] = pooled_embed.detach().cpu()
+    sd["attention_mask"] = attention_mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KANDINSKY5_FULL)
+
+
+def save_text_encoder_output_cache_hunyuan_video_1_5(item_info: ItemInfo, embed: torch.Tensor, byt5_embed: torch.Tensor):
+    """Hunyuan-Video 1.5 architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_vl_embed_{dtype_str}"] = embed.detach().cpu()
+    dtype_str = dtype_to_str(byt5_embed.dtype)
+    sd[f"varlen_byt5_embed_{dtype_str}"] = byt5_embed.detach().cpu()
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL)
+
+
+def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Tensor):
+    """Z-Image architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_llm_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
+
+
+def save_text_encoder_output_cache_hidream_o1(
+    item_info: ItemInfo,
+    input_ids: torch.Tensor,
+    input_embeds: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    token_types: Optional[torch.Tensor] = None,
+    image_grid_thw: Optional[torch.Tensor] = None,
+):
+    """HiDream-O1 architecture."""
+    tensors = {
+        "varlen_input_ids": input_ids,
+        "varlen_input_embeds": input_embeds,
+        "varlen_position_ids": position_ids,
+        "varlen_token_types": token_types,
+        "varlen_image_grid_thw": image_grid_thw,
+    }
+    sd = {f"{name}_{dtype_to_str(t.dtype)}": t.detach().cpu() for name, t in tensors.items() if t is not None}
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL, merge_existing=False)
+
+
+def save_text_encoder_output_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    *,
+    atomic: bool = False,
+    merge_existing: bool = True,
+):
+    for key, value in sd.items():
+        # NaN check and show warning, replace NaN with 0
+        if torch.isnan(value).any():
+            logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
+            value[torch.isnan(value)] = 0
+
+    metadata = {
+        "architecture": arch_fullname,
+        "caption1": item_info.caption,
+        "format_version": "1.0.1",
+    }
+
+    if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
+        # load existing cache and update metadata
+        new_key_bases = {remove_dtype_suffix(key) for key in sd}
+        with safetensors_utils.MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path) as f:
+            existing_metadata = f.metadata()
+            for key in f.keys():
+                if remove_dtype_suffix(key) not in new_key_bases:
+                    sd[key] = f.get_tensor(key)
+
+        assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"
+        if existing_metadata["caption1"] != metadata["caption1"]:
+            logger.warning(f"caption mismatch: existing={existing_metadata['caption1']}, new={metadata['caption1']}, overwrite")
+        # TODO verify format_version
+
+        existing_metadata.pop("caption1", None)
+        existing_metadata.pop("format_version", None)
+        metadata.update(existing_metadata)  # copy existing metadata except caption and format_version
+    else:
+        text_encoder_output_dir = os.path.dirname(item_info.text_encoder_output_cache_path)
+        os.makedirs(text_encoder_output_dir, exist_ok=True)
+
+    safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata, atomic=atomic)
+
+
+from musubi_tuner.dataset import cache_io as _cache_io  # noqa: E402
+
+save_latent_cache_ltx2 = _cache_io.save_latent_cache_ltx2  # noqa: F811
+save_text_encoder_output_cache_ltx2 = _cache_io.save_text_encoder_output_cache_ltx2  # noqa: F811
+save_text_encoder_output_cache_ltx2_gemma = _cache_io.save_text_encoder_output_cache_ltx2_gemma  # noqa: F811
+save_latent_cache_ideogram4 = _cache_io.save_latent_cache_ideogram4  # noqa: F811
+save_text_encoder_output_cache_ideogram4 = _cache_io.save_text_encoder_output_cache_ideogram4  # noqa: F811
+save_latent_cache_krea2 = _cache_io.save_latent_cache_krea2  # noqa: F811
+save_text_encoder_output_cache_krea2 = _cache_io.save_text_encoder_output_cache_krea2  # noqa: F811
+
+
+from musubi_tuner.dataset import bucket as _bucket  # noqa: E402
+
+BucketSelector = _bucket.BucketSelector  # noqa: F811
+
+
+def load_video(
+    video_path: str,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    bucket_selector: Optional[BucketSelector] = None,
+    bucket_reso: Optional[tuple[int, int]] = None,
+    source_fps: Optional[float] = None,
+    target_fps: Optional[float] = None,
+) -> list[np.ndarray]:
+    """
+    bucket_reso: if given, resize the video to the bucket resolution, (width, height)
+    """
+    # Opt-in alternate decode backend (env LTX2_VIDEO_DECODE_BACKEND; default 'pyav' = no-op).
+    # An alternate-backend exception is logged and retried through the PyAV path below.
+    from musubi_tuner.dataset.video_decode import get_video_decode_backend, load_video_alt
+
+    _vb = get_video_decode_backend()
+    if _vb != "pyav":
+        try:
+            from musubi_tuner.ltx_2.env import get_ltx2_env
+
+            _thr = get_ltx2_env().fps_resampling_threshold
+            _alt = load_video_alt(
+                video_path, start_frame, end_frame, bucket_selector, bucket_reso, source_fps, target_fps, _thr, backend=_vb
+            )
+            if _alt is not None:
+                return _alt
+        except Exception as e:
+            logger.warning(
+                f"video_decode backend '{_vb}' failed for {os.path.basename(video_path)} "
+                f"({type(e).__name__}: {e}); falling back to PyAV"
+            )
+
+    # auto-detect source FPS from video container when not explicitly set
+    if source_fps is None and target_fps is not None and os.path.isfile(video_path):
+        try:
+            with av.open(video_path) as probe_container:
+                stream = probe_container.streams.video[0]
+                detected = stream.average_rate or stream.base_rate
+                if detected and float(detected) > 0:
+                    source_fps = float(detected)
+                    # Keep this at debug level to avoid per-file log spam.
+                    logger.debug(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
+        except Exception:
+            pass  # detection failed, fall through to no-conversion branch
+
+    # skip resampling when source and target FPS are nearly equal
+    # ceil the source FPS so that e.g. 23.976 -> 24, then compare against target (25): diff=1, skip
+    from musubi_tuner.ltx_2.env import get_ltx2_env
+
+    fps_threshold = get_ltx2_env().fps_resampling_threshold
+    needs_resampling = source_fps is not None and target_fps is not None and abs(math.ceil(source_fps) - target_fps) > fps_threshold
+
+    if not needs_resampling and source_fps is not None and target_fps is not None and source_fps != target_fps:
+        logger.info(
+            f"Skipping FPS resampling for {os.path.basename(video_path)}: "
+            f"source {source_fps:.3f} FPS within threshold of target {target_fps:.1f} FPS "
+            f"(ceil={math.ceil(source_fps)}, diff={abs(math.ceil(source_fps) - target_fps)}, threshold={fps_threshold})"
+        )
+
+    if not needs_resampling:
+        if os.path.isfile(video_path):
+            container = av.open(video_path)
+            video = []
+            for i, frame in enumerate(container.decode(video=0)):
+                if start_frame is not None and i < start_frame:
+                    continue
+                if end_frame is not None and i >= end_frame:
+                    break
+                frame = frame.to_image()
+
+                if bucket_selector is not None and bucket_reso is None:
+                    bucket_reso = bucket_selector.get_bucket_resolution(frame.size)  # calc resolution from first frame
+
+                if bucket_reso is not None:
+                    frame = resize_image_to_bucket(frame, bucket_reso)
+                else:
+                    frame = np.array(frame)
+
+                video.append(frame)
+            container.close()
+        else:
+            # load images in the directory
+            image_files = glob_images(video_path)
+            image_files.sort()
+            video = []
+            for i in range(len(image_files)):
+                if start_frame is not None and i < start_frame:
+                    continue
+                if end_frame is not None and i >= end_frame:
+                    break
+
+                image_file = image_files[i]
+                image = Image.open(image_file).convert("RGB")
+
+                if bucket_selector is not None and bucket_reso is None:
+                    bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame
+                image = np.array(image)
+                if bucket_reso is not None:
+                    image = resize_image_to_bucket(image, bucket_reso)
+
+                video.append(image)
+    else:
+        # drop frames to match the target fps TODO commonize this code with the above if this works
+        logger.info(f"Resampling {os.path.basename(video_path)}: {source_fps:.2f} FPS -> {target_fps:.2f} FPS")
+        frame_index_delta = target_fps / source_fps  # example: 16 / 30 = 0.5333
+        if os.path.isfile(video_path):
+            container = av.open(video_path)
+            video = []
+            frame_index_with_fraction = 0.0
+            previous_frame_index = -1
+            for i, frame in enumerate(container.decode(video=0)):
+                target_frame_index = int(frame_index_with_fraction)
+                frame_index_with_fraction += frame_index_delta
+
+                if target_frame_index == previous_frame_index:  # drop this frame
+                    continue
+
+                # accept this frame
+                previous_frame_index = target_frame_index
+
+                if start_frame is not None and target_frame_index < start_frame:
+                    continue
+                if end_frame is not None and target_frame_index >= end_frame:
+                    break
+                frame = frame.to_image()
+
+                if bucket_selector is not None and bucket_reso is None:
+                    bucket_reso = bucket_selector.get_bucket_resolution(frame.size)  # calc resolution from first frame
+
+                if bucket_reso is not None:
+                    frame = resize_image_to_bucket(frame, bucket_reso)
+                else:
+                    frame = np.array(frame)
+
+                video.append(frame)
+            container.close()
+        else:
+            # load images in the directory
+            image_files = glob_images(video_path)
+            image_files.sort()
+            video = []
+            frame_index_with_fraction = 0.0
+            previous_frame_index = -1
+            for i in range(len(image_files)):
+                target_frame_index = int(frame_index_with_fraction)
+                frame_index_with_fraction += frame_index_delta
+
+                if target_frame_index == previous_frame_index:  # drop this frame
+                    continue
+
+                # accept this frame
+                previous_frame_index = target_frame_index
+
+                if start_frame is not None and target_frame_index < start_frame:
+                    continue
+                if end_frame is not None and target_frame_index >= end_frame:
+                    break
+
+                image_file = image_files[i]
+                image = Image.open(image_file).convert("RGB")
+
+                if bucket_selector is not None and bucket_reso is None:
+                    bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame
+                image = np.array(image)
+                if bucket_reso is not None:
+                    image = resize_image_to_bucket(image, bucket_reso)
+
+                video.append(image)
+
+    return video
+
+
+BucketBatchManager = _bucket.BucketBatchManager  # noqa: F811
+
+
+class ContentDatasource:
+    def __init__(self):
+        self.caption_only = False  # set to True to only fetch caption for Text Encoder caching
+        self.has_control = False
+
+    def set_caption_only(self, caption_only: bool):
+        self.caption_only = caption_only
+
+    def is_indexable(self):
+        return False
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        """
+        Returns caption. May not be called if is_indexable() returns False.
+        """
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+
+    def __iter__(self):
+        raise NotImplementedError
+
+    def __next__(self):
+        raise NotImplementedError
+
+
+class ImageDatasource(ContentDatasource):
+    def __init__(self):
+        super().__init__()
+
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, list[Image.Image]]:
+        """
+        Returns image data as a tuple of image path, image, and caption for the given index.
+        Key must be unique and valid as a file name.
+        May not be called if is_indexable() returns False.
+        """
+        raise NotImplementedError
+
+
+class AudioDatasource(ContentDatasource):
+    def __init__(self):
+        super().__init__()
+
+    def get_audio_data(self, idx: int) -> tuple[str, str]:
+        """
+        Returns audio data as a tuple of audio path and caption.
+        Key must be unique and valid as a file name.
+        May not be called if is_indexable() returns False.
+        """
+        raise NotImplementedError
+
+
+class ImageDirectoryDatasource(ImageDatasource):
+    def __init__(
+        self,
+        image_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        control_count_per_image: Optional[int] = None,
+        multiple_target: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+    ):
+        super().__init__()
+        self.image_directory = image_directory
+        self.caption_extension = caption_extension
+        self.control_directory = control_directory
+        self.control_count_per_image = control_count_per_image
+        self.multiple_target = multiple_target
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
+        self.current_idx = 0
+
+        # glob images
+        logger.info(f"glob images in {self.image_directory}")
+        self.image_paths = glob_images(self.image_directory, caption_extension=self.caption_extension)
+        logger.info(f"found {len(self.image_paths)} images")
+
+        # check if multiple-target images exist
+        self.target_paths: dict[str, list[str]] = {}  # image_path -> list of target image paths
+
+        if self.multiple_target:
+            # sort by length, longer first
+            sorted_image_paths = sorted(self.image_paths, key=lambda p: len(os.path.basename(p)), reverse=True)
+
+            all_image_paths = set(glob_images(self.image_directory))  # image1.jpg, image1_1.jpg, image1_2.jpg, ...
+            multiple_target_candidates = all_image_paths - set(sorted_image_paths)  # those not in the images with captions
+
+            if len(multiple_target_candidates) > 0:
+                logger.info("checking for multiple-target images")
+                for image_path in sorted_image_paths:
+                    image_path_no_ext = os.path.splitext(image_path)[0]
+
+                    # find matching multiple-target images
+                    potential_paths = [p for p in multiple_target_candidates if p.startswith(image_path_no_ext + "_")]
+
+                    if potential_paths:
+                        # sort by the digits (`_0000`) suffix
+                        def sort_key(path):
+                            path_no_ext = os.path.splitext(path)[0]
+                            digits_suffix = path_no_ext.rsplit("_", 1)[-1]
+                            if not digits_suffix.isdigit():
+                                raise ValueError(
+                                    f"Invalid digits suffix in '{path_no_ext}'. Expected a numeric suffix after '_' "
+                                    f"(e.g., '_0', '_1', '_2') for proper sorting of multiple target images."
+                                )
+                            return int(digits_suffix)
+
+                        potential_paths.sort(key=sort_key)
+                        self.target_paths[image_path] = potential_paths
+
+                        # remove to avoid duplicate matching
+                        multiple_target_candidates.difference_update(potential_paths)
+
+                # check the number of targets: all multiple-target images should have the same number of targets
+                num_targets = 0
+                for image_path, paths in self.target_paths.items():
+                    if num_targets == 0:
+                        num_targets = len(paths)
+                    elif num_targets != len(paths):
+                        logger.error(
+                            f"All multiple-target images must have the same number of targets / 全ての複数ターゲット画像は同じ数のターゲットを持つ必要があります: {image_path}"
+                        )
+                        raise ValueError(
+                            f"All multiple-target images must have the same number of targets / 全ての複数ターゲット画像は同じ数のターゲットを持つ必要があります: {image_path}"
+                        )
+
+                if num_targets == 0:
+                    logger.error("no multiple-target images found, but multiple_target is set to True")
+                    raise ValueError("no multiple-target images found, but multiple_target is set to True")
+
+                logger.info(f"found multiple-target images, max targets per image: {num_targets}")
+
+        # glob control images if specified
+        if self.control_directory is not None:
+            logger.info(f"glob control images in {self.control_directory}")
+            self.has_control = True
+            self.control_paths = {}
+
+            # sort image paths for matching control images properly: longer names first
+            image_paths_sorted = sorted(self.image_paths, key=lambda p: len(os.path.basename(p)), reverse=True)
+
+            # glob control images first
+            all_control_image_paths = set(glob_images(self.control_directory))
+
+            for image_path in image_paths_sorted:
+                image_basename = os.path.basename(image_path)
+                image_basename_no_ext = os.path.splitext(image_basename)[0]
+
+                # find matching control images
+                potential_paths = [
+                    p
+                    for p in all_control_image_paths
+                    if os.path.basename(p).startswith(image_basename_no_ext + ".")
+                    or os.path.basename(p).startswith(image_basename_no_ext + "_")
+                ]
+
+                # remove to avoid duplicate matching
+                all_control_image_paths.difference_update(potential_paths)
+
+                if potential_paths:
+                    # sort by the digits (`_0000`) suffix, prefer the one without the suffix
+                    def sort_key(path):
+                        basename = os.path.basename(path)
+                        basename_no_ext = os.path.splitext(basename)[0]
+                        if image_basename_no_ext == basename_no_ext:  # prefer the one without suffix
+                            return 0
+                        digits_suffix = basename_no_ext.rsplit("_", 1)[-1]
+                        if not digits_suffix.isdigit():
+                            raise ValueError(f"Invalid digits suffix in {basename_no_ext}")
+                        return int(digits_suffix) + 1
+
+                    potential_paths.sort(key=sort_key)
+                    if control_count_per_image is not None and len(potential_paths) < control_count_per_image:
+                        logger.error(
+                            f"Not enough control images for {image_path}: found {len(potential_paths)}, expected {control_count_per_image}"
+                        )
+                        raise ValueError(
+                            f"Not enough control images for {image_path}: found {len(potential_paths)}, expected {control_count_per_image}"
+                        )
+
+                    # take the first `control_count_per_image` paths
+                    self.control_paths[image_path] = (
+                        potential_paths[:control_count_per_image] if control_count_per_image is not None else potential_paths
+                    )
+            logger.info(
+                f"found {len(self.control_paths)} matching control images for {'arbitrary' if control_count_per_image is None else control_count_per_image} images"
+            )
+
+            # log the distribution of number of control images
+            count_of_num_control_images = {}
+            for paths in self.control_paths.values():
+                count = len(paths)
+                if count not in count_of_num_control_images:
+                    count_of_num_control_images[count] = 0
+                count_of_num_control_images[count] += 1
+            for count, num_images in count_of_num_control_images.items():
+                logger.info(f"  {num_images} images have {count} control images")
+
+            missing_controls = len(self.image_paths) - len(self.control_paths)
+            if missing_controls > 0:
+                missing_control_paths = set(self.image_paths) - set(self.control_paths.keys())
+                logger.error(f"Could not find matching control images for {missing_controls} images: {missing_control_paths}")
+                raise ValueError(f"Could not find matching control images for {missing_controls} images")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
+        image_path = self.image_paths[idx]
+        image_paths = [image_path]
+        if self.multiple_target:
+            # load multiple-target images
+            image_paths += self.target_paths.get(image_path, [])
+
+        images = []
+        for p in image_paths:
+            img = Image.open(p)
+            if img.mode != "RGB" and img.mode != "RGBA":
+                img = img.convert("RGB")
+            images.append(img)
+
+        _, caption = self.get_caption(idx)
+
+        loss_mask = None
+        if self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(image_path))[0]
+            loss_mask_path = find_stem_matched_file(self.loss_mask_directory, stem, IMAGE_EXTENSIONS)
+            if loss_mask_path is not None:
+                loss_mask = load_loss_mask_image(loss_mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_use_alpha:
+            loss_mask = alpha_channel_to_loss_mask(images[0], invert=self.loss_mask_invert)
+
+        controls = None
+        if self.has_control:
+            controls = []
+            for control_path in self.control_paths[image_path]:
+                control = Image.open(control_path)
+                if control.mode != "RGB" and control.mode != "RGBA":
+                    control = control.convert("RGB")
+                controls.append(control)
+
+        return image_path, images, caption, controls, loss_mask
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        image_path = self.image_paths[idx]
+        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
+        with open(caption_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+        return image_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        """
+        Returns a fetcher function that returns image data.
+        """
+        if self.current_idx >= len(self.image_paths):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+        else:
+
+            def create_image_fetcher(index):
+                return lambda: self.get_image_data(index)
+
+            fetcher = create_image_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
+class ImageJsonlDatasource(ImageDatasource):
+    def __init__(
+        self,
+        image_jsonl_file: str,
+        control_count_per_image: Optional[int] = None,
+        multiple_target: bool = False,
+        caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+    ):
+        super().__init__()
+        self.image_jsonl_file = image_jsonl_file
+        self.control_count_per_image = control_count_per_image
+        self.multiple_target = multiple_target
+        self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
+        self.current_idx = 0
+
+        # load jsonl
+        logger.info(f"load image jsonl from {self.image_jsonl_file}")
+        self.data = []
+        with open(self.image_jsonl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.error(f"failed to load json: {line} @ {self.image_jsonl_file}")
+                    raise
+                self.data.append(data)
+        logger.info(f"loaded {len(self.data)} images")
+
+        # Normalize control paths
+        for item in self.data:
+            if "control_path" in item:
+                item["control_path_0"] = item.pop("control_path")
+
+            # Ensure control paths are named consistently, from control_path_0000 to control_path_0, control_path_1, etc.
+            control_path_keys = [key for key in item.keys() if key.startswith("control_path_")]
+            control_path_keys.sort(key=lambda x: int(x.split("_")[-1]))
+            for i, key in enumerate(control_path_keys):
+                if key != f"control_path_{i}":
+                    item[f"control_path_{i}"] = item.pop(key)
+
+        # Check if there are control paths in the JSONL
+        self.has_control = any("control_path_0" in item for item in self.data)
+        if self.has_control:
+            if self.control_count_per_image is None:
+                logger.info(f"found {len(self.data)} images with arbitrary control images per image in JSONL data")
+            else:
+                missing_control_images = [
+                    item["image_path"]
+                    for item in self.data
+                    if sum(f"control_path_{i}" not in item for i in range(self.control_count_per_image)) > 0
+                ]
+                if missing_control_images:
+                    logger.error(f"Some images do not have control paths in JSONL data: {missing_control_images}")
+                    raise ValueError(f"Some images do not have control paths in JSONL data: {missing_control_images}")
+                logger.info(
+                    f"found {len(self.data)} images with {self.control_count_per_image} control images per image in JSONL data"
+                )
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.data)
+
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
+        data = self.data[idx]
+        image_path = data.get("image_path", data.get("image_path_0"))
+        image_paths = [image_path]
+        if self.multiple_target:
+            # load multiple-target images
+            while True:
+                next_index = len(image_paths)  # start from 1
+                next_image_path = data.get("image_path_" + str(next_index), None)
+                if next_image_path is None:
+                    break
+                if not os.path.exists(next_image_path):
+                    raise ValueError(f"multiple-target image not found: {next_image_path}")
+
+                image_paths.append(next_image_path)
+
+        images = []
+        for path in image_paths:
+            img = Image.open(path)
+            if img.mode != "RGB" and img.mode != "RGBA":
+                img = img.convert("RGB")
+            images.append(img)
+
+        caption = select_caption_from_metadata(data, self.caption_field)
+
+        loss_mask = None
+        mask_path = data.get("loss_mask_path") or data.get("image_loss_mask_path")
+        if mask_path:
+            loss_mask = load_loss_mask_image(mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(image_path))[0]
+            loss_mask_path = find_stem_matched_file(self.loss_mask_directory, stem, IMAGE_EXTENSIONS)
+            if loss_mask_path is not None:
+                loss_mask = load_loss_mask_image(loss_mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_use_alpha:
+            loss_mask = alpha_channel_to_loss_mask(images[0], invert=self.loss_mask_invert)
+
+        controls = None
+        if self.has_control:
+            controls = []
+            for i in range(self.control_count_per_image or 1000):  # arbitrary large number if control_count_per_image is None
+                if f"control_path_{i}" not in data:
+                    break
+                control_path = data[f"control_path_{i}"]
+                control = Image.open(control_path)
+                if control.mode != "RGB" and control.mode != "RGBA":
+                    control = control.convert("RGB")
+                controls.append(control)
+
+        return image_path, images, caption, controls, loss_mask
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        data = self.data[idx]
+        image_path = data.get("image_path", data.get("image_path_0"))
+        caption = select_caption_from_metadata(data, self.caption_field)
+        return image_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.data):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+
+        else:
+
+            def create_fetcher(index):
+                return lambda: self.get_image_data(index)
+
+            fetcher = create_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
+class AudioDirectoryDatasource(AudioDatasource):
+    def __init__(
+        self,
+        audio_directory: str,
+        caption_extension: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+    ):
+        super().__init__()
+        self.audio_directory = audio_directory
+        self.caption_extension = caption_extension
+        self.loss_mask_directory = loss_mask_directory
+        self.current_idx = 0
+
+        logger.info(f"glob audio in {self.audio_directory}")
+        self.audio_paths = glob_audio(self.audio_directory)
+        logger.info(f"found {len(self.audio_paths)} audio files")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.audio_paths)
+
+    def get_audio_data(self, idx: int) -> tuple[str, str, Optional[list[tuple[float, float]]]]:
+        audio_path = self.audio_paths[idx]
+        caption_path = os.path.splitext(audio_path)[0] + (self.caption_extension or "")
+        with open(caption_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+        intervals = None
+        if self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(audio_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem, MASK_METADATA_EXTENSIONS)
+            if mask_path is not None and os.path.isfile(mask_path):
+                intervals = load_audio_loss_mask_intervals(mask_path)
+        return audio_path, caption, intervals
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        audio_path, caption, _intervals = self.get_audio_data(idx)
+        return audio_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.audio_paths):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+        else:
+
+            def create_audio_fetcher(index):
+                return lambda: self.get_audio_data(index)
+
+            fetcher = create_audio_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
+class AudioJsonlDatasource(AudioDatasource):
+    def __init__(
+        self,
+        audio_jsonl_file: str,
+        caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+    ):
+        super().__init__()
+        self.audio_jsonl_file = audio_jsonl_file
+        self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
+        self.current_idx = 0
+
+        logger.info(f"load audio jsonl from {self.audio_jsonl_file}")
+        self.data = []
+        with open(self.audio_jsonl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.error(f"failed to load json: {line} @ {self.audio_jsonl_file}")
+                    raise
+                self.data.append(data)
+        logger.info(f"loaded {len(self.data)} audio items")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.data)
+
+    def get_audio_data(self, idx: int) -> tuple[str, str, Optional[list[tuple[float, float]]]]:
+        data = self.data[idx]
+        audio_path = data["audio_path"]
+        caption = select_caption_from_metadata(data, self.caption_field)
+        intervals = normalize_loss_mask_intervals(data.get("loss_mask_intervals") or data.get("audio_loss_mask_intervals"))
+        mask_path = data.get("loss_mask_path") or data.get("audio_loss_mask_path")
+        if mask_path:
+            intervals = load_audio_loss_mask_intervals(mask_path)
+        elif intervals is None and self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(audio_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem, MASK_METADATA_EXTENSIONS)
+            if mask_path is not None and os.path.isfile(mask_path):
+                intervals = load_audio_loss_mask_intervals(mask_path)
+        return audio_path, caption, intervals
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        audio_path, caption, _intervals = self.get_audio_data(idx)
+        return audio_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.data):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+        else:
+
+            def create_audio_fetcher(index):
+                return lambda: self.get_audio_data(index)
+
+            fetcher = create_audio_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
+class VideoDatasource(ContentDatasource):
+    def __init__(self):
+        super().__init__()
+
+        # None means all frames
+        self.start_frame = None
+        self.end_frame = None
+
+        self.bucket_selector = None
+
+        self.source_fps = None
+        self.target_fps = None
+
+    def __len__(self):
+        raise NotImplementedError
+
+    def get_video_data_from_path(
+        self,
+        video_path: str,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        bucket_selector: Optional[BucketSelector] = None,
+    ) -> list[Image.Image]:
+        # this method can resize the video if bucket_selector is given to reduce the memory usage
+
+        start_frame = start_frame if start_frame is not None else self.start_frame
+        end_frame = end_frame if end_frame is not None else self.end_frame
+        bucket_selector = bucket_selector if bucket_selector is not None else self.bucket_selector
+
+        video = load_video(
+            video_path, start_frame, end_frame, bucket_selector, source_fps=self.source_fps, target_fps=self.target_fps
+        )
+        return video
+
+    def get_control_data_from_path(
+        self,
+        control_path: str,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        bucket_selector: Optional[BucketSelector] = None,
+    ) -> list[Image.Image]:
+        start_frame = start_frame if start_frame is not None else self.start_frame
+        end_frame = end_frame if end_frame is not None else self.end_frame
+        bucket_selector = bucket_selector if bucket_selector is not None else self.bucket_selector
+
+        control = load_video(
+            control_path, start_frame, end_frame, bucket_selector, source_fps=self.source_fps, target_fps=self.target_fps
+        )
+        return control
+
+    def set_start_and_end_frame(self, start_frame: Optional[int], end_frame: Optional[int]):
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+
+    def set_bucket_selector(self, bucket_selector: BucketSelector):
+        self.bucket_selector = bucket_selector
+
+    def set_source_and_target_fps(self, source_fps: Optional[float], target_fps: Optional[float]):
+        self.source_fps = source_fps
+        self.target_fps = target_fps
+
+    def __iter__(self):
+        raise NotImplementedError
+
+    def __next__(self):
+        raise NotImplementedError
+
+
+class VideoDirectoryDatasource(VideoDatasource):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_invert: bool = False,
+    ):
+        super().__init__()
+        self.video_directory = video_directory
+        self.caption_extension = caption_extension
+        self.control_directory = control_directory  # 新しく追加: コントロール画像ディレクトリ
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_invert = loss_mask_invert
+        self.current_idx = 0
+
+        # glob videos
+        logger.info(f"glob videos in {self.video_directory}")
+        self.video_paths = glob_videos(self.video_directory)
+        logger.info(f"found {len(self.video_paths)} videos")
+
+        # glob control images if specified
+        if self.control_directory is not None:
+            logger.info(f"glob control videos in {self.control_directory}")
+            self.has_control = True
+            self.control_paths = {}
+            for video_path in self.video_paths:
+                video_basename = os.path.basename(video_path)
+                # construct control path from video path
+                # for example: video_path = "vid/video.mp4" -> control_path = "control/video.mp4"
+                control_path = os.path.join(self.control_directory, video_basename)
+                if os.path.exists(control_path):
+                    self.control_paths[video_path] = control_path
+                else:
+                    # use the same base name for control path
+                    base_name = os.path.splitext(video_basename)[0]
+
+                    # directory with images. for example: video_path = "vid/video.mp4" -> control_path = "control/video"
+                    potential_path = os.path.join(self.control_directory, base_name)  # no extension
+                    if os.path.isdir(potential_path):
+                        self.control_paths[video_path] = potential_path
+                    else:
+                        # another extension for control path
+                        # for example: video_path = "vid/video.mp4" -> control_path = "control/video.mov"
+                        for ext in VIDEO_EXTENSIONS:
+                            potential_path = os.path.join(self.control_directory, base_name + ext)
+                            if os.path.exists(potential_path):
+                                self.control_paths[video_path] = potential_path
+                                break
+
+            logger.info(f"found {len(self.control_paths)} matching control videos/images")
+            # check if all videos have matching control paths, if not, raise an error
+            missing_controls = len(self.video_paths) - len(self.control_paths)
+            if missing_controls > 0:
+                # logger.warning(f"Could not find matching control videos/images for {missing_controls} videos")
+                missing_controls_videos = [video_path for video_path in self.video_paths if video_path not in self.control_paths]
+                logger.error(
+                    f"Could not find matching control videos/images for {missing_controls} videos: {missing_controls_videos}"
+                )
+                raise ValueError(f"Could not find matching control videos/images for {missing_controls} videos")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.video_paths)
+
+    def get_video_data(
+        self,
+        idx: int,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        bucket_selector: Optional[BucketSelector] = None,
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[np.ndarray]]]:
+        video_path = self.video_paths[idx]
+        video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
+
+        _, caption = self.get_caption(idx)
+
+        control = None
+        if self.control_directory is not None and video_path in self.control_paths:
+            control_path = self.control_paths[video_path]
+            control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
+
+        loss_mask = None
+        if self.loss_mask_directory is not None and video:
+            stem = os.path.splitext(os.path.basename(video_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem)
+            if mask_path is not None:
+                bucket_reso = (video[0].shape[1], video[0].shape[0])
+                loss_mask = load_loss_mask_frames(
+                    mask_path,
+                    bucket_reso=bucket_reso,
+                    frame_count=len(video),
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    source_fps=self.source_fps,
+                    target_fps=self.target_fps,
+                    invert=self.loss_mask_invert,
+                )
+
+        return video_path, video, caption, control, loss_mask
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        video_path = self.video_paths[idx]
+        caption_path = os.path.splitext(video_path)[0] + self.caption_extension if self.caption_extension else ""
+        with open(caption_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+        return video_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self):
+        if self.current_idx >= len(self.video_paths):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+
+        else:
+
+            def create_fetcher(index):
+                return lambda: self.get_video_data(index)
+
+            fetcher = create_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
+class VideoJsonlDatasource(VideoDatasource):
+    def __init__(
+        self,
+        video_jsonl_file: str,
+        caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_invert: bool = False,
+    ):
+        super().__init__()
+        self.video_jsonl_file = video_jsonl_file
+        self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_invert = loss_mask_invert
+        self.current_idx = 0
+
+        # load jsonl
+        logger.info(f"load video jsonl from {self.video_jsonl_file}")
+        self.data = []
+        with open(self.video_jsonl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                self.data.append(data)
+        logger.info(f"loaded {len(self.data)} videos")
+
+        # Check if there are control paths in the JSONL
+        self.has_control = any("control_path" in item for item in self.data)
+        if self.has_control:
+            control_count = sum(1 for item in self.data if "control_path" in item)
+            if control_count < len(self.data):
+                missing_control_videos = [item["video_path"] for item in self.data if "control_path" not in item]
+                logger.error(f"Some videos do not have control paths in JSONL data: {missing_control_videos}")
+                raise ValueError(f"Some videos do not have control paths in JSONL data: {missing_control_videos}")
+            logger.info(f"found {control_count} control videos/images in JSONL data")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.data)
+
+    def get_video_data(
+        self,
+        idx: int,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        bucket_selector: Optional[BucketSelector] = None,
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[np.ndarray]]]:
+        data = self.data[idx]
+        video_path = data["video_path"]
+        video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
+
+        caption = select_caption_from_metadata(data, self.caption_field)
+
+        control = None
+        if "control_path" in data and data["control_path"]:
+            control_path = data["control_path"]
+            control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
+
+        loss_mask = None
+        mask_path = data.get("loss_mask_path") or data.get("video_loss_mask_path")
+        if not mask_path and self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(video_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem)
+        if mask_path and video:
+            bucket_reso = (video[0].shape[1], video[0].shape[0])
+            loss_mask = load_loss_mask_frames(
+                mask_path,
+                bucket_reso=bucket_reso,
+                frame_count=len(video),
+                start_frame=start_frame,
+                end_frame=end_frame,
+                source_fps=self.source_fps,
+                target_fps=self.target_fps,
+                invert=self.loss_mask_invert,
+            )
+
+        return video_path, video, caption, control, loss_mask
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        data = self.data[idx]
+        video_path = data["video_path"]
+        caption = select_caption_from_metadata(data, self.caption_field)
+        return video_path, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self):
+        if self.current_idx >= len(self.data):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+
+        else:
+
+            def create_fetcher(index):
+                return lambda: self.get_video_data(index)
+
+            fetcher = create_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -108,23 +1979,129 @@ class BaseDataset(torch.utils.data.Dataset):
         self,
         resolution: Tuple[int, int] = (960, 544),
         caption_extension: Optional[str] = None,
+        caption_field: Optional[str] = None,
         batch_size: int = 1,
         num_repeats: int = 1,
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
         cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
+        reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
+        reference_audio_cache_directory: Optional[str] = None,
+        reference_audio_cache_directories: Optional[Sequence[str]] = None,
+        separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        # Keep guide kwargs at end of signature so subclass super() calls that
+        # pass earlier params positionally still work.
+        latent_idx_guide_directory: Optional[str] = None,
+        latent_idx_guide_cache_directory: Optional[str] = None,
+        latent_idx_guide_frame_idx: int = 0,
+        latent_idx_guide_strength: float = 1.0,
+        keyframe_guide_directory: Optional[str] = None,
+        keyframe_guide_cache_directory: Optional[str] = None,
+        keyframe_guide_frame_idx: int = -1,
+        keyframe_guide_strength: float = 1.0,
+        keyframe_guide_extra_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
+        keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
+        self.caption_field = caption_field
         self.batch_size = batch_size
+        self.bucket_batch_sizes = dict(bucket_batch_sizes or {})
         self.num_repeats = num_repeats
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
+        self.video_loss_weight = video_loss_weight
+        self.audio_loss_weight = audio_loss_weight
         self.cache_directory = cache_directory
+        # LTX-2 text-encoder full fine-tune runs Gemma live and keeps no te cache; when set,
+        # training-item enumeration accepts latent-only items and recovers the caption from disk.
+        self.text_encoder_cache_optional = os.getenv("LTX2_TE_CACHE_OPTIONAL", "0") == "1"
+        self.reference_cache_directories = _normalize_optional_path_list(
+            reference_cache_directory,
+            reference_cache_directories,
+        )
+        self.reference_cache_directory = self.reference_cache_directories[0] if self.reference_cache_directories else None
+        self.reference_frames = reference_frames
+        self.reference_audio_cache_directories = _normalize_optional_path_list(
+            reference_audio_cache_directory,
+            reference_audio_cache_directories,
+        )
+        self.reference_audio_cache_directory = (
+            self.reference_audio_cache_directories[0] if self.reference_audio_cache_directories else None
+        )
+        # Latent guides
+        self.latent_idx_guide_directory = latent_idx_guide_directory
+        self.latent_idx_guide_cache_directory = latent_idx_guide_cache_directory
+        self.latent_idx_guide_frame_idx = int(latent_idx_guide_frame_idx)
+        self.latent_idx_guide_strength = float(latent_idx_guide_strength)
+        self.keyframe_guide_directory = keyframe_guide_directory
+        self.keyframe_guide_cache_directory = keyframe_guide_cache_directory
+        self.keyframe_guide_frame_idx = int(keyframe_guide_frame_idx)
+        self.keyframe_guide_strength = float(keyframe_guide_strength)
+
+        # Multi-keyframe extras: validated parallel lists. Empty/None falls back
+        # to single-keyframe behavior (the primary above is the only entry).
+        self.keyframe_guide_extras: List[Dict[str, Any]] = []
+        extra_dirs = list(keyframe_guide_extra_directories or [])
+        extra_caches = list(keyframe_guide_extra_cache_directories or [])
+        extra_fis = list(keyframe_guide_extra_frame_idxs or [])
+        extra_sts = list(keyframe_guide_extra_strengths or [])
+        if extra_dirs:
+            n = len(extra_dirs)
+            if not (len(extra_caches) == n and len(extra_fis) == n and len(extra_sts) == n):
+                raise ValueError(
+                    "keyframe_guide_extra_* arrays must all have the same length. "
+                    f"Got directories={len(extra_dirs)}, cache_directories={len(extra_caches)}, "
+                    f"frame_idxs={len(extra_fis)}, strengths={len(extra_sts)}."
+                )
+            if not self.keyframe_guide_directory:
+                raise ValueError(
+                    "keyframe_guide_extra_* set but keyframe_guide_directory (primary) is empty. Set the primary keyframe first."
+                )
+            for d, c, fi, st in zip(extra_dirs, extra_caches, extra_fis, extra_sts):
+                self.keyframe_guide_extras.append(
+                    {
+                        "directory": str(d),
+                        "cache_directory": str(c),
+                        "frame_idx": int(fi),
+                        "strength": float(st),
+                    }
+                )
+        self.separate_audio_buckets = separate_audio_buckets
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
+        self.audio_cond_mask_directory = audio_cond_mask_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.reference_downscale = 1
+        # LTX-2 spatial-crop region conditioning. The dataset-level region (PIXEL
+        # coords [y1, x1, y2, x2]) is read only when spatial_crop_enabled is set
+        # post-construction (LTX-2 only, from --ltx2_spatial_crop). Off by default.
+        if spatial_crop_region:
+            _scr = tuple(int(v) for v in spatial_crop_region)
+            if len(_scr) != 4:
+                raise ValueError(f"spatial_crop_region must have exactly 4 ints [y1, x1, y2, x2]; got {list(spatial_crop_region)}")
+            self.spatial_crop_region = _scr
+        else:
+            self.spatial_crop_region = None
+        self.spatial_crop_enabled = False
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -136,12 +2113,96 @@ class BaseDataset(torch.utils.data.Dataset):
         metadata = {
             "resolution": self.resolution,
             "caption_extension": self.caption_extension,
+            "caption_field": self.caption_field,
             "batch_size_per_device": self.batch_size,
             "num_repeats": self.num_repeats,
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
+            "separate_audio_buckets": bool(self.separate_audio_buckets),
+            "reference_frames": self.reference_frames,
         }
         return metadata
+
+    def get_audio_latent_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
+        base_dir = os.path.dirname(latent_cache_path)
+        base_name = os.path.basename(latent_cache_path)
+        suffix = f"_{self.architecture}.safetensors"
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)] + f"_{self.architecture}_audio.safetensors"
+            return os.path.join(base_dir, base_name)
+        stem, _ext = os.path.splitext(base_name)
+        return os.path.join(base_dir, f"{stem}_{self.architecture}_audio.safetensors")
+
+    def get_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
+        latent_cache_path = getattr(item_info, "latent_cache_path", None)
+        if not latent_cache_path:
+            latent_cache_path = self.get_latent_cache_path(item_info)
+        return self.get_audio_latent_cache_path_from_latent_cache_path(latent_cache_path)
+
+    def get_dino_feature_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
+        """Derive DINOv2 feature cache path: ``*_ltx2.safetensors`` → ``*_ltx2_dino.safetensors``."""
+        base_dir = os.path.dirname(latent_cache_path)
+        base_name = os.path.basename(latent_cache_path)
+        suffix = f"_{self.architecture}.safetensors"
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)] + f"_{self.architecture}_dino.safetensors"
+            return os.path.join(base_dir, base_name)
+        stem, _ext = os.path.splitext(base_name)
+        return os.path.join(base_dir, f"{stem}_{self.architecture}_dino.safetensors")
+
+    def _append_audio_bucket_key(self, bucket_key: tuple[Any, ...], has_audio: bool) -> tuple[Any, ...]:
+        if not self.separate_audio_buckets:
+            return bucket_key
+        if self.architecture not in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            return bucket_key
+        return (*bucket_key, bool(has_audio))
+
+    def get_keyframe_guide_specs(self) -> List[Dict[str, Any]]:
+        """Return the unified list of keyframe guide specs (primary + extras).
+
+        Empty list when no keyframe is configured.
+        """
+        specs: List[Dict[str, Any]] = []
+        if getattr(self, "keyframe_guide_directory", None):
+            specs.append(
+                {
+                    "directory": self.keyframe_guide_directory,
+                    "cache_directory": getattr(self, "keyframe_guide_cache_directory", None),
+                    "frame_idx": int(getattr(self, "keyframe_guide_frame_idx", -1)),
+                    "strength": float(getattr(self, "keyframe_guide_strength", 1.0)),
+                }
+            )
+        for extra in getattr(self, "keyframe_guide_extras", []) or []:
+            specs.append(dict(extra))
+        return specs
+
+    def _append_latent_guide_bucket_key(self, bucket_key: tuple[Any, ...]) -> tuple[Any, ...]:
+        """Extend the bucket key with LTX-2 guide config so items with different
+        guide structure don't end up in the same batch.
+
+        Items in the same batch must share: presence of latent_idx guide,
+        latent_idx frame_idx + strength, AND for keyframe guides — the full
+        ordered list of (frame_idx, strength) pairs (so single-vs-multi keyframe
+        datasets bucket separately).
+        """
+        if self.architecture not in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            return bucket_key
+        has_latidx = bool(getattr(self, "latent_idx_guide_directory", None))
+        kf_specs = self.get_keyframe_guide_specs()
+        has_kf = bool(kf_specs)
+        if not (has_latidx or has_kf):
+            return bucket_key
+        # Round strength to 4 decimals so near-equal floats from config / float32
+        # round-trips don't accidentally split into separate buckets.
+        kf_signature = tuple((int(s["frame_idx"]), round(float(s["strength"]), 4)) for s in kf_specs)
+        latidx_strength = round(float(getattr(self, "latent_idx_guide_strength", 1.0)), 4)
+        return (
+            *bucket_key,
+            has_latidx,
+            int(getattr(self, "latent_idx_guide_frame_idx", 0)) if has_latidx else 0,
+            latidx_strength if has_latidx else 1.0,
+            kf_signature,
+        )
 
     def get_all_latent_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -165,6 +2226,94 @@ class BaseDataset(torch.utils.data.Dataset):
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
 
+    def get_reference_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_cache_directory is not None, (
+            "reference_cache_directory is required / reference_cache_directoryは必須です"
+        )
+        return os.path.join(
+            self.reference_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors",
+        )
+
+    def get_reference_latent_cache_paths(self, item_info: ItemInfo) -> list[str]:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_cache_directories, "reference_cache_directories is required / reference_cache_directoriesは必須です"
+        return [
+            os.path.join(directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
+            for directory in self.reference_cache_directories
+        ]
+
+    def get_reference_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_audio_cache_directory is not None, (
+            "reference_audio_cache_directory is required / reference_audio_cache_directoryは必須です"
+        )
+        return os.path.join(
+            self.reference_audio_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors",
+        )
+
+    def get_reference_audio_latent_cache_paths(self, item_info: ItemInfo) -> list[str]:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_audio_cache_directories, (
+            "reference_audio_cache_directories is required / reference_audio_cache_directoriesは必須です"
+        )
+        return [
+            os.path.join(directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors")
+            for directory in self.reference_audio_cache_directories
+        ]
+
+    def get_latent_idx_guide_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = self._get_latent_guide_cache_basename(item_info)
+        assert self.latent_idx_guide_cache_directory is not None, (
+            "latent_idx_guide_cache_directory is required when latent_idx_guide_directory is set"
+        )
+        return os.path.join(
+            self.latent_idx_guide_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_latidx_guide.safetensors",
+        )
+
+    def get_keyframe_guide_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = self._get_latent_guide_cache_basename(item_info)
+        assert self.keyframe_guide_cache_directory is not None, (
+            "keyframe_guide_cache_directory is required when keyframe_guide_directory is set"
+        )
+        return os.path.join(
+            self.keyframe_guide_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_kf_guide.safetensors",
+        )
+
+    def get_keyframe_guide_extra_cache_paths(self, item_info: ItemInfo) -> list[str]:
+        """Return the list of extra-keyframe cache paths (parallel to extras).
+
+        Each path uses the same `_kf_guide.safetensors` suffix but lives in the
+        per-extra cache directory. Empty list when no extras are configured.
+        """
+        extras = getattr(self, "keyframe_guide_extras", None) or []
+        if not extras:
+            return []
+        w, h = item_info.original_size
+        basename = self._get_latent_guide_cache_basename(item_info)
+        paths: list[str] = []
+        for spec in extras:
+            cache_dir = spec.get("cache_directory")
+            assert cache_dir, "keyframe_guide_extra cache_directory is required for every extra keyframe"
+            paths.append(os.path.join(cache_dir, f"{basename}_{w:04d}x{h:04d}_{self.architecture}_kf_guide.safetensors"))
+        return paths
+
+    @staticmethod
+    def _get_latent_guide_cache_basename(item_info: ItemInfo) -> str:
+        """Use the stable source stem for guides shared by video frame windows."""
+        source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
+        return os.path.splitext(os.path.basename(source_key))[0]
+
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
@@ -175,6 +2324,33 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
         raise NotImplementedError
+
+    def _caption_for_te_optional_item(self, item_key: str) -> Optional[str]:
+        """Best-effort caption for a training item that has no text-encoder cache.
+
+        Used only when ``text_encoder_cache_optional`` is set (LTX-2 text-encoder full
+        fine-tune, which must run Gemma live and therefore keeps no te cache). Reads the
+        original caption file for directory datasets; returns None when it cannot be
+        resolved (jsonl datasets, missing file) so the caller falls back to skipping the
+        item — i.e. the pre-existing behavior.
+        """
+        directory = (
+            getattr(self, "video_directory", None)
+            or getattr(self, "image_directory", None)
+            or getattr(self, "audio_directory", None)
+        )
+        ext = getattr(self, "caption_extension", None)
+        if not directory or not ext:
+            return None
+        caption_path = os.path.join(directory, item_key + ext)
+        if not os.path.isfile(caption_path):
+            return None
+        try:
+            with open(caption_path, "r", encoding="utf-8") as handle:
+                caption = handle.read().strip()
+        except Exception:
+            return None
+        return caption or None
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         pass
@@ -274,30 +2450,87 @@ class ImageDataset(BaseDataset):
         num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
+        caption_field: Optional[str] = None,
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
+        reference_cache_directory: Optional[str] = None,
+        reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
+        reference_audio_cache_directory: Optional[str] = None,
+        reference_audio_cache_directories: Optional[Sequence[str]] = None,
+        separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
         fp_1f_no_post: Optional[bool] = False,
         no_resize_control: Optional[bool] = False,
         control_resolution: Optional[Tuple[int, int]] = None,
+        cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        latent_idx_guide_directory: Optional[str] = None,
+        latent_idx_guide_cache_directory: Optional[str] = None,
+        latent_idx_guide_frame_idx: int = 0,
+        latent_idx_guide_strength: float = 1.0,
+        keyframe_guide_directory: Optional[str] = None,
+        keyframe_guide_cache_directory: Optional[str] = None,
+        keyframe_guide_frame_idx: int = -1,
+        keyframe_guide_strength: float = 1.0,
+        keyframe_guide_extra_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
+        keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
     ):
         super(ImageDataset, self).__init__(
             resolution,
             caption_extension,
+            caption_field,
             batch_size,
             num_repeats,
             enable_bucket,
             bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
             cache_directory,
+            reference_cache_directory,
+            reference_cache_directories,
+            reference_frames,
+            reference_audio_cache_directory,
+            reference_audio_cache_directories,
+            separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
             debug_dataset,
             architecture,
+            latent_idx_guide_directory=latent_idx_guide_directory,
+            latent_idx_guide_cache_directory=latent_idx_guide_cache_directory,
+            latent_idx_guide_frame_idx=latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=latent_idx_guide_strength,
+            keyframe_guide_directory=keyframe_guide_directory,
+            keyframe_guide_cache_directory=keyframe_guide_cache_directory,
+            keyframe_guide_frame_idx=keyframe_guide_frame_idx,
+            keyframe_guide_strength=keyframe_guide_strength,
+            keyframe_guide_extra_directories=keyframe_guide_extra_directories,
+            keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
+            keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
+            keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -309,6 +2542,7 @@ class ImageDataset(BaseDataset):
         self.fp_1f_no_post = fp_1f_no_post
         self.no_resize_control = no_resize_control
         self.control_resolution = control_resolution
+        self.cache_only = cache_only
 
         control_count_per_image: Optional[int] = 1
         if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
@@ -329,21 +2563,40 @@ class ImageDataset(BaseDataset):
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
 
-        if image_directory is not None:
+        if self.cache_only:
+            self.datasource = None
+        elif image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
+                image_directory,
+                caption_extension,
+                control_directory,
+                control_count_per_image,
+                multiple_target,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_use_alpha=loss_mask_use_alpha,
+                loss_mask_invert=loss_mask_invert,
             )
         elif image_jsonl_file is not None:
-            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
+            self.datasource = ImageJsonlDatasource(
+                image_jsonl_file,
+                control_count_per_image,
+                multiple_target,
+                caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_use_alpha=loss_mask_use_alpha,
+                loss_mask_invert=loss_mask_invert,
+            )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
 
         self.batch_manager = None
         self.num_train_items = 0
-        self.has_control = self.datasource.has_control
+        self.has_control = self.datasource.has_control if self.datasource is not None else False
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -354,13 +2607,24 @@ class ImageDataset(BaseDataset):
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
+        metadata["cache_only"] = self.cache_only
         return metadata
 
     def get_total_image_count(self):
+        if self.datasource is None:
+            return None
         return len(self.datasource) if self.datasource.is_indexable() else None
 
     def retrieve_latent_cache_batches(self, num_workers: int):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
@@ -378,7 +2642,7 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, images, caption, controls = future.result()
+                    original_size, item_key, images, caption, controls, loss_mask = future.result()
                     image = images[0]  # use the first image as the main content
                     bucket_height, bucket_width = image.shape[:2]
                     bucket_reso = (bucket_width, bucket_height)
@@ -387,6 +2651,17 @@ class ImageDataset(BaseDataset):
                         item_key, caption, original_size, bucket_reso, content=image if len(images) == 1 else images
                     )
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                    if self.reference_cache_directories:
+                        item_info.reference_latent_cache_paths = self.get_reference_latent_cache_paths(item_info)
+                        item_info.reference_latent_cache_path = item_info.reference_latent_cache_paths[0]
+
+                    if self.latent_idx_guide_cache_directory:
+                        item_info.latent_idx_guide_cache_path = self.get_latent_idx_guide_cache_path(item_info)
+                    if self.keyframe_guide_cache_directory:
+                        item_info.keyframe_guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
+                    if getattr(self, "keyframe_guide_extras", None):
+                        item_info.keyframe_guide_extra_cache_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
@@ -406,15 +2681,15 @@ class ImageDataset(BaseDataset):
 
                     if controls is not None:
                         item_info.control_content = controls
-                        # Add every control size to bucket_reso so that different control resolutions AND a
-                        # different number of control images go to different batches. Run this whenever control
-                        # data is present (not only for no_resize_control / control_resolution): otherwise items
-                        # with a different control count share a batch and the collator stacks a ragged batch.
-                        # controls is already in index order, so the appended shapes stay index-aligned.
-                        bucket_reso = list(bucket_reso)
-                        for control in controls:
-                            bucket_reso = bucket_reso + list(control.shape[0:2])
-                        bucket_reso = tuple(bucket_reso)
+                        if self.no_resize_control or self.control_resolution is not None:
+                            # Add control size to bucket_reso to make different control resolutions to different batch
+                            bucket_reso = list(bucket_reso)
+                            for control in controls:
+                                bucket_reso = bucket_reso + list(control.shape[0:2])
+                            bucket_reso = tuple(bucket_reso)
+
+                    if loss_mask is not None:
+                        item_info.loss_mask_content = loss_mask
 
                     if bucket_reso not in batches:
                         batches[bucket_reso] = []
@@ -436,14 +2711,30 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
-                image_key, images, caption, controls = op()
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+                result = op()
+                if len(result) == 4:
+                    image_key, images, caption, controls = result
+                    loss_mask = None
+                else:
+                    image_key, images, caption, controls, loss_mask = result
                 images: list[Image.Image]
                 image: Image.Image = images[0]  # use the first image as the main content
                 image_size = image.size
 
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
                 images = [resize_image_to_bucket(img, bucket_reso) for img in images]  # list of np.ndarray
+
+                resized_loss_mask = None
+                if loss_mask is not None:
+                    resized_loss_mask = loss_mask_to_float_array(loss_mask, bucket_reso)
+                elif self.default_loss_mask_path:
+                    resized_loss_mask = loss_mask_to_float_array(
+                        load_loss_mask_image(self.default_loss_mask_path, invert=self.loss_mask_invert),
+                        bucket_reso,
+                    )
 
                 resized_controls = None
                 if controls is not None:
@@ -458,7 +2749,10 @@ class ImageDataset(BaseDataset):
                                 max_width, max_height = self.control_resolution
                                 if width * height > max_width * max_height:
                                     width, height = BucketSelector.calculate_bucket_resolution(
-                                        control.size, self.control_resolution, architecture=self.architecture
+                                        control.size,
+                                        self.control_resolution,
+                                        architecture=self.architecture,
+                                        reference_downscale=getattr(self, "reference_downscale", 1),
                                     )
                             else:
                                 width = width - (width % bucket_selector.reso_steps)
@@ -469,7 +2763,10 @@ class ImageDataset(BaseDataset):
                     elif self.control_resolution is not None:
                         for control in controls:
                             control_bucket_reso = BucketSelector.calculate_bucket_resolution(
-                                control.size, self.control_resolution, architecture=self.architecture
+                                control.size,
+                                self.control_resolution,
+                                architecture=self.architecture,
+                                reference_downscale=getattr(self, "reference_downscale", 1),
                             )
                             resized_control = resize_image_to_bucket(control, control_bucket_reso)
                             resized_controls.append(resized_control)
@@ -478,7 +2775,7 @@ class ImageDataset(BaseDataset):
                             resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
-                return image_size, image_key, images, caption, resized_controls
+                return image_size, image_key, images, caption, resized_controls, resized_loss_mask
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
@@ -499,10 +2796,18 @@ class ImageDataset(BaseDataset):
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -519,9 +2824,16 @@ class ImageDataset(BaseDataset):
 
             item_key = "_".join(tokens[:-2])
             text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            _live_caption = ""
             if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+                if self.text_encoder_cache_optional:
+                    _live_caption = self._caption_for_te_optional_item(item_key) or ""
+                if not _live_caption:
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+                text_encoder_output_cache_file = None
+
+            audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 
@@ -532,22 +2844,63 @@ class ImageDataset(BaseDataset):
                     bucket_reso.append(len(self.fp_1f_clean_indices))
                     bucket_reso.append(self.fp_1f_no_post)
                 bucket_reso = tuple(bucket_reso)
-            # Split the bucket by control latents so that every item in a batch has the same number of
-            # control images AND matching per-control shapes. The collator stacks latents_control_{i}
-            # across the batch (see BucketBatchManager.__getitem__), so a count or shape mismatch produces
-            # a ragged stack (crash) or silently misaligns controls between samples. This must run whenever
-            # control data is present, not only for no_resize_control / control_resolution: even controls
-            # resized to the bucket resolution share that resolution but can still differ in *count*.
-            # find_keys returns the keys sorted, so the per-control order (and the index<->shape pairing,
-            # which remove_dtype_suffix keeps in each element) is deterministic across cache files.
-            control_keys = safetensors_utils.find_keys(cache_file, starts_with="latents_control_")
-            if control_keys:
-                # key: latents_control_{i}_FxHxW_dtype -> "latents_control_{i}_FxHxW" (index + shape)
-                control_shapes = [remove_dtype_suffix(key) for key in control_keys]
-                bucket_reso = tuple(list(bucket_reso) + control_shapes)
+            if self.no_resize_control or self.control_resolution is not None:
+                # we also need to split the bucket with control resolutions
+                control_keys = safetensors_utils.find_keys(cache_file, starts_with="latents_control_")
+                if control_keys:
+                    control_shapes = [remove_dtype_suffix(key) for key in control_keys]
+                    bucket_reso = tuple(list(bucket_reso) + control_shapes)  # (int, int, str...)
 
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
+            has_audio = os.path.exists(audio_latent_cache_file)
+            bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
+            bucket_reso = self._append_latent_guide_bucket_key(bucket_reso)
+            item_info = ItemInfo(item_key, _live_caption, image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+            # LTX-2: attach the dataset-level spatial-crop region to the TRAINING item.
+            if self.spatial_crop_enabled and self.spatial_crop_region is not None:
+                item_info.spatial_crop_region = self.spatial_crop_region
+
+            dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
+            item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
+
+            if self.latent_idx_guide_cache_directory:
+                guide_cache_path = self.get_latent_idx_guide_cache_path(item_info)
+                if os.path.exists(guide_cache_path):
+                    item_info.latent_idx_guide_cache_path = guide_cache_path
+                else:
+                    logger.warning("latent_idx guide cache not found, skipping item: %s", guide_cache_path)
+                    continue
+            if self.keyframe_guide_cache_directory:
+                guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
+                if os.path.exists(guide_cache_path):
+                    item_info.keyframe_guide_cache_path = guide_cache_path
+                    if getattr(self, "keyframe_guide_extras", None):
+                        _extra_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
+                        for _xp in _extra_paths:
+                            if not os.path.exists(_xp):
+                                raise FileNotFoundError(f"Extra keyframe guide cache file not found: {_xp}")
+                        item_info.keyframe_guide_extra_cache_paths = _extra_paths
+                else:
+                    logger.warning("keyframe guide cache not found, skipping item: %s", guide_cache_path)
+                    continue
+
+            if self.reference_cache_directories:
+                reference_cache_paths: list[str] = []
+                missing_reference_cache = False
+                for reference_cache_directory in self.reference_cache_directories:
+                    ref_cache_path = os.path.join(reference_cache_directory, os.path.basename(cache_file))
+                    if os.path.exists(ref_cache_path):
+                        reference_cache_paths.append(ref_cache_path)
+                    else:
+                        logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                        missing_reference_cache = True
+                        break
+                if missing_reference_cache:
+                    continue
+                if reference_cache_paths:
+                    item_info.reference_latent_cache_paths = reference_cache_paths
+                    item_info.reference_latent_cache_path = reference_cache_paths[0]
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -555,7 +2908,20 @@ class ImageDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            architecture=self.architecture,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
+            latent_idx_guide_frame_idx=self.latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=self.latent_idx_guide_strength,
+            keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
+            keyframe_guide_strength=self.keyframe_guide_strength,
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
@@ -575,9 +2941,369 @@ class ImageDataset(BaseDataset):
         return self.batch_manager[idx]
 
 
+class AudioDataset(BaseDataset):
+    def __init__(
+        self,
+        resolution: Tuple[int, int],
+        caption_extension: Optional[str],
+        batch_size: int,
+        num_repeats: int,
+        enable_bucket: bool,
+        bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
+        caption_field: Optional[str] = None,
+        audio_directory: Optional[str] = None,
+        audio_jsonl_file: Optional[str] = None,
+        cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
+        reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
+        reference_audio_cache_directory: Optional[str] = None,
+        reference_audio_cache_directories: Optional[Sequence[str]] = None,
+        separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+        cache_only: bool = False,
+        debug_dataset: bool = False,
+        architecture: str = "no_default",
+        audio_bucket_strategy: str = "pad",
+        audio_bucket_interval: float = 2.0,
+        latent_idx_guide_directory: Optional[str] = None,
+        latent_idx_guide_cache_directory: Optional[str] = None,
+        latent_idx_guide_frame_idx: int = 0,
+        latent_idx_guide_strength: float = 1.0,
+        keyframe_guide_directory: Optional[str] = None,
+        keyframe_guide_cache_directory: Optional[str] = None,
+        keyframe_guide_frame_idx: int = -1,
+        keyframe_guide_strength: float = 1.0,
+        keyframe_guide_extra_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
+        keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
+    ):
+        super(AudioDataset, self).__init__(
+            resolution,
+            caption_extension,
+            caption_field,
+            batch_size,
+            num_repeats,
+            enable_bucket,
+            bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
+            cache_directory,
+            reference_cache_directory,
+            reference_cache_directories,
+            reference_frames,
+            reference_audio_cache_directory,
+            reference_audio_cache_directories,
+            separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
+            debug_dataset,
+            architecture,
+            latent_idx_guide_directory=latent_idx_guide_directory,
+            latent_idx_guide_cache_directory=latent_idx_guide_cache_directory,
+            latent_idx_guide_frame_idx=latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=latent_idx_guide_strength,
+            keyframe_guide_directory=keyframe_guide_directory,
+            keyframe_guide_cache_directory=keyframe_guide_cache_directory,
+            keyframe_guide_frame_idx=keyframe_guide_frame_idx,
+            keyframe_guide_strength=keyframe_guide_strength,
+            keyframe_guide_extra_directories=keyframe_guide_extra_directories,
+            keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
+            keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
+            keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
+        )
+        self.audio_directory = audio_directory
+        self.audio_jsonl_file = audio_jsonl_file
+        self.cache_only = cache_only
+        self.audio_bucket_strategy = audio_bucket_strategy
+        self.audio_bucket_interval = audio_bucket_interval
+
+        if self.audio_bucket_strategy not in ("pad", "truncate"):
+            raise ValueError(f"audio_bucket_strategy must be 'pad' or 'truncate', got '{self.audio_bucket_strategy}'")
+
+        if self.cache_only:
+            self.datasource = None
+        elif audio_directory is not None:
+            self.datasource = AudioDirectoryDatasource(audio_directory, caption_extension, loss_mask_directory=loss_mask_directory)
+        elif audio_jsonl_file is not None:
+            self.datasource = AudioJsonlDatasource(
+                audio_jsonl_file,
+                caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+            )
+        else:
+            raise ValueError("audio_directory or audio_jsonl_file must be specified")
+
+        if self.cache_directory is None:
+            self.cache_directory = self.audio_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
+
+        self.batch_manager = None
+        self.num_train_items = 0
+
+    def get_metadata(self):
+        metadata = super().get_metadata()
+        if self.audio_directory is not None:
+            metadata["audio_directory"] = os.path.basename(self.audio_directory)
+        if self.audio_jsonl_file is not None:
+            metadata["audio_jsonl_file"] = os.path.basename(self.audio_jsonl_file)
+        metadata["cache_only"] = self.cache_only
+        return metadata
+
+    def _uses_ltx2_audio_video_geometry(self) -> bool:
+        return self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}
+
+    def _legacy_audio_latent_cache_path(self, item_key: str) -> str:
+        basename = os.path.splitext(os.path.basename(item_key))[0]
+        assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
+        return os.path.join(self.cache_directory, f"{basename}_0001x0001_{self.architecture}.safetensors")
+
+    def _legacy_strip_resolution_suffix(self, item_key: str) -> str:
+        suffix = "_0001x0001"
+        return item_key[: -len(suffix)] if item_key.endswith(suffix) else item_key
+
+    def retrieve_latent_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        data: list[ItemInfo] = []
+        futures = []
+
+        def aggregate_future(consume_all: bool = False):
+            while len(futures) >= num_workers or (consume_all and len(futures) > 0):
+                completed_futures = [future for future in futures if future.done()]
+                if len(completed_futures) == 0:
+                    if len(futures) >= num_workers or consume_all:
+                        time.sleep(0.1)
+                        continue
+                    break
+
+                for future in completed_futures:
+                    result = future.result()
+                    if len(result) == 2:
+                        audio_path, caption = result
+                        loss_mask_intervals = None
+                    else:
+                        audio_path, caption, loss_mask_intervals = result
+                    if self._uses_ltx2_audio_video_geometry():
+                        width, height = int(self.resolution[0]), int(self.resolution[1])
+                        bucket_reso = self._append_audio_bucket_key((width, height), True)
+                        item_info = ItemInfo(audio_path, caption, (width, height), bucket_reso)
+                        item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                    else:
+                        bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                        item_info = ItemInfo(audio_path, caption, (1, 1), bucket_reso)
+                        item_info.latent_cache_path = self._legacy_audio_latent_cache_path(audio_path)
+                    item_info.audio_latent_cache_path = self.get_audio_latent_cache_path(item_info)
+                    item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+                    item_info.audio_path = audio_path
+                    if loss_mask_intervals is None and self.default_loss_mask_path:
+                        loss_mask_intervals = load_audio_loss_mask_intervals(self.default_loss_mask_path)
+                    item_info.audio_loss_mask_intervals = loss_mask_intervals
+                    # Audio conditioning mask intervals (opt-in; separate directory + channel from the
+                    # loss mask). None when audio_cond_mask_directory is unset -> no cond mask cached.
+                    cond_mask_intervals = None
+                    if getattr(self, "audio_cond_mask_directory", None):
+                        cond_stem = os.path.splitext(os.path.basename(audio_path))[0]
+                        cond_mask_path = find_stem_matched_file(self.audio_cond_mask_directory, cond_stem, MASK_METADATA_EXTENSIONS)
+                        if cond_mask_path is not None and os.path.isfile(cond_mask_path):
+                            cond_mask_intervals = load_audio_cond_mask_intervals(cond_mask_path)
+                    item_info.audio_cond_mask_intervals = cond_mask_intervals
+                    data.append(item_info)
+                    futures.remove(future)
+
+        def submit_batch(flush: bool = False):
+            nonlocal data
+            if len(data) >= self.batch_size or (len(data) > 0 and flush):
+                batch = data[0 : self.batch_size]
+                if len(data) > self.batch_size:
+                    data = data[self.batch_size :]
+                else:
+                    data = []
+                return batch
+            return None
+
+        for fetch_op in self.datasource:
+            future = executor.submit(fetch_op)
+            futures.append(future)
+            aggregate_future()
+            while True:
+                batch = submit_batch()
+                if batch is None:
+                    break
+                if self._uses_ltx2_audio_video_geometry():
+                    yield (int(self.resolution[0]), int(self.resolution[1])), batch
+                else:
+                    yield (1, 1), batch
+
+        aggregate_future(consume_all=True)
+        while True:
+            batch = submit_batch(flush=True)
+            if batch is None:
+                break
+            if self._uses_ltx2_audio_video_geometry():
+                yield (int(self.resolution[0]), int(self.resolution[1])), batch
+            else:
+                yield (1, 1), batch
+        executor.shutdown()
+
+    def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
+        return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
+
+    def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
+        assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
+        audio_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_audio.safetensors"))
+        bucketed_item_info: dict[tuple[int, int], list[ItemInfo]] = {}
+
+        for audio_cache_file in audio_cache_files:
+            base = os.path.basename(audio_cache_file)
+            suffix = f"_{self.architecture}_audio.safetensors"
+            if not base.endswith(suffix):
+                continue
+            if self._uses_ltx2_audio_video_geometry():
+                latent_cache_file = os.path.join(
+                    self.cache_directory,
+                    base[: -len(suffix)] + f"_{self.architecture}.safetensors",
+                )
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
+
+                latent_stem = os.path.basename(latent_cache_file)[: -len(f"_{self.architecture}.safetensors")]
+                original_size = (int(self.resolution[0]), int(self.resolution[1]))
+                item_key = latent_stem
+                if "_" in latent_stem:
+                    key_stem, resolution_token = latent_stem.rsplit("_", 1)
+                    if "x" in resolution_token:
+                        w_s, h_s = resolution_token.split("x", 1)
+                        try:
+                            original_size = (int(w_s), int(h_s))
+                            item_key = key_stem
+                        except ValueError:
+                            item_key = latent_stem
+
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors"
+                )
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((original_size[0], original_size[1]), True)
+                item_info = ItemInfo(item_key, "", original_size, bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
+            else:
+                item_key = self._legacy_strip_resolution_suffix(base[: -len(suffix)])
+                latent_cache_file = os.path.join(self.cache_directory, f"{item_key}_0001x0001_{self.architecture}.safetensors")
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors"
+                )
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                item_info = ItemInfo(item_key, "", (1, 1), bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
+
+            # Duration bucketing: group audio clips by quantized length to minimize
+            # padding within batches.  Reads only the safetensors header (fast).
+            # Convert audio_bucket_interval (seconds) to latent frames (25 fps).
+            _AUDIO_DURATION_BUCKET_STEP = max(int(round(self.audio_bucket_interval * 25)), 1)
+            audio_key = safetensors_utils.find_key(audio_cache_file, starts_with="audio_latents_")
+            if audio_key is not None:
+                try:
+                    # key format: audio_latents_{T}x{F}x{C}_{dtype}
+                    dims_part = audio_key.split("_")[2]  # "{T}x{F}x{C}"
+                    audio_t = int(dims_part.split("x")[0])
+                    if self.audio_bucket_strategy == "truncate":
+                        # Floor division: all items in bucket have T >= quantized_t.
+                        # Items shorter than one bucket step would violate that invariant
+                        # (and break torch.stack in the truncate batch path), so key them
+                        # on their actual length — same-length clips co-bucket cleanly.
+                        floored = (audio_t // _AUDIO_DURATION_BUCKET_STEP) * _AUDIO_DURATION_BUCKET_STEP
+                        quantized_t = floored if floored >= _AUDIO_DURATION_BUCKET_STEP else audio_t
+                    else:
+                        # Round-to-nearest (pad mode). Pad batch path computes max_t from
+                        # actual shapes, so the bucket key only affects grouping efficiency.
+                        quantized_t = max(
+                            ((audio_t + _AUDIO_DURATION_BUCKET_STEP // 2) // _AUDIO_DURATION_BUCKET_STEP)
+                            * _AUDIO_DURATION_BUCKET_STEP,
+                            _AUDIO_DURATION_BUCKET_STEP,
+                        )
+                    bucket_reso = (*bucket_reso, quantized_t)
+                except (ValueError, IndexError):
+                    pass
+
+            bucket = bucketed_item_info.get(bucket_reso, [])
+            for _ in range(self.num_repeats):
+                bucket.append(item_info)
+            bucketed_item_info[bucket_reso] = bucket
+
+        target_fps = 24.0
+        if self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            target_fps = VideoDataset.TARGET_FPS_LTX2
+
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            architecture=self.architecture,
+            target_fps=target_fps,
+            audio_bucket_strategy=self.audio_bucket_strategy,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
+            latent_idx_guide_frame_idx=self.latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=self.latent_idx_guide_strength,
+            keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
+            keyframe_guide_strength=self.keyframe_guide_strength,
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
+        )
+        self.batch_manager.show_bucket_info()
+
+        self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
+
+    def shuffle_buckets(self):
+        random.seed(self.seed + self.current_epoch)
+        self.batch_manager.shuffle()
+
+    def __len__(self):
+        if self.batch_manager is None:
+            return 100
+        return len(self.batch_manager)
+
+    def __getitem__(self, idx):
+        super().__getitem__(idx)
+        return self.batch_manager[idx]
+
+
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
+    TARGET_FPS_LTX2 = 25.0
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
@@ -590,46 +3316,129 @@ class VideoDataset(BaseDataset):
         num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
+        caption_field: Optional[str] = None,
         frame_extraction: Optional[str] = "head",
         frame_stride: Optional[int] = 1,
         frame_sample: Optional[int] = 1,
         target_frames: Optional[list[int]] = None,
         max_frames: Optional[int] = None,
         source_fps: Optional[float] = None,
+        target_fps: Optional[float] = None,
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        reference_directory: Optional[str] = None,
+        reference_directories: Optional[Sequence[str]] = None,
+        reference_audio_directory: Optional[str] = None,
+        reference_audio_directories: Optional[Sequence[str]] = None,
         cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
+        reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
+        reference_audio_cache_directory: Optional[str] = None,
+        reference_audio_cache_directories: Optional[Sequence[str]] = None,
+        separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         fp_latent_window_size: Optional[int] = 9,
+        cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        latent_idx_guide_directory: Optional[str] = None,
+        latent_idx_guide_cache_directory: Optional[str] = None,
+        latent_idx_guide_frame_idx: int = 0,
+        latent_idx_guide_strength: float = 1.0,
+        keyframe_guide_directory: Optional[str] = None,
+        keyframe_guide_cache_directory: Optional[str] = None,
+        keyframe_guide_frame_idx: int = -1,
+        keyframe_guide_strength: float = 1.0,
+        keyframe_guide_extra_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_cache_directories: Optional[List[str]] = None,
+        keyframe_guide_extra_frame_idxs: Optional[List[int]] = None,
+        keyframe_guide_extra_strengths: Optional[List[float]] = None,
+        spatial_crop_region: Optional[Sequence[int]] = None,
+        audio_cond_mask_directory: Optional[str] = None,
+        bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None,
     ):
+        from musubi_tuner.ltx2_conditioning_routing import normalize_reference_target_frame_ranges
+
+        configured_references = list(reference_directories or ())
+        if not configured_references and reference_directory:
+            configured_references = [reference_directory]
+        self.reference_target_frame_ranges = normalize_reference_target_frame_ranges(
+            reference_target_frame_ranges,
+            reference_count=len(configured_references),
+        )
+
         super(VideoDataset, self).__init__(
             resolution,
             caption_extension,
+            caption_field,
             batch_size,
             num_repeats,
             enable_bucket,
             bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
             cache_directory,
+            reference_cache_directory,
+            reference_cache_directories,
+            reference_frames,
+            reference_audio_cache_directory,
+            reference_audio_cache_directories,
+            separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
             debug_dataset,
             architecture,
+            latent_idx_guide_directory=latent_idx_guide_directory,
+            latent_idx_guide_cache_directory=latent_idx_guide_cache_directory,
+            latent_idx_guide_frame_idx=latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=latent_idx_guide_strength,
+            keyframe_guide_directory=keyframe_guide_directory,
+            keyframe_guide_cache_directory=keyframe_guide_cache_directory,
+            keyframe_guide_frame_idx=keyframe_guide_frame_idx,
+            keyframe_guide_strength=keyframe_guide_strength,
+            keyframe_guide_extra_directories=keyframe_guide_extra_directories,
+            keyframe_guide_extra_cache_directories=keyframe_guide_extra_cache_directories,
+            keyframe_guide_extra_frame_idxs=keyframe_guide_extra_frame_idxs,
+            keyframe_guide_extra_strengths=keyframe_guide_extra_strengths,
+            spatial_crop_region=spatial_crop_region,
+            audio_cond_mask_directory=audio_cond_mask_directory,
+            bucket_batch_sizes=bucket_batch_sizes,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
+        self.reference_directories = _normalize_optional_path_list(reference_directory, reference_directories)
+        self.reference_directory = self.reference_directories[0] if self.reference_directories else None
+        self.reference_audio_directories = _normalize_optional_path_list(
+            reference_audio_directory,
+            reference_audio_directories,
+        )
+        self.reference_audio_directory = self.reference_audio_directories[0] if self.reference_audio_directories else None
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
         self.max_frames = max_frames
         self.source_fps = source_fps
         self.fp_latent_window_size = fp_latent_window_size
+        self.cache_only = cache_only
 
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
             self.target_fps = VideoDataset.TARGET_FPS_WAN
+        elif self.architecture == ARCHITECTURE_LTX2:
+            self.target_fps = target_fps if target_fps is not None else VideoDataset.TARGET_FPS_LTX2
         elif self.architecture == ARCHITECTURE_FRAMEPACK:
             self.target_fps = VideoDataset.TARGET_FPS_FRAMEPACK
         elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
@@ -658,24 +3467,41 @@ class VideoDataset(BaseDataset):
 
         self.target_frames = target_frames
 
-        if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+        if self.cache_only:
+            self.datasource = None
+        elif video_directory is not None:
+            self.datasource = VideoDirectoryDatasource(
+                video_directory,
+                caption_extension,
+                control_directory,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_invert=loss_mask_invert,
+            )
         elif video_jsonl_file is not None:
-            self.datasource = VideoJsonlDatasource(video_jsonl_file)
+            self.datasource = VideoJsonlDatasource(
+                video_jsonl_file,
+                caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_invert=loss_mask_invert,
+            )
+        else:
+            raise ValueError("video_directory or video_jsonl_file must be specified")
 
-        if self.frame_extraction == "uniform" and self.frame_sample == 1:
+        if not self.cache_only and self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
             logger.warning("frame_sample is set to 1 for frame_extraction=uniform. frame_extraction is changed to head.")
-        if self.frame_extraction == "head":
+        if not self.cache_only and self.frame_extraction == "head":
             # head extraction. we can limit the number of frames to be extracted
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
 
         if self.cache_directory is None:
             self.cache_directory = self.video_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
 
         self.batch_manager = None
         self.num_train_items = 0
-        self.has_control = self.datasource.has_control
+        self.has_control = self.datasource.has_control if self.datasource is not None else False
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -692,15 +3518,19 @@ class VideoDataset(BaseDataset):
         metadata["max_frames"] = self.max_frames
         metadata["source_fps"] = self.source_fps
         metadata["has_control"] = self.has_control
+        metadata["cache_only"] = self.cache_only
         return metadata
 
     def retrieve_latent_cache_batches(self, num_workers: int):
-        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
+        buckset_selector = BucketSelector(
+            self.resolution,
+            architecture=self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
         self.datasource.set_bucket_selector(buckset_selector)
-        if self.source_fps is not None:
-            self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
-        else:
-            self.datasource.set_source_and_target_fps(None, None)  # no conversion
+        self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
 
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
@@ -719,7 +3549,11 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control = future.result()
+                    res = future.result()
+                    if res is None:  # clip decoded to 0 frames (corrupt/undecodable) -> skip, keep loop healthy
+                        futures.remove(future)
+                        continue
+                    original_frame_size, video_key, video, caption, control, loss_mask = res
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -737,6 +3571,10 @@ class VideoDataset(BaseDataset):
                             last_frame = control[-1]
                             control.extend([last_frame] * (frame_count - len(control)))
                         control_video = np.stack(control, axis=0)
+
+                    loss_mask_video = None
+                    if loss_mask is not None:
+                        loss_mask_video = np.asarray(loss_mask, dtype=np.float32)
 
                     crop_pos_and_frames = []
                     if self.frame_extraction == "head":
@@ -785,11 +3623,34 @@ class VideoDataset(BaseDataset):
                         if control_video is not None:
                             cropped_control = control_video[crop_pos : crop_pos + target_frame]
 
+                        cropped_loss_mask = None
+                        if loss_mask_video is not None:
+                            cropped_loss_mask = loss_mask_video[crop_pos : crop_pos + target_frame]
+
                         item_info = ItemInfo(
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
+                        item_info.source_item_key = video_key
+                        item_info.target_fps = self.target_fps
+                        item_info.source_total_frames = frame_count
+                        item_info.chunk_start_frame = crop_pos
+                        item_info.chunk_num_frames = target_frame
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                        if self.reference_cache_directories:
+                            item_info.reference_latent_cache_paths = self.get_reference_latent_cache_paths(item_info)
+                            item_info.reference_latent_cache_path = item_info.reference_latent_cache_paths[0]
+                        if self.reference_audio_cache_directories:
+                            item_info.reference_audio_latent_cache_paths = self.get_reference_audio_latent_cache_paths(item_info)
+                            item_info.reference_audio_latent_cache_path = item_info.reference_audio_latent_cache_paths[0]
+                        if self.latent_idx_guide_cache_directory:
+                            item_info.latent_idx_guide_cache_path = self.get_latent_idx_guide_cache_path(item_info)
+                        if self.keyframe_guide_cache_directory:
+                            item_info.keyframe_guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
+                        if getattr(self, "keyframe_guide_extras", None):
+                            item_info.keyframe_guide_extra_cache_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
                         item_info.control_content = cropped_control  # None is allowed
+                        item_info.loss_mask_content = cropped_loss_mask
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 
                         batch = batches.get(batch_key, [])
@@ -811,16 +3672,25 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                    loss_mask = None
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                    loss_mask = None
+                else:
+                    video_key, video, caption, control, loss_mask = result
 
                 video: list[np.ndarray]
+                if not video:  # corrupt/undecodable clip -> 0 frames decoded; skip instead of crashing the whole cache job
+                    logger.warning(f"Skipping {video_key}: decoded to 0 frames (corrupt/undecodable) — excluded from cache")
+                    return None
                 frame_size = (video[0].shape[1], video[0].shape[0])
 
                 # resize if necessary
@@ -831,7 +3701,22 @@ class VideoDataset(BaseDataset):
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                resized_loss_mask = None
+                if loss_mask is not None:
+                    # Datasource already returns a float32 [0,1] ndarray pre-resized
+                    # to bucket_reso via load_loss_mask_frames; do not re-normalize.
+                    resized_loss_mask = np.asarray(loss_mask, dtype=np.float32)
+                elif self.default_loss_mask_path:
+                    resized_loss_mask = load_loss_mask_frames(
+                        self.default_loss_mask_path,
+                        bucket_reso=bucket_reso,
+                        frame_count=len(video),
+                        source_fps=self.source_fps,
+                        target_fps=self.target_fps,
+                        invert=self.loss_mask_invert,
+                    )
+
+                return frame_size, video_key, video, caption, control, resized_loss_mask
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)
@@ -852,10 +3737,18 @@ class VideoDataset(BaseDataset):
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -874,14 +3767,92 @@ class VideoDataset(BaseDataset):
 
             item_key = "_".join(tokens[:-3])
             text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            _live_caption = ""
             if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+                if self.text_encoder_cache_optional:
+                    _live_caption = self._caption_for_te_optional_item(item_key) or ""
+                if not _live_caption:
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+                text_encoder_output_cache_file = None
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
             bucket_reso = (*bucket_reso, frame_count)
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
+            audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
+            has_audio = os.path.exists(audio_latent_cache_file)
+            bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
+            bucket_reso = self._append_latent_guide_bucket_key(bucket_reso)
+            item_info = ItemInfo(
+                item_key, _live_caption, image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file
+            )
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+            # LTX-2: attach the dataset-level spatial-crop region to the training item.
+            if self.spatial_crop_enabled and self.spatial_crop_region is not None:
+                item_info.spatial_crop_region = self.spatial_crop_region
+
+            dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
+            item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
+
+            if self.latent_idx_guide_cache_directory:
+                guide_cache_path = self.get_latent_idx_guide_cache_path(item_info)
+                if os.path.exists(guide_cache_path):
+                    item_info.latent_idx_guide_cache_path = guide_cache_path
+                else:
+                    logger.warning("latent_idx guide cache not found, skipping item: %s", guide_cache_path)
+                    continue
+            if self.keyframe_guide_cache_directory:
+                guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
+                if os.path.exists(guide_cache_path):
+                    item_info.keyframe_guide_cache_path = guide_cache_path
+                    if getattr(self, "keyframe_guide_extras", None):
+                        _extra_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
+                        for _xp in _extra_paths:
+                            if not os.path.exists(_xp):
+                                raise FileNotFoundError(f"Extra keyframe guide cache file not found: {_xp}")
+                        item_info.keyframe_guide_extra_cache_paths = _extra_paths
+                else:
+                    logger.warning("keyframe guide cache not found, skipping item: %s", guide_cache_path)
+                    continue
+
+            if self.reference_cache_directories:
+                reference_cache_paths: list[str] = []
+                missing_reference_cache = False
+                for reference_cache_directory in self.reference_cache_directories:
+                    ref_cache_path = os.path.join(reference_cache_directory, os.path.basename(cache_file))
+                    if os.path.exists(ref_cache_path):
+                        reference_cache_paths.append(ref_cache_path)
+                    else:
+                        logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                        missing_reference_cache = True
+                        break
+                if missing_reference_cache:
+                    continue
+                if reference_cache_paths:
+                    item_info.reference_latent_cache_paths = reference_cache_paths
+                    item_info.reference_latent_cache_path = reference_cache_paths[0]
+            if self.reference_audio_cache_directories:
+                reference_audio_cache_paths: list[str] = []
+                missing_reference_audio_cache = False
+                for reference_audio_cache_directory in self.reference_audio_cache_directories:
+                    ref_audio_cache_path = os.path.join(
+                        reference_audio_cache_directory,
+                        os.path.basename(cache_file).replace(
+                            f"_{self.architecture}.safetensors",
+                            f"_{self.architecture}_audio.safetensors",
+                        ),
+                    )
+                    if os.path.exists(ref_audio_cache_path):
+                        reference_audio_cache_paths.append(ref_audio_cache_path)
+                    else:
+                        logger.warning(f"Reference audio cache not found, skipping item: {ref_audio_cache_path}")
+                        missing_reference_audio_cache = True
+                        break
+                if missing_reference_audio_cache:
+                    continue
+                if reference_audio_cache_paths:
+                    item_info.reference_audio_latent_cache_paths = reference_audio_cache_paths
+                    item_info.reference_audio_latent_cache_path = reference_audio_cache_paths[0]
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -889,7 +3860,22 @@ class VideoDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            architecture=self.architecture,
+            target_fps=self.target_fps,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
+            latent_idx_guide_frame_idx=self.latent_idx_guide_frame_idx,
+            latent_idx_guide_strength=self.latent_idx_guide_strength,
+            keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
+            keyframe_guide_strength=self.keyframe_guide_strength,
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
+            bucket_batch_sizes=self.bucket_batch_sizes,
+            reference_target_frame_ranges=getattr(self, "reference_target_frame_ranges", None),
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
@@ -910,9 +3896,9 @@ class VideoDataset(BaseDataset):
 
 
 class DatasetGroup(torch.utils.data.ConcatDataset):
-    def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset]]):
+    def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset, AudioDataset]]):
         super().__init__(datasets)
-        self.datasets: list[Union[ImageDataset, VideoDataset]] = datasets
+        self.datasets: list[Union[ImageDataset, VideoDataset, AudioDataset]] = datasets
         self.num_train_items = 0
         for dataset in self.datasets:
             self.num_train_items += dataset.num_train_items

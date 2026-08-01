@@ -131,6 +131,7 @@ The following `--network_args` options are available for both LoHa and LoKr, sam
 |---|---|
 | `verbose=True` | Display detailed information about the network modules |
 | `rank_dropout=0.1` | Apply dropout to the rank dimension during training |
+| `rank_dropout_scale=True` | Use the LyCORIS stochastic rank-dropout renorm (`drop/drop.mean()`); default keeps the deterministic `1/(1-rank_dropout)` |
 | `module_dropout=0.1` | Randomly skip entire modules during training |
 | `exclude_patterns=[r'...']` | Exclude modules matching the regex patterns (in addition to architecture defaults) |
 | `include_patterns=[r'...']` | Include only modules matching the regex patterns |
@@ -146,6 +147,7 @@ See [Advanced configuration](advanced_config.md) for details on how to specify `
 |---|---|
 | `verbose=True` | ネットワークモジュールの詳細情報を表示 |
 | `rank_dropout=0.1` | 学習時にランク次元にドロップアウトを適用 |
+| `rank_dropout_scale=True` | LyCORIS方式の確率的ランクドロップアウト補正（`drop/drop.mean()`）を使用。デフォルトは決定的な `1/(1-rank_dropout)` |
 | `module_dropout=0.1` | 学習時にモジュール全体をランダムにスキップ |
 | `exclude_patterns=[r'...']` | 正規表現パターンに一致するモジュールを除外（アーキテクチャのデフォルトに追加） |
 | `include_patterns=[r'...']` | 正規表現パターンに一致するモジュールのみを対象とする |

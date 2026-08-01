@@ -1,107 +1,80 @@
-"""HunyuanVideo training entry point.
-
-Defines HunyuanVideoNetworkTrainer, the concrete NetworkTrainer subclass for
-HunyuanVideo. The shared NetworkTrainer base class and helpers live under the
-musubi_tuner.training package; this module re-exports those symbols so existing
-imports from architecture-specific training scripts (wan_train_network,
-fpack_train_network, ...) keep working.
-"""
-
 import argparse
-import logging
-from typing import Optional
+from typing import Any, Optional
+from PIL import Image
+
 
 import torch
 from tqdm import tqdm
-from PIL import Image
 from accelerate import Accelerator
 
-from musubi_tuner import convert_lora
-from musubi_tuner.training.trainer_base import (
-    DiTOutput,
-    NetworkTrainer,
-    SS_METADATA_KEY_BASE_MODEL_VERSION,
-    SS_METADATA_KEY_NETWORK_MODULE,
-    SS_METADATA_KEY_NETWORK_DIM,
-    SS_METADATA_KEY_NETWORK_ALPHA,
-    SS_METADATA_KEY_NETWORK_ARGS,
-    SS_METADATA_MINIMUM_KEYS,
-)
-from musubi_tuner.training.accelerator_setup import (
-    clean_memory_on_device,
-    collator_class,
-    prepare_accelerator,
-)
-from musubi_tuner.training.sampling_prompts import (
-    line_to_prompt_dict,
-    load_prompts,
-    should_sample_images,
-)
-from musubi_tuner.training.timesteps import (
-    compute_density_for_timestep_sampling,
-    compute_loss_weighting_for_sd3,
-    get_sigmas,
-)
-from musubi_tuner.training.parser_common import (
-    setup_parser_common,
-    read_config_from_file,
-)
-
-from musubi_tuner.hunyuan_model.models import (
-    load_transformer as hv_load_transformer,
-    get_rotary_pos_embed_by_shape,
-    HYVideoDiffusionTransformer,
-)
+from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape, HYVideoDiffusionTransformer
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
-from musubi_tuner.hunyuan_model.vae import load_vae as hv_load_vae, VAE_VER
+from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-import musubi_tuner.networks.lora as lora_module
-from musubi_tuner.dataset.image_video_dataset import (
-    ARCHITECTURE_HUNYUAN_VIDEO,
-    ARCHITECTURE_HUNYUAN_VIDEO_FULL,
-)
+from musubi_tuner.training import metadata as _metadata
+from musubi_tuner.training import outputs as _outputs
+from musubi_tuner.training.trainer_ext import NetworkTrainer as BaseNetworkTrainer
+from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO, ARCHITECTURE_HUNYUAN_VIDEO_FULL
 from musubi_tuner.hv_generate_video import resize_image_to_bucket, encode_to_latents
+
+import logging
+
 from musubi_tuner.utils import model_utils
 
-# accelerate.set_seed is re-exported because qwen_image_train.py and
-# zimage_train.py import it from this module.
-from accelerate.utils import set_seed
-
-__all__ = [
-    # trainer_base
-    "DiTOutput",
-    "NetworkTrainer",
-    "HunyuanVideoNetworkTrainer",
-    "SS_METADATA_KEY_BASE_MODEL_VERSION",
-    "SS_METADATA_KEY_NETWORK_MODULE",
-    "SS_METADATA_KEY_NETWORK_DIM",
-    "SS_METADATA_KEY_NETWORK_ALPHA",
-    "SS_METADATA_KEY_NETWORK_ARGS",
-    "SS_METADATA_MINIMUM_KEYS",
-    # accelerator_setup
-    "clean_memory_on_device",
-    "collator_class",
-    "prepare_accelerator",
-    # sampling_prompts
-    "line_to_prompt_dict",
-    "load_prompts",
-    "should_sample_images",
-    # timesteps
-    "compute_density_for_timestep_sampling",
-    "compute_loss_weighting_for_sd3",
-    "get_sigmas",
-    # parser_common
-    "setup_parser_common",
-    "read_config_from_file",
-    # accelerate
-    "set_seed",
-]
-
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-class HunyuanVideoNetworkTrainer(NetworkTrainer):
+DiTOutput = _outputs.DiTOutput
+SS_METADATA_KEY_BASE_MODEL_VERSION = _metadata.SS_METADATA_KEY_BASE_MODEL_VERSION
+SS_METADATA_KEY_NETWORK_MODULE = _metadata.SS_METADATA_KEY_NETWORK_MODULE
+SS_METADATA_KEY_NETWORK_DIM = _metadata.SS_METADATA_KEY_NETWORK_DIM
+SS_METADATA_KEY_NETWORK_ALPHA = _metadata.SS_METADATA_KEY_NETWORK_ALPHA
+SS_METADATA_KEY_NETWORK_ARGS = _metadata.SS_METADATA_KEY_NETWORK_ARGS
+SS_METADATA_MINIMUM_KEYS = _metadata.SS_METADATA_MINIMUM_KEYS
+
+
+from musubi_tuner.training import runtime_utils as _runtime_utils  # noqa: E402
+
+configure_console_output_for_help = _runtime_utils.configure_console_output_for_help  # noqa: F811
+_update_global_peak = _runtime_utils.update_global_peak  # noqa: F811
+_log_vram = _runtime_utils.log_vram  # noqa: F811
+_log_cuda_memory_stats = _runtime_utils.log_cuda_memory_stats  # noqa: F811
+offload_optimizer_state_during_validation = _runtime_utils.offload_optimizer_state_during_validation  # noqa: F811
+
+
+from musubi_tuner.training import losses as _losses  # noqa: E402
+
+_per_element_loss = _losses.per_element_loss  # noqa: F811
+apply_loss_mask = _losses.apply_loss_mask  # noqa: F811
+
+
+from musubi_tuner.training import accelerator_setup as _accelerator_setup  # noqa: E402
+from musubi_tuner.training import sampling_prompts as _sampling_prompts  # noqa: E402
+from musubi_tuner.training import timesteps as _timesteps  # noqa: E402
+
+clean_memory_on_device = _accelerator_setup.clean_memory_on_device  # noqa: F811
+collator_class = _accelerator_setup.collator_class  # noqa: F811,N816
+prepare_accelerator = _accelerator_setup.prepare_accelerator  # noqa: F811
+line_to_prompt_dict = _sampling_prompts.line_to_prompt_dict  # noqa: F811
+load_prompts = _sampling_prompts.load_prompts  # noqa: F811
+should_sample_images = _sampling_prompts.should_sample_images  # noqa: F811
+compute_density_for_timestep_sampling = _timesteps.compute_density_for_timestep_sampling  # noqa: F811
+get_sigmas = _timesteps.get_sigmas  # noqa: F811
+compute_loss_weighting_for_sd3 = _timesteps.compute_loss_weighting_for_sd3  # noqa: F811
+
+
+class HunyuanVideoNetworkTrainer(BaseNetworkTrainer):
+    def __init__(self):
+        self.blocks_to_swap = None
+        self.timestep_range_pool = []
+        self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
+        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
+        self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._current_batch_latents_info: Optional[dict[str, Any]] = None
+        self.training = False
+
     # region model specific
 
     @property
@@ -122,16 +95,6 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
         self._control_training = False  # HunyuanVideo does not support control training yet
 
         self.default_guidance_scale = 6.0
-
-    def convert_weight_keys(self, weights_sd: dict[str, torch.Tensor], network_module: lora_module):
-        keys = list(weights_sd.keys())
-        if keys[0].startswith("lora_"):
-            return weights_sd  # default format
-        if keys[0].startswith("diffusion_model.") or keys[0].startswith("transformer."):
-            # Diffusers? format
-            logger.info("converting LoRA weights from diffusers format to default format")
-            return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
-        return weights_sd  # unknown format, return as is
 
     def process_sample_prompts(
         self,
@@ -358,7 +321,7 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
         return video
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
-        vae, _, s_ratio, t_ratio = hv_load_vae(vae_dtype=vae_dtype, device="cpu", vae_path=vae_path)
+        vae, _, s_ratio, t_ratio = load_vae(vae_dtype=vae_dtype, device="cpu", vae_path=vae_path)
 
         if args.vae_chunk_size is not None:
             vae.set_chunk_size_for_causal_conv_3d(args.vae_chunk_size)
@@ -382,7 +345,7 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
-        transformer = hv_load_transformer(dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype, args.dit_in_channels)
+        transformer = load_transformer(dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype, args.dit_in_channels)
 
         if args.img_in_txt_in_offloading:
             logger.info("Enable offloading img_in and txt_in to CPU")
@@ -419,8 +382,7 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-        **kwargs,
-    ) -> DiTOutput:
+    ):
         transformer: HYVideoDiffusionTransformer = transformer_arg
         bsz = latents.shape[0]
 
@@ -466,9 +428,18 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
         # flow matching loss
         target = noise - latents
 
-        return DiTOutput(pred=model_pred, target=target)
+        return model_pred, target
 
     # endregion model specific
+
+
+NetworkTrainer = HunyuanVideoNetworkTrainer
+
+
+from musubi_tuner.training import parser_common as _parser_common  # noqa: E402
+
+setup_parser_common = _parser_common.setup_parser_common  # noqa: F811
+read_config_from_file = _parser_common.read_config_from_file  # noqa: F811
 
 
 def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -490,6 +461,12 @@ def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
     )
+
+    # GUI dashboard
+    parser.add_argument("--gui", action="store_true", help="enable live web training dashboard")
+    parser.add_argument("--gui_port", type=int, default=7860, help="port for the GUI dashboard server")
+    parser.add_argument("--gui_host", type=str, default="0.0.0.0", help="host for the GUI dashboard server")
+
     return parser
 
 
@@ -502,7 +479,7 @@ def main():
 
     args.fp8_scaled = False  # HunyuanVideo does not support this yet
 
-    trainer = HunyuanVideoNetworkTrainer()
+    trainer = NetworkTrainer()
     trainer.train(args)
 
 

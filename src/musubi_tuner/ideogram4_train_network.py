@@ -13,7 +13,7 @@ from musubi_tuner.ideogram4.sampling_policy import should_use_unconditional_dit_
 from musubi_tuner.ideogram4.sampler_configs import PRESETS
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import load_prompts
-from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
+from musubi_tuner.training.trainer_ext import DiTOutput, NetworkTrainer
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 

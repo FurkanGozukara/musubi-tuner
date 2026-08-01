@@ -1,6 +1,6 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -269,7 +269,9 @@ def load_safetensors_with_fp8_optimization(
     block_size: Optional[int] = 64,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
     allow_prequantized_fp8: bool = False,
+    placement_fn: Optional[Callable[[str, torch.device], torch.device]] = None,
 ) -> dict:
     """
     Load weight tensors from safetensors files and merge LoRA weights into the state dict with explicit FP8 optimization.
@@ -287,6 +289,7 @@ def load_safetensors_with_fp8_optimization(
         block_size (int, optional): Block size for block-wise quantization (used if quantization_mode is "block")
         disable_numpy_memmap (bool): Disable numpy memmap when loading safetensors
         weight_transform_hooks (WeightTransformHooks, optional): Hooks for weight transformation during loading
+        key_filter (Callable[[str], bool], optional): Optional predicate for skipping checkpoint keys before tensor loading.
         allow_prequantized_fp8 (bool): If True, target weights that are already FP8 are kept as-is instead of
             raising; their scale is expected to be supplied separately (e.g. via weight_transform_hooks).
 
@@ -320,12 +323,48 @@ def load_safetensors_with_fp8_optimization(
         with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as original_f:
             f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
 
-            keys = f.keys()
-            use_prefetch = weight_transform_hooks is None and calc_device is not None and torch.device(calc_device).type != "cpu"
+            keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
+
+            # Detect pre-quantized FP8 checkpoint (e.g. ltx-2.3-22b-dev-fp8.safetensors)
+            # These have weight_scale/input_scale keys alongside F8_E4M3 weights.
+            # We skip scale keys during iteration and use them to dequantize weights.
+            checkpoint_scale_keys = set(k for k in keys if k.endswith(".weight_scale") or k.endswith(".input_scale"))
+            if checkpoint_scale_keys:
+                logger.info(
+                    f"Detected pre-quantized FP8 checkpoint with {len(checkpoint_scale_keys)} scale keys. "
+                    f"Will dequantize to bf16 before re-quantizing with FP8 scheme."
+                )
+
+            use_prefetch = (
+                weight_transform_hooks is None
+                and calc_device is not None
+                and torch.device(calc_device).type != "cpu"
+                and not checkpoint_scale_keys
+            )
             tensors = _prefetch_tensors(f, keys) if use_prefetch else ((key, f.get_tensor(key)) for key in keys)
             for key, value in tqdm(tensors, total=len(keys), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                # Skip scale keys from pre-quantized checkpoints — consumed via the .weight key
+                if key in checkpoint_scale_keys:
+                    continue
+
                 # Save original device
                 original_device = value.device  # usually cpu
+
+                # Dequantize pre-quantized FP8 weights BEFORE weight_hook (LoRA merge),
+                # so the hook receives correct bf16 values instead of raw fp8.
+                # When allow_prequantized_fp8 is set, the weights are kept in FP8 and handled by the
+                # pass-through path below (scale supplied separately), so skip dequantization here.
+                if value.dtype.itemsize == 1 and key.endswith(".weight") and not allow_prequantized_fp8:
+                    ckpt_scale_key = key.replace(".weight", ".weight_scale")
+                    if ckpt_scale_key in checkpoint_scale_keys:
+                        ckpt_scale = original_f.get_tensor(ckpt_scale_key).to(value.device)
+                        value = value.to(torch.bfloat16) * ckpt_scale
+                        logger.debug(f"Dequantized pre-quantized FP8 weight: {key}")
+                    else:
+                        raise ValueError(
+                            f"Layer {key} is already in {value.dtype} format. "
+                            f"`--fp8_scaled` optimization should not be applied. Please use fp16/bf16/float32 model weights."
+                        )
 
                 if weight_hook is not None:
                     # Apply weight hook if provided
@@ -333,6 +372,8 @@ def load_safetensors_with_fp8_optimization(
 
                 if not is_target_key(key):
                     target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                    if placement_fn is not None:
+                        target_device = placement_fn(key, target_device)
                     value = value.to(target_device)
                     state_dict[key] = value
                     continue
@@ -349,6 +390,8 @@ def load_safetensors_with_fp8_optimization(
                         # (e.g. renamed to `.scale_weight` via weight_transform_hooks).
                         if not move_to_device:
                             value = value.to(original_device)
+                        if placement_fn is not None:
+                            value = value.to(placement_fn(key, value.device))
                         state_dict[key] = value
                         optimized_count += 1
                         continue
@@ -367,6 +410,8 @@ def load_safetensors_with_fp8_optimization(
 
                 if not move_to_device:
                     quantized_weight = quantized_weight.to(original_device)
+                if placement_fn is not None:
+                    quantized_weight = quantized_weight.to(placement_fn(fp8_key, quantized_weight.device))
 
                 # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
                 scale_tensor = scale_tensor.to(dtype=original_dtype, device=quantized_weight.device)

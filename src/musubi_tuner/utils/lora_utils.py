@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 import torch
 
 import logging
@@ -23,14 +23,22 @@ from musubi_tuner.utils.safetensors_utils import (
 
 
 def detect_network_type(lora_sd: Dict[str, torch.Tensor]) -> str:
-    """Detect network type (lora, loha, lokr) from state dict keys."""
+    """Detect network type (lora, dora_oft, loha, lokr, dokr) from state dict keys."""
+    has_lokr = any("lokr_w1" in key for key in lora_sd)
+    has_dora_magnitude = any("lora_magnitude_vector" in key for key in lora_sd)
+    has_oft = any(".oft_R.weight" in key for key in lora_sd)
+    has_dora_oft = any(".dora_scale" in key for key in lora_sd) and has_oft
+    if has_lokr and has_dora_magnitude:
+        return "dokr"
+    if has_lokr:
+        return "lokr"
+    if has_dora_oft or has_oft:
+        return "dora_oft"
     for key in lora_sd:
         if "lora_down" in key:
             return "lora"
         if "hada_w1_a" in key:
             return "loha"
-        if "lokr_w1" in key:
-            return "lokr"
     return "lora"  # default
 
 
@@ -74,8 +82,10 @@ def load_safetensors_with_lora_and_fp8(
     exclude_keys: Optional[List[str]] = None,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
     allow_prequantized_fp8: bool = False,
     quantizer=None,
+    placement_fn=None,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -94,6 +104,7 @@ def load_safetensors_with_lora_and_fp8(
         quantizer: Optional quantization strategy object with its own streaming loader
             (e.g. ConvRotInt8Quantizer). Mutually exclusive with fp8_optimization. The LoRA
             merge weight_hook is passed through, so LoRA is merged before quantization.
+        key_filter (Optional[Callable[[str], bool]]): Optional predicate for skipping checkpoint keys before tensor loading.
     """
 
     # if the file name ends with 00001-of-00004 etc, we need to load the files with the same prefix
@@ -160,6 +171,14 @@ def load_safetensors_with_lora_and_fp8(
                     from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
 
                     model_weight = lokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
+                elif net_type == "dokr":
+                    from musubi_tuner.networks.lokr import merge_weights_to_tensor as dokr_merge
+
+                    model_weight = dokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
+                elif net_type == "dora_oft":
+                    from musubi_tuner.networks.lora import merge_weights_to_tensor as lora_merge
+
+                    model_weight = lora_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
                 else:
                     # standard LoRA (lora_down/lora_up)
                     down_key = lora_name + ".lora_down.weight"
@@ -232,8 +251,10 @@ def load_safetensors_with_lora_and_fp8(
         weight_hook=weight_hook,
         disable_numpy_memmap=disable_numpy_memmap,
         weight_transform_hooks=weight_transform_hooks,
+        key_filter=key_filter,
         allow_prequantized_fp8=allow_prequantized_fp8,
         quantizer=quantizer,
+        placement_fn=placement_fn,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -257,8 +278,10 @@ def load_safetensors_with_fp8_optimization_and_hook(
     weight_hook: callable = None,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
     allow_prequantized_fp8: bool = False,
     quantizer=None,
+    placement_fn=None,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
@@ -288,7 +311,9 @@ def load_safetensors_with_fp8_optimization_and_hook(
             weight_hook=weight_hook,
             disable_numpy_memmap=disable_numpy_memmap,
             weight_transform_hooks=weight_transform_hooks,
+            key_filter=key_filter,
             allow_prequantized_fp8=allow_prequantized_fp8,
+            placement_fn=placement_fn,
         )
     else:
         logger.info(
@@ -298,11 +323,40 @@ def load_safetensors_with_fp8_optimization_and_hook(
         for model_file in model_files:
             with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as original_f:
                 f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
-                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False):
-                    if weight_hook is None and move_to_device:
+                all_keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
+
+                # Detect pre-quantized FP8 checkpoint scale keys
+                checkpoint_scale_keys = set(k for k in all_keys if k.endswith(".weight_scale") or k.endswith(".input_scale"))
+                # Always dequantize to a compute-capable dtype (not FP8 — CPU doesn't support FP8 arithmetic)
+                deq_dtype = dit_weight_dtype if dit_weight_dtype is not None and dit_weight_dtype.itemsize > 1 else torch.bfloat16
+                if checkpoint_scale_keys:
+                    logger.info(
+                        f"Detected pre-quantized FP8 checkpoint with {len(checkpoint_scale_keys)} scale keys. "
+                        f"Will dequantize to {deq_dtype} during loading."
+                    )
+
+                for key in tqdm(all_keys, desc=f"Loading {os.path.basename(model_file)}", leave=False):
+                    # Skip scale keys from pre-quantized checkpoints
+                    if key in checkpoint_scale_keys:
+                        continue
+
+                    if weight_hook is None and move_to_device and not checkpoint_scale_keys:
                         value = f.get_tensor(key, device=calc_device, dtype=dit_weight_dtype)
                     else:
                         value = f.get_tensor(key)  # we cannot directly load to device because get_tensor does non-blocking transfer
+
+                        # Dequantize pre-quantized FP8 weights using checkpoint's scale
+                        if value.dtype.itemsize == 1 and key.endswith(".weight"):
+                            ckpt_scale_key = key.replace(".weight", ".weight_scale")
+                            if ckpt_scale_key in checkpoint_scale_keys:
+                                ckpt_scale = original_f.get_tensor(ckpt_scale_key).to(value.device)
+                                value = value.to(deq_dtype) * ckpt_scale
+                            else:
+                                logger.warning(
+                                    f"Layer {key} is in {value.dtype} format without a weight_scale. "
+                                    f"Casting to {deq_dtype} without dequantization — values may be incorrect."
+                                )
+
                         if weight_hook is not None:
                             value = weight_hook(key, value, keep_on_calc_device=move_to_device)
                         if move_to_device:
@@ -310,6 +364,8 @@ def load_safetensors_with_fp8_optimization_and_hook(
                         elif dit_weight_dtype is not None:
                             value = value.to(dit_weight_dtype)
 
+                    if placement_fn is not None:
+                        value = value.to(placement_fn(key, value.device))
                     state_dict[key] = value
         if move_to_device:
             synchronize_device(calc_device)

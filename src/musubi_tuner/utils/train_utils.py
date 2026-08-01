@@ -1,7 +1,11 @@
 import argparse
+import json
 import logging
 import os
+import re
 import shutil
+import time
+from contextlib import contextmanager
 from typing import Callable
 
 import accelerate
@@ -15,13 +19,215 @@ logging.basicConfig(level=logging.INFO)
 
 
 # checkpointファイル名
+STATE_MANIFEST_NAME = "state_manifest.json"
+RESUME_METADATA_NAME = "resume_metadata.json"
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
 EPOCH_DIFFUSERS_DIR_NAME = "{}-{:06d}"
 LAST_STATE_NAME = "{}-state"
+INTERRUPT_STATE_NAME = "{}-interrupt-step{:08d}-state"
+INTERRUPT_STATE_UNIQUE_NAME = "{}-interrupt-step{:08d}-{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+
+SAVE_STATE_MODE_FULL = "full"
+SAVE_STATE_MODE_MINIMAL = "minimal"
+SAVE_STATE_MODES = {SAVE_STATE_MODE_FULL, SAVE_STATE_MODE_MINIMAL}
+
+
+def get_save_state_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "save_state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower()
+    if mode not in SAVE_STATE_MODES:
+        raise ValueError(f"--save_state_mode must be one of: {', '.join(sorted(SAVE_STATE_MODES))}")
+    return mode
+
+
+def save_resume_metadata(
+    state_dir: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+    state_mode: str = SAVE_STATE_MODE_FULL,
+):
+    """Save resume metadata alongside an accelerator state checkpoint."""
+    metadata = {"global_step": global_step, "step_in_epoch": step_in_epoch, "epoch": epoch, "state_mode": state_mode}
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(metadata, f)
+    os.replace(tmp_path, path)
+
+
+def load_resume_metadata(state_dir: str) -> dict | None:
+    """Load resume metadata from a state directory, or None if not present (old checkpoint)."""
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_state_manifest(
+    state_dir: str,
+    *,
+    state_type: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+    state_mode: str = SAVE_STATE_MODE_FULL,
+) -> None:
+    """Write a completion marker after accelerator.save_state() finishes."""
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    files = sorted(
+        name for name in os.listdir(state_dir) if os.path.isfile(os.path.join(state_dir, name)) and name != STATE_MANIFEST_NAME
+    )
+    manifest = {
+        "format_version": 1,
+        "complete": True,
+        "state_type": state_type,
+        "state_mode": state_mode,
+        "global_step": int(global_step or 0),
+        "step_in_epoch": int(step_in_epoch or 0),
+        "epoch": int(epoch or 0),
+        "files": files,
+        "saved_at": time.time(),
+    }
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def load_state_manifest(state_dir: str) -> dict | None:
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            manifest = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(manifest, dict) or not manifest.get("complete"):
+        return None
+    return manifest
+
+
+def state_manifest_mode(state_dir: str) -> str | None:
+    manifest = load_state_manifest(state_dir)
+    if manifest is None:
+        return None
+    return str(manifest.get("state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower()
+
+
+def is_minimal_state_dir(state_dir: str) -> bool:
+    return state_manifest_mode(state_dir) == SAVE_STATE_MODE_MINIMAL
+
+
+def _has_state_payload_files(state_dir: str, *, require_optimizer: bool = True) -> bool:
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return False
+
+    has_model = any(
+        name in {"model.safetensors", "pytorch_model.bin"} or re.match(r"model_\d+\.(safetensors|bin)$", name) for name in names
+    )
+    has_optimizer = any(name == "optimizer.bin" or re.match(r"optimizer_\d+\.bin$", name) for name in names)
+    return has_model and (has_optimizer or not require_optimizer)
+
+
+def is_complete_state_dir(state_dir: str) -> bool:
+    """Return True when a local accelerator state directory still has its required files."""
+    if not os.path.isdir(state_dir):
+        return False
+
+    manifest = load_state_manifest(state_dir)
+    if manifest is not None:
+        if str(manifest.get("state_mode", SAVE_STATE_MODE_FULL) or SAVE_STATE_MODE_FULL).lower() == SAVE_STATE_MODE_MINIMAL:
+            return False
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            return False
+        try:
+            for name in files:
+                if not isinstance(name, str) or not os.path.isfile(os.path.join(state_dir, name)):
+                    return False
+        except OSError:
+            return False
+        return _has_state_payload_files(state_dir)
+
+    metadata_path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    scheduler_path = os.path.join(state_dir, "scheduler.bin")
+    if not os.path.isfile(metadata_path) and not os.path.isfile(scheduler_path):
+        return False
+
+    return _has_state_payload_files(state_dir)
+
+
+@contextmanager
+def _without_accelerator_runtime_state(accelerator: accelerate.Accelerator):
+    """Temporarily omit heavy runtime objects from accelerator.save_state()."""
+
+    attrs = ("_optimizers", "_schedulers", "_dataloaders")
+    originals = {}
+    for attr in attrs:
+        if hasattr(accelerator, attr):
+            originals[attr] = getattr(accelerator, attr)
+            setattr(accelerator, attr, [])
+
+    try:
+        yield
+    finally:
+        for attr, value in originals.items():
+            setattr(accelerator, attr, value)
+
+
+def save_accelerator_state(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    state_dir: str,
+) -> str:
+    """Save accelerator state and return the effective state mode."""
+
+    state_mode = get_save_state_mode(args)
+    if state_mode == SAVE_STATE_MODE_FULL:
+        accelerator.save_state(state_dir)
+        return SAVE_STATE_MODE_FULL
+
+    distributed_type = str(getattr(accelerator, "distributed_type", "")).upper()
+    if "DEEPSPEED" in distributed_type or "MEGATRON" in distributed_type:
+        logger.warning(
+            "--save_state_mode minimal is not supported for %s; falling back to full state saving.",
+            distributed_type,
+        )
+        accelerator.save_state(state_dir)
+        return SAVE_STATE_MODE_FULL
+
+    logger.info("saving minimal state without optimizer, scheduler, or dataloader state")
+    with _without_accelerator_runtime_state(accelerator):
+        accelerator.save_state(state_dir)
+    return SAVE_STATE_MODE_MINIMAL
+
+
+def update_resume_metadata(state_dir: str, extra: dict):
+    """Update an existing resume_metadata.json with additional fields (e.g. loss info)."""
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    metadata = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                metadata = json.load(f)
+        except Exception:
+            pass
+    metadata.update(extra)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(metadata, f)
+    os.replace(tmp_path, path)
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
@@ -99,9 +305,43 @@ class LossRecorder:
             self.loss_list[step] = loss
         self.loss_total += loss
 
+    def prefill(self, avg: float, count: int) -> None:
+        """Pre-fill with a known average from a resumed checkpoint so the
+        moving average starts close to where training left off."""
+        if count > 0 and avg > 0:
+            self.loss_list = [avg] * count
+            self.loss_total = avg * count
+
     @property
     def moving_average(self) -> float:
+        if not self.loss_list:
+            return 0.0
         return self.loss_total / len(self.loss_list)
+
+
+def save_checkpoint_metadata(ckpt_file: str, metadata: dict) -> None:
+    """Save a JSON sidecar file alongside a checkpoint."""
+    json_path = os.path.splitext(ckpt_file)[0] + ".json"
+    clean = {k: v for k, v in metadata.items() if v is not None}
+    with open(json_path, "w") as f:
+        json.dump(clean, f, indent=2)
+
+
+def save_state_metadata(state_dir: str, metadata: dict) -> None:
+    """Write a JSON sidecar with training settings inside a state directory."""
+    path = os.path.join(state_dir, "slider_metadata.json")
+    clean = {k: v for k, v in metadata.items() if v is not None}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(clean, f, indent=2)
+    os.replace(tmp, path)
+
+
+def remove_checkpoint_metadata(ckpt_file: str) -> None:
+    """Remove JSON sidecar if it exists."""
+    json_path = os.path.splitext(ckpt_file)[0] + ".json"
+    if os.path.exists(json_path):
+        os.remove(json_path)
 
 
 def get_epoch_ckpt_name(model_name, epoch_no: int):
@@ -139,7 +379,13 @@ def get_remove_step_no(args: argparse.Namespace, step_no: int):
     return remove_step_no
 
 
-def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+def save_and_remove_state_on_epoch_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    epoch_no: int,
+    global_step: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -147,7 +393,16 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
-    accelerator.save_state(state_dir)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, state_mode=effective_state_mode)
+    save_state_manifest(
+        state_dir,
+        state_type="epoch",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch_no,
+        state_mode=effective_state_mode,
+    )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -161,7 +416,13 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
             shutil.rmtree(state_dir_old)
 
 
-def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accelerate.Accelerator, step_no: int):
+def save_and_remove_state_stepwise(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    step_no: int,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -169,7 +430,16 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
-    accelerator.save_state(state_dir)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, state_mode=effective_state_mode)
+    save_state_manifest(
+        state_dir,
+        state_type="step",
+        global_step=step_no,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+        state_mode=effective_state_mode,
+    )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -187,7 +457,13 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator):
+def save_state_on_train_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    global_step: int = 0,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -195,11 +471,101 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Ac
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
-    accelerator.save_state(state_dir)
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, state_mode=effective_state_mode)
+    save_state_manifest(
+        state_dir,
+        state_type="final",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+        state_mode=effective_state_mode,
+    )
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
+
+
+def save_state_on_interrupt(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    global_step: int = 0,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+) -> str:
+    """Save a dashboard stop snapshot without touching normal retention windows."""
+    model_name = args.output_name
+    step_no = max(int(global_step or 0), 0)
+    state_name = INTERRUPT_STATE_NAME.format(model_name, step_no)
+
+    logger.info("")
+    logger.info("saving interrupt state at step %s.", step_no)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    state_dir = os.path.join(args.output_dir, state_name)
+    if os.path.exists(state_dir):
+        state_name = INTERRUPT_STATE_UNIQUE_NAME.format(model_name, step_no, int(time.time()))
+        state_dir = os.path.join(args.output_dir, state_name)
+
+    effective_state_mode = save_accelerator_state(args, accelerator, state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, state_mode=effective_state_mode)
+    save_state_manifest(
+        state_dir,
+        state_type="interrupt",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+        state_mode=effective_state_mode,
+    )
+
+    if args.save_state_to_huggingface:
+        logger.info("uploading interrupt state to huggingface.")
+        huggingface_utils.upload(args, state_dir, "/" + state_name, force_sync_upload=True)
+
+    return state_dir
+
+
+def get_dashboard_stop_request_file() -> str | None:
+    path = os.getenv("MUSUBI_DASHBOARD_STOP_FILE")
+    return path or None
+
+
+def dashboard_stop_requested() -> bool:
+    path = get_dashboard_stop_request_file()
+    return bool(path and os.path.exists(path))
+
+
+def dashboard_stop_mode() -> str | None:
+    path = get_dashboard_stop_request_file()
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return "graceful"
+
+    if not raw:
+        return "graceful"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return "graceful"
+    if not isinstance(payload, dict):
+        return "graceful"
+    mode = str(payload.get("mode", "graceful")).lower()
+    return "force" if mode == "force" else "graceful"
+
+
+def clear_dashboard_stop_request() -> None:
+    path = get_dashboard_stop_request_file()
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15) -> Callable[[float], float]:

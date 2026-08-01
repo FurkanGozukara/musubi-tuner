@@ -56,7 +56,7 @@ I18N_DATA = {
 - **Epochs**: One complete pass through the entire training dataset.
 - **Save Every N Epochs**: How often to save the model and generate sample images.
 - **Discrete Flow Shift**: A parameter specific to flow matching models.
-- **Block Swap**: Offloads model blocks to CPU to save VRAM. Higher values save more VRAM but slow down training. Using pinned memory can speed up Block Swap (64GB+ system RAM recommended).
+- **Block Swap**: Offloads model blocks to CPU to save VRAM. Higher values save more VRAM but slow down training. Using pinned memory can speed up Block Swap (64GB+ system RAM recommended). H2D-only Block Swap is for frozen-base LoRA training and requires Gradient Checkpointing.
 - **Mixed Precision**: fp16 and bf16 are both supported; which is better depends on the model architecture. For bf16, RTX30xx or higher is required.
 - **Gradient Checkpointing**: Saves VRAM by recomputing activations during backward pass.
 - **FP8**: Further reduces memory usage by using 8-bit floating point arithmetic.
@@ -64,6 +64,8 @@ I18N_DATA = {
         "lbl_flow_shift": "Discrete Flow Shift",
         "lbl_block_swap": "Block Swap (Z-Image: 0-28, Qwen: 0-58)",
         "lbl_use_pinned_memory_for_block_swap": "Use Pinned Memory for Block Swap",
+        "lbl_block_swap_h2d_only": "H2D-only Block Swap (LoRA / frozen base)",
+        "lbl_block_swap_ring_size": "Block Swap Ring Size",
         "lbl_mixed_precision": "Mixed Precision",
         "lbl_grad_cp": "Gradient Checkpointing",
         "lbl_fp8_scaled": "FP8 Scaled (DiT) - Enables --fp8_base and --fp8_scaled",
@@ -147,7 +149,7 @@ I18N_DATA = {
 - **エポック数 (Epochs)**: 学習データセット全体を通す回数です。
 - **保存頻度 (Save Every N Epochs)**: モデルの保存とサンプル生成を行う頻度です。
 - **Discrete Flow Shift**: Flow Matchingモデル特有のパラメータです。
-- **Block Swap**: VRAMを節約するためにモデルブロックをCPUにオフロードします。値を大きくするとVRAMを節約できますが、学習が遅くなります。共有メモリを使うとBlock Swapが高速化されます（64GB以上のメインRAMを推奨）。
+- **Block Swap**: VRAMを節約するためにモデルブロックをCPUにオフロードします。値を大きくするとVRAMを節約できますが、学習が遅くなります。共有メモリを使うとBlock Swapが高速化されます（64GB以上のメインRAMを推奨）。H2D-only Block Swapはベースモデルを凍結したLoRA学習向けで、Gradient Checkpointingが必要です。
 - **混合精度 (Mixed Precision)**: モデルアーキテクチャによりfp16とbf16のどちらが適しているかは異なります。bf16はRTX30xx以降のGPUが必要です。
 - **Gradient Checkpointing**: Backwardパス中にアクティベーションを再計算することでVRAMを節約します。
 - **FP8**: 8ビット浮動小数点演算を使用することでメモリ使用量をさらに削減します。
@@ -155,6 +157,8 @@ I18N_DATA = {
         "lbl_flow_shift": "Discrete Flow Shift",
         "lbl_block_swap": "Block Swap (Z-Image: 0-28, Qwen: 0-58)",
         "lbl_use_pinned_memory_for_block_swap": "Block Swapに共有メモリを使う",
+        "lbl_block_swap_h2d_only": "H2D-only Block Swap (LoRA / frozen base)",
+        "lbl_block_swap_ring_size": "Block Swap Ring Size",
         "lbl_mixed_precision": "混合精度 (Mixed Precision)",
         "lbl_grad_cp": "Gradient Checkpointing",
         "lbl_fp8_scaled": "FP8 Scaled (DiT) - --fp8_base と --fp8_scaled を有効化",

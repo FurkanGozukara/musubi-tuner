@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""
+Cache text encoder outputs for LTX-2 training.
+
+Uses the standard musubi-tuner dataset config so cached files match the trainer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+
+import logging
+from contextlib import nullcontext
+import torch
+from safetensors.torch import save_file
+
+import musubi_tuner.cache_latents as cache_latents
+import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
+from musubi_tuner.dataset import config_utils
+from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.dataset.image_video_dataset import (
+    ARCHITECTURE_LTX2,
+    ItemInfo,
+    save_text_encoder_output_cache_ltx2_gemma,
+)
+from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
+from musubi_tuner.preservation import (
+    DOP_CACHE_VERSION,
+    PreservationConfig,
+    build_dop_prompt_variants,
+    build_text_encoder_identity,
+    configure_dop,
+    dop_prompt_hash,
+    parse_preservation_args,
+)
+from musubi_tuner.utils.safetensors_utils import atomic_torch_save
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
+DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
+
+
+def _checkpoint_model_loader(args: argparse.Namespace) -> SafetensorsModelStateDictLoader:
+    return SafetensorsModelStateDictLoader(cpu_staging=bool(getattr(args, "cpu_staged_checkpoint_loading", False)))
+
+
+def _all_declared_datasets_are_audio(user_config: dict) -> bool:
+    declared_datasets: list[dict] = []
+    for section_name in ("datasets", "validation_datasets"):
+        section = user_config.get(section_name, [])
+        if isinstance(section, list):
+            declared_datasets.extend(ds for ds in section if isinstance(ds, dict))
+
+    if not declared_datasets:
+        return False
+
+    return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
+
+
+def encode_and_save_batch_gemma(
+    text_encoder,
+    batch: list[ItemInfo],
+    *,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+    audio_video: bool,
+    atomic_cache_writes: bool = False,
+) -> None:
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+
+    with torch.no_grad(), autocast_context:
+        for item in batch:
+            if audio_video:
+                out = text_encoder(item.caption, padding_side="left")
+                video_embed = out.video_encoding
+                audio_embed = out.audio_encoding
+                mask = out.attention_mask
+            else:
+                out = text_encoder(item.caption, padding_side="left")
+                video_embed = out.video_encoding
+                audio_embed = None
+                mask = out.attention_mask
+
+            video_embed = video_embed.squeeze(0).detach().cpu()
+            mask = mask.squeeze(0).detach().cpu()
+            audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
+
+            save_text_encoder_output_cache_ltx2_gemma(
+                item,
+                video_prompt_embeds=video_embed,
+                audio_prompt_embeds=audio_embed_out,
+                prompt_attention_mask=mask,
+                atomic=atomic_cache_writes,
+            )
+
+
+def encode_and_save_batch_pre_connector(
+    text_encoder,
+    batch: list[ItemInfo],
+    *,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+    audio_video: bool,
+    atomic_cache_writes: bool = False,
+) -> None:
+    """Encode and save with both pre-connector features and post-connector embeddings.
+
+    Calls _preprocess_text() to get pre-connector features, then _run_connectors()
+    to get standard embeddings. Both are saved in the same cache file.
+    """
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+
+    with torch.no_grad(), autocast_context:
+        for item in batch:
+            # Phase 1: Gemma + feature extractor (pre-connector)
+            projected, attention_mask = text_encoder._preprocess_text(item.caption, padding_side="left")
+
+            if isinstance(projected, tuple):
+                video_feat, audio_feat = projected
+            else:
+                video_feat, audio_feat = projected, None
+
+            # Phase 2: run connectors for standard embeddings
+            if audio_video:
+                video_embed, audio_embed, mask = text_encoder._run_connectors(projected, attention_mask)
+            else:
+                video_embed, mask = text_encoder._run_connector(projected, attention_mask)
+                audio_embed = None
+
+            # Squeeze batch dim and detach
+            video_embed = video_embed.squeeze(0).detach().cpu()
+            mask = mask.squeeze(0).detach().cpu()
+            audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
+
+            video_feat_out = video_feat.squeeze(0).detach().cpu()
+            audio_feat_out = audio_feat.squeeze(0).detach().cpu() if audio_feat is not None else None
+
+            save_text_encoder_output_cache_ltx2_gemma(
+                item,
+                video_prompt_embeds=video_embed,
+                audio_prompt_embeds=audio_embed_out,
+                prompt_attention_mask=mask,
+                video_features=video_feat_out,
+                audio_features=audio_feat_out,
+                atomic=atomic_cache_writes,
+            )
+
+
+def _encode_prompt_text_ltx2(
+    text_encoder,
+    prompt_text: str,
+    *,
+    audio_video: bool,
+    ltx_mode: str,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+    with torch.no_grad(), autocast_context:
+        out = text_encoder(prompt_text, padding_side="left")
+        if ltx_mode == "video":
+            embed = out.video_encoding
+        elif ltx_mode == "audio":
+            embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
+        elif ltx_mode == "av" and audio_video:
+            embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
+        else:
+            embed = out.video_encoding
+        mask = out.attention_mask
+    return embed.squeeze(0).detach().cpu(), mask.squeeze(0).detach().cpu()
+
+
+def _resolve_default_sample_prompts_cache(datasets: list) -> str:
+    if not datasets:
+        raise ValueError("No datasets available to resolve sample prompt cache directory")
+    cache_dir = getattr(datasets[0], "cache_directory", None)
+    if not cache_dir:
+        raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+    return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
+
+
+def _precache_sample_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    ltx_mode: str,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    from musubi_tuner.training.sampling_prompts import load_prompts
+
+    if args.sample_prompts is None:
+        raise ValueError("--sample_prompts is required when --precache_sample_prompts is set")
+
+    prompts = load_prompts(args.sample_prompts)
+    if not prompts:
+        raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+    cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
+
+    prompt_cache: list[dict] = []
+    default_guidance_scale = float(getattr(args, "guidance_scale", 3.0))
+    default_negative_prompt = ""
+    video_cfg_scale = getattr(args, "video_cfg_scale", None)
+    audio_cfg_scale = getattr(args, "audio_cfg_scale", None)
+
+    from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+
+    preset = get_ltx2_sampling_preset(
+        getattr(args, "sample_sampling_preset", "defaults"),
+        ltx_version=str(getattr(args, "ltx_version", "2.3")),
+    )
+    if preset is not None:
+        default_guidance_scale = preset.video_cfg_scale
+        if video_cfg_scale is None:
+            video_cfg_scale = preset.video_cfg_scale
+        if audio_cfg_scale is None:
+            audio_cfg_scale = preset.audio_cfg_scale
+        use_default_negative = getattr(args, "sample_use_default_negative_prompt", None)
+        if use_default_negative is None or bool(use_default_negative):
+            default_negative_prompt = preset.negative_prompt
+
+    for prompt_dict in prompts:
+        param = prompt_dict.copy()
+        prompt_text = param.get("prompt", "")
+        prompt_embeds, prompt_mask = _encode_prompt_text_ltx2(
+            text_encoder,
+            prompt_text,
+            audio_video=audio_video,
+            ltx_mode=ltx_mode,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+        cache_entry = {
+            "prompt": prompt_text,
+            "prompt_embeds": prompt_embeds,
+            "prompt_attention_mask": prompt_mask,
+        }
+
+        cfg_scale = param.get("cfg_scale", None)
+        guidance_scale = param.get("guidance_scale", default_guidance_scale)
+        effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+        try:
+            do_classifier_free_guidance = (
+                float(effective_cfg_scale) != 1.0
+                or (video_cfg_scale is not None and float(video_cfg_scale) != 1.0)
+                or (audio_cfg_scale is not None and float(audio_cfg_scale) != 1.0)
+            )
+        except (TypeError, ValueError):
+            do_classifier_free_guidance = False
+
+        negative_prompt = param.get("negative_prompt", default_negative_prompt)
+
+        if do_classifier_free_guidance or negative_prompt:
+            neg_embeds, neg_mask = _encode_prompt_text_ltx2(
+                text_encoder,
+                negative_prompt,
+                audio_video=audio_video,
+                ltx_mode=ltx_mode,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
+            cache_entry["negative_prompt"] = negative_prompt
+            cache_entry["negative_prompt_embeds"] = neg_embeds
+            cache_entry["negative_prompt_attention_mask"] = neg_mask
+
+        prompt_cache.append(cache_entry)
+
+    payload = {
+        "version": 2,
+        "ltx_mode": ltx_mode,
+        "audio_video": audio_video,
+        "prompt_cache": prompt_cache,
+    }
+    if bool(getattr(args, "atomic_cache_writes", False)):
+        atomic_torch_save(payload, cache_path)
+    else:
+        torch.save(payload, cache_path)
+    logger.info("Saved precached sample prompts to %s", cache_path)
+
+
+def _precache_preservation_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    """Encode blank and deduplicated fixed/contextual DOP prompts."""
+    blank = getattr(args, "blank_preservation", False)
+    dop = getattr(args, "dop", False)
+    dop_options = parse_preservation_args(getattr(args, "dop_args", None))
+    if "class" not in dop_options and getattr(args, "dop_class_prompt", ""):
+        dop_options["class"] = getattr(args, "dop_class_prompt")
+    dop_cfg = PreservationConfig(dop=dop)
+    if dop:
+        configure_dop(dop_cfg, dop_options)
+
+    if not blank and not dop:
+        logger.warning("--precache_preservation_prompts set but neither --blank_preservation nor --dop enabled, skipping.")
+        return
+
+    cache_path = getattr(args, "preservation_prompts_cache", None)
+    if not cache_path:
+        if not datasets:
+            raise ValueError("No datasets available to resolve preservation cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_path = os.path.join(cache_dir, DEFAULT_PRESERVATION_CACHE)
+
+    payload: dict = {"version": DOP_CACHE_VERSION, "audio_video": audio_video}
+
+    # Always encode as video-only for preservation (even in AV mode)
+    def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        embed, mask = _encode_prompt_text_ltx2(
+            text_encoder,
+            prompt_text,
+            audio_video=audio_video,
+            ltx_mode="video",  # force video-only encoding
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+        return embed, mask
+
+    if blank:
+        embed, mask = _encode_video_only("")
+        payload["blank_embed"] = embed
+        payload["blank_mask"] = mask
+        logger.info("Preservation cache: encoded blank prompt  embed=%s", tuple(embed.shape))
+
+    if dop:
+        unique_prompts: dict[str, str] = {}
+        caption_index: dict[str, list[str]] = {}
+        if dop_cfg.dop_mode == "fixed":
+            prompts = build_dop_prompt_variants(
+                "",
+                mode=dop_cfg.dop_mode,
+                class_prompts=dop_cfg.dop_class_prompts,
+                replacements=dop_cfg.dop_replacements,
+                prompt_bank=dop_cfg.dop_prompt_bank_prompts,
+            )
+            unique_prompts.update((dop_prompt_hash(prompt), prompt) for prompt in prompts)
+        else:
+            for dataset in datasets:
+                for batch in dataset.retrieve_text_encoder_output_cache_batches(1):
+                    for item in batch:
+                        prompts = build_dop_prompt_variants(
+                            item.caption,
+                            mode=dop_cfg.dop_mode,
+                            class_prompts=dop_cfg.dop_class_prompts,
+                            replacements=dop_cfg.dop_replacements,
+                            prompt_bank=dop_cfg.dop_prompt_bank_prompts,
+                        )
+                        prompt_hashes = [dop_prompt_hash(prompt) for prompt in prompts]
+                        unique_prompts.update((prompt_hash, prompt) for prompt_hash, prompt in zip(prompt_hashes, prompts))
+                        caption_index[dop_prompt_hash(item.caption)] = prompt_hashes
+        if not unique_prompts:
+            raise ValueError("DOP caching found no preservation prompts")
+
+        cache_base_dir = os.path.dirname(os.path.abspath(cache_path))
+        cache_stem = os.path.splitext(os.path.basename(cache_path))[0]
+        bank_dir_name = f"{cache_stem}_dop_bank"
+        bank_dir = os.path.join(cache_base_dir, bank_dir_name)
+        prompt_bank: dict[str, dict[str, object]] = {}
+        first_embed: torch.Tensor | None = None
+        first_mask: torch.Tensor | None = None
+        for prompt_hash, prompt in sorted(unique_prompts.items()):
+            embed, mask = _encode_video_only(prompt)
+            shard_dir = os.path.join(bank_dir, prompt_hash[:2])
+            os.makedirs(shard_dir, exist_ok=True)
+            shard_path = os.path.join(shard_dir, f"{prompt_hash}.safetensors")
+            shard_payload = {"embed": embed.contiguous(), "mask": mask.contiguous()}
+            if bool(getattr(args, "atomic_cache_writes", False)):
+                temp_path = shard_path + ".tmp"
+                save_file(shard_payload, temp_path, metadata={"prompt_sha256": prompt_hash})
+                os.replace(temp_path, shard_path)
+            else:
+                save_file(shard_payload, shard_path, metadata={"prompt_sha256": prompt_hash})
+            prompt_bank[prompt_hash] = {
+                "prompt_hash": prompt_hash,
+                "path": os.path.relpath(shard_path, cache_base_dir).replace("\\", "/"),
+            }
+            if first_embed is None:
+                first_embed = embed
+                first_mask = mask
+        payload["dop_prompt_bank"] = prompt_bank
+        payload["dop_caption_index"] = caption_index
+        payload["dop_prompt_config_hash"] = dop_cfg.dop_prompt_config_hash
+        payload["dop_text_encoder_identity"] = build_text_encoder_identity(args)
+        payload["dop_mode"] = dop_cfg.dop_mode
+        payload["dop_class_prompt"] = dop_cfg.dop_class_prompt
+        assert first_embed is not None and first_mask is not None
+        payload["dop_cache_dimensions"] = {
+            "embed": list(first_embed.shape),
+            "mask": list(first_mask.shape),
+        }
+        if dop_cfg.dop_mode == "fixed":
+            payload["dop_embed"] = first_embed
+            payload["dop_mask"] = first_mask
+        logger.info(
+            "Preservation cache: encoded %d unique DOP prompts (mode=%s)",
+            len(prompt_bank),
+            dop_cfg.dop_mode,
+        )
+
+    if bool(getattr(args, "atomic_cache_writes", False)):
+        atomic_torch_save(payload, cache_path)
+    else:
+        torch.save(payload, cache_path)
+    logger.info("Saved preservation prompt cache to %s", cache_path)
+
+
+def main() -> None:
+    parser = cache_text_encoder_outputs.setup_parser_common()
+    parser = ltx2_setup_parser(parser)
+    args = parser.parse_args()
+    apply_ltx2_tweaks(args)
+
+    short_map = {"v": "video", "a": "audio", "va": "av"}
+    if getattr(args, "ltx_mode", None) in short_map:
+        args.ltx_mode = short_map[args.ltx_mode]
+
+    device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+    if getattr(args, "cpu_staged_checkpoint_loading", False):
+        logger.info("CPU-staged LTX checkpoint loading is enabled")
+
+    # Opt-in multi-process cache sharding (default off → single process, no change).
+    device, _shard = cache_latents.resolve_distributed_cache_shard(args, device)
+    args._cache_shard = _shard
+    shard_rank, shard_world = _shard
+
+    blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+    logger.info("Load dataset config from %s", args.dataset_config)
+    user_config = config_utils.load_user_config(args.dataset_config)
+    ltx_mode = getattr(args, "ltx_mode", "video")
+    if ltx_mode == "video" and _all_declared_datasets_are_audio(user_config):
+        logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
+        ltx_mode = "audio"
+        args.ltx_mode = "audio"
+
+    # For audio-only or AV mode, we need the AV encoder to get audio encodings
+    audio_video = ltx_mode in ("av", "audio")
+
+    blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+    train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+
+    datasets = list(train_dataset_group.datasets)
+
+    if user_config.get("validation_datasets"):
+        logger.info("Load validation datasets from dataset config")
+        validation_user_config = {
+            "general": user_config.get("general", {}),
+            "datasets": user_config.get("validation_datasets", []),
+        }
+        validation_blueprint = blueprint_generator.generate(validation_user_config, args, architecture=ARCHITECTURE_LTX2)
+        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(validation_blueprint.dataset_group)
+        datasets.extend(validation_dataset_group.datasets)
+
+    all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
+
+    if args.mixed_precision == "fp16":
+        dtype = torch.float16
+    elif args.mixed_precision == "bf16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
+    if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
+        if device.type != "cuda":
+            raise ValueError("Gemma 8-bit/4-bit loading requires --device cuda")
+
+    autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
+
+    gemma_safetensors = getattr(args, "gemma_safetensors", None)
+    if args.gemma_root is None and not gemma_safetensors:
+        raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
+    if gemma_safetensors and (getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)):
+        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+    if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
+        raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
+    from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.av_encoder import (
+        AVGemmaTextEncoderModelConfigurator,
+        AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+    )
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
+        apply_text_encoder_checkpoint_overrides,
+        module_ops_from_gemma_root,
+    )
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
+        VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
+        VideoGemmaTextEncoderModelConfigurator,
+    )
+
+    text_encoder_checkpoint = (
+        args.ltx2_text_encoder_checkpoint
+        if getattr(args, "ltx2_text_encoder_checkpoint", None) is not None
+        else args.ltx2_checkpoint
+    )
+
+    configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
+    key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
+
+    bnb_compute_dtype = None
+    bnb_compute_dtype_arg = getattr(args, "gemma_bnb_4bit_compute_dtype", "auto")
+    if bnb_compute_dtype_arg == "auto":
+        bnb_compute_dtype = dtype
+    elif bnb_compute_dtype_arg == "fp16":
+        bnb_compute_dtype = torch.float16
+    elif bnb_compute_dtype_arg == "bf16":
+        bnb_compute_dtype = torch.bfloat16
+    elif bnb_compute_dtype_arg == "fp32":
+        bnb_compute_dtype = torch.float32
+
+    text_encoder = SingleGPUModelBuilder(
+        model_path=str(text_encoder_checkpoint),
+        model_class_configurator=configurator,
+        model_sd_ops=key_ops,
+        model_loader=_checkpoint_model_loader(args),
+        module_ops=module_ops_from_gemma_root(
+            args.gemma_root,
+            gemma_safetensors=gemma_safetensors,
+            torch_dtype=dtype,
+            load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
+            load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
+            bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
+            bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
+            bnb_4bit_compute_dtype=bnb_compute_dtype,
+            fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
+        ),
+    ).build(device=device, dtype=dtype)
+    apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
+    text_encoder.eval()
+
+    # If connector weights are missing, SingleGPUModelBuilder returns a meta-device model.
+    # That will make caching appear to hang or behave unpredictably. Fail fast with a clear error.
+    meta_params = [name for name, p in text_encoder.named_parameters() if p.device.type == "meta"]
+    meta_bufs = [name for name, b in text_encoder.named_buffers() if b.device.type == "meta"]
+    if meta_params or meta_bufs:
+        raise ValueError(
+            "LTX-2 Gemma text encoder has uninitialized (meta) parameters/buffers. "
+            "Your --ltx2_checkpoint likely does not contain the Gemma connector weights required for caching. "
+            f"meta_params={meta_params[:10]} meta_bufs={meta_bufs[:10]}"
+        )
+
+    cache_before_connector = bool(getattr(args, "cache_before_connector", False))
+    atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
+
+    def encode_fn(batch: list[ItemInfo]) -> None:
+        if cache_before_connector:
+            encode_and_save_batch_pre_connector(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+                atomic_cache_writes=atomic_cache_writes,
+            )
+        else:
+            encode_and_save_batch_gemma(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+                atomic_cache_writes=atomic_cache_writes,
+            )
+
+    # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
+    # often hurts throughput or appears to hang due to thread contention. Default to 1 unless specified.
+    num_workers = 1 if args.num_workers is None else args.num_workers
+
+    # Sample/preservation prompt precaching writes shared (non-partitioned) caches, so under
+    # distributed sharding only rank 0 runs them to avoid concurrent identical writes.
+    if shard_rank == 0:
+        if getattr(args, "precache_sample_prompts", False):
+            _precache_sample_prompts(
+                args,
+                datasets=datasets,
+                text_encoder=text_encoder,
+                audio_video=audio_video,
+                ltx_mode=ltx_mode,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
+
+        if getattr(args, "precache_preservation_prompts", False):
+            _precache_preservation_prompts(
+                args,
+                datasets=datasets,
+                text_encoder=text_encoder,
+                audio_video=audio_video,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
+
+    cache_text_encoder_outputs.process_text_encoder_batches(
+        num_workers,
+        args.skip_existing,
+        args.batch_size,
+        datasets,
+        all_cache_files_for_dataset,
+        all_cache_paths_for_dataset,
+        encode_fn,
+        shard=_shard,
+    )
+
+    cache_text_encoder_outputs.post_process_cache_files(
+        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache, shard=_shard
+    )
+
+
+def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--cache_distributed",
+        action="store_true",
+        help="Shard text-encoder caching across processes for multi-GPU preprocessing. Launch with "
+        "torchrun/accelerate (sets WORLD_SIZE/RANK/LOCAL_RANK); each rank caches a disjoint subset "
+        "on its own GPU. Off by default (single process, unchanged).",
+    )
+    parser.add_argument(
+        "--ltx2_checkpoint",
+        type=str,
+        default=default_ltx2_checkpoint_path(),
+        help="Path to LTX-2 checkpoint (.safetensors)",
+    )
+    parser.add_argument(
+        "--cpu_staged_checkpoint_loading",
+        action="store_true",
+        help="Load LTX checkpoint tensors through CPU before moving them to the selected device. "
+        "Useful as a compatibility workaround for direct CUDA safetensors loading errors.",
+    )
+    parser.add_argument(
+        "--ltx2_text_encoder_checkpoint",
+        type=str,
+        default=None,
+        help="Optional separate checkpoint (.safetensors) used only for Gemma text encoder connector weights. Defaults to --ltx2_checkpoint.",
+    )
+    parser.add_argument(
+        "--gemma_root",
+        type=str,
+        default=default_gemma_root_path(),
+        help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
+    )
+    parser.add_argument(
+        "--ltx2_mode",
+        "--ltx_mode",
+        dest="ltx_mode",
+        type=str,
+        default="v",
+        choices=["video", "av", "audio", "v", "a", "va"],
+        help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
+    )
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="LTX model version used to resolve sample-prompt preset defaults.",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode",
+    )
+    parser.add_argument(
+        "--precache_sample_prompts",
+        action="store_true",
+        help="Also cache Gemma embeddings for sample prompts and save to --sample_prompts_cache.",
+    )
+    parser.add_argument(
+        "--atomic_cache_writes",
+        action="store_true",
+        help="Write cache files to a temporary sibling file and atomically replace the final path after a successful save.",
+    )
+    parser.add_argument(
+        "--sample_prompts",
+        type=str,
+        default=None,
+        help="Sample prompt file used for --precache_sample_prompts.",
+    )
+    parser.add_argument(
+        "--sample_prompts_cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to write precached sample prompt embeddings (.pt). Defaults to "
+            "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
+        ),
+    )
+    parser.add_argument(
+        "--caption_field",
+        type=str,
+        default=None,
+        help=(
+            "For JSONL datasets, cache text embeddings from this metadata field instead of 'caption'. "
+            "Use fields such as target_caption for I2V/reference datasets with separate captions."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Sampling preset used to resolve default negative prompts for sample prompt caching.",
+    )
+    parser.add_argument(
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the preset default negative prompt when caching sample prompt embeddings.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.0,
+        help="Fallback guidance scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--video_cfg_scale",
+        type=float,
+        default=None,
+        help="Video CFG scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--audio_cfg_scale",
+        type=float,
+        default=None,
+        help="Audio CFG scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+
+    # -- Preservation prompt precaching --
+    parser.add_argument(
+        "--precache_preservation_prompts",
+        action="store_true",
+        help="Cache Gemma embeddings for preservation prompts (blank/DOP class) and save to --preservation_prompts_cache.",
+    )
+    parser.add_argument(
+        "--blank_preservation",
+        action="store_true",
+        help="Include blank prompt in preservation cache (for --blank_preservation during training).",
+    )
+    parser.add_argument(
+        "--dop",
+        action="store_true",
+        help="Include DOP class prompt in preservation cache (for --dop during training).",
+    )
+    parser.add_argument(
+        "--dop_class_prompt",
+        type=str,
+        default="",
+        help="Class prompt for DOP preservation, e.g. 'woman' (without trigger word).",
+    )
+    parser.add_argument(
+        "--dop_args",
+        type=str,
+        nargs="*",
+        help=(
+            "DOP prompt-cache configuration. Use the same prompt-related values as training, for example "
+            "mode=caption_replace trigger=sks class=woman or replace=sks=>woman;sksdog=>dog."
+        ),
+    )
+    parser.add_argument(
+        "--preservation_prompts_cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to write precached preservation prompt embeddings (.pt). Defaults to "
+            "the first dataset's cache_directory/ltx2_preservation_cache.pt"
+        ),
+    )
+
+    parser.add_argument(
+        "--gemma_load_in_8bit",
+        action="store_true",
+        help="Load Gemma LLM in 8-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_load_in_4bit",
+        action="store_true",
+        help="Load Gemma LLM in 4-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_quant_type",
+        type=str,
+        default="nf4",
+        choices=["nf4", "fp4"],
+        help="bitsandbytes 4-bit quant type (nf4 or fp4)",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_disable_double_quant",
+        action="store_true",
+        help="Disable bitsandbytes double quant for 4-bit loading.",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_compute_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32"],
+        help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
+    )
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--cache_before_connector",
+        action="store_true",
+        help="Also cache pre-connector features (for --train_connectors training). "
+        "Saves both pre-connector features and standard post-connector embeddings.",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    main()

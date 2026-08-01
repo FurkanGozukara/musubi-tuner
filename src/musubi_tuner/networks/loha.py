@@ -99,6 +99,8 @@ class LoHaModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # True -> LyCORIS renorm (drop/drop.mean()); False -> kohya 1/(1-p).
+        self.rank_dropout_scale = lora_module._parse_bool_network_arg(kwargs.get("rank_dropout_scale", False))
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -124,9 +126,13 @@ class LoHaModule(torch.nn.Module):
         if self.rank_dropout is not None and self.training:
             drop = (torch.rand(diff_weight.size(0), device=diff_weight.device) > self.rank_dropout).to(diff_weight.dtype)
             drop = drop.view(-1, 1)
-            diff_weight = diff_weight * drop
-            # scaling for rank dropout
-            scale = 1.0 / (1.0 - self.rank_dropout)
+            if self.rank_dropout_scale:
+                drop = drop / drop.mean().clamp_min(1e-8)
+                diff_weight = diff_weight * drop
+                scale = 1.0
+            else:
+                diff_weight = diff_weight * drop
+                scale = 1.0 / (1.0 - self.rank_dropout)
         else:
             scale = 1.0
 

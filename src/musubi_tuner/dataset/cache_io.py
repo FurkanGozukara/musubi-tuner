@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Optional, TYPE_CHECKING
 
 import torch
 from safetensors.torch import save_file
@@ -19,6 +19,9 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
 )
+
+# LTX-2 fork addition — separate import so upstream's inserts into the sorted block above don't conflict
+from musubi_tuner.dataset.architectures import ARCHITECTURE_LTX2_FULL
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
@@ -29,12 +32,60 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SOURCE_PATH_METADATA_KEY = "source_path"
+SOURCE_PATH_FORMAT_METADATA_KEY = "source_path_format"
+SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE = "relative_to_cache"
+SOURCE_PATH_FORMAT_FILENAME_ONLY = "filename_only"
+SOURCE_SIZE_METADATA_KEY = "source_size"
+SOURCE_MTIME_NS_METADATA_KEY = "source_mtime_ns"
+
 
 # We use simple if-else approach to support multiple architectures.
 # Maybe we can use a plugin system in the future.
 
 # the keys of the dict are `<content_type>_FxHxW_<dtype>` for latents
 # and `<content_type>_<dtype|mask>` for other tensors
+
+
+def build_source_freshness_metadata(item_info: ItemInfo, source_path: Optional[str] = None) -> dict[str, str]:
+    """Return source file identity for cache freshness checks, when available."""
+    source_path = source_path or getattr(item_info, "source_item_key", None) or item_info.item_key
+    if not source_path:
+        return {}
+    source_path = os.path.abspath(os.path.expanduser(str(source_path)))
+    try:
+        source_stat = os.stat(source_path)
+    except OSError:
+        return {}
+    if not os.path.isfile(source_path):
+        return {}
+
+    cache_path = getattr(item_info, "latent_cache_path", None)
+    source_path_format = SOURCE_PATH_FORMAT_FILENAME_ONLY
+    portable_source_path = os.path.basename(source_path)
+    if cache_path:
+        cache_directory = os.path.dirname(os.path.abspath(os.path.expanduser(str(cache_path))))
+        try:
+            portable_source_path = os.path.relpath(source_path, cache_directory).replace("\\", "/")
+            source_path_format = SOURCE_PATH_FORMAT_RELATIVE_TO_CACHE
+        except ValueError:
+            # Windows paths on different drives have no meaningful relative
+            # representation. Keep a non-identifying filename for diagnostics
+            # instead of embedding a machine-specific absolute path.
+            pass
+
+    metadata = {
+        SOURCE_PATH_METADATA_KEY: portable_source_path,
+        SOURCE_PATH_FORMAT_METADATA_KEY: source_path_format,
+        SOURCE_SIZE_METADATA_KEY: str(source_stat.st_size),
+        SOURCE_MTIME_NS_METADATA_KEY: str(source_stat.st_mtime_ns),
+    }
+    target_fps = getattr(item_info, "target_fps", None)
+    if isinstance(target_fps, (int, float)) and target_fps > 0:
+        metadata["target_fps"] = str(float(target_fps))
+        if isinstance(item_info.frame_count, int) and item_info.frame_count > 0:
+            metadata["duration_seconds"] = str(float(item_info.frame_count) / float(target_fps))
+    return metadata
 
 
 def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
@@ -77,6 +128,31 @@ def save_latent_cache_wan(
         sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_latent_cache_ltx2(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    extra_tensors: Optional[dict[str, torch.Tensor]] = None,
+    *,
+    atomic: bool = False,
+):
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+    if extra_tensors:
+        for key, value in extra_tensors.items():
+            sd[key] = value.detach().cpu().contiguous()
+
+    save_latent_cache_common(
+        item_info,
+        sd,
+        ARCHITECTURE_LTX2_FULL,
+        atomic=atomic,
+        extra_metadata=build_source_freshness_metadata(item_info),
+    )
 
 
 def save_latent_cache_framepack(
@@ -262,11 +338,11 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
 
 
 def save_pixel_cache_hidream_o1(
-    item_info: ItemInfo, pixel_tokens: torch.Tensor, control_pixel_tokens: Optional[Union[list[torch.Tensor], torch.Tensor]] = None
+    item_info: ItemInfo,
+    pixel_tokens: torch.Tensor,
+    control_pixel_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
 ):
-    """HiDream-O1 architecture. Cache normalized 32x32 pixel patch tokens."""
-    assert pixel_tokens.dim() == 3, "pixel_tokens should be 3D tensor (height_patches, width_patches, patch_dim)"
-
+    """HiDream-O1 pixel-token cache."""
     height_patches, width_patches, _ = pixel_tokens.shape
     dtype_str = dtype_to_str(pixel_tokens.dtype)
     sd = {f"latents_1x{height_patches}x{width_patches}_{dtype_str}": pixel_tokens.detach().cpu().contiguous()}
@@ -276,11 +352,10 @@ def save_pixel_cache_hidream_o1(
             assert control_pixel_tokens.dim() == 4, (
                 "control_pixel_tokens should be 4D tensor (num_controls, height_patches, width_patches, patch_dim)"
             )
-            control_pixel_tokens = list(control_pixel_tokens)
-        assert all(cl.dim() == 3 for cl in control_pixel_tokens), (
-            "control_pixel_tokens should contain 3D tensors (height_patches, width_patches, patch_dim)"
-        )
-        for i, cl in enumerate(control_pixel_tokens):
+            control_iter = list(control_pixel_tokens)
+        else:
+            control_iter = control_pixel_tokens
+        for i, cl in enumerate(control_iter):
             control_height_patches, control_width_patches, _ = cl.shape
             control_dtype_str = dtype_to_str(cl.dtype)
             sd[f"latents_control_{i}_{control_height_patches}x{control_width_patches}_{control_dtype_str}"] = (
@@ -302,7 +377,14 @@ def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_latent_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    *,
+    atomic: bool = False,
+    extra_metadata: Optional[dict[str, str]] = None,
+):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
@@ -311,6 +393,8 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+    if extra_metadata:
+        metadata.update(extra_metadata)
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -321,7 +405,10 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     latent_dir = os.path.dirname(item_info.latent_cache_path)
     os.makedirs(latent_dir, exist_ok=True)
 
-    save_file(sd, item_info.latent_cache_path, metadata=metadata)
+    if atomic:
+        safetensors_utils.save_file_atomic(sd, item_info.latent_cache_path, metadata=metadata)
+    else:
+        save_file(sd, item_info.latent_cache_path, metadata=metadata)
 
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
@@ -339,6 +426,66 @@ def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mas
         sd[f"{text_encoder_type}_mask"] = mask.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_FULL)
+
+
+def save_text_encoder_output_cache_ltx2(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor]):
+    assert embed.dim() == 1 or embed.dim() == 2, (
+        f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
+    )
+    assert mask is None or mask.dim() == 1, f"mask should be 1D tensor (feature), got {mask.shape}"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"text_{dtype_str}"] = embed.detach().cpu()
+    if mask is not None:
+        sd["text_mask"] = mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
+
+
+def save_text_encoder_output_cache_ltx2_gemma(
+    item_info: ItemInfo,
+    *,
+    video_prompt_embeds: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    audio_prompt_embeds: Optional[torch.Tensor] = None,
+    video_features: Optional[torch.Tensor] = None,
+    audio_features: Optional[torch.Tensor] = None,
+    atomic: bool = False,
+):
+    assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
+        f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
+    )
+    assert prompt_attention_mask is None or prompt_attention_mask.dim() == 1, (
+        f"prompt_attention_mask should be 1D tensor (feature), got {prompt_attention_mask.shape}"
+    )
+    if audio_prompt_embeds is not None:
+        assert audio_prompt_embeds.dim() == 1 or audio_prompt_embeds.dim() == 2, (
+            f"audio_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {audio_prompt_embeds.shape}"
+        )
+
+    sd = {}
+    dtype_str = dtype_to_str(video_prompt_embeds.dtype)
+
+    sd[f"video_prompt_embeds_{dtype_str}"] = video_prompt_embeds.detach().cpu()
+    if audio_prompt_embeds is not None:
+        sd[f"audio_prompt_embeds_{dtype_str}"] = audio_prompt_embeds.detach().cpu()
+    if prompt_attention_mask is not None:
+        sd["prompt_attention_mask"] = prompt_attention_mask.detach().cpu()
+
+    if video_features is not None:
+        sd[f"video_features_{dtype_str}"] = video_features.detach().cpu()
+    if audio_features is not None:
+        sd[f"audio_features_{dtype_str}"] = audio_features.detach().cpu()
+
+    text = video_prompt_embeds
+    if audio_prompt_embeds is not None:
+        text = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
+    sd[f"text_{dtype_str}"] = text.detach().cpu()
+    if prompt_attention_mask is not None:
+        sd["text_mask"] = prompt_attention_mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL, atomic=atomic)
 
 
 def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor):
@@ -464,19 +611,14 @@ def save_text_encoder_output_cache_hidream_o1(
     input_embeds: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
     token_types: Optional[torch.Tensor] = None,
-    pixel_values: Optional[torch.Tensor] = None,
     image_grid_thw: Optional[torch.Tensor] = None,
 ):
-    """HiDream-O1 architecture. Cache tokenized prompt and optional initial text token embeddings."""
-    # The dtype suffix is parsed back on load (see bucket.py), so it must be built per tensor here; absent optionals
-    # are simply skipped. HiDream-O1 writes its full key set in a single pass, so the cache is overwritten fresh
-    # (merge_existing=False) instead of merged, dropping any stale optional/dtype keys left from a previous run.
+    """HiDream-O1 architecture."""
     tensors = {
         "varlen_input_ids": input_ids,
         "varlen_input_embeds": input_embeds,
         "varlen_position_ids": position_ids,
         "varlen_token_types": token_types,
-        "varlen_pixel_values": pixel_values,
         "varlen_image_grid_thw": image_grid_thw,
     }
     sd = {f"{name}_{dtype_to_str(t.dtype)}": t.detach().cpu() for name, t in tensors.items() if t is not None}
@@ -488,11 +630,10 @@ def save_text_encoder_output_cache_common(
     item_info: ItemInfo,
     sd: dict[str, torch.Tensor],
     arch_fullname: str,
+    *,
+    atomic: bool = False,
     merge_existing: bool = True,
 ):
-    # merge_existing keeps keys written by previous passes (e.g. HunyuanVideo caches LLM and CLIP separately).
-    # Single-pass architectures that write their full key set at once should pass merge_existing=False so the
-    # cache is overwritten fresh, dropping any stale keys (e.g. optionals/dtypes) left from an earlier run.
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
         if torch.isnan(value).any():
@@ -506,16 +647,12 @@ def save_text_encoder_output_cache_common(
     }
     if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
-        new_key_bases = {remove_dtype_suffix(key) for key in sd}  # logical keys (dtype stripped) just written
+        new_key_bases = {remove_dtype_suffix(key) for key in sd}
         with safetensors_utils.MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path) as f:
             existing_metadata = f.metadata()
             for key in f.keys():
-                # Skip any existing key superseded by a freshly written one. Comparing on the dtype-stripped base
-                # (not the exact key) also drops a stale copy written in another precision, e.g. re-caching after
-                # toggling fp8; otherwise both dtype variants would survive and collide under one key on load.
-                if remove_dtype_suffix(key) in new_key_bases:
-                    continue
-                sd[key] = f.get_tensor(key)
+                if remove_dtype_suffix(key) not in new_key_bases:
+                    sd[key] = f.get_tensor(key)
 
         assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"
         if existing_metadata["caption1"] != metadata["caption1"]:
@@ -529,4 +666,4 @@ def save_text_encoder_output_cache_common(
         text_encoder_output_dir = os.path.dirname(item_info.text_encoder_output_cache_path)
         os.makedirs(text_encoder_output_dir, exist_ok=True)
 
-    safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata)
+    safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata, atomic=atomic)

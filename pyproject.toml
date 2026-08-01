@@ -5,18 +5,24 @@ description = "Musubi Tuner by kohya_ss"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 dependencies = [
-    "accelerate==1.6.0",
+    "accelerate>=1.7.0",
+    "adv_optm==2.2.3",
+    "apollo-torch==1.0.3",
     "av==14.0.1",
     "bitsandbytes",
     "diffusers==0.32.1",
     "einops==0.7.0",
     "huggingface-hub==0.34.3",
+    "lpips==0.1.4",
     "opencv-python==4.10.0.84",
     "pillow>=11.3.0",
-    "safetensors==0.4.5",
+    "prodigy-plus-schedule-free==2.0.1",
+    "safetensors>=0.4.5",
     # "sageattention>=1.0.6",
+    "schedulefree==1.4.1",
     "toml==0.10.2",
     "tqdm==4.67.1",
+    "torch-optimi==0.3.3",
     "transformers==4.57.6",
     "voluptuous==0.15.2",
     # Wan2.1
@@ -30,24 +36,29 @@ dependencies = [
 cu124 = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
+    "torchaudio>=2.5.1",
 ]
 cu128 = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
+    "torchaudio>=2.7.1",
 ]
 cu130 = [
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-]
-cu132 = [
-    "torch>=2.12.0",
-    "torchvision>=0.27.0",
+    "torch~=2.11.0",
+    "torchvision~=0.26.0",
+    "torchaudio~=2.11.0",
 ]
 gui = [
     "gradio>=4.0.0, <6.0.0",
 ]
 hidream_o1 = [
     "sensecraft[dinov3]>=0.3.11",
+]
+dashboard = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sse-starlette>=2.0.0",
+    "pyarrow>=17.0.0",
 ]
 
 [tool.uv]
@@ -56,7 +67,6 @@ conflicts = [
     { extra = "cu124" },
     { extra = "cu128" },
     { extra = "cu130" },
-    { extra = "cu132" },
   ],
 ]
 
@@ -67,6 +77,7 @@ dev = [
   "tensorboard",
   "prompt-toolkit==3.0.51",
   "ruff>=0.12.10",
+  "pre-commit>=4.6.0",
 ]
 
 [build-system]
@@ -78,13 +89,16 @@ torch = [
   { index = "pytorch-cu124", extra = "cu124" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu130", extra = "cu130" },
-  { index = "pytorch-cu132", extra = "cu132" },
 ]
 torchvision = [
   { index = "pytorch-cu124", extra = "cu124" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu130", extra = "cu130" },
-  { index = "pytorch-cu132", extra = "cu132" },
+]
+torchaudio = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 [[tool.uv.index]]
@@ -100,11 +114,6 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.ruff]
@@ -136,8 +145,6 @@ extend-exclude = [
   "src/musubi_tuner/frame_pack/k_diffusion_hunyuan.py",
   "src/musubi_tuner/hunyuan_model/autoencoder_kl_causal_3d.py",
   "src/musubi_tuner/hunyuan_model/pipeline_hunyuan_video.py",
-  "src/musubi_tuner/hidream_o1/qwen3_vl_transformers.py",
-  "src/musubi_tuner/hidream_o1/flash_scheduler.py",
   "src/musubi_tuner/modules/scheduling_flow_match_discrete.py",
   "src/musubi_tuner/modules/unet_causal_3d_blocks.py",
   "src/musubi_tuner/wan/configs/__init__.py",
@@ -181,8 +188,6 @@ docstring-code-line-length = "dynamic"
 "src/musubi_tuner/frame_pack/k_diffusion_hunyuan.py" = ["ALL"]
 "src/musubi_tuner/hunyuan_model/autoencoder_kl_causal_3d.py" = ["ALL"]
 "src/musubi_tuner/hunyuan_model/pipeline_hunyuan_video.py" = ["ALL"]
-"src/musubi_tuner/hidream_o1/qwen3_vl_transformers.py" = ["ALL"]
-"src/musubi_tuner/hidream_o1/flash_scheduler.py" = ["ALL"]
 "src/musubi_tuner/modules/scheduling_flow_match_discrete.py" = ["ALL"]
 "src/musubi_tuner/modules/unet_causal_3d_blocks.py" = ["ALL"]
 "src/musubi_tuner/wan/configs/__init__.py" = ["ALL"]

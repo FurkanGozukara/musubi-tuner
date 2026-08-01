@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Optional, Union
 
 import numpy as np
@@ -12,6 +13,11 @@ from PIL import Image
 
 import logging
 
+from musubi_tuner.gui_dashboard.cache_progress import (
+    cache_progress_total,
+    create_cache_progress_writer_from_env,
+    should_update_cache_progress,
+)
 from musubi_tuner.dataset.image_video_dataset import BaseDataset, ItemInfo, save_latent_cache, ARCHITECTURE_HUNYUAN_VIDEO
 from musubi_tuner.hunyuan_model.vae import load_vae
 from musubi_tuner.hunyuan_model.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
@@ -284,17 +290,69 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
         save_latent_cache(item, l)
 
 
+def cache_shard_takes(key: str, rank: int, world: int) -> bool:
+    """Deterministic, order-independent shard assignment for a stable per-item key.
+
+    Maps every key to exactly one rank, so the union over ranks is a disjoint cover even
+    when processes iterate buckets in different orders. Positional ``index % world`` is NOT
+    safe here (orders can differ → dropped/duplicated items). ``zlib.crc32`` is used instead
+    of ``hash()`` because the latter is per-process salted (PYTHONHASHSEED).
+    """
+    return (zlib.crc32(os.path.normpath(key).encode("utf-8")) % world) == rank
+
+
+def resolve_distributed_cache_shard(args: argparse.Namespace, device):
+    """Opt-in multi-process cache sharding via torchrun/accelerate env vars.
+
+    Returns ``(device, (rank, world_size))``. When ``--cache_distributed`` is set and the
+    launcher provides ``WORLD_SIZE > 1``, picks a per-rank CUDA device (unless ``--device``
+    was given explicitly) and returns the shard tuple. Off by default → ``(device, (0, 1))``,
+    so single-process callers are unchanged.
+    """
+    if not getattr(args, "cache_distributed", False):
+        return device, (0, 1)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world > 1 and getattr(args, "device", None) is None and torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    if world > 1:
+        logger.info("Distributed cache sharding enabled: rank %d/%d on %s", rank, world, device)
+    else:
+        logger.warning("--cache_distributed set but WORLD_SIZE<=1; running single-process. Launch with torchrun/accelerate.")
+    return device, (rank, world)
+
+
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace, supports_alpha: bool = False):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
+    # Opt-in multi-process cache sharding: (rank, world_size). Default (0, 1) = single
+    # process → no behavior change. When world_size > 1, each rank processes a disjoint
+    # subset of items (assigned by a stable hash of the cache path) so N GPUs cache in parallel.
+    shard_rank, shard_world = getattr(args, "_cache_shard", (0, 1)) or (0, 1)
+    progress_writer = create_cache_progress_writer_from_env()
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
+        total_items = cache_progress_total(dataset)
+        processed_items = 0
+        last_progress_items = 0
+        if progress_writer is not None:
+            progress_writer.update(dataset_index=i, current_items=0, total_items=total_items)
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
+            if shard_world > 1:
+                # Stable per-item assignment by cache path → order-independent disjoint cover.
+                batch = [it for it in batch if cache_shard_takes(it.latent_cache_path, shard_rank, shard_world)]
+                if not batch:
+                    continue
+            original_batch_size = len(batch)
             if not supports_alpha:
                 # make sure content has 3 channels
                 for item in batch:
+                    if item.content is None:
+                        # audio-only datasets have no visual content
+                        continue
                     if isinstance(item.content, np.ndarray):
                         if item.content.shape[-1] == 4:
                             item.content = item.content[..., :3]
@@ -306,26 +364,44 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
             if args.skip_existing:
                 filtered_batch = [item for item in batch if not os.path.exists(item.latent_cache_path)]
                 if len(filtered_batch) == 0:
+                    processed_items += original_batch_size
+                    if progress_writer is not None and should_update_cache_progress(
+                        processed_items, total_items, last_progress_items
+                    ):
+                        progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                        last_progress_items = processed_items
                     continue
                 batch = filtered_batch
 
             bs = args.batch_size if args.batch_size is not None else len(batch)
-            for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+            for start in range(0, len(batch), bs):
+                encode(batch[start : start + bs])
+            processed_items += original_batch_size
+            if progress_writer is not None and should_update_cache_progress(processed_items, total_items, last_progress_items):
+                progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                last_progress_items = processed_items
+
+        if progress_writer is not None and processed_items > last_progress_items:
+            progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
 
         # normalize paths
         all_latent_cache_paths = [os.path.normpath(p) for p in all_latent_cache_paths]
         all_latent_cache_paths = set(all_latent_cache_paths)
 
         # remove old cache files not in the dataset
-        all_cache_files = dataset.get_all_latent_cache_files()
-        for cache_file in all_cache_files:
-            if os.path.normpath(cache_file) not in all_latent_cache_paths:
-                if args.keep_cache:
-                    logger.info(f"Keep cache file not in the dataset: {cache_file}")
-                else:
-                    os.remove(cache_file)
-                    logger.info(f"Removed old cache file: {cache_file}")
+        if shard_world > 1:
+            # Under sharding each rank only sees its own subset, so it cannot tell a stale
+            # file from another rank's valid cache. Skip cleanup to avoid deleting siblings.
+            logger.info("Distributed cache sharding active (world_size=%d): skipping stale-cache cleanup", shard_world)
+        else:
+            all_cache_files = dataset.get_all_latent_cache_files()
+            for cache_file in all_cache_files:
+                if os.path.normpath(cache_file) not in all_latent_cache_paths:
+                    if args.keep_cache:
+                        logger.info(f"Keep cache file not in the dataset: {cache_file}")
+                    else:
+                        os.remove(cache_file)
+                        logger.info(f"Removed old cache file: {cache_file}")
 
 
 def main():
@@ -343,6 +419,15 @@ def main():
     user_config = config_utils.load_user_config(args.dataset_config)
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_HUNYUAN_VIDEO)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    if args.save_dataset_manifest:
+        manifest = config_utils.create_cache_only_dataset_manifest(
+            user_config,
+            args,
+            architecture=ARCHITECTURE_HUNYUAN_VIDEO,
+            source_dataset_config=args.dataset_config,
+        )
+        manifest_path = config_utils.save_dataset_manifest(manifest, args.save_dataset_manifest)
+        logger.info(f"Saved cache-only dataset manifest: {manifest_path}")
 
     datasets = train_dataset_group.datasets
 
@@ -379,6 +464,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_config", type=str, required=True, help="path to dataset config .toml file")
+    parser.add_argument(
+        "--save_dataset_manifest",
+        type=str,
+        default=None,
+        help="optional path to write a cache-only dataset manifest JSON for source-free training",
+    )
     parser.add_argument("--vae", type=str, required=False, default=None, help="path to vae checkpoint")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16")
     parser.add_argument("--device", type=str, default=None, help="device to use, default is cuda if available")
@@ -401,6 +492,22 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--disable_cudnn_backend", action="store_true", help="Disable CUDNN PyTorch backend. May be useful for AMD GPUs."
+    )
+    parser.add_argument(
+        "--video_decode_backend",
+        type=str,
+        default=None,
+        choices=["pyav", "decord", "torchcodec"],
+        help="Video decoder for caching. pyav keeps the default path; decord and torchcodec batch-decode selected "
+        "frames and require their optional dependencies. Overrides LTX2_VIDEO_DECODE_BACKEND. An alternate-backend "
+        "decode error is logged before retrying with pyav.",
+    )
+    parser.add_argument(
+        "--video_decode_device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="Device passed to torchcodec's VideoDecoder. CUDA support depends on the installed torchcodec/FFmpeg build. Default cpu.",
     )
     return parser
 

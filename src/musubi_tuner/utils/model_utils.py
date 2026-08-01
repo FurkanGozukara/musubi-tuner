@@ -577,3 +577,230 @@ def _install_first_call_fallback(
 def _compile_fallback_enabled() -> bool:
     value = os.environ.get("MUSUBI_TORCH_COMPILE_FALLBACK", "1")
     return value.strip().casefold() not in {"", "0", "false", "no", "off"}
+
+
+def compile_dynamic_arg(args: argparse.Namespace) -> bool | None:
+    compile_dynamic = getattr(args, "compile_dynamic", None)
+    if compile_dynamic is None:
+        return None
+    if isinstance(compile_dynamic, bool):
+        return compile_dynamic
+    return {"true": True, "false": False, "auto": None}[compile_dynamic.lower()]
+
+
+def unwrap_compile_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap common compile/distributed wrappers without requiring an Accelerator instance."""
+    unwrapped = module
+    seen: set[int] = set()
+    for _ in range(8):
+        if id(unwrapped) in seen:
+            break
+        seen.add(id(unwrapped))
+
+        next_module = getattr(unwrapped, "module", None)
+        if isinstance(next_module, torch.nn.Module) and next_module is not unwrapped:
+            unwrapped = next_module
+            continue
+
+        next_module = getattr(unwrapped, "_orig_mod", None)
+        if isinstance(next_module, torch.nn.Module) and next_module is not unwrapped:
+            unwrapped = next_module
+            continue
+
+        break
+    return unwrapped
+
+
+def resolve_compile_block_lists(
+    module: torch.nn.Module,
+    block_attr_names: tuple[str, ...] = ("transformer_blocks",),
+) -> list[torch.nn.ModuleList | list[torch.nn.Module]]:
+    """Find block lists on a model or a single-GPU wrapper's `.model` child."""
+    roots = [unwrap_compile_module(module)]
+    wrapped_model = getattr(roots[0], "model", None)
+    if isinstance(wrapped_model, torch.nn.Module) and wrapped_model is not roots[0]:
+        roots.append(wrapped_model)
+
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]] = []
+    seen: set[int] = set()
+    for root in roots:
+        for attr_name in block_attr_names:
+            value: Any = root
+            for part in attr_name.split("."):
+                value = getattr(value, part, None)
+                if value is None:
+                    break
+            if value is None or id(value) in seen:
+                continue
+            if isinstance(value, (torch.nn.ModuleList, list)):
+                target_blocks.append(value)
+                seen.add(id(value))
+    return target_blocks
+
+
+def _collect_compile_targets(
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
+) -> list[tuple[torch.nn.ModuleList | list[torch.nn.Module], int, torch.nn.Module]]:
+    targets: list[tuple[torch.nn.ModuleList | list[torch.nn.Module], int, torch.nn.Module]] = []
+    for blocks in target_blocks:
+        for i, block in enumerate(blocks):
+            if not isinstance(block, torch.nn.Module):
+                logger.debug("Skipping non-module torch.compile target at index %s: %r", i, block)
+                continue
+            if hasattr(block, "_hf_hook"):
+                logger.info("Skipping torch.compile target at index %s because an HF offload hook is attached", i)
+                continue
+            targets.append((blocks, i, block))
+    return targets
+
+
+def _configure_compile_cache(args: argparse.Namespace, target_count: int) -> None:
+    cache_size_limit = getattr(args, "compile_cache_size_limit", None)
+    if getattr(args, "compile_auto_cache_size_limit", False) and target_count > 0:
+        auto_limit = target_count * 2
+        if cache_size_limit is None:
+            current_limit = getattr(torch._dynamo.config, "cache_size_limit", 0)
+            cache_size_limit = max(int(current_limit or 0), auto_limit)
+        else:
+            cache_size_limit = max(cache_size_limit, auto_limit)
+
+    if cache_size_limit is not None:
+        torch._dynamo.config.cache_size_limit = cache_size_limit
+        logger.info("Set torch._dynamo.config.cache_size_limit to %s", cache_size_limit)
+
+
+def _parse_inductor_config_value(raw: str) -> Any:
+    lowered = raw.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "none":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _apply_inductor_config(args: argparse.Namespace) -> None:
+    overrides = getattr(args, "inductor_config", None)
+    if not overrides:
+        return
+
+    import torch._inductor.config as _ind
+    import torch._dynamo.config as _dyn
+
+    applied: list[str] = []
+    for token in overrides:
+        if "=" not in token:
+            raise ValueError(f"--inductor_config expects KEY=VALUE tokens, got {token!r}")
+        key, raw_value = token.split("=", 1)
+        key = key.strip()
+        value = _parse_inductor_config_value(raw_value)
+
+        parts = key.split(".")
+        root = _ind if hasattr(_ind, parts[0]) else _dyn
+        target = root
+        missing = False
+        for part in parts[:-1]:
+            if not hasattr(target, part):
+                missing = True
+                break
+            target = getattr(target, part)
+        if missing or not hasattr(target, parts[-1]):
+            logger.warning("--inductor_config: skipping unknown key %s", key)
+            continue
+        setattr(target, parts[-1], value)
+        applied.append(f"{key}={value}")
+
+    if applied:
+        logger.info("Applied %d inductor/dynamo config overrides: %s", len(applied), " ".join(applied))
+
+
+def compile_module(args: argparse.Namespace, module: torch.nn.Module) -> torch.nn.Module:
+    _apply_inductor_config(args)
+    compile_dynamic = compile_dynamic_arg(args)
+    logger.info(
+        "Compiling model with torch.compile: backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
+        args.compile_backend,
+        args.compile_mode,
+        compile_dynamic,
+        args.compile_fullgraph,
+    )
+    _configure_compile_cache(args, 1)
+    try:
+        return torch.compile(
+            module,
+            backend=args.compile_backend,
+            mode=args.compile_mode,
+            dynamic=compile_dynamic,
+            fullgraph=args.compile_fullgraph,
+        )
+    except Exception as e:
+        if getattr(args, "compile_fallback_to_eager", False):
+            logger.warning("torch.compile setup failed; continuing with eager model: %s", e)
+            return module
+        raise
+
+
+def compile_transformer_inner_forwards(
+    args: argparse.Namespace,
+    transformer: torch.nn.Module,
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
+    disable_linear: bool,
+) -> torch.nn.Module:
+    targets = _collect_compile_targets(target_blocks)
+    if len(targets) == 0:
+        logger.warning("Inner-block torch.compile was requested, but no compile target blocks were found")
+        return transformer
+
+    if disable_linear:
+        logger.info("Disable linear from torch.compile for swap blocks...")
+        for _, _, block in targets:
+            disable_linear_from_compile(block)
+
+    inner_forwards: list[tuple[torch.nn.Module, Callable]] = []
+    for _, i, block in targets:
+        inner_forward = getattr(block, "_forward", None)
+        if not callable(inner_forward):
+            raise TypeError(f"torch.compile target block at index {i} has no callable _forward")
+        inner_forwards.append((block, inner_forward))
+
+    _apply_inductor_config(args)
+    compile_dynamic = compile_dynamic_arg(args)
+    logger.info(
+        "Compiling DiT block compute with eager wrappers: blocks=%d, backend=%s, mode=%s, dynamic=%s, fullgraph=%s",
+        len(inner_forwards),
+        args.compile_backend,
+        args.compile_mode,
+        compile_dynamic,
+        args.compile_fullgraph,
+    )
+    _configure_compile_cache(args, len(inner_forwards))
+
+    compiled_refs: list[tuple[torch.nn.Module, Callable]] = []
+    try:
+        for block, inner_forward in inner_forwards:
+            block._forward = torch.compile(
+                inner_forward,
+                backend=args.compile_backend,
+                mode=args.compile_mode,
+                dynamic=compile_dynamic,
+                fullgraph=args.compile_fullgraph,
+            )
+            compiled_refs.append((block, inner_forward))
+    except Exception as e:
+        for block, inner_forward in reversed(compiled_refs):
+            block._forward = inner_forward
+        if getattr(args, "compile_fallback_to_eager", False):
+            logger.warning("Inner-block torch.compile setup failed; restored eager compute and continuing: %s", e)
+            return transformer
+        raise
+
+    return transformer

@@ -54,6 +54,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["discrete_flow_shift"] = float(m.group(1))
                 continue
 
+            m = re.match(r"fr ([\d\.]+)", parg, re.IGNORECASE)
+            if m:  # frame rate (fps) for architectures that condition on it (e.g. LTX-2)
+                prompt_dict["frame_rate"] = float(m.group(1))
+                continue
+
             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
             if m:  # scale
                 prompt_dict["cfg_scale"] = float(m.group(1))
@@ -65,8 +70,23 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"i (.+)", parg, re.IGNORECASE)
-            if m:  # image path
+            if m:  # image path (I2V conditioning)
                 prompt_dict["image_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"v (.+)", parg, re.IGNORECASE)
+            if m:  # v2v reference path (IC-LoRA / v2v conditioning)
+                prompt_dict["v2v_ref_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"ra (.+)", parg, re.IGNORECASE)
+            if m:  # reference audio path (audio_ref_ic sampling)
+                prompt_dict["ref_audio_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"vra (.+)", parg, re.IGNORECASE)
+            if m:  # held-out reference audio used only by validation metrics
+                prompt_dict["validation_reference_audio_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
@@ -91,6 +111,21 @@ def line_to_prompt_dict(line: str) -> dict:
             m = re.match(r"of (.+)", parg, re.IGNORECASE)
             if m:  # output folder
                 prompt_dict["one_frame"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"im (.+)", parg, re.IGNORECASE)
+            if m:  # inpaint mask path (composes with the v2v reference on the pure v2v path)
+                prompt_dict["inpaint_mask_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"ii (\d)", parg, re.IGNORECASE)
+            if m:  # inpaint invert (0/1): condition the complement of the mask
+                prompt_dict["inpaint_invert"] = bool(int(m.group(1)))
+                continue
+
+            m = re.match(r"it ([\d.]+)", parg, re.IGNORECASE)
+            if m:  # inpaint mask binarization threshold (default 0.5)
+                prompt_dict["inpaint_threshold"] = float(m.group(1))
                 continue
 
         except ValueError as ex:

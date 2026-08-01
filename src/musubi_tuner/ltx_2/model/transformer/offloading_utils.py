@@ -1,0 +1,879 @@
+import logging
+import os
+import torch
+import torch.nn as nn
+
+from typing import Iterable, List, Optional
+
+from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
+    ModelOffloader,
+    _clean_memory_on_device,
+    _synchronize_device,
+    weighs_to_device,
+    params_to_device,
+)
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import set_block_swap_active
+from musubi_tuner.modules.custom_offloading_utils import LoRAStreamOffloader
+
+logger = logging.getLogger(__name__)
+_LOGGED_SWAP_BYTES = False
+_LOGGED_FIRST_PARAM = False
+_SWAP_MASK_TOKENS = {"all", "ff", "attn", "self_attn", "cross_attn", "av_cross_attn"}
+_LOGGED_SWAP_MASK = False
+
+
+def _swap_full_block_enabled() -> bool:
+    """Enable full block swap (move ALL params to CPU, not just Linear weights).
+
+    This significantly reduces VRAM but may be slower due to more data transfer.
+    Set LTX2_SWAP_FULL_BLOCK=1 to enable.
+    """
+    return os.getenv("LTX2_SWAP_FULL_BLOCK", "1") == "1"
+
+
+def _swap_keep_enabled(env_name: str) -> bool:
+    """Read swap policy when an offloader is configured, not when this module is imported."""
+    return os.getenv(env_name, "0") == "1"
+
+
+def _should_skip_swap(name: str) -> bool:
+    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") and "audio" in name:
+        return True
+    if _swap_keep_enabled("LTX2_SWAP_KEEP_ATTN") and "attn" in name:
+        return True
+    if _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN") and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
+        return True
+    return False
+
+
+def _swap_mask_tokens() -> set[str]:
+    raw = os.getenv("LTX2_FULL_FT_SWAP_MASK", "all")
+    tokens = {token.strip().lower() for token in raw.replace("+", ",").split(",") if token.strip()}
+    if not tokens or "all" in tokens:
+        return {"all"}
+
+    aliases = {
+        "mlp": "ff",
+        "feedforward": "ff",
+        "feed_forward": "ff",
+        "self": "self_attn",
+        "cross": "cross_attn",
+        "av": "av_cross_attn",
+    }
+    tokens = {aliases.get(token, token) for token in tokens}
+    invalid = sorted(tokens - _SWAP_MASK_TOKENS)
+    if invalid:
+        logger.warning(
+            "Ignoring invalid LTX-2 linear swap mask token(s): %s; falling back to all",
+            ", ".join(invalid),
+        )
+        return {"all"}
+    return tokens
+
+
+def _module_matches_swap_mask(name: str, mask_tokens: set[str]) -> bool:
+    if "all" in mask_tokens:
+        return True
+
+    top = name.split(".", 1)[0]
+    if "ff" in mask_tokens and (top in {"ff", "audio_ff"} or ".ff." in f".{name}."):
+        return True
+    if "attn" in mask_tokens and "attn" in name:
+        return True
+    if "self_attn" in mask_tokens and top in {"attn1", "audio_attn1"}:
+        return True
+    if "cross_attn" in mask_tokens and top in {
+        "attn2",
+        "audio_attn2",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+    }:
+        return True
+    if "av_cross_attn" in mask_tokens and top in {"audio_to_video_attn", "video_to_audio_attn"}:
+        return True
+    return False
+
+
+def _move_masked_linear_params(
+    block: nn.Module,
+    offload_device: torch.device,
+    keep_device: torch.device,
+    *,
+    mask_tokens: set[str],
+    use_pinned: bool,
+    skip_trainable: bool = True,
+) -> None:
+    for name, module in block.named_modules():
+        if not module.__class__.__name__.endswith("Linear"):
+            continue
+        target_device = offload_device
+        if _should_skip_swap(name) or not _module_matches_swap_mask(name, mask_tokens):
+            target_device = keep_device
+        weighs_to_device(module, target_device, use_pinned=use_pinned, skip_trainable=skip_trainable)
+
+
+def _move_masked_module_groups(
+    block: nn.Module,
+    offload_device: torch.device,
+    keep_device: torch.device,
+    *,
+    mask_tokens: set[str],
+    skip_trainable: bool = True,
+) -> None:
+    """Move selected top-level module groups to CPU and keep the rest on GPU."""
+    should_skip_trainable = skip_trainable and offload_device.type == "cpu"
+    non_blocking_keep = keep_device.type != "cpu"
+
+    for param in block.parameters(recurse=False):
+        if param.device != keep_device:
+            param.data = param.data.to(keep_device, non_blocking=non_blocking_keep)
+    for buf in block.buffers(recurse=False):
+        if buf.device != keep_device:
+            buf.data = buf.data.to(keep_device, non_blocking=non_blocking_keep)
+
+    for name, module in block.named_children():
+        if _should_skip_swap(name) or not _module_matches_swap_mask(name, mask_tokens):
+            module.to(keep_device)
+        elif should_skip_trainable:
+            params_to_device(module, offload_device, include_norms=True, use_pinned=False, skip_trainable=skip_trainable)
+        else:
+            module.to(offload_device)
+
+
+def _move_block_params_excluding_audio(
+    block: nn.Module,
+    device: torch.device,
+    *,
+    include_norms: bool,
+    use_pinned: bool,
+    skip_trainable: bool = True,
+) -> None:
+    for name, module in block.named_modules():
+        if _should_skip_swap(name):
+            continue
+        if include_norms:
+            params_to_device(module, device, include_norms=True, use_pinned=use_pinned, skip_trainable=skip_trainable)
+        else:
+            if module.__class__.__name__.endswith("Linear"):
+                weighs_to_device(module, device, use_pinned=use_pinned, skip_trainable=skip_trainable)
+
+
+def _is_norm_module(module: nn.Module) -> bool:
+    name = module.__class__.__name__
+    return name.endswith("RMSNorm") or name.endswith("LayerNorm") or name.endswith("GroupNorm") or name.endswith("BatchNorm")
+
+
+def _move_non_linear_params(block: nn.Module, device: torch.device, *, include_norms: bool) -> None:
+    """Move non-linear params/buffers to device without touching Linear weights."""
+    non_blocking = device.type != "cpu"
+    for module in block.modules():
+        if module.__class__.__name__.endswith("Linear"):
+            continue
+        if not include_norms and _is_norm_module(module):
+            continue
+        for param in module.parameters(recurse=False):
+            if param.device != device:
+                param.data = param.data.to(device, non_blocking=non_blocking)
+        for buf in module.buffers(recurse=False):
+            if buf.device != device:
+                buf.data = buf.data.to(device, non_blocking=non_blocking)
+
+
+def _mark_swap_weight_offload(block: nn.Module, enabled: bool) -> None:
+    """Tag block and ALL its submodules to avoid FP8 sync pulling weights to GPU."""
+    setattr(block, "swap_weight_offload", bool(enabled))
+    for module in block.modules():
+        # Mark Linear, RMSNorm, LayerNorm, and other modules that have weights
+        class_name = module.__class__.__name__
+        if (
+            class_name.endswith("Linear")
+            or class_name.endswith("RMSNorm")
+            or class_name.endswith("LayerNorm")
+            or class_name.endswith("GroupNorm")
+            or class_name.endswith("BatchNorm")
+        ):
+            setattr(module, "swap_weight_offload", bool(enabled))
+
+
+def _log_cuda_memory(tag: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    logger.info("LTX-2 swap mem [%s]: cuda_allocated=%.2fGB cuda_reserved=%.2fGB", tag, allocated, reserved)
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _module_cuda_bytes(module: nn.Module) -> int:
+    total = 0
+    for tensor in module.parameters():
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+            total += _tensor_bytes(tensor)
+    for tensor in module.buffers():
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+            total += _tensor_bytes(tensor)
+    return total
+
+
+def _log_block_cuda_bytes(blocks: List[nn.Module], split_idx: int) -> None:
+    kept = blocks[:split_idx]
+    swapped = blocks[split_idx:]
+    kept_bytes = sum(_module_cuda_bytes(block) for block in kept)
+    swapped_bytes = sum(_module_cuda_bytes(block) for block in swapped)
+    logger.info(
+        "LTX-2 swap mem [blocks_cuda_bytes]: kept=%.2fMB swapped=%.2fMB",
+        kept_bytes / (1024**2),
+        swapped_bytes / (1024**2),
+    )
+
+
+def _log_first_param(blocks: List[nn.Module]) -> None:
+    for block in blocks:
+        for param in block.parameters():
+            logger.info(
+                "LTX-2 swap diag [first_param]: dtype=%s device=%s",
+                param.dtype,
+                param.device,
+            )
+            return
+
+
+def _summarize_block_tensors(block: nn.Module, label: str) -> None:
+    entries = []
+    for name, param in block.named_parameters(recurse=True):
+        if isinstance(param, torch.Tensor):
+            entries.append((name, param.device, _tensor_bytes(param)))
+    for name, buf in block.named_buffers(recurse=True):
+        if isinstance(buf, torch.Tensor):
+            entries.append((f"{name} (buffer)", buf.device, _tensor_bytes(buf)))
+    entries.sort(key=lambda item: item[2], reverse=True)
+    for name, device, size in entries[:8]:
+        logger.info("LTX-2 swap diag [%s]: %s device=%s size=%.2fMB", label, name, device, size / (1024**2))
+
+
+def _module_on_device(module: nn.Module, device: torch.device) -> bool:
+    target = torch.device(device)
+    for tensor in module.parameters():
+        if tensor.device != target:
+            return False
+    for tensor in module.buffers():
+        if tensor.device != target:
+            return False
+    return True
+
+
+class LTX2BlockSwapManager:
+    """Stream full blocks between devices for LTX-2."""
+
+    def __init__(self, block_indices: List[int], offload_device: torch.device):
+        self.block_indices = set(block_indices)
+        self.offload_device = offload_device
+        self._backward_hooks: List[torch.utils.hooks.RemovableHandle] = []
+        self._backward_hook_device: Optional[torch.device] = None
+
+    @classmethod
+    def build(
+        cls,
+        depth: int,
+        blocks_to_swap: int,
+        swap_device: str,
+    ) -> Optional["LTX2BlockSwapManager"]:
+        if not blocks_to_swap:
+            return None
+        max_swappable_blocks = max(depth - 1, 0)
+        if max_swappable_blocks == 0:
+            return None
+        if blocks_to_swap > max_swappable_blocks:
+            logger.warning(
+                "Requested LTX-2 aggressive blocks_to_swap=%s but maximum swappable blocks is %s; clamping.",
+                blocks_to_swap,
+                max_swappable_blocks,
+            )
+            blocks_to_swap = max_swappable_blocks
+        try:
+            offload_device = torch.device(swap_device)
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize LTX-2 aggressive block swap; continuing without offload: %s",
+                exc,
+            )
+            return None
+        block_indices = list(range(depth - blocks_to_swap, depth))
+        return cls(block_indices, offload_device)
+
+    def activate(self, blocks: Iterable[nn.Module], compute_device: torch.device, grad_enabled: bool) -> bool:
+        if compute_device == self.offload_device:
+            return False
+        blocks_list = list(blocks)
+        # Mark managed blocks so FP8 device sync avoids pulling weights onto GPU.
+        for idx, block in enumerate(blocks_list):
+            _mark_swap_weight_offload(block, idx in self.block_indices)
+        self._ensure_backward_hooks(blocks_list, compute_device, grad_enabled)
+        self.mark_blocks_for_offload(blocks_list)
+        return True
+
+    def is_managed_block(self, index: int) -> bool:
+        return index in self.block_indices
+
+    def stream_in(self, block: nn.Module, device: torch.device):
+        self._move_module(block, device)
+
+    def stream_out(self, block: nn.Module):
+        self._move_module(block, self.offload_device)
+
+    def mark_blocks_for_offload(self, blocks: List[nn.Module]):
+        for idx in self.block_indices:
+            if idx < 0 or idx >= len(blocks):
+                continue
+            self._move_module(blocks[idx], self.offload_device)
+
+    def _clear_backward_hooks(self):
+        for handle in self._backward_hooks:
+            try:
+                handle.remove()
+            except Exception:
+                continue
+        self._backward_hooks.clear()
+        self._backward_hook_device = None
+
+    def _ensure_backward_hooks(self, blocks: List[nn.Module], compute_device: torch.device, grad_enabled: bool) -> None:
+        if not grad_enabled:
+            return
+        if self._backward_hook_device == compute_device and self._backward_hooks:
+            return
+        self._clear_backward_hooks()
+
+        for idx, block in enumerate(blocks):
+            if not self.is_managed_block(idx):
+                continue
+
+            def _make_pre_hook():
+                def _pre_hook(module, _grad_output):
+                    self.stream_in(module, compute_device)
+                    return None
+
+                return _pre_hook
+
+            def _make_post_hook():
+                def _post_hook(module, _grad_input, _grad_output):
+                    self.stream_out(module)
+                    return None
+
+                return _post_hook
+
+            self._backward_hooks.append(block.register_full_backward_pre_hook(_make_pre_hook()))
+            self._backward_hooks.append(block.register_full_backward_hook(_make_post_hook()))
+
+        self._backward_hook_device = compute_device
+
+    def _move_module(self, module: nn.Module, device: torch.device):
+        if _module_on_device(module, device):
+            return
+        with torch.no_grad():
+            module.to(device)
+
+
+class LTX2H2DModelOffloader(LoRAStreamOffloader):
+    """LTX-owned H2D-only offloader for frozen-base LoRA-style block swap."""
+
+    def __init__(self, *args, swap_norms: bool = False, **kwargs):
+        self.swap_norms = swap_norms
+        self._swap_mask = _swap_mask_tokens()
+        super().__init__(*args, **kwargs)
+
+    def _swap_modules(self, block: nn.Module) -> list[nn.Module]:
+        mods = []
+        for name, module in block.named_modules():
+            if not module.__class__.__name__.endswith("Linear"):
+                continue
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            # A requested full ("all") H2D swap must not retain the audio half of the AV
+            # transformer: the shared skip-audio default is a throughput knob for
+            # partial/classic swap, and applying it to a full H2D swap leaves ~5GB resident
+            # on a 40-block INT8 run. An explicit non-"all" mask still selects a partial set.
+            if self._swap_mask != {"all"} and (_should_skip_swap(name) or not _module_matches_swap_mask(name, self._swap_mask)):
+                continue
+            mods.append(module)
+        return mods
+
+
+class LTX2ModelOffloader(ModelOffloader):
+    """LTX-2 local offloader that avoids GPU preloading for swap blocks."""
+
+    def __init__(self, *args, swap_norms: bool = False, prefetch_window: int = 1, **kwargs):
+        super().__init__(*args, prefetch_window=prefetch_window, **kwargs)
+        self.swap_norms = swap_norms
+        self._aggressive_backward_handles = []
+
+    def swap_weight_devices_cuda(self, device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+        offload_event = getattr(layer_to_cuda, "_async_backward_offload_event", None)
+        if offload_event is not None:
+            self.stream.wait_event(offload_event)
+            layer_to_cuda._async_backward_offload_event = None
+        return super().swap_weight_devices_cuda(device, layer_to_cpu, layer_to_cuda)
+
+    def _setup_aggressive_backward_hooks(self, blocks: List[nn.Module]) -> None:
+        """Setup backward hooks to unload swapped blocks after backward pass.
+
+        Loading during backward is handled by checkpoint_wrapper in transformer.py.
+        This hook only handles unloading after each block's backward is complete.
+        """
+        # Remove existing backward hooks from base class
+        if hasattr(self, "remove_handles"):
+            for handle in self.remove_handles:
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+            self.remove_handles = []
+
+        # Remove any previous aggressive hooks
+        for handle in self._aggressive_backward_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._aggressive_backward_handles = []
+
+        split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+
+        for block_idx, block in enumerate(blocks):
+            # Only add hooks for swapped blocks (split_idx to num_blocks-1)
+            if block_idx < split_idx:
+                continue
+
+            # Capture block_idx and device in closure
+            def make_post_hook(idx, device):
+                def post_hook(module, grad_input, grad_output):
+                    # Unload block to CPU after backward to free VRAM
+                    module.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    return None
+
+                return post_hook
+
+            # Register post-hook to unload after backward
+            post_handle = block.register_full_backward_hook(make_post_hook(block_idx, self.device))
+            self._aggressive_backward_handles.append(post_handle)
+
+        logger.info(f"Registered backward unload hooks for {len(blocks) - split_idx} swapped blocks")
+
+    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
+        global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM, _LOGGED_SWAP_MASK
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+
+        if self.debug:
+            print(f"[{self.block_type}] Prepare block devices before forward (LTX2)")
+        diag_enabled = os.getenv("LTX2_SWAP_DIAG", "0") == "1"
+        if diag_enabled:
+            keep_idx = 0
+            swap_idx = max(0, self.num_blocks - self.blocks_to_swap)
+            if blocks:
+                _summarize_block_tensors(blocks[keep_idx], "before_keep_block")
+                if swap_idx < len(blocks):
+                    _summarize_block_tensors(blocks[swap_idx], "before_swap_block")
+        _log_cuda_memory("before_prepare_blocks")
+
+        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
+        skip_trainable = os.getenv("LTX2_FULL_FT_OFFLOAD_TRAINABLE_SWAP", "0") != "1"
+        swap_mask = _swap_mask_tokens()
+        split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+        cpu_device = torch.device("cpu")
+
+        # Full block swap mode: move ALL params to CPU for swapped blocks (maximum VRAM savings)
+        if _swap_full_block_enabled():
+            logger.info(f"LTX-2 swap: FULL BLOCK MODE - blocks 0-{split_idx - 1} to GPU, {split_idx}-{len(blocks) - 1} to CPU")
+            _log_cuda_memory("full_block_swap_START")
+
+            # Debug: count params on each device before
+            gpu_params_before = sum(1 for b in blocks for p in b.parameters() if p.is_cuda)
+            cpu_params_before = sum(1 for b in blocks for p in b.parameters() if not p.is_cuda)
+            logger.info(f"BEFORE swap: GPU params={gpu_params_before}, CPU params={cpu_params_before}")
+
+            for idx, block in enumerate(blocks[0:split_idx]):
+                _mark_swap_weight_offload(block, False)
+                block.to(self.device)
+                params_to_device(
+                    block,
+                    self.device,
+                    include_norms=True,
+                    use_pinned=use_pinned,
+                    skip_trainable=skip_trainable,
+                )
+            _log_cuda_memory(f"full_block_swap_AFTER_GPU_blocks_0_to_{split_idx - 1}")
+
+            for idx, block in enumerate(blocks[split_idx:], start=split_idx):
+                _mark_swap_weight_offload(block, True)
+                if swap_mask == {"all"}:
+                    block.to(cpu_device)
+                    params_to_device(
+                        block,
+                        cpu_device,
+                        include_norms=True,
+                        use_pinned=use_pinned,
+                        skip_trainable=skip_trainable,
+                    )
+                else:
+                    if not _LOGGED_SWAP_MASK:
+                        logger.info(
+                            "LTX-2 swap: FULL MASK MODE - offloading mask=%s for swapped blocks",
+                            ",".join(sorted(swap_mask)),
+                        )
+                        _LOGGED_SWAP_MASK = True
+                    _move_masked_module_groups(
+                        block,
+                        cpu_device,
+                        self.device,
+                        mask_tokens=swap_mask,
+                        skip_trainable=skip_trainable,
+                    )
+            _log_cuda_memory(f"full_block_swap_AFTER_CPU_blocks_{split_idx}_to_{len(blocks) - 1}")
+
+            # Debug: count params on each device after
+            gpu_params_after = sum(1 for b in blocks for p in b.parameters() if p.is_cuda)
+            cpu_params_after = sum(1 for b in blocks for p in b.parameters() if not p.is_cuda)
+            logger.info(f"AFTER swap: GPU params={gpu_params_after}, CPU params={cpu_params_after}")
+        else:
+            # Partial swap: keep non-linear params on GPU (faster but uses more VRAM)
+            for block in blocks[0:split_idx]:
+                _mark_swap_weight_offload(block, False)
+                block.to(self.device)
+                weighs_to_device(block, self.device, use_pinned=use_pinned, skip_trainable=skip_trainable)
+
+            for block in blocks[split_idx:]:
+                _mark_swap_weight_offload(block, True)
+                if swap_mask != {"all"}:
+                    if not _LOGGED_SWAP_MASK:
+                        logger.info(
+                            "LTX-2 swap: LINEAR MASK MODE - offloading mask=%s for swapped blocks",
+                            ",".join(sorted(swap_mask)),
+                        )
+                        _LOGGED_SWAP_MASK = True
+                    _move_masked_linear_params(
+                        block,
+                        cpu_device,
+                        self.device,
+                        mask_tokens=swap_mask,
+                        use_pinned=use_pinned,
+                        skip_trainable=skip_trainable,
+                    )
+                    _move_non_linear_params(block, self.device, include_norms=True)
+                elif self.swap_norms:
+                    # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
+                    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") or _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN"):
+                        _move_block_params_excluding_audio(
+                            block,
+                            cpu_device,
+                            include_norms=True,
+                            use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
+                        )
+                    else:
+                        params_to_device(
+                            block,
+                            cpu_device,
+                            include_norms=True,
+                            use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
+                        )
+                    _move_non_linear_params(block, self.device, include_norms=False)
+                else:
+                    # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
+                    if _swap_keep_enabled("LTX2_SWAP_SKIP_AUDIO") or _swap_keep_enabled("LTX2_SWAP_KEEP_CROSS_ATTN"):
+                        _move_block_params_excluding_audio(
+                            block,
+                            cpu_device,
+                            include_norms=False,
+                            use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
+                        )
+                    else:
+                        weighs_to_device(block, cpu_device, use_pinned=use_pinned, skip_trainable=skip_trainable)
+                    _move_non_linear_params(block, self.device, include_norms=True)
+
+        _synchronize_device(self.device)
+        _clean_memory_on_device(self.device)
+        _log_cuda_memory("after_prepare_blocks")
+
+        # Initialize gpu_resident_blocks tracking
+        self.gpu_resident_blocks = set(range(split_idx))
+
+        # Warmup pinned slab pool if enabled
+        slab_pool_enabled = os.getenv("LTX2_SWAP_SLAB_POOL", "0") == "1"
+        if slab_pool_enabled and use_pinned:
+            from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
+                get_pinned_slab_pool,
+                init_pinned_slab_pool,
+            )
+
+            pool = get_pinned_slab_pool()
+            if pool is None:
+                pool = init_pinned_slab_pool()
+            pool.warmup(blocks, num_buffers_per_shape=max(2, self.prefetch_window))
+            logger.info("PinnedSlabPool warmed up: %s", pool.stats)
+
+        # Preload first swapped block if training with aggressive swap
+        # This ensures block split_idx is on GPU when forward pass reaches it
+        aggressive_train_swap = os.getenv("LTX2_SWAP_TRAIN_FULL", "0") == "1"
+        if aggressive_train_swap:
+            # Setup backward hooks to unload blocks after backward pass
+            # Loading during backward is handled by checkpoint_wrapper in transformer.py
+            self._setup_aggressive_backward_hooks(blocks)
+            # Enable block swap active flag (used by ensure_fp8_modules_on_device)
+            set_block_swap_active(True)
+            logger.info("Block swap active: backward hooks registered for unloading")
+
+        if aggressive_train_swap and split_idx < len(blocks):
+            # If split_idx == 0, all blocks are swapped - preload block 0
+            # If split_idx > 0, preload will be handled by submit_move_blocks_forward
+            # when block split_idx-1 finishes. But for safety, still preload here.
+            if split_idx == 0:
+                logger.info(f"Preloading first swapped block {split_idx} to GPU (full block move)")
+                # Use full block move for consistency with aggressive swap mode
+                blocks[split_idx].to(self.device)
+                self.gpu_resident_blocks.add(split_idx)
+                _synchronize_device(self.device)
+                _log_cuda_memory(f"after_preload_block_{split_idx}")
+
+        if not _LOGGED_SWAP_BYTES:
+            split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+            _log_block_cuda_bytes(blocks, split_idx)
+            _LOGGED_SWAP_BYTES = True
+        if not _LOGGED_FIRST_PARAM:
+            _log_first_param(blocks)
+            _LOGGED_FIRST_PARAM = True
+        if diag_enabled:
+            keep_idx = 0
+            swap_idx = max(0, self.num_blocks - self.blocks_to_swap)
+            if blocks:
+                _summarize_block_tensors(blocks[keep_idx], "after_keep_block")
+                if swap_idx < len(blocks):
+                    _summarize_block_tensors(blocks[swap_idx], "after_swap_block")
+
+
+class LTX2TrainableRingOffloader:
+    """Coalesced block ring for fused-backward full fine-tuning."""
+
+    def __init__(
+        self,
+        block_type: str,
+        blocks: list[nn.Module],
+        num_blocks: int,
+        blocks_to_swap: int,
+        supports_backward: bool,
+        device: torch.device,
+        *,
+        ring_size: int = 2,
+        use_pinned_memory: bool = True,
+    ):
+        if device.type != "cuda":
+            raise ValueError("Trainable block ring requires CUDA.")
+        if not supports_backward:
+            raise ValueError("Trainable block ring requires backward block swapping.")
+        if not use_pinned_memory:
+            raise ValueError("Trainable block ring requires pinned host memory.")
+        if blocks_to_swap >= num_blocks:
+            raise ValueError("Trainable block ring requires at least one resident block.")
+
+        self.block_type = block_type
+        self._blocks = blocks
+        self.num_blocks = num_blocks
+        self.blocks_to_swap = blocks_to_swap
+        self.device = device
+        self.supports_backward = True
+        self.forward_only = False
+        self.B = min(max(1, ring_size), num_blocks - blocks_to_swap)
+        stream_count = min(num_blocks, blocks_to_swap + self.B)
+        self.stream_idx = list(range(num_blocks - stream_count, num_blocks))
+        self.rank = {block_idx: rank for rank, block_idx in enumerate(self.stream_idx)}
+        self.S = len(self.stream_idx)
+        self.B = min(self.B, self.S)
+
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.cpu_flat: dict[int, torch.Tensor] = {}
+        self.ring_flat: list[torch.Tensor] = []
+        self.in_slot: list[int | None] = [None] * self.B
+        self.free_event: list[torch.cuda.Event | None] = [None] * self.B
+        self.load_event: dict[int, torch.cuda.Event] = {}
+        self._entries: dict[int, list[tuple[nn.Module, str, nn.Parameter | None]]] = {}
+        self._layout: list[tuple[int, int, torch.dtype, torch.Size]] | None = None
+        self._total_bytes = 0
+        self._prepared = False
+        self._phase = "forward"
+        self._last_wait_rank: int | None = None
+
+    @staticmethod
+    def _block_tensors(block: nn.Module) -> list[tuple[nn.Module, str, nn.Parameter | None, torch.Tensor]]:
+        entries = []
+        seen = set()
+        for module in block.modules():
+            for name, parameter in module._parameters.items():
+                if parameter is None or id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                entries.append((module, name, parameter, parameter.data))
+            for name, buffer in module._buffers.items():
+                if buffer is None or id(buffer) in seen:
+                    continue
+                seen.add(id(buffer))
+                entries.append((module, name, None, buffer))
+        return entries
+
+    @staticmethod
+    def _make_layout(tensors: list[torch.Tensor]) -> tuple[list[tuple[int, int, torch.dtype, torch.Size]], int]:
+        layout = []
+        total = 0
+        for tensor in tensors:
+            total = (total + 255) // 256 * 256
+            size = tensor.numel() * tensor.element_size()
+            layout.append((total, size, tensor.dtype, tensor.shape))
+            total += size
+        return layout, total
+
+    def _views(self, flat: torch.Tensor) -> list[torch.Tensor]:
+        assert self._layout is not None
+        return [flat[offset : offset + size].view(dtype).view(shape) for offset, size, dtype, shape in self._layout]
+
+    def _bind(self, block_idx: int, flat: torch.Tensor) -> None:
+        entries = self._entries[block_idx]
+        for (module, name, parameter), view in zip(entries, self._views(flat)):
+            if parameter is not None:
+                parameter.data = view
+            else:
+                module._buffers[name] = view
+
+    def _evict(self, slot: int, *, writeback: bool) -> None:
+        block_idx = self.in_slot[slot]
+        if block_idx is None:
+            return
+        with torch.cuda.stream(self.copy_stream):
+            free_event = self.free_event[slot]
+            if free_event is not None:
+                self.copy_stream.wait_event(free_event)
+            if writeback:
+                self.cpu_flat[block_idx].copy_(self.ring_flat[slot], non_blocking=True)
+        self._bind(block_idx, self.cpu_flat[block_idx])
+        self.in_slot[slot] = None
+        self.free_event[slot] = None
+        self.load_event.pop(block_idx, None)
+
+    def _load(self, rank: int, slot: int, *, writeback_owner: bool = False) -> None:
+        block_idx = self.stream_idx[rank]
+        if self.in_slot[slot] == block_idx:
+            self._bind(block_idx, self.ring_flat[slot])
+            return
+        self._evict(slot, writeback=writeback_owner)
+        with torch.cuda.stream(self.copy_stream):
+            self.ring_flat[slot].copy_(self.cpu_flat[block_idx], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.copy_stream)
+        self._bind(block_idx, self.ring_flat[slot])
+        self.in_slot[slot] = block_idx
+        self.load_event[block_idx] = event
+
+    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
+        if self._prepared:
+            self.copy_stream.synchronize()
+            for rank in range(min(self.B, self.S)):
+                self._load(rank, rank)
+            return
+
+        stream_set = set(self.stream_idx)
+        for block_idx, block in enumerate(blocks):
+            if block_idx not in stream_set:
+                block.to(self.device)
+                continue
+
+            block.to("cpu")
+            entries = self._block_tensors(block)
+            tensors = [entry[3] for entry in entries]
+            layout, total_bytes = self._make_layout(tensors)
+            if self._layout is None:
+                self._layout = layout
+                self._total_bytes = total_bytes
+            elif [(size, dtype, shape) for _, size, dtype, shape in layout] != [
+                (size, dtype, shape) for _, size, dtype, shape in self._layout
+            ]:
+                raise ValueError(f"LTX-2 block {block_idx} is incompatible with the trainable ring layout.")
+
+            flat = torch.empty(self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            for source, target in zip(tensors, self._views(flat)):
+                target.copy_(source)
+            self._entries[block_idx] = [(module, name, parameter) for module, name, parameter, _ in entries]
+            self.cpu_flat[block_idx] = flat
+            self._bind(block_idx, flat)
+
+        self.ring_flat = [torch.empty(self._total_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.B)]
+        for rank in range(self.B):
+            self._load(rank, rank)
+        self._prepared = True
+        torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+        _clean_memory_on_device(self.device)
+
+    def wait_for_block(self, block_idx: int) -> None:
+        rank = self.rank.get(block_idx)
+        if rank is None:
+            if self._phase == "backward" and self._last_wait_rank == 0 and block_idx < self.stream_idx[0]:
+                self._finish_backward_rank(0)
+                self._last_wait_rank = None
+            if block_idx == 0:
+                self._phase = "forward"
+                self._last_wait_rank = None
+            return
+
+        if self.forward_only and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "backward" and self._last_wait_rank == 0 and rank == 0:
+            self._finish_backward_rank(0)
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "forward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._phase = "backward"
+            self._finish_backward_rank(self._last_wait_rank)
+        elif self._phase == "backward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._finish_backward_rank(self._last_wait_rank)
+
+        slot = rank % self.B
+        if self.in_slot[slot] != block_idx:
+            self._load(rank, slot)
+        event = self.load_event.get(block_idx)
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        self._last_wait_rank = rank
+
+    def submit_move_blocks_forward(self, blocks: list[nn.Module], block_idx: int) -> None:
+        rank = self.rank.get(block_idx)
+        if rank is None:
+            return
+        slot = rank % self.B
+        self.free_event[slot] = torch.cuda.current_stream(self.device).record_event()
+        if rank + self.B < self.S:
+            self._load(rank + self.B, slot)
+
+    def _finish_backward_rank(self, rank: int) -> None:
+        slot = rank % self.B
+        self.free_event[slot] = torch.cuda.current_stream(self.device).record_event()
+        if rank >= self.B:
+            self._load(rank - self.B, slot, writeback_owner=True)
+        else:
+            self._evict(slot, writeback=True)
+            self._load(rank, slot)
+
+    def set_forward_only(self, forward_only: bool) -> None:
+        self.copy_stream.synchronize()
+        if forward_only and self._phase == "backward" and self._last_wait_rank == 0:
+            self._finish_backward_rank(0)
+            self.copy_stream.synchronize()
+        self.forward_only = forward_only
+        self._phase = "forward"
+        self._last_wait_rank = None
+
+    def synchronize(self) -> None:
+        self.copy_stream.synchronize()

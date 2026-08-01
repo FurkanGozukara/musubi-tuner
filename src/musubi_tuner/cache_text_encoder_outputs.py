@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Optional, Union
 
 import torch
@@ -20,6 +21,11 @@ from musubi_tuner.hunyuan_model.text_encoder import TextEncoder
 
 import logging
 
+from musubi_tuner.gui_dashboard.cache_progress import (
+    cache_progress_total,
+    create_cache_progress_writer_from_env,
+    should_update_cache_progress,
+)
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
@@ -79,16 +85,27 @@ def process_text_encoder_batches(
     all_cache_paths_for_dataset: list[set],
     encode: callable,
     requires_content: Optional[bool] = False,
+    shard: Optional[tuple] = None,
 ):
     """
     Architecture independent processing of text encoder batches.
+
+    shard: optional (rank, world_size) for opt-in multi-process sharding. Default None →
+    single process, no change. When world_size > 1 each rank encodes a disjoint subset.
     """
 
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
+    shard_rank, shard_world = shard if shard else (0, 1)
+    progress_writer = create_cache_progress_writer_from_env()
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_cache_files = all_cache_files_for_dataset[i]
         all_cache_paths = all_cache_paths_for_dataset[i]
+        total_items = cache_progress_total(dataset)
+        processed_items = 0
+        last_progress_items = 0
+        if progress_writer is not None:
+            progress_writer.update(dataset_index=i, current_items=0, total_items=total_items)
 
         if not requires_content:
             batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)  # return captions only
@@ -99,6 +116,16 @@ def process_text_encoder_batches(
             # update cache files (it's ok if we update it multiple times)
             if requires_content:
                 batch = batch[1]  # batch is (key, items), so use items
+            if shard_world > 1:
+                # Stable per-item assignment by cache path → order-independent disjoint cover.
+                batch = [
+                    it
+                    for it in batch
+                    if (zlib.crc32(os.path.normpath(it.text_encoder_output_cache_path).encode("utf-8")) % shard_world) == shard_rank
+                ]
+                if not batch:
+                    continue
+            original_batch_size = len(batch)
             all_cache_paths.update([os.path.normpath(item.text_encoder_output_cache_path) for item in batch])
 
             # skip existing cache files
@@ -108,17 +135,40 @@ def process_text_encoder_batches(
                 ]
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:
+                    processed_items += original_batch_size
+                    if progress_writer is not None and should_update_cache_progress(
+                        processed_items, total_items, last_progress_items
+                    ):
+                        progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                        last_progress_items = processed_items
                     continue
                 batch = filtered_batch
 
             bs = batch_size if batch_size is not None else len(batch)
-            for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+            for start in range(0, len(batch), bs):
+                encode(batch[start : start + bs])
+            processed_items += original_batch_size
+            if progress_writer is not None and should_update_cache_progress(processed_items, total_items, last_progress_items):
+                progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                last_progress_items = processed_items
+
+        if progress_writer is not None and processed_items > last_progress_items:
+            progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
 
 
 def post_process_cache_files(
-    datasets: list[BaseDataset], all_cache_files_for_dataset: list[set], all_cache_paths_for_dataset: list[set], keep_cache: bool
+    datasets: list[BaseDataset],
+    all_cache_files_for_dataset: list[set],
+    all_cache_paths_for_dataset: list[set],
+    keep_cache: bool,
+    shard: Optional[tuple] = None,
 ):
+    _, shard_world = shard if shard else (0, 1)
+    if shard_world > 1:
+        # Each rank only saw its own subset; it cannot distinguish a stale file from another
+        # rank's valid cache. Skip cleanup under sharding to avoid deleting siblings' work.
+        logger.info("Distributed cache sharding active (world_size=%d): skipping stale-cache cleanup", shard_world)
+        return
     for i, dataset in enumerate(datasets):
         all_cache_files = all_cache_files_for_dataset[i]
         all_cache_paths = all_cache_paths_for_dataset[i]

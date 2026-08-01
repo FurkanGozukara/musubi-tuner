@@ -21,11 +21,12 @@
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
-import math 
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 flash_attn_version = os.environ.get("FA_VERSION", "auto")
 USE_BF16_ROPE = os.environ.get("USE_BF16_ROPE", "0")
 # Flash Attention import (FA3 preferred, FA2 fallback)
@@ -53,7 +54,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring as _transformers_auto_docstring, is_torchdynamo_compiling
+from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
@@ -103,9 +104,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )
+        hidden_states = hidden_states.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
 
@@ -257,9 +256,7 @@ class Qwen3VLVisionAttention(nn.Module):
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
+            splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
 
             attn_outputs = [
                 attention_interface(
@@ -356,9 +353,13 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         if USE_BF16_ROPE == "1":
-            inv_freq_expanded = self.inv_freq[None, None, :, None].float().to(device=x.device).expand(3, position_ids.shape[1], -1, 1)
+            inv_freq_expanded = (
+                self.inv_freq[None, None, :, None].float().to(device=x.device).expand(3, position_ids.shape[1], -1, 1)
+            )
         else:
-            inv_freq_expanded = self.original_inv_freq[None, None, :, None].float().to(device=x.device).expand(3, position_ids.shape[1], -1, 1)
+            inv_freq_expanded = (
+                self.original_inv_freq[None, None, :, None].float().to(device=x.device).expand(3, position_ids.shape[1], -1, 1)
+            )
         # inv_freq_expanded = self.inv_freq[None, None, :, None].float().to(device=x.device).expand(3, position_ids.shape[1], -1, 1)
         position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
 
@@ -434,22 +435,12 @@ class Qwen3VLTextAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
         self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
+        self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -722,9 +713,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
-        )
+        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device)
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
@@ -786,9 +775,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
-                    hidden_states
-                )
+                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = self.merger(hidden_states)
@@ -798,8 +785,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
 @auto_docstring(
     custom_intro=(
-        "Text part of Qwen3VL, "
-        "not a pure text-only model, as DeepStack integrates visual features into the early hidden states."
+        "Text part of Qwen3VL, not a pure text-only model, as DeepStack integrates visual features into the early hidden states."
     )
 )
 class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
@@ -812,9 +798,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.layers = nn.ModuleList([Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -832,9 +816,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             f"Cannot swap more than {num_blocks - 1} Qwen3VL decoder blocks. Requested {self.blocks_to_swap} blocks."
         )
 
-        self.offloader = create_offloader(
-            "hidream-o1-qwen3vl-block", self.layers, num_blocks, self.blocks_to_swap, config
-        )
+        self.offloader = create_offloader("hidream-o1-qwen3vl-block", self.layers, num_blocks, self.blocks_to_swap, config)
         print(
             f"HiDream-O1: Block swap enabled. Swapping {self.blocks_to_swap} of {num_blocks} Qwen3VL decoder blocks. "
             f"Supports backward: {config.supports_backward}"
@@ -894,9 +876,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
@@ -927,7 +907,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # === Memory profiling for decoder loop (gated by DEBUG_MEM=1) ===
         import os as _os
-        _mem_debug = _os.environ.get('DEBUG_MEM', '0') == '1'
+
+        _mem_debug = _os.environ.get("DEBUG_MEM", "0") == "1"
         _gc_count = 0
 
         # decoder layers
@@ -963,7 +944,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             # Per-layer memory logging (gated by DEBUG_MEM=1)
             if _mem_debug and (layer_idx % 4 == 0 or layer_idx == len(self.layers) - 1):
                 _a = torch.cuda.memory_allocated() / 1e9
-                _rank = int(_os.environ.get('RANK', 0))
+                _rank = int(_os.environ.get("RANK", 0))
                 print(f"[MEM][rank{_rank}][decoder] layer {layer_idx:2d}/{len(self.layers)}: alloc={_a:.2f}GB", flush=True)
 
             # add visual features to the hidden states of first several layers
@@ -982,8 +963,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         _a = torch.cuda.memory_allocated() / 1e9
         if _mem_debug:
-            _rank = int(_os.environ.get('RANK', 0))
-            print(f"[MEM][rank{_rank}][decoder] LOOP END: alloc={_a:.2f}GB, GC_used={_gc_count}/{len(self.layers)} layers", flush=True)
+            _rank = int(_os.environ.get("RANK", 0))
+            print(
+                f"[MEM][rank{_rank}][decoder] LOOP END: alloc={_a:.2f}GB, GC_used={_gc_count}/{len(self.layers)} layers", flush=True
+            )
 
         hidden_states = self.norm(hidden_states)
 
@@ -994,19 +977,18 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         output.mid_results = mid_results
         return output
 
-    def _deepstack_process(
-        self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
-    ):
+    def _deepstack_process(self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor):
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
         local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
+
 class BottleneckPatchEmbed(nn.Module):
     def __init__(self, config, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
         super().__init__()
-        self.proj1 = nn.Linear(patch_size*patch_size*in_chans, pca_dim, bias=False)
+        self.proj1 = nn.Linear(patch_size * patch_size * in_chans, pca_dim, bias=False)
         self.proj2 = nn.Linear(pca_dim, embed_dim, bias=bias)
         self.initialize_weights()
 
@@ -1020,7 +1002,8 @@ class BottleneckPatchEmbed(nn.Module):
     def forward(self, x):
         x = self.proj2(self.proj1(x))
         return x
-    
+
+
 class FinalLayer(nn.Module):
     def __init__(self, config, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -1038,11 +1021,11 @@ class FinalLayer(nn.Module):
         return x
 
 
-
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
+
     def __init__(self, config, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -1066,9 +1049,7 @@ class TimestepEmbedder(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
@@ -1079,6 +1060,7 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t * 1000, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq.to(self.mlp[0].weight.dtype))
         return t_emb
+
 
 @auto_docstring
 class Qwen3VLModel(Qwen3VLPreTrainedModel):
@@ -1102,11 +1084,20 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         bottleneck_dim = hidden_size // 4
 
         self.t_embedder1 = TimestepEmbedder(self.config, hidden_size)
-        self.x_embedder = BottleneckPatchEmbed(self.config,  patch_size = self.patch_size, in_chans = self.in_channels, pca_dim = bottleneck_dim, embed_dim = hidden_size, bias=True)
-    
+        self.x_embedder = BottleneckPatchEmbed(
+            self.config,
+            patch_size=self.patch_size,
+            in_chans=self.in_channels,
+            pca_dim=bottleneck_dim,
+            embed_dim=hidden_size,
+            bias=True,
+        )
+
         # self.t_embedder2 = TimestepEmbedder(self.config, hidden_size)
         self.t_embedder2 = None
-        self.final_layer2 = FinalLayer(self.config, hidden_size = hidden_size, patch_size = self.patch_size, out_channels = self.in_channels)
+        self.final_layer2 = FinalLayer(
+            self.config, hidden_size=hidden_size, patch_size=self.patch_size, out_channels=self.in_channels
+        )
         self.tms_token_id = 151673
 
         # Initialize weights and apply final processing
@@ -1231,9 +1222,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
+                    torch.arange(input_ids.shape[1], device=input_ids.device).view(1, 1, -1).expand(3, input_ids.shape[0], -1)
                 )
                 mrope_position_deltas = torch.zeros(
                     [input_ids.shape[0], 1],
@@ -1243,9 +1232,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
             return position_ids, mrope_position_deltas
 
-    def get_video_features(
-        self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
-    ):
+    def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None):
         """
         Encodes videos into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
 
@@ -1341,7 +1328,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds: visual features injected into decoder layers
         """
         assert _flash_attn_func is not None, (
-            "Flash attention is not available. Install flash_attn_interface (FA3) or flash_attn (FA2).")
+            "Flash attention is not available. Install flash_attn_interface (FA3) or flash_attn (FA2)."
+        )
 
         text_model = self.language_model
 
@@ -1391,18 +1379,26 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 k = k_r.transpose(1, 2).contiguous()  # [B, S, KVH, D]
                 v = v.contiguous()
 
-                softmax_scale = head_dim ** -0.5
+                softmax_scale = head_dim**-0.5
 
                 # --- Two-pass flash attention ---
                 # Pass 1: causal attention on AR tokens only
                 q_ar = q[:, idx_ar].contiguous()
                 k_ar = k[:, idx_ar].contiguous()
                 v_ar = v[:, idx_ar].contiguous()
-                result_ar = _flash_attn_func(q_ar.to(torch.bfloat16), k_ar.to(torch.bfloat16), v_ar.to(torch.bfloat16), softmax_scale=softmax_scale, causal=True)
+                result_ar = _flash_attn_func(
+                    q_ar.to(torch.bfloat16),
+                    k_ar.to(torch.bfloat16),
+                    v_ar.to(torch.bfloat16),
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
                 out_ar = result_ar[0] if isinstance(result_ar, tuple) else result_ar
 
                 # Pass 2: full (bidirectional) attention on all tokens
-                result_full = _flash_attn_func(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), softmax_scale=softmax_scale, causal=False)
+                result_full = _flash_attn_func(
+                    q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), softmax_scale=softmax_scale, causal=False
+                )
                 out_full = result_full[0] if isinstance(result_full, tuple) else result_full
 
                 # Replace AR positions with causal result
@@ -1437,19 +1433,23 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             if use_gc:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     _flash_layer_forward,
-                    hidden_states, decoder_layer, cos, sin, idx_ar,
+                    hidden_states,
+                    decoder_layer,
+                    cos,
+                    sin,
+                    idx_ar,
                     use_reentrant=False,
                 )
             else:
                 hidden_states = _flash_layer_forward(
-                    hidden_states, decoder_layer, cos, sin, idx_ar,
+                    hidden_states,
+                    decoder_layer,
+                    cos,
+                    sin,
+                    idx_ar,
                 )
 
-            if (
-                deepstack_visual_embeds is not None
-                and visual_pos_masks is not None
-                and layer_idx < len(deepstack_visual_embeds)
-            ):
+            if deepstack_visual_embeds is not None and visual_pos_masks is not None and layer_idx < len(deepstack_visual_embeds):
                 hidden_states = text_model._deepstack_process(
                     hidden_states,
                     visual_pos_masks,
@@ -1466,12 +1466,23 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         hidden_states = text_model.norm(hidden_states)
         return hidden_states, mid_results
 
-    def _forward_generation(self, input_ids, position_ids, vinputs, timestep, token_types,
-                             inputs_embeds=None,
-                             attention_mask=None, pixel_values=None, pixel_values_videos=None,
-                             image_grid_thw=None, video_grid_thw=None, use_flash_attn=False,
-                             return_mid_results_layers=None,
-                             **kwargs):
+    def _forward_generation(
+        self,
+        input_ids,
+        position_ids,
+        vinputs,
+        timestep,
+        token_types,
+        inputs_embeds=None,
+        attention_mask=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        use_flash_attn=False,
+        return_mid_results_layers=None,
+        **kwargs,
+    ):
         """Forward pass for image generation (denoising step).
 
         Args:
@@ -1517,8 +1528,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             else:
                 image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
                 image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+            image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             cond_image_embeds_out = image_embeds
             cond_deepstack_image_embeds_out = deepstack_image_embeds
@@ -1530,16 +1540,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # preventing collective hangs at backward / clip_grad_norm_.
             # The dummy output is zeroed out before being added to inputs_embeds, so
             # the forward result is numerically identical to the no-pixel_values path.
-            pe    = self.visual.patch_embed          # PatchEmbed
-            t_sz  = pe.temporal_patch_size           # e.g. 2
-            m_sz  = self.visual.spatial_merge_size   # e.g. 2
+            pe = self.visual.patch_embed  # PatchEmbed
+            t_sz = pe.temporal_patch_size  # e.g. 2
+            m_sz = self.visual.spatial_merge_size  # e.g. 2
             n_patches = t_sz * m_sz * m_sz
             patch_dim = pe.in_channels * t_sz * pe.patch_size * pe.patch_size
-            fake_pv   = torch.zeros(n_patches, patch_dim,
-                                    device=inputs_embeds.device,
-                                    dtype=pe.proj.weight.dtype)
-            fake_grid = torch.tensor([[t_sz, m_sz, m_sz]],
-                                     dtype=torch.long, device=inputs_embeds.device)
+            fake_pv = torch.zeros(n_patches, patch_dim, device=inputs_embeds.device, dtype=pe.proj.weight.dtype)
+            fake_grid = torch.tensor([[t_sz, m_sz, m_sz]], dtype=torch.long, device=inputs_embeds.device)
             fake_embs, fake_deepstack = self.get_image_features(fake_pv, fake_grid)
             fake_embs = torch.cat(fake_embs, dim=0).to(inputs_embeds.dtype)
             fake_total = fake_embs.sum()
@@ -1550,8 +1557,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
+            _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         visual_pos_masks = None
@@ -1583,7 +1589,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         timestep = timestep.to(inputs_embeds.device)
         t_emb = self.t_embedder1(timestep)  # [batch, hidden]
 
-        tms_mask = (input_ids == self.tms_token_id)  # [batch, txt_seq_len]
+        tms_mask = input_ids == self.tms_token_id  # [batch, txt_seq_len]
         tms_mask_3d = tms_mask.unsqueeze(-1).expand_as(inputs_embeds)
         t_emb_expanded = t_emb.unsqueeze(1).expand_as(inputs_embeds)
         inputs_embeds = torch.where(tms_mask_3d, t_emb_expanded, inputs_embeds)
@@ -1624,30 +1630,35 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # 6. Forward through decoder
         mid_results = None
         import os as _os2
-        _mem_debug2 = _os2.environ.get('DEBUG_MEM', '0') == '1'
+
+        _mem_debug2 = _os2.environ.get("DEBUG_MEM", "0") == "1"
 
         if _mem_debug2:
-            _rank2 = int(_os2.environ.get('RANK', 0))
+            _rank2 = int(_os2.environ.get("RANK", 0))
             _a = torch.cuda.memory_allocated() / 1e9
-            print(f"[MEM][rank{_rank2}][_forward_gen] before decoder: alloc={_a:.2f}GB, "
-                  f"total_seq_len={total_seq_len}, batch={batch_size}, flash={use_flash_attn}", flush=True)
+            print(
+                f"[MEM][rank{_rank2}][_forward_gen] before decoder: alloc={_a:.2f}GB, "
+                f"total_seq_len={total_seq_len}, batch={batch_size}, flash={use_flash_attn}",
+                flush=True,
+            )
 
         if use_flash_attn:
             # Flash attention: two-pass approach (causal on AR + full on all → index_copy)
             hidden_states, mid_results = self._run_decoder_flash(
-                inputs_embeds, position_ids, token_types,
+                inputs_embeds,
+                position_ids,
+                token_types,
                 visual_pos_masks=visual_pos_masks,
                 deepstack_visual_embeds=deepstack_visual_embeds,
-                return_mid_results_layers=return_mid_results_layers)
+                return_mid_results_layers=return_mid_results_layers,
+            )
         else:
             # Standard path: 4D attention mask (causal for AR, full for gen tokens)
             dtype = inputs_embeds.dtype
             min_val = torch.finfo(dtype).min
             attn_masks = []
             for b in range(batch_size):
-                causal = torch.full(
-                    (total_seq_len, total_seq_len), min_val,
-                    device=inputs_embeds.device, dtype=dtype)
+                causal = torch.full((total_seq_len, total_seq_len), min_val, device=inputs_embeds.device, dtype=dtype)
                 causal = torch.triu(causal, diagonal=1)  # lower tri + diag = 0 (allowed)
                 gen_positions = token_types[b].bool()  # [total_seq_len]
                 causal[gen_positions, :] = 0  # gen tokens attend to everything
@@ -1660,11 +1671,14 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             attention_mask_4d = torch.stack(attn_masks, dim=0).unsqueeze(1)  # [batch, 1, seq, seq]
 
             if _mem_debug2:
-                _rank2 = int(_os2.environ.get('RANK', 0))
+                _rank2 = int(_os2.environ.get("RANK", 0))
                 _mask_gb = attention_mask_4d.element_size() * attention_mask_4d.numel() / 1e9
                 _a = torch.cuda.memory_allocated() / 1e9
-                print(f"[MEM][rank{_rank2}][_forward_gen] attn_mask_4d: shape={list(attention_mask_4d.shape)}, "
-                      f"size={_mask_gb:.3f}GB, alloc={_a:.2f}GB", flush=True)
+                print(
+                    f"[MEM][rank{_rank2}][_forward_gen] attn_mask_4d: shape={list(attention_mask_4d.shape)}, "
+                    f"size={_mask_gb:.3f}GB, alloc={_a:.2f}GB",
+                    flush=True,
+                )
 
             outputs = self.language_model(
                 input_ids=None,
@@ -1677,7 +1691,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 return_mid_results_layers=return_mid_results_layers,
             )
             hidden_states = outputs.last_hidden_state
-            if hasattr(outputs, 'mid_results'):
+            if hasattr(outputs, "mid_results"):
                 mid_results = outputs.mid_results
 
         # 7. Apply final layer to get pixel predictions
@@ -1721,15 +1735,21 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # Dispatch to generation forward if vinputs is provided
         if vinputs is not None:
             return self._forward_generation(
-                input_ids=input_ids, position_ids=position_ids,
-                vinputs=vinputs, timestep=timestep, token_types=token_types,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                vinputs=vinputs,
+                timestep=timestep,
+                token_types=token_types,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                pixel_values=pixel_values, pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
                 use_flash_attn=use_flash_attn,
                 return_mid_results_layers=return_mid_results_layers,
-                **kwargs)
+                **kwargs,
+            )
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1743,17 +1763,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-            )
+            image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
+            _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         visual_pos_masks = None
@@ -1781,9 +1797,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
-            attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
-            )
+            attention_mask_tensor = attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
                 # Only apply conversion for floating point tensors (inverted masks)
@@ -1796,8 +1810,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
             prefill_compiled_stage = is_torchdynamo_compiling() and (
-                (input_ids is not None and input_ids.shape[1] != 1)
-                or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
+                (input_ids is not None and input_ids.shape[1] != 1) or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
             )
             prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
                 (cache_position is not None and cache_position[0] == 0)
@@ -1814,11 +1827,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
-                delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                    if cache_position is not None
-                    else 0
-                )
+                delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 if cache_position is not None:  # otherwise `deltas` is an int `0`
@@ -1877,6 +1886,7 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     cond_image_embeds: Optional[torch.FloatTensor] = None
     cond_deepstack_image_embeds: Optional[list[torch.Tensor]] = None
 
+
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
@@ -1907,9 +1917,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model.get_decoder()
 
-    def get_video_features(
-        self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
-    ):
+    def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None):
         return self.model.get_video_features(pixel_values_videos, video_grid_thw)
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
@@ -2009,7 +2017,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if vinputs is not None:
             return Qwen3VLCausalLMOutputWithPast(
                 x_pred=outputs.x_pred,
-                mid_results=outputs.mid_results if hasattr(outputs, 'mid_results') else None,
+                mid_results=outputs.mid_results if hasattr(outputs, "mid_results") else None,
                 cond_image_embeds=getattr(outputs, "cond_image_embeds", None),
                 cond_deepstack_image_embeds=getattr(outputs, "cond_deepstack_image_embeds", None),
             )
@@ -2096,21 +2104,15 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if inputs_embeds is not None:
             vision_start_mask = (
                 inputs_embeds
-                == self.get_input_embeddings()(
-                    torch.tensor(vision_start_token_id, dtype=torch.long, device=inputs_embeds.device)
-                )
+                == self.get_input_embeddings()(torch.tensor(vision_start_token_id, dtype=torch.long, device=inputs_embeds.device))
             )[..., 0]
             image_mask = (
                 inputs_embeds
-                == self.get_input_embeddings()(
-                    torch.tensor(image_token_id, dtype=torch.long, device=inputs_embeds.device)
-                )
+                == self.get_input_embeddings()(torch.tensor(image_token_id, dtype=torch.long, device=inputs_embeds.device))
             )[..., 0]
             video_mask = (
                 inputs_embeds
-                == self.get_input_embeddings()(
-                    torch.tensor(video_token_id, dtype=torch.long, device=inputs_embeds.device)
-                )
+                == self.get_input_embeddings()(torch.tensor(video_token_id, dtype=torch.long, device=inputs_embeds.device))
             )[..., 0]
         else:
             vision_start_mask = input_ids == vision_start_token_id
@@ -2159,26 +2161,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     samples = torch.split(image_grid_thw, list(image_nums))
                     # compute the sequence length of images for each sample
                     lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
+                    dict_to_expand[key] = _repeat_interleave_samples(dict_to_expand[key], lengths=lengths, repeat_times=expand_size)
                 elif key == "image_grid_thw":
                     # get the num of images for each sample
                     lengths = list(image_nums)
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
+                    dict_to_expand[key] = _repeat_interleave_samples(dict_to_expand[key], lengths=lengths, repeat_times=expand_size)
                 elif key == "pixel_values_videos":
                     samples = torch.split(video_grid_thw, list(video_nums))
                     lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
+                    dict_to_expand[key] = _repeat_interleave_samples(dict_to_expand[key], lengths=lengths, repeat_times=expand_size)
                 elif key == "video_grid_thw":
                     lengths = list(video_nums)
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
+                    dict_to_expand[key] = _repeat_interleave_samples(dict_to_expand[key], lengths=lengths, repeat_times=expand_size)
                 elif key == "second_per_grid_ts":
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=list(video_nums), repeat_times=expand_size
