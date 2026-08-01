@@ -87,6 +87,17 @@ from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, t
 logger = logging.getLogger("musubi_tuner.hv_train_network")
 
 
+def _enable_transformer_gradient_checkpointing(transformer, activation_cpu_offloading: bool, **options) -> None:
+    """Enable checkpointing without assuming every model exposes LTX-only options."""
+    method = transformer.enable_gradient_checkpointing
+    parameters = inspect.signature(method).parameters
+    accepts_arbitrary_options = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    supported_options = (
+        options if accepts_arbitrary_options else {name: value for name, value in options.items() if name in parameters}
+    )
+    method(activation_cpu_offloading, **supported_options)
+
+
 def train(self, args):
     validate_weight_noise_args(args)
 
@@ -534,7 +545,8 @@ def train(self, args):
     if args.gradient_checkpointing:
         blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
         if getattr(args, "blockwise_checkpointing", False):
-            transformer.enable_gradient_checkpointing(
+            _enable_transformer_gradient_checkpointing(
+                transformer,
                 args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True, blocks_to_checkpoint=blocks_to_ckpt
             )
             if hasattr(transformer, "transformer_blocks"):
@@ -556,7 +568,9 @@ def train(self, args):
                     if hasattr(block, "use_pinned_memory"):
                         block.use_pinned_memory = True
         else:
-            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt)
+            _enable_transformer_gradient_checkpointing(
+                transformer, args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt
+            )
         try:
             network.enable_gradient_checkpointing(
                 args.gradient_checkpointing_cpu_offload,
