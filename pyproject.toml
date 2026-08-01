@@ -5,7 +5,7 @@ description = "Musubi Tuner by kohya_ss"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 dependencies = [
-    "accelerate>=1.7.0",
+    "accelerate>=1.6.0",
     "adv_optm==2.2.3",
     "apollo-torch==1.0.3",
     "av==14.0.1",
@@ -44,9 +44,9 @@ cu128 = [
     "torchaudio>=2.7.1",
 ]
 cu130 = [
-    "torch~=2.11.0",
-    "torchvision~=0.26.0",
-    "torchaudio~=2.11.0",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "torchaudio>=2.11.0",
 ]
 gui = [
     "gradio>=4.0.0, <6.0.0",
