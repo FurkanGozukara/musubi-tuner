@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,8 @@ def _run_distributed_workers(worker: str, output_dir: Path) -> None:
         env = os.environ.copy()
         env.update(
             {
+                "ACCELERATE_USE_CPU": "true",
+                "CUDA_VISIBLE_DEVICES": "",
                 "LOCAL_RANK": str(rank),
                 "LOCAL_WORLD_SIZE": "2",
                 "OMP_NUM_THREADS": "1",
@@ -61,7 +64,11 @@ def _run_distributed_workers(worker: str, output_dir: Path) -> None:
         )
 
     try:
-        results = [process.communicate(timeout=120) for process in processes]
+        # Drain both workers concurrently. Waiting on rank 0 first can fill
+        # rank 1's Windows pipe while rank 0 is blocked at a Gloo barrier.
+        with ThreadPoolExecutor(max_workers=len(processes)) as executor:
+            futures = [executor.submit(process.communicate, timeout=120) for process in processes]
+            results = [future.result() for future in futures]
     finally:
         for process in processes:
             if process.poll() is None:
@@ -169,26 +176,30 @@ def _record_event(output_dir: Path, label: str, rank: int, order: int) -> None:
 
 def _run_ddp_update(output_dir: Path, rank: int, init_method: str) -> None:
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
-    accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1, mixed_precision="no")
-    assert accelerator.process_index == rank
-    trainer = TinyFullTrainer()
-    full_finetune.prepare_accelerator = lambda _args: accelerator
-    full_finetune.clean_memory_on_device = lambda _device: None
-    full_finetune.sai_model_spec.build_metadata = lambda *args, **kwargs: {
-        "modelspec.architecture": "tiny",
-        "is_lora": str(kwargs["is_lora"]),
-    }
+    try:
+        accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1, mixed_precision="no")
+        assert accelerator.process_index == rank
+        trainer = TinyFullTrainer()
+        full_finetune.prepare_accelerator = lambda _args: accelerator
+        full_finetune.clean_memory_on_device = lambda _device: None
+        full_finetune.sai_model_spec.build_metadata = lambda *args, **kwargs: {
+            "modelspec.architecture": "tiny",
+            "is_lora": str(kwargs["is_lora"]),
+        }
 
-    trainer.train(
-        make_args(
-            output_dir,
-            blocks_to_swap=0,
-            compile=False,
-            sample_prompts=None,
-            max_train_steps=1,
+        trainer.train(
+            make_args(
+                output_dir,
+                blocks_to_swap=0,
+                compile=False,
+                sample_prompts=None,
+                max_train_steps=1,
+            )
         )
-    )
-    torch.save(trainer.raw_model.state_dict(), output_dir / f"rank-{rank}.pt")
+        torch.save(trainer.raw_model.state_dict(), output_dir / f"rank-{rank}.pt")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class _DelayedStateAccelerator:

@@ -43,6 +43,11 @@ from musubi_tuner.modules.modality_optimization import (
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
+from musubi_tuner.optimizers.factory import (
+    materialize_stochastic_gradients,
+    move_optimizer_gradients_to_parameters,
+    should_patch_block_swap_gradients,
+)
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
@@ -2645,6 +2650,10 @@ def train(self, args):
                 grad_metrics = {}
                 self.validate_loss_before_backward(loss)
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    # Automagic v1/v3 retain low-precision gradients in a
+                    # stochastic accumulation buffer until the update boundary.
+                    materialize_stochastic_gradients(optimizer)
                 if _is_first_step:
                     _log_vram("FIRST_ITER: AFTER backward", logger)
                 if differential_guidance_enabled and accelerator.sync_gradients:
@@ -2665,6 +2674,10 @@ def train(self, args):
                     )
 
                 pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
+                if accelerator.sync_gradients:
+                    # Preservation may run another backward pass, which moves
+                    # the combined gradient back into the accumulation buffer.
+                    materialize_stochastic_gradients(optimizer)
                 if _prior_div_value is not None:
                     pres_losses["loss/prior_div"] = _prior_div_value
                 if _crepa_value is not None:
@@ -2772,6 +2785,9 @@ def train(self, args):
                             self.clip_grad_norm_for_model_parallel(args, accelerator, params_to_clip, optimizer)
                         else:
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                    if self.blocks_to_swap and should_patch_block_swap_gradients(optimizer):
+                        move_optimizer_gradients_to_parameters(optimizer)
 
                 if _is_first_step:
                     _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)

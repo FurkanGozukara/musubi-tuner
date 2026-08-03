@@ -54,6 +54,20 @@ def _fused_incompatibilities(args: Any) -> list[str]:
         problems.append("block_swap_optimizer_patch_params must be disabled because fused updates do not retain gradients to patch")
     if _world_size() != 1:
         problems.append("fused Automagic optimizers currently require single-process training")
+    extra_backward_features = [
+        label
+        for name, label in (
+            ("blank_preservation", "blank preservation"),
+            ("dop", "DOP"),
+            ("audio_dop", "audio DOP"),
+            ("motion_preservation_separate_backward", "separate motion-preservation backward"),
+        )
+        if bool(getattr(args, name, False))
+    ]
+    if extra_backward_features:
+        problems.append(f"fused updates are incompatible with additional backward passes ({', '.join(extra_backward_features)})")
+    if bool(getattr(args, "ltx2_model_parallel", False)):
+        problems.append("fused Automagic optimizers are incompatible with LTX-2 model parallelism")
     return problems
 
 
@@ -68,6 +82,12 @@ def prepare_automagic_optimizer(
     normalized_type = optimizer_type.strip().lower()
     optimizer_class = AUTOMAGIC_OPTIMIZER_CLASSES[normalized_type]
     resolved_kwargs = dict(optimizer_kwargs)
+
+    if bool(getattr(args, "fused_backward_pass", False)):
+        raise ValueError(
+            "--fused_backward_pass is the separate Adafactor-only trainer mode. "
+            f"{optimizer_class.__name__} manages its own fused behavior; disable --fused_backward_pass."
+        )
 
     ignored_kwargs = sorted(_ADAFACTOR_ONLY_KWARGS.intersection(resolved_kwargs))
     if ignored_kwargs:
@@ -107,12 +127,12 @@ def prepare_automagic_optimizer(
             resolved_kwargs.setdefault("offload_gradients", True)
         logger.info("use Automagic3 optimizer | %s", resolved_kwargs)
     else:
+        explicitly_configured = "fused" in resolved_kwargs
+        if explicitly_configured and bool(resolved_kwargs["fused"]) and problems:
+            raise ValueError("Automagic fused=True is incompatible with this configuration: " + "; ".join(problems))
         if offload_block_swap_gradients:
-            explicitly_configured = "fused" in resolved_kwargs
             if not explicitly_configured:
                 resolved_kwargs["fused"] = not problems
-            elif bool(resolved_kwargs["fused"]) and problems:
-                raise ValueError("Automagic fused=True is incompatible with this configuration: " + "; ".join(problems))
             if resolved_kwargs["fused"]:
                 resolved_kwargs.setdefault("offload_state", True)
                 logger.info("Automagic selected fused block-swap mode with CPU optimizer-state offload")

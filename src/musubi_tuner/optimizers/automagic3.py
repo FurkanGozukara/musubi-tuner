@@ -93,8 +93,13 @@ class Automagic3(torch.optim.Optimizer):
     lr : float
         Starting learning rate for every group. The controller adapts away
         from this in whichever direction the pooled vote points, so it is a
-        launch point, not a tuned target. There are no min/max lr clamps
-        (only a numerical overflow guard far outside the usable range).
+        launch point, not a tuned target.
+    min_lr : float
+        Lower bound on the adapted lr. The default is a permissive numerical
+        guard; set it higher to put a hard floor under the controller.
+    max_lr : float
+        Upper bound on the adapted lr. The default is a permissive numerical
+        guard; set it lower to prevent runaway adaptation.
     beta2 : float
         EMA decay for the second moment, as in Adam/Adafactor.
     eps : float
@@ -172,6 +177,8 @@ class Automagic3(torch.optim.Optimizer):
         self,
         params,
         lr: float = 1e-6,
+        min_lr: float = 1e-8,
+        max_lr: float = 1e3,
         beta2: float = 0.999,
         eps: float = 1e-30,
         clip_threshold: float = 1.0,
@@ -180,6 +187,8 @@ class Automagic3(torch.optim.Optimizer):
         fused: bool = True,
         offload_gradients: bool = False,
     ):
+        if min_lr > max_lr:
+            raise ValueError(f"min_lr ({min_lr}) must be <= max_lr ({max_lr})")
         if lr > 1e-3:
             # No clamping: a too-high start just oscillates immediately and
             # the controller drives it down.
@@ -187,8 +196,12 @@ class Automagic3(torch.optim.Optimizer):
                 f"Note: start lr {lr} is high; the controller will correct it "
                 f"(the pooled vote will walk it down)."
             )
+        self._hook_handles = []
+        self._hooks_ready = False
         defaults = dict(
             lr=lr,
+            min_lr=min_lr,
+            max_lr=max_lr,
             beta2=beta2,
             eps=eps,
             clip_threshold=clip_threshold,
@@ -199,8 +212,17 @@ class Automagic3(torch.optim.Optimizer):
 
         self.fused = fused
         self.offload_gradients = offload_gradients
-        self._rebuild_group_index()
+        self._hooks_ready = True
+        self._refresh_param_hooks()
+
+        total = sum(p.numel() for g in self.param_groups for p in g["params"])
+        print(f"Total training paramiters: {total:,}")
+
+    def _refresh_param_hooks(self):
+        for handle in self._hook_handles:
+            handle.remove()
         self._hook_handles = []
+        self._rebuild_group_index()
         for group in self.param_groups:
             for p in group["params"]:
                 if not p.requires_grad:
@@ -221,8 +243,17 @@ class Automagic3(torch.optim.Optimizer):
                     )
                     self._hook_handles.append(handle)
 
-        total = sum(p.numel() for g in self.param_groups for p in g["params"])
-        print(f"Total training paramiters: {total:,}")
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        if getattr(self, "_hooks_ready", False):
+            self._refresh_param_hooks()
+
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none=set_to_none)
+        for group in self.param_groups:
+            for param in group["params"]:
+                if hasattr(param, "_accum_grad"):
+                    del param._accum_grad
 
     # ------------------------------------------------------------------ utils
 
@@ -363,7 +394,9 @@ class Automagic3(torch.optim.Optimizer):
         # param rides the normal state_dict machinery and tolerates
         # multi-device groups).
         state["lr"] = torch.tensor(
-            float(group["lr"]), dtype=torch.float32, device=p.device
+            min(max(float(group["lr"]), group["min_lr"]), group["max_lr"]),
+            dtype=torch.float32,
+            device=p.device,
         )
         # Ring buffer of per-element update sign bits, one 1-bit-packed
         # plane per step (H/8 bytes per element). Sums are recomputed from
@@ -597,9 +630,7 @@ class Automagic3(torch.optim.Optimizer):
                     continue
                 lr_t = st["lr"]
                 f = factor if factor.device == lr_t.device else factor.to(lr_t.device)
-                # Numerical overflow guard only -- NOT a control rail
-                # (decades outside the usable range).
-                lr_t.mul_(f).clamp_(min=1e-30, max=1e3)
+                lr_t.mul_(f).clamp_(min=group["min_lr"], max=group["max_lr"])
             self._group_num[gi] = None
             self._group_den[gi] = None
 
@@ -687,6 +718,6 @@ class Automagic3(torch.optim.Optimizer):
                     )
                     st["hist_idx"] = 0
                     st["hist_fill"] = 0
-        # The parent rebuilt the group dicts; remap params to groups and
-        # reset the vote accumulators.
-        self._rebuild_group_index()
+        # The parent rebuilt the group dicts, so hook closures must be rebound
+        # as well as the parameter-to-group vote map.
+        self._refresh_param_hooks()

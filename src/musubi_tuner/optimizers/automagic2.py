@@ -37,6 +37,8 @@ class Automagic2(torch.optim.Optimizer):
         if lr > 1e-3:
             print(f"Warning! Start lr {lr} is very high; forcing to 1e-6.")
             lr = 1e-6
+        self._hook_handles = []
+        self._hooks_ready = False
         defaults = dict(
             lr=lr,
             min_lr=min_lr,
@@ -50,6 +52,15 @@ class Automagic2(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
 
+        self._hooks_ready = True
+        self._refresh_param_hooks()
+
+        total = sum(p.numel() for g in self.param_groups for p in g["params"])
+        print(f"Total training paramiters: {total:,}")
+
+    def _refresh_param_hooks(self):
+        for handle in self._hook_handles:
+            handle.remove()
         self._hook_handles = []
         for group in self.param_groups:
             for p in group["params"]:
@@ -59,8 +70,10 @@ class Automagic2(torch.optim.Optimizer):
                     )
                     self._hook_handles.append(handle)
 
-        total = sum(p.numel() for g in self.param_groups for p in g["params"])
-        print(f"Total training paramiters: {total:,}")
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        if getattr(self, "_hooks_ready", False):
+            self._refresh_param_hooks()
 
     # ------------------------------------------------------------------ utils
 
@@ -220,3 +233,4 @@ class Automagic2(torch.optim.Optimizer):
                 st = self.state.get(p)
                 if st is not None and isinstance(st.get("lr"), torch.Tensor):
                     st["lr"] = st["lr"].to(torch.float32)
+        self._refresh_param_hooks()

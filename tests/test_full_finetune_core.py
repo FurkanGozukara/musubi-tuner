@@ -16,16 +16,16 @@ from musubi_tuner.training.full_finetune import (
     validate_full_finetune_args,
 )
 
+NON_REPLICA_DISTRIBUTED_TYPES = [
+    distributed_type
+    for name in ("DEEPSPEED", "FSDP", "TP", "MEGATRON_LM", "XLA")
+    if (distributed_type := getattr(DistributedType, name, None)) is not None
+]
+
 
 @pytest.mark.parametrize(
     "distributed_type",
-    [
-        DistributedType.DEEPSPEED,
-        DistributedType.FSDP,
-        DistributedType.TP,
-        DistributedType.MEGATRON_LM,
-        DistributedType.XLA,
-    ],
+    NON_REPLICA_DISTRIBUTED_TYPES,
 )
 def test_validate_full_finetune_distributed_type_rejects_non_replica_backends(distributed_type):
     with pytest.raises(ValueError) as error:

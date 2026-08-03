@@ -27,6 +27,11 @@ from musubi_tuner.modules.group_lr_scheduler import (
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.modality_optimization import has_modality_group_controls
 from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
+from musubi_tuner.optimizers.factory import (
+    get_adaptive_learning_rates,
+    is_automagic_optimizer_type,
+    prepare_automagic_optimizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,12 +285,14 @@ def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tup
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-    elif optimizer_type == "automagic":
-        from musubi_tuner.optimizers.automagic import Automagic
-
-        logger.info("use Automagic optimizer | lr=%s | %s", lr, optimizer_kwargs)
-        optimizer_class = Automagic
-        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+    elif is_automagic_optimizer_type(optimizer_type):
+        optimizer_class, optimizer, optimizer_kwargs = prepare_automagic_optimizer(
+            optimizer_type,
+            trainable_params,
+            lr,
+            optimizer_kwargs,
+            args,
+        )
 
     elif optimizer_type in ("badam", "blockadam", "block_optimizer", "blockoptimizer"):
         base_type = str(optimizer_kwargs.get("base_optimizer_type") or "AdamW")
@@ -330,7 +337,7 @@ def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tup
 
 
 def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
+    return args.optimizer_type.lower().endswith("schedulefree".lower()) or is_automagic_optimizer_type(args.optimizer_type)
 
 
 def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
@@ -342,7 +349,7 @@ def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
             pass
 
         def get_last_lr(self):
-            return [group["lr"] for group in self.optimizer.param_groups]
+            return get_adaptive_learning_rates(self.optimizer)
 
     return DummyScheduler(optimizer)
 

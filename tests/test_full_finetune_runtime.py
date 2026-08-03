@@ -14,6 +14,12 @@ import musubi_tuner.training.full_finetune as full_finetune
 from musubi_tuner.training.full_finetune import FullFineTuningTrainerMixin, save_state_all_ranks
 from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
 
+NON_REPLICA_DISTRIBUTED_TYPES = [
+    distributed_type
+    for name in ("DEEPSPEED", "FSDP", "TP", "MEGATRON_LM", "XLA")
+    if (distributed_type := getattr(DistributedType, name, None)) is not None
+]
+
 
 class TinyDataset(torch.utils.data.Dataset):
     num_train_items = 2
@@ -573,13 +579,7 @@ def test_attention_backend_is_validated_before_dataset_and_sampling_setup(tmp_pa
 
 @pytest.mark.parametrize(
     "distributed_type",
-    [
-        DistributedType.DEEPSPEED,
-        DistributedType.FSDP,
-        DistributedType.TP,
-        DistributedType.MEGATRON_LM,
-        DistributedType.XLA,
-    ],
+    NON_REPLICA_DISTRIBUTED_TYPES,
 )
 def test_non_replica_backend_is_rejected_before_dataset_or_model_allocation(
     tmp_path,

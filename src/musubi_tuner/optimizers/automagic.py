@@ -31,6 +31,8 @@ class Automagic(torch.optim.Optimizer):
         self.min_lr = min_lr
         self.max_lr = max_lr
         self.lr_bump = lr_bump
+        self._hook_handles = []
+        self._hooks_ready = False
 
         defaults = {
             "lr": lr,
@@ -49,26 +51,8 @@ class Automagic(torch.optim.Optimizer):
         self.offload_gradients = offload_gradients
         self.fused = fused
         self.offload_state = offload_state
-        self._hook_handles = []
-
-        # Set up either fused updates or stochastic low-precision accumulation.
-        for group in self.param_groups:
-            for param in group['params']:
-                if not param.requires_grad:
-                    continue
-                if self.fused:
-                    self._hook_handles.append(
-                        param.register_post_accumulate_grad_hook(self._make_backward_hook(group))
-                    )
-                elif param.dtype != torch.float32:
-                    self.is_stochastic_rounding_accumulation = True
-                    self._hook_handles.append(
-                        param.register_post_accumulate_grad_hook(
-                            lambda current_param: stochastic_grad_accummulation(
-                                current_param, offload_to_cpu=self.offload_gradients
-                            )
-                        )
-                    )
+        self._hooks_ready = True
+        self._refresh_param_hooks()
 
         self.do_paramiter_swapping = do_paramiter_swapping
         self.paramiter_swapping_factor = paramiter_swapping_factor
@@ -83,6 +67,42 @@ class Automagic(torch.optim.Optimizer):
         # needs to be enabled to count paramiters
         if self.do_paramiter_swapping:
             self.enable_paramiter_swapping(self.paramiter_swapping_factor)
+
+    def _refresh_param_hooks(self):
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+        self.is_stochastic_rounding_accumulation = False
+
+        for group in self.param_groups:
+            for param in group["params"]:
+                if not param.requires_grad:
+                    continue
+                if self.fused:
+                    self._hook_handles.append(param.register_post_accumulate_grad_hook(self._make_backward_hook(group)))
+                elif param.dtype != torch.float32:
+                    self.is_stochastic_rounding_accumulation = True
+                    self._hook_handles.append(
+                        param.register_post_accumulate_grad_hook(
+                            lambda current_param: stochastic_grad_accummulation(
+                                current_param, offload_to_cpu=self.offload_gradients
+                            )
+                        )
+                    )
+
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        if getattr(self, "_hooks_ready", False):
+            self.base_lrs = [group["lr"] for group in self.param_groups]
+            self._total_paramiter_size = sum(param.numel() for group in self.param_groups for param in group["params"])
+            self._refresh_param_hooks()
+
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none=set_to_none)
+        for group in self.param_groups:
+            for param in group["params"]:
+                if hasattr(param, "_accum_grad"):
+                    del param._accum_grad
 
     def enable_paramiter_swapping(self, paramiter_swapping_factor=0.1):
         self.do_paramiter_swapping = True
@@ -425,8 +445,9 @@ class Automagic(torch.optim.Optimizer):
                     current_params.append(p)
         
         # If the number of parameters doesn't match, we can't reliably map them
-        if len(current_params) != len(state_dict['param_groups'][0]['params']):
-            print(f"WARNING: Number of parameters doesn't match between saved state ({len(state_dict['param_groups'][0]['params'])}) "
+        saved_param_count = sum(len(group["params"]) for group in state_dict["param_groups"])
+        if len(current_params) != saved_param_count:
+            print(f"WARNING: Number of parameters doesn't match between saved state ({saved_param_count}) "
                   f"and current model ({len(current_params)}). Learning rate masks may not be correctly loaded.")
         
         # Map parameters by their position in the param_groups
@@ -473,3 +494,5 @@ class Automagic(torch.optim.Optimizer):
                 current_state['lr_mask'] = Auto8bitTensor(torch.ones(
                     current_param.shape).to(current_param.device, dtype=torch.float32) * self.lr
                 )
+
+        self._refresh_param_hooks()
