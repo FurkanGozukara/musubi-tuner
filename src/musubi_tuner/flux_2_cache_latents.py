@@ -110,7 +110,7 @@ def main():
     assert args.vae is not None, "ae checkpoint is required"
 
     logger.info(f"Loading AE model from {args.vae}")
-    vae_dtype = torch.float32 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
+    vae_dtype = torch.float32 if not str(args.vae_dtype or "").strip() else str_to_dtype(args.vae_dtype)
     ae = flux2_utils.load_ae(args.vae, dtype=vae_dtype, device=device, disable_mmap=True)
     ae.to(device)
 

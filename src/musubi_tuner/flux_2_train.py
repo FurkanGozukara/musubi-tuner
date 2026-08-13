@@ -43,7 +43,7 @@ def main():
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
-    if args.vae_dtype is None:
+    if not str(args.vae_dtype or "").strip():
         args.vae_dtype = "float32"
 
     trainer = Flux2Trainer()

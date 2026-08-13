@@ -360,7 +360,7 @@ def main():
     args = read_config_from_file(args, parser)
 
     args.dit_dtype = None  # set from mixed_precision
-    if args.vae_dtype is None:
+    if not str(args.vae_dtype or "").strip():
         args.vae_dtype = "float32"  # make float32 as default for VAE
 
     trainer = Flux2NetworkTrainer()
