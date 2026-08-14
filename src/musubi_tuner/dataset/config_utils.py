@@ -496,7 +496,7 @@ def generate_dataset_group_by_blueprint(
             dataset_klass = VideoDataset
 
         dataset_params = asdict(dataset_blueprint.params)
-        if not dataset_blueprint.is_image_dataset and audio_spec is not None:
+        if dataset_blueprint.dataset_type == "video" and audio_spec is not None:
             dataset_params["audio_spec"] = audio_spec
         dataset = dataset_klass(**dataset_params)
         datasets.append(dataset)

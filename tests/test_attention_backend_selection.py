@@ -141,3 +141,18 @@ def test_every_training_selector_delegates_sdpa_resolution():
     for path in selector_files:
         source = path.read_text(encoding="utf-8")
         assert "resolve_sdpa_backend(getattr(args, \"use_legacy_sdpa\", False)" in source, path.name
+
+
+def test_minimax_h3_model_accepts_resolved_flash_auto_mode():
+    """resolve_sdpa_backend() may return "flash_auto" for --sdpa on Windows; every model whose
+    attention routes through modules.attention must accept it in its attn_mode validation.
+    MiniMax-H3 rejected it once (the tab's default --sdpa run crashed at transformer load)."""
+    from musubi_tuner.minimax_h3.model import MiniMaxH3Model
+
+    import inspect
+
+    source = inspect.getsource(MiniMaxH3Model.__init__)
+    assert "flash_auto" in source, (
+        "MiniMaxH3Model.__init__ attn_mode validation must accept 'flash_auto' "
+        "(the SECourses resolve_sdpa_backend() result for --sdpa without native flash SDPA)"
+    )

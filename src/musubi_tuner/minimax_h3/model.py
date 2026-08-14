@@ -635,7 +635,10 @@ class MiniMaxH3Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        if attn_mode not in {"torch", "sdpa", "flash", "flash3", "sageattn", "xformers"}:
+        # "flash_auto" is the SECourses resolve_sdpa_backend() result: PyTorch native flash
+        # SDPA is unavailable but the external FlashAttention package passed a fwd+bwd probe.
+        # The shared modules.attention dispatch used by the blocks handles it natively.
+        if attn_mode not in {"torch", "sdpa", "flash", "flash3", "sageattn", "xformers", "flash_auto"}:
             raise ValueError(f"Unsupported MiniMax-H3 attention mode: {attn_mode}")
         self.config = config
         self.attn_mode = attn_mode
