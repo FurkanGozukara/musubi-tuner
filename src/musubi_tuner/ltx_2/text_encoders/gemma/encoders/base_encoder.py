@@ -650,7 +650,7 @@ def module_ops_from_gemma_root(
                                     wscale_k = prefix + ".weight_scale"
                                     wscale2_k = prefix + ".weight_scale_2"
                                     if wscale_k in keys and wscale2_k in keys:
-                                        from musubi_tuner.modules.nvfp4_utils import dequantize_nvfp4_weight
+                                        from musubi_tuner.modules.ltx2_nvfp4_utils import dequantize_nvfp4_weight
                                         block_scale = f.get_tensor(wscale_k)
                                         tensor_scale = f.get_tensor(wscale2_k)
                                         tensor = dequantize_nvfp4_weight(tensor, block_scale, tensor_scale, dtype=torch_dtype)

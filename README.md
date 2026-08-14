@@ -41,7 +41,7 @@
 
 ## Introduction
 
-This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Ideogram 4, Krea 2, Qwen-Image, and Z-Image architectures.
+This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Ideogram 4, Krea 2, Qwen-Image, Z-Image, LTX-2/2.3, and MiniMax-H3 architectures.
 
 FLUX.1 Kontext, FLUX.2, Ideogram 4, and Krea 2 support both LoRA and full-DiT finetuning. Full-DiT finetuning updates only the DiT; the VAE and text encoder(s) remain frozen.
 
@@ -64,6 +64,12 @@ If you find this project helpful, please consider supporting its development via
 ### Recent Updates
 
 GitHub Discussions Enabled: We've enabled GitHub Discussions for community Q&A, knowledge sharing, and technical information exchange. Please use Issues for bug reports and feature requests, and Discussions for questions and sharing experiences. [Join the conversation →](https://github.com/kohya-ss/musubi-tuner/discussions)
+
+- August 8, 2026
+    - Added MiniMax-H3 ConvRot INT8 support for LoRA training and generation: BF16 checkpoints quantize at load time with `--convrot_int8`, and the released full and pruned ConvRot INT8 transformers and the ConvRot INT8 Qwen3-VL-32B text encoder are detected automatically. Generation attaches LoRAs to pre-quantized bases as runtime branches. Thank you sdbds [PR #1024](https://github.com/kohya-ss/musubi-tuner/pull/1024). See the [MiniMax-H3 documentation](./docs/minimax_h3.md) for details.
+
+- August 3, 2026
+    - Added experimental MiniMax-H3 R1 support for T2VA, FL2VA, and Ref2VA LoRA training plus standalone and scheduled training-time joint video/audio generation. R1 supports the published BF16 transformers, dual VAEs, Qwen3-VL-32B conditioning, and block swap. See the [MiniMax-H3 documentation](./docs/minimax_h3.md) for dataset, cache, training, generation, and R2 deferral details.
 
 - July 14, 2026
     - Added the `--log_grad_metrics` option to log gradient norm diagnostics (`grad/norm`, `grad/mean_norm`, `grad/max`, measured before gradient clipping) to the tracker. Thank you rockerBOO [PR #988](https://github.com/kohya-ss/musubi-tuner/pull/988).
@@ -166,6 +172,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
 - [FLUX.2](./docs/flux_2.md)
+- [MiniMax-H3](./docs/minimax_h3.md)
 
 **Common Configuration & Usage:**
 - [Dataset Configuration](./docs/dataset_config.md)

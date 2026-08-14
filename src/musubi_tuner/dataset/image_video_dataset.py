@@ -29,114 +29,32 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+from musubi_tuner.dataset.architectures import *  # noqa: F401,F403
+from musubi_tuner.dataset.architectures import (  # explicit imports for local use
+    ARCHITECTURE_FLUX_2_DEV,
+    ARCHITECTURE_FLUX_2_KLEIN_4B,
+    ARCHITECTURE_FLUX_2_KLEIN_9B,
+    ARCHITECTURE_FLUX_KONTEXT,
+    ARCHITECTURE_FRAMEPACK,
+    ARCHITECTURE_HIDREAM_O1,
+    ARCHITECTURE_HUNYUAN_VIDEO,
+    ARCHITECTURE_HUNYUAN_VIDEO_1_5,
+    ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_MINIMAX_H3,
+    ARCHITECTURE_QWEN_IMAGE_EDIT,
+    ARCHITECTURE_WAN,
+    round_down_frame_count,
+)
+from musubi_tuner.dataset.audio_utils import AudioSpec, audio_window_start, slice_audio_window
+from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
+from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
 
-IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP", ".avif", ".AVIF"]
 
 AUDIO_EXTENSIONS = [".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma"]
 
 
-if find_spec("jxlpy") is not None:  # JPEG-XL on Linux
-    from jxlpy import JXLImagePlugin  # noqa: F401 # type: ignore
-
-    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
-
-if find_spec("pillow_jxl") is not None:  # JPEG-XL on Windows
-    import pillow_jxl  # noqa: F401 # type: ignore
-
-    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
-
-VIDEO_EXTENSIONS = [
-    ".mp4",
-    ".webm",
-    ".avi",
-    ".mkv",
-    ".mov",
-    ".flv",
-    ".wmv",
-    ".m4v",
-    ".mpg",
-    ".mpeg",
-    ".MP4",
-    ".WEBM",
-    ".AVI",
-    ".MKV",
-    ".MOV",
-    ".FLV",
-    ".WMV",
-    ".M4V",
-    ".MPG",
-    ".MPEG",
-]  # some of them are not tested
 MASK_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
 MASK_METADATA_EXTENSIONS = [".json", ".JSON", ".txt", ".TXT", ".csv", ".CSV"]
-
-# Architecture short names cannot contain underscore
-ARCHITECTURE_HUNYUAN_VIDEO = "hv"
-ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
-ARCHITECTURE_WAN = "wan"
-ARCHITECTURE_WAN_FULL = "wan"
-ARCHITECTURE_LTX2 = "ltx2"
-ARCHITECTURE_LTX2_FULL = "ltx2_v1"
-ARCHITECTURE_FRAMEPACK = "fp"
-ARCHITECTURE_FRAMEPACK_FULL = "framepack"
-ARCHITECTURE_FLUX_KONTEXT = "fk"
-ARCHITECTURE_FLUX_KONTEXT_FULL = "flux_kontext"
-ARCHITECTURE_FLUX_2_DEV = "f2d"
-ARCHITECTURE_FLUX_2_DEV_FULL = "flux_2_dev"
-ARCHITECTURE_FLUX_2_KLEIN_4B = "f2k4b"
-ARCHITECTURE_FLUX_2_KLEIN_4B_FULL = "flux_2_klein_4b"
-ARCHITECTURE_FLUX_2_KLEIN_9B = "f2k9b"
-ARCHITECTURE_FLUX_2_KLEIN_9B_FULL = "flux_2_klein_9b"
-ARCHITECTURE_QWEN_IMAGE = "qi"
-ARCHITECTURE_QWEN_IMAGE_FULL = "qwen_image"
-ARCHITECTURE_QWEN_IMAGE_EDIT = "qie"
-ARCHITECTURE_QWEN_IMAGE_EDIT_FULL = "qwen_image_edit"
-ARCHITECTURE_QWEN_IMAGE_LAYERED = "qil"
-ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL = "qwen_image_layered"
-ARCHITECTURE_KANDINSKY5 = "k5"
-ARCHITECTURE_KANDINSKY5_FULL = "kandinsky5"
-ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
-ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
-ARCHITECTURE_Z_IMAGE = "zi"
-ARCHITECTURE_Z_IMAGE_FULL = "z_image"
-ARCHITECTURE_HIDREAM_O1 = "ho1"
-ARCHITECTURE_HIDREAM_O1_FULL = "hidream_o1_image"
-ARCHITECTURE_IDEOGRAM4 = "i4"
-ARCHITECTURE_IDEOGRAM4_FULL = "ideogram4"
-ARCHITECTURE_KREA2 = "kr2"
-ARCHITECTURE_KREA2_FULL = "krea2"
-
-
-def glob_images(directory, base="*", caption_extension=None):
-    img_paths = []
-    for ext in IMAGE_EXTENSIONS:
-        if base == "*":
-            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
-        else:
-            img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
-    img_paths = list(set(img_paths))  # remove duplicates
-
-    # check for caption files and only keep images with captions
-    if caption_extension is not None:
-        caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
-        caption_bases = set()
-        for caption_path in caption_paths:
-            caption_name = os.path.basename(caption_path)
-            if caption_name.endswith(caption_extension):
-                caption_base = caption_name[: -len(caption_extension)]
-            else:
-                caption_base = os.path.splitext(caption_name)[0]
-            caption_bases.add(caption_base)
-        filtered_img_paths = []
-        for img_path in img_paths:
-            img_base = os.path.splitext(os.path.basename(img_path))[0]
-            if img_base in caption_bases:
-                filtered_img_paths.append(img_path)
-        img_paths = filtered_img_paths
-
-    img_paths.sort()
-    return img_paths
-
 
 def glob_audio(directory, base="*"):
     audio_paths = []
@@ -148,18 +66,6 @@ def glob_audio(directory, base="*"):
     audio_paths = list(set(audio_paths))  # remove duplicates
     audio_paths.sort()
     return audio_paths
-
-
-def glob_videos(directory, base="*"):
-    video_paths = []
-    for ext in VIDEO_EXTENSIONS:
-        if base == "*":
-            video_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
-        else:
-            video_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
-    video_paths = list(set(video_paths))  # remove duplicates
-    video_paths.sort()
-    return video_paths
 
 
 def find_stem_matched_file(directory: Optional[str], stem: str, extensions: Optional[Sequence[str]] = None) -> Optional[str]:
@@ -324,10 +230,6 @@ def normalize_loss_mask_intervals(value: Any) -> Optional[list[tuple[float, floa
     return intervals
 
 
-def divisible_by(num: int, divisor: int) -> int:
-    return num - num % divisor
-
-
 def _normalize_optional_path_list(
     primary: Optional[str] = None,
     extras: Optional[Sequence[str]] = None,
@@ -343,45 +245,6 @@ def _normalize_optional_path_list(
         values.append(normalized)
 
     return values
-
-
-def resize_image_to_bucket(image: Union[Image.Image, np.ndarray], bucket_reso: tuple[int, int]) -> np.ndarray:
-    """
-    Resize the image to the bucket resolution.
-
-    bucket_reso: **(width, height)**
-    """
-    is_pil_image = isinstance(image, Image.Image)
-    if is_pil_image:
-        image_width, image_height = image.size
-    else:
-        image_height, image_width = image.shape[:2]
-
-    if bucket_reso == (image_width, image_height):
-        return np.array(image) if is_pil_image else image
-
-    bucket_width, bucket_height = bucket_reso
-
-    # resize the image to the bucket resolution to match the short side
-    scale_width = bucket_width / image_width
-    scale_height = bucket_height / image_height
-    scale = max(scale_width, scale_height)
-    image_width = int(image_width * scale + 0.5)
-    image_height = int(image_height * scale + 0.5)
-
-    if scale > 1:
-        image = Image.fromarray(image) if not is_pil_image else image
-        image = image.resize((image_width, image_height), Image.LANCZOS)
-        image = np.array(image)
-    else:
-        image = np.array(image) if is_pil_image else image
-        image = cv2.resize(image, (image_width, image_height), interpolation=cv2.INTER_AREA)
-
-    # crop the image to the bucket resolution
-    crop_left = (image_width - bucket_width) // 2
-    crop_top = (image_height - bucket_height) // 2
-    image = image[crop_top : crop_top + bucket_height, crop_left : crop_left + bucket_width]
-    return image
 
 
 class ItemInfo:
@@ -421,6 +284,16 @@ class ItemInfo:
         self.spatial_crop_region: Optional[tuple[int, int, int, int]] = None
         self.audio_loss_mask_intervals: Optional[list[tuple[float, float]]] = None
         self.audio_cond_mask_intervals: Optional[list[tuple[float, float]]] = None
+
+        # crop provenance (video datasets): start frame of the crop in target-fps space and
+        # the index of the originating datasource record
+        self.frame_pos: Optional[int] = None
+        self.datasource_index: Optional[int] = None
+
+        # audio (audio-capable architectures): waveform window [channels, samples] aligned to
+        # the crop, and whether it came from real audio (False: silence placeholder)
+        self.audio_content: Optional[torch.Tensor] = None
+        self.audio_present: Optional[bool] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -3307,6 +3180,7 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_MINIMAX_H3 = 24.0
 
     def __init__(
         self,
@@ -3364,6 +3238,7 @@ class VideoDataset(BaseDataset):
         audio_cond_mask_directory: Optional[str] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
         reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None,
+        audio_spec: Optional["AudioSpec"] = None,
     ):
         from musubi_tuner.ltx2_conditioning_routing import normalize_reference_target_frame_ranges
 
@@ -3432,7 +3307,8 @@ class VideoDataset(BaseDataset):
         self.fp_latent_window_size = fp_latent_window_size
         self.cache_only = cache_only
 
-        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
+        self.vae_frame_stride = 4  # legacy frame-grid fallback; architecture-specific helpers may override the formula
+        self.strict_target_fps = False  # timestamp-based fps normalization (required for AV alignment)
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
@@ -3447,15 +3323,30 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            self.target_fps = VideoDataset.TARGET_FPS_MINIMAX_H3
+            self.strict_target_fps = True
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
+
+        self.audio_spec = audio_spec
+        self.audio_fps: Optional[int] = None
+        if audio_spec is not None:
+            audio_fps = int(round(self.target_fps))
+            if abs(self.target_fps - audio_fps) > 1e-9:
+                raise ValueError(f"Audio-capable datasets require an integer target fps, got {self.target_fps}")
+            self.audio_fps = audio_fps
+        if self.strict_target_fps and source_fps is not None:
+            logger.warning(
+                f"source_fps={source_fps} is ignored: architecture {self.architecture} always resamples to "
+                f"{self.target_fps} fps using frame timestamps"
+            )
 
         if target_frames is not None:
             target_frames = list(set(target_frames))
             target_frames.sort()
 
-            # round each value to N*4+1
-            rounded_target_frames = [(f - 1) // self.vae_frame_stride * self.vae_frame_stride + 1 for f in target_frames]
+            rounded_target_frames = [round_down_frame_count(f, self.architecture, self.vae_frame_stride) for f in target_frames]
             rounded_target_frames = list(set(rounded_target_frames))
             rounded_target_frames.sort()
 
@@ -3486,6 +3377,11 @@ class VideoDataset(BaseDataset):
             )
         else:
             raise ValueError("video_directory or video_jsonl_file must be specified")
+
+        if self.strict_target_fps:
+            self.datasource.set_strict_target_fps(self.target_fps)
+        if self.audio_spec is not None:
+            self.datasource.set_audio_spec(self.audio_spec)
 
         if not self.cache_only and self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
@@ -3553,7 +3449,7 @@ class VideoDataset(BaseDataset):
                     if res is None:  # clip decoded to 0 frames (corrupt/undecodable) -> skip, keep loop healthy
                         futures.remove(future)
                         continue
-                    original_frame_size, video_key, video, caption, control, loss_mask = res
+                    original_frame_size, video_key, video, caption, control, loss_mask, waveform, datasource_index = res
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -3603,7 +3499,7 @@ class VideoDataset(BaseDataset):
                     elif self.frame_extraction == "full":
                         # select all frames
                         target_frame = min(frame_count, self.max_frames)
-                        target_frame = (target_frame - 1) // self.vae_frame_stride * self.vae_frame_stride + 1  # round to N*4+1
+                        target_frame = round_down_frame_count(target_frame, self.architecture, self.vae_frame_stride)
                         crop_pos_and_frames.append((0, target_frame))
                     else:
                         raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
@@ -3649,9 +3545,29 @@ class VideoDataset(BaseDataset):
                             item_info.keyframe_guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
                         if getattr(self, "keyframe_guide_extras", None):
                             item_info.keyframe_guide_extra_cache_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
+                        if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                            item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.loss_mask_content = cropped_loss_mask
                         item_info.fp_latent_window_size = self.fp_latent_window_size
+                        item_info.frame_pos = int(crop_pos)
+                        item_info.datasource_index = datasource_index
+
+                        if self.audio_spec is not None:
+                            sample_count = self.audio_spec.samples_per_crop(target_frame)
+                            if waveform is None:
+                                item_info.audio_content = torch.zeros(self.audio_spec.channels, sample_count, dtype=torch.float32)
+                                item_info.audio_present = False
+                            else:
+                                start_sample = audio_window_start(crop_pos, self.audio_fps, self.audio_spec.sample_rate)
+                                item_info.audio_content = slice_audio_window(
+                                    waveform,
+                                    start_sample=start_sample,
+                                    sample_count=sample_count,
+                                    pad_tolerance=self.audio_spec.codec_pad_tolerance,
+                                    context=video_key,
+                                )
+                                item_info.audio_present = True
 
                         batch = batches.get(batch_key, [])
                         batch.append(item_info)
@@ -3672,11 +3588,10 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(
-                op: callable,
-            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+            def fetch_and_resize(op: callable) -> tuple:
                 result = op()
 
+                waveform = None
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
@@ -3684,8 +3599,9 @@ class VideoDataset(BaseDataset):
                 elif len(result) == 4:
                     video_key, video, caption, control = result
                     loss_mask = None
-                else:
-                    video_key, video, caption, control, loss_mask = result
+                else:  # audio-enabled datasource
+                    video_key, video, caption, control, waveform = result
+                    loss_mask = None
 
                 video: list[np.ndarray]
                 if not video:  # corrupt/undecodable clip -> 0 frames decoded; skip instead of crashing the whole cache job
@@ -3716,7 +3632,16 @@ class VideoDataset(BaseDataset):
                         invert=self.loss_mask_invert,
                     )
 
-                return frame_size, video_key, video, caption, control, resized_loss_mask
+                return (
+                    frame_size,
+                    video_key,
+                    video,
+                    caption,
+                    control,
+                    resized_loss_mask,
+                    waveform,
+                    getattr(op, "datasource_index", None),
+                )
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)
@@ -3766,7 +3691,13 @@ class VideoDataset(BaseDataset):
             frame_pos, frame_count = int(frame_pos), int(frame_count)
 
             item_key = "_".join(tokens[:-3])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                text_item_key = f"{item_key}_{tokens[-3]}"
+            else:
+                text_item_key = item_key
+            text_encoder_output_cache_file = os.path.join(
+                self.cache_directory, f"{text_item_key}_{self.architecture}_te.safetensors"
+            )
             _live_caption = ""
             if not os.path.exists(text_encoder_output_cache_file):
                 if self.text_encoder_cache_optional:

@@ -18,6 +18,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
 
+    from musubi_tuner.dataset.audio_utils import AudioSpec
+
 SharedEpoch = Optional["Synchronized[int]"]
 
 
@@ -473,6 +475,7 @@ class BlueprintGenerator:
 
 
 # if training is True, it will return a dataset group for training, otherwise for caching
+# audio_spec: audio-capable architectures pass their AudioSpec here to enable audio for video datasets
 def generate_dataset_group_by_blueprint(
     dataset_group_blueprint: DatasetGroupBlueprint,
     training: bool = False,
@@ -480,6 +483,7 @@ def generate_dataset_group_by_blueprint(
     shared_epoch: SharedEpoch = None,
     reference_downscale: int = 1,
     spatial_crop_enabled: bool = False,
+    audio_spec: Optional["AudioSpec"] = None,
 ) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset, AudioDataset]] = []
 
@@ -491,7 +495,10 @@ def generate_dataset_group_by_blueprint(
         else:
             dataset_klass = VideoDataset
 
-        dataset = dataset_klass(**asdict(dataset_blueprint.params))
+        dataset_params = asdict(dataset_blueprint.params)
+        if not dataset_blueprint.is_image_dataset and audio_spec is not None:
+            dataset_params["audio_spec"] = audio_spec
+        dataset = dataset_klass(**dataset_params)
         datasets.append(dataset)
 
     try:

@@ -201,7 +201,7 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
     # be misidentified as fp8 model weights.  Detect NVFP4 early and skip those
     # quantization-internal keys so we return the true model dtype (bf16),
     # mirroring the behaviour of NF4 checkpoints.
-    from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+    from musubi_tuner.modules.ltx2_nvfp4_utils import detect_nvfp4_checkpoint
 
     _is_nvfp4 = detect_nvfp4_checkpoint(model_path)
 
@@ -1538,13 +1538,13 @@ def load_ltx2_model(
     # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
     _is_nvfp4 = False
     if not nf4_base and not fp8_scaled and not int4_convrot_base and not int4_convrot_dynamic and not nvfp4_training_base:
-        from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+        from musubi_tuner.modules.ltx2_nvfp4_utils import detect_nvfp4_checkpoint
 
         _check_path = model_path if isinstance(model_path, str) else model_path[0]
         _is_nvfp4 = detect_nvfp4_checkpoint(_check_path)
 
     if _is_nvfp4:
-        from musubi_tuner.modules.nvfp4_utils import load_nvfp4_state_dict, apply_nvfp4_monkey_patch
+        from musubi_tuner.modules.ltx2_nvfp4_utils import load_nvfp4_state_dict, apply_nvfp4_monkey_patch
 
         logger.info("Detected NVFP4 (Lightricks FP4 E2M1) checkpoint — loading with on-the-fly dequantization")
         sd = load_nvfp4_state_dict(
@@ -1885,7 +1885,7 @@ def load_ltx2_model(
 
     _trace_vram_ltx2(f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})")
     if _is_nvfp4:
-        from musubi_tuner.modules.nvfp4_utils import apply_nvfp4_monkey_patch
+        from musubi_tuner.modules.ltx2_nvfp4_utils import apply_nvfp4_monkey_patch
 
         apply_nvfp4_monkey_patch(base_model, sd)
     elif nf4_base:

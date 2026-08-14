@@ -460,7 +460,7 @@ def main():
     encode_datasets(datasets, encode, args)
 
 
-def setup_parser_common() -> argparse.ArgumentParser:
+def setup_parser_common(*, include_vae: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_config", type=str, required=True, help="path to dataset config .toml file")
@@ -470,8 +470,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         help="optional path to write a cache-only dataset manifest JSON for source-free training",
     )
-    parser.add_argument("--vae", type=str, required=False, default=None, help="path to vae checkpoint")
-    parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16")
+    if include_vae:
+        parser.add_argument("--vae", type=str, required=False, default=None, help="path to vae checkpoint")
+        parser.add_argument(
+            "--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16"
+        )
     parser.add_argument("--device", type=str, default=None, help="device to use, default is cuda if available")
     parser.add_argument(
         "--batch_size", type=int, default=None, help="batch size, override dataset config if dataset batch size > this"

@@ -101,6 +101,8 @@ class LoHaModule(torch.nn.Module):
         self.module_dropout = module_dropout
         # True -> LyCORIS renorm (drop/drop.mean()); False -> kohya 1/(1-p).
         self.rank_dropout_scale = lora_module._parse_bool_network_arg(kwargs.get("rank_dropout_scale", False))
+        # honored by the training forward too, so set_enabled(False) yields the frozen base
+        self.enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -113,6 +115,9 @@ class LoHaModule(torch.nn.Module):
         return HadaWeight.apply(self.hada_w1_a, self.hada_w1_b, self.hada_w2_a, self.hada_w2_b, scale)
 
     def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
+
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -155,7 +160,6 @@ class LoHaInfModule(LoHaModule):
         super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
 
         self.org_module_ref = [org_module]
-        self.enabled = True
         self.network: lora_module.LoRANetwork = None
 
     def set_network(self, network):

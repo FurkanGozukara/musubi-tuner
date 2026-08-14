@@ -150,7 +150,9 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
         # RL hooks (default-on so supervised / slider training is unchanged):
-        #   enabled=False         -> bypass the adapter entirely (NFT `ref` forward). DoRA-safe:
+        #   enabled=False         -> bypass the adapter entirely (NFT `ref` forward; also the
+        #                            MiniMax-H3 teacher-matching frozen-base forward via
+        #                            LoRANetwork.set_enabled(False)). DoRA-safe:
         #                            returns org_forward, skipping the magnitude path (multiplier=0
         #                            would NOT, because magnitude still rescales the base).
         #   dropout_enabled=False -> deterministic forward even under .train() (NFT old/default/ref
@@ -195,6 +197,7 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
     def forward(self, x):
         if not self.enabled:
             return self.org_forward(x)
+
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -280,7 +283,6 @@ class LoRAInfModule(LoRAModule):
         super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
 
         self.org_module_ref = [org_module]  # for reference
-        self.enabled = True
         self.network: LoRANetwork = None
 
     def set_network(self, network):
