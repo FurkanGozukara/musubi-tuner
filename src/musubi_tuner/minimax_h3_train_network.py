@@ -1046,6 +1046,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer,
             [transformer.blocks],
             disable_linear=bool(self.blocks_to_swap) or bool(getattr(transformer, "is_convrot_int8", False)),
+            offloaders=[transformer.offloader if self.blocks_to_swap else None],
         )
 
     def scale_shift_latents(self, latents):

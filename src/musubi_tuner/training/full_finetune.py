@@ -682,7 +682,7 @@ class FullFineTuningTrainerMixin:
 
         train_dataset_group, collator, current_epoch = self._build_dataset(args)
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-        sample_parameters, vae = self._prepare_sampling(args, accelerator, vae_dtype)
+        sample_parameters, vae = self.prepare_sampling(args, accelerator, vae_dtype)
 
         blocks_to_swap = 0 if args.blocks_to_swap is None else args.blocks_to_swap
         has_block_swap = blocks_to_swap > 0

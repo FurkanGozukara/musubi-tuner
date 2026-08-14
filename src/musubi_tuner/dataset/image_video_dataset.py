@@ -1545,6 +1545,13 @@ class VideoDatasource(ContentDatasource):
         self.source_fps = None
         self.target_fps = None
 
+        # timestamp-based fps normalization (audio-capable architectures need deterministic fps)
+        self.strict_target_fps: Optional[float] = None
+
+        # audio support: set via set_audio_spec by audio-capable architectures (e.g. MiniMax-H3)
+        self.audio_spec: Optional[AudioSpec] = None
+        self.audio_sources = None
+
     def __len__(self):
         raise NotImplementedError
 
@@ -1560,6 +1567,18 @@ class VideoDatasource(ContentDatasource):
         start_frame = start_frame if start_frame is not None else self.start_frame
         end_frame = end_frame if end_frame is not None else self.end_frame
         bucket_selector = bucket_selector if bucket_selector is not None else self.bucket_selector
+
+        if self.strict_target_fps is not None:
+            from musubi_tuner.dataset import media_utils as _media_utils
+
+            return _media_utils.load_video(
+                video_path,
+                start_frame,
+                end_frame,
+                bucket_selector,
+                target_fps=self.strict_target_fps,
+                fps_resample_mode="timestamps",
+            )
 
         video = load_video(
             video_path, start_frame, end_frame, bucket_selector, source_fps=self.source_fps, target_fps=self.target_fps
@@ -1577,6 +1596,18 @@ class VideoDatasource(ContentDatasource):
         end_frame = end_frame if end_frame is not None else self.end_frame
         bucket_selector = bucket_selector if bucket_selector is not None else self.bucket_selector
 
+        if self.strict_target_fps is not None:
+            from musubi_tuner.dataset import media_utils as _media_utils
+
+            return _media_utils.load_video(
+                control_path,
+                start_frame,
+                end_frame,
+                bucket_selector,
+                target_fps=self.strict_target_fps,
+                fps_resample_mode="timestamps",
+            )
+
         control = load_video(
             control_path, start_frame, end_frame, bucket_selector, source_fps=self.source_fps, target_fps=self.target_fps
         )
@@ -1592,6 +1623,67 @@ class VideoDatasource(ContentDatasource):
     def set_source_and_target_fps(self, source_fps: Optional[float], target_fps: Optional[float]):
         self.source_fps = source_fps
         self.target_fps = target_fps
+
+    def set_strict_target_fps(self, target_fps: Optional[float]):
+        self.strict_target_fps = target_fps
+
+    def set_audio_spec(self, audio_spec: Optional[AudioSpec]):
+        """Enables audio for this datasource and eagerly resolves all audio sources (fail-fast)."""
+        self.audio_spec = audio_spec
+        self.audio_sources = None
+        if audio_spec is None:
+            return
+
+        from musubi_tuner.dataset.audio_utils import resolve_audio_source
+
+        audio_sources = []
+        missing = []
+        for index in range(len(self)):
+            video_path, explicit_path = self._audio_resolution_inputs(index)
+            source = resolve_audio_source(video_path, explicit_path)
+            audio_sources.append(source)
+            if source is None:
+                missing.append(video_path)
+        self.audio_sources = audio_sources
+
+        if missing:
+            for video_path in missing[:10]:
+                logger.warning(f"Video has no audio source; an unsupervised silence placeholder will be cached: {video_path}")
+            logger.info(f"audio sources resolved: {len(audio_sources) - len(missing)} with audio, {len(missing)} without")
+
+    def _audio_resolution_inputs(self, idx: int) -> tuple[str, Optional[str]]:
+        """Returns (video_path, explicit_audio_path) for audio source resolution."""
+        raise NotImplementedError
+
+    def get_audio_waveform(self, idx: int):
+        """Decodes the full waveform [C, L] for the item, or None if it has no audio source."""
+        if self.audio_spec is None or self.audio_sources is None:
+            raise ValueError("Audio is not enabled for this datasource; call set_audio_spec first")
+        source = self.audio_sources[idx]
+        if source is None:
+            return None
+        from musubi_tuner.dataset.audio_utils import decode_audio
+
+        return decode_audio(source, sample_rate=self.audio_spec.sample_rate, channels=self.audio_spec.channels)
+
+    def _create_video_fetcher(self, index: int):
+        if self.audio_spec is not None:
+
+            def fetch():
+                result = self.get_video_data(index)
+                waveform = self.get_audio_waveform(index)
+                # append waveform after the datasource tuple (…, control, loss_mask) -> 6-tuple
+                return (*result, waveform)
+
+        else:
+
+            def fetch():
+                return self.get_video_data(index)
+
+        # the datasource record index travels as a fetcher attribute so that ItemInfo can
+        # reference the originating record without re-deriving it from item keys
+        fetch.datasource_index = index
+        return fetch
 
     def __iter__(self):
         raise NotImplementedError
@@ -1711,6 +1803,9 @@ class VideoDirectoryDatasource(VideoDatasource):
             caption = f.read().strip()
         return video_path, caption
 
+    def _audio_resolution_inputs(self, idx: int) -> tuple[str, Optional[str]]:
+        return self.video_paths[idx], None
+
     def __iter__(self):
         self.current_idx = 0
         return self
@@ -1727,11 +1822,7 @@ class VideoDirectoryDatasource(VideoDatasource):
             fetcher = create_caption_fetcher(self.current_idx)
 
         else:
-
-            def create_fetcher(index):
-                return lambda: self.get_video_data(index)
-
-            fetcher = create_fetcher(self.current_idx)
+            fetcher = self._create_video_fetcher(self.current_idx)
 
         self.current_idx += 1
         return fetcher
@@ -1821,6 +1912,10 @@ class VideoJsonlDatasource(VideoDatasource):
         caption = select_caption_from_metadata(data, self.caption_field)
         return video_path, caption
 
+    def _audio_resolution_inputs(self, idx: int) -> tuple[str, Optional[str]]:
+        data = self.data[idx]
+        return data["video_path"], data.get("audio_path")
+
     def __iter__(self):
         self.current_idx = 0
         return self
@@ -1837,11 +1932,7 @@ class VideoJsonlDatasource(VideoDatasource):
             fetcher = create_caption_fetcher(self.current_idx)
 
         else:
-
-            def create_fetcher(index):
-                return lambda: self.get_video_data(index)
-
-            fetcher = create_fetcher(self.current_idx)
+            fetcher = self._create_video_fetcher(self.current_idx)
 
         self.current_idx += 1
         return fetcher
@@ -3592,16 +3683,16 @@ class VideoDataset(BaseDataset):
                 result = op()
 
                 waveform = None
+                loss_mask = None
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                    loss_mask = None
                 elif len(result) == 4:
                     video_key, video, caption, control = result
-                    loss_mask = None
-                else:  # audio-enabled datasource
-                    video_key, video, caption, control, waveform = result
-                    loss_mask = None
+                elif len(result) == 5:
+                    video_key, video, caption, control, loss_mask = result
+                else:  # audio-enabled datasource: (..., loss_mask, waveform)
+                    video_key, video, caption, control, loss_mask, waveform = result
 
                 video: list[np.ndarray]
                 if not video:  # corrupt/undecodable clip -> 0 frames decoded; skip instead of crashing the whole cache job
