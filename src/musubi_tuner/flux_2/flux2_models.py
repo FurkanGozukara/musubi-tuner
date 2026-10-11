@@ -497,37 +497,72 @@ class Flux2(nn.Module):
 
         print("FLUX2: Gradient checkpointing disabled.")
 
+    def _proportional_block_swap_split(self, num_blocks: int) -> tuple[int, int]:
+        swap_ratio = self.num_single_blocks / self.num_double_blocks
+        double_blocks_to_swap = int(round(num_blocks / (1.0 + swap_ratio / 2.0)))
+        single_blocks_to_swap = int(round(double_blocks_to_swap * swap_ratio))
+
+        # adjust if we exceed available blocks
+        if self.num_double_blocks * 2 < self.num_single_blocks:
+            while double_blocks_to_swap >= 1 and double_blocks_to_swap > self.num_double_blocks - 2:
+                double_blocks_to_swap -= 1
+                single_blocks_to_swap += 2
+        else:
+            while single_blocks_to_swap >= 2 and single_blocks_to_swap > self.num_single_blocks - 2:
+                single_blocks_to_swap -= 2
+                double_blocks_to_swap += 1
+
+        if double_blocks_to_swap == 0 and single_blocks_to_swap == 0:
+            if self.num_single_blocks >= self.num_double_blocks:
+                single_blocks_to_swap = 1
+            else:
+                double_blocks_to_swap = 1
+        return double_blocks_to_swap, single_blocks_to_swap
+
+    def split_blocks_to_swap(self, num_blocks: int) -> tuple[int, int]:
+        """(double, single) blocks swapped for ``num_blocks``.
+
+        Past the range of the proportional split (FLUX Klein 9B stops at 16 = 6 double + 18 single blocks
+        although 6 + 22 can be swapped), the largest valid proportional split is kept and every extra step
+        swaps two more single blocks (about one double block), then one more double block. Values the
+        proportional split already supports map exactly as before.
+        """
+        if num_blocks <= 0:
+            return 0, 0
+        if self.num_double_blocks == 0:
+            return 0, num_blocks
+        if self.num_single_blocks == 0:
+            return num_blocks, 0
+        max_double, max_single = self.num_double_blocks - 2, self.num_single_blocks - 2
+        double_blocks_to_swap, single_blocks_to_swap = self._proportional_block_swap_split(num_blocks)
+        if double_blocks_to_swap <= max_double and single_blocks_to_swap <= max_single:
+            return double_blocks_to_swap, single_blocks_to_swap
+        base = num_blocks - 1
+        double_blocks_to_swap = single_blocks_to_swap = 0
+        while base > 0:
+            double_blocks_to_swap, single_blocks_to_swap = self._proportional_block_swap_split(base)
+            if double_blocks_to_swap <= max_double and single_blocks_to_swap <= max_single:
+                break
+            base -= 1
+        if base == 0:
+            double_blocks_to_swap = single_blocks_to_swap = 0
+        extra = num_blocks - base
+        while extra > 0 and single_blocks_to_swap + 2 <= max_single:
+            single_blocks_to_swap += 2
+            extra -= 1
+        while extra > 0 and double_blocks_to_swap + 1 <= max_double:
+            double_blocks_to_swap += 1
+            extra -= 1
+        if extra > 0:
+            raise ValueError(
+                f"blocks_to_swap={num_blocks} is too large: at most {num_blocks - extra} for this model "
+                f"({max_double} double and {max_single} single blocks)."
+            )
+        return double_blocks_to_swap, single_blocks_to_swap
+
     def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig):
         self.blocks_to_swap = num_blocks
-        if num_blocks <= 0:
-            double_blocks_to_swap = 0
-            single_blocks_to_swap = 0
-        elif self.num_double_blocks == 0:
-            double_blocks_to_swap = 0
-            single_blocks_to_swap = num_blocks
-        elif self.num_single_blocks == 0:
-            double_blocks_to_swap = num_blocks
-            single_blocks_to_swap = 0
-        else:
-            swap_ratio = self.num_single_blocks / self.num_double_blocks
-            double_blocks_to_swap = int(round(num_blocks / (1.0 + swap_ratio / 2.0)))
-            single_blocks_to_swap = int(round(double_blocks_to_swap * swap_ratio))
-
-            # adjust if we exceed available blocks
-            if self.num_double_blocks * 2 < self.num_single_blocks:
-                while double_blocks_to_swap >= 1 and double_blocks_to_swap > self.num_double_blocks - 2:
-                    double_blocks_to_swap -= 1
-                    single_blocks_to_swap += 2
-            else:
-                while single_blocks_to_swap >= 2 and single_blocks_to_swap > self.num_single_blocks - 2:
-                    single_blocks_to_swap -= 2
-                    double_blocks_to_swap += 1
-
-            if double_blocks_to_swap == 0 and single_blocks_to_swap == 0:
-                if self.num_single_blocks >= self.num_double_blocks:
-                    single_blocks_to_swap = 1
-                else:
-                    double_blocks_to_swap = 1
+        double_blocks_to_swap, single_blocks_to_swap = self.split_blocks_to_swap(num_blocks)
 
         assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
             f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
