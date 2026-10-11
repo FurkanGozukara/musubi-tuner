@@ -35,6 +35,10 @@ import torch.nn as nn
 from musubi_tuner.zimage import zimage_config
 
 
+# query rows per attention chunk in the VAE mid block (0 = whole image at once)
+ATTENTION_QUERY_CHUNK = 4096
+
+
 @dataclass
 class AutoencoderKLOutput:
     sample: torch.Tensor
@@ -117,7 +121,16 @@ class Attention(nn.Module):
 
         import torch.nn.functional as F
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value)
+        chunk = ATTENTION_QUERY_CHUNK
+        if chunk and query.shape[1] > chunk:
+            # one 512-channel head has no fused SDPA kernel, so the math kernel builds the full (H*W)^2 score matrix:
+            # 5.4 GB in float32 for a 1536x1536 image (36864 tokens). Query chunks compute the same rows with a
+            # fraction of that memory.
+            hidden_states = torch.cat(
+                [F.scaled_dot_product_attention(query[:, i : i + chunk], key, value) for i in range(0, query.shape[1], chunk)], dim=1
+            )
+        else:
+            hidden_states = F.scaled_dot_product_attention(query, key, value)
 
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = hidden_states.transpose(1, 2).view(b, c, h, w)
