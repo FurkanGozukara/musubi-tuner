@@ -69,3 +69,15 @@ def test_transfers_are_batched_and_finished():
     assert type(result) is dict
     assert sorted(result) == ["a", "b", "c"]
     assert {tensor.device.type for tensor in result.values()} == {"meta"}
+
+
+def test_model_key_filter_loads_only_the_variants_tensors():
+    """A video-only model skips the checkpoint's audio branch, VAEs and vocoder (~18.5 GB of BF16 in LTX-2.3)."""
+    from musubi_tuner.ltx2_model_loading import make_ltx2_model_key_filter
+
+    keep = make_ltx2_model_key_filter({"transformer_blocks.0.attn1.to_q.weight", "transformer_blocks.0.attn1.to_q.bias", "proj_out.weight"})
+    assert keep("transformer_blocks.0.attn1.to_q.weight")
+    assert keep("model.diffusion_model.transformer_blocks.0.attn1.to_q.weight")  # Comfy prefix
+    assert keep("transformer_blocks.0.attn1.to_q.weight_scale") and keep("transformer_blocks.0.attn1.to_q.comfy_quant")
+    for skipped in ("transformer_blocks.0.audio_attn1.to_q.weight", "transformer_blocks.0.audio_scale_shift_table", "vocoder.conv.weight", "vae.decoder.weight"):
+        assert not keep(skipped), skipped

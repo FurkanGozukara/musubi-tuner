@@ -137,6 +137,29 @@ def build_fp8_keep_block_exclude_keys(value: Any, num_blocks: Optional[int]) -> 
     return [f"transformer_blocks.{idx}." for idx in block_indices]
 
 
+def make_ltx2_model_key_filter(model_keys: Iterable[str]) -> Callable[[str], bool]:
+    """Key filter that loads only tensors of modules the built transformer has.
+
+    The single-file LTX-2.3 checkpoint also carries the audio branch, the audio/video VAEs, the vocoder
+    and the text connectors (4490 of 5947 tensors, ~18.5 GB in BF16 for a video-only model); loading
+    them only to discard them in load_state_dict costs time and, without block swap, GPU memory.
+    Companion tensors of a kept weight (FP8/INT8 scales, quantization metadata) are kept with it.
+    """
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+
+    keys = set(model_keys)
+
+    def key_filter(key: str) -> bool:
+        renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(key)
+        normalized = renamed if renamed is not None else key
+        if normalized in keys:
+            return True
+        # a sibling of a kept weight: "<module>.weight_scale", ".comfy_quant", ".input_scale", ...
+        return "." in normalized and normalized.rsplit(".", 1)[0] + ".weight" in keys
+
+    return key_filter
+
+
 def should_load_ltx2_transformer_block_key(key: str, *, keep_start: int, keep_end: int) -> bool:
     """Return whether a checkpoint key belongs to the requested transformer block range.
 
@@ -1528,6 +1551,16 @@ def load_ltx2_model(
             )
 
         logger.info("LTX-2 range-aware load enabled for transformer blocks %d:%d", keep_start, keep_end)
+
+    # load only what this transformer variant has (a video-only model skips the audio branch, VAEs, vocoder)
+    _range_key_filter = state_dict_key_filter
+    _model_key_filter = make_ltx2_model_key_filter(base_model.state_dict().keys())
+
+    def state_dict_key_filter(key: str) -> bool:  # noqa: F811
+        if not _model_key_filter(key):
+            return False
+        return True if _range_key_filter is None else _range_key_filter(key)
+
 
     # Streamed placement (opt-in). Each weight is written straight to the device it will
     # be used from, so the whole model is never staged in main RAM. Only the training
