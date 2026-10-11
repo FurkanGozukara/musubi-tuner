@@ -1979,16 +1979,27 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     def switch_block_swap_for_training(self):
         self.language_model.switch_block_swap_for_training()
 
+    def visual_unused_in_training(self) -> bool:
+        """t2i training with the dummy visual pass skipped never runs the vision encoder (no pixel inputs)."""
+        inner = getattr(self, "model", None)
+        return bool(getattr(inner, "skip_t2i_visual_dummy", False)) and getattr(self, "hidream_o1_task", "t2i") == "t2i"
+
     def move_to_device_except_swap_blocks(self, device: torch.device):
         if self.blocks_to_swap:
             language_model = self.model.language_model
             save_layers = language_model.layers
             language_model.layers = nn.ModuleList()
+        # with block swap (low VRAM) an unused vision encoder (0.57B parameters) stays on the CPU
+        save_visual = self.model.visual if self.blocks_to_swap and self.visual_unused_in_training() else None
+        if save_visual is not None:
+            self.model.visual = nn.Module()
 
         self.to(device)
 
         if self.blocks_to_swap:
             language_model.layers = save_layers
+        if save_visual is not None:
+            self.model.visual = save_visual
 
     def prepare_block_swap_before_forward(self):
         self.language_model.prepare_block_swap_before_forward()
