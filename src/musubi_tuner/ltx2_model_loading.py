@@ -544,6 +544,39 @@ def load_quanto_int8_state_dict(
     return sd
 
 
+class _StateDictOnDevice(dict):
+    """State dict whose tensors end up on ``device``.
+
+    Tensors computed on another device (quantized on the GPU for a CPU load) are moved in batches of about
+    ``batch_bytes``: a synchronous copy per tensor would stop the GPU quantization from overlapping with reading
+    the next tensors of the checkpoint. Call ``finish()`` for the final plain dict.
+    """
+
+    def __init__(self, device: torch.device, batch_bytes: int = 512 * 1024**2):
+        super().__init__()
+        self.device = device
+        self.batch_bytes = batch_bytes
+        self._pending: list[str] = []
+        self._pending_bytes = 0
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if isinstance(value, torch.Tensor) and value.device != self.device:
+            self._pending.append(key)
+            self._pending_bytes += value.numel() * value.element_size()
+            if self._pending_bytes >= self.batch_bytes:
+                self.flush()
+
+    def flush(self) -> None:
+        for key in self._pending:
+            super().__setitem__(key, dict.__getitem__(self, key).to(self.device))
+        self._pending, self._pending_bytes = [], 0
+
+    def finish(self) -> dict:
+        self.flush()
+        return dict(self)
+
+
 def load_safetensors_dynamic_int8(
     model_files: List[str],
     *,
@@ -571,7 +604,7 @@ def load_safetensors_dynamic_int8(
 
     calc_device = torch.device(calc_device)
     output_device = torch.device(output_device) if output_device is not None else None
-    sd: dict[str, torch.Tensor] = {}
+    sd: dict[str, torch.Tensor] = _StateDictOnDevice(output_device) if output_device is not None else {}
     quantized = 0
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file) as f:
@@ -591,8 +624,6 @@ def load_safetensors_dynamic_int8(
                     w = value.to(device=calc_device, dtype=torch.float32)
                     scale = (w.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
                     q = (w / scale).round_().clamp_(-127, 127).to(torch.int8)
-                    if output_device is not None:
-                        q, scale = q.to(output_device), scale.to(output_device)
                     sd[mkey] = q
                     sd[mkey[: -len(".weight")] + ".scale_weight"] = scale.to(torch.float32)
                     quantized += 1
@@ -606,6 +637,8 @@ def load_safetensors_dynamic_int8(
                         value = value.to(calc_device)
                     sd[mkey] = value
     logger.info("int8 dynamic: quantized %d Linear weights to per-row int8 (%d tensors total)", quantized, len(sd))
+    if isinstance(sd, _StateDictOnDevice):
+        sd = sd.finish()
     return sd
 
 
@@ -725,7 +758,7 @@ def load_safetensors_dynamic_int8_convrot(
     output_device = torch.device(output_device) if output_device is not None else None
     group_candidates = parse_int8_convrot_groupsizes(groupsizes)
     collect_quality = bool(quality_report)
-    sd: dict[str, torch.Tensor] = {}
+    sd: dict[str, torch.Tensor] = _StateDictOnDevice(output_device) if output_device is not None else {}
     quality_layers = []
     quantized = 0
     skipped_groupsize = 0
@@ -781,8 +814,6 @@ def load_safetensors_dynamic_int8_convrot(
                         collect_quality=collect_quality,
                         key=mkey,
                     )
-                    if output_device is not None:
-                        q, scale = q.to(output_device), scale.to(output_device)
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
                     sd[base + ".scale_weight"] = scale
@@ -839,6 +870,8 @@ def load_safetensors_dynamic_int8_convrot(
             layers=[],
         )
         logger.warning("INT8 ConvRot quality report requested, but no layers were quantized.")
+    if isinstance(sd, _StateDictOnDevice):
+        sd = sd.finish()
     return sd
 
 
@@ -1054,7 +1087,7 @@ def load_safetensors_dynamic_int4_convrot(
         raise ValueError("compare_group_scales requires quality_report")
     group_candidates = parse_int4_convrot_groupsizes(groupsizes)
     collect_quality = bool(quality_report)
-    sd: dict[str, torch.Tensor] = {}
+    sd: dict[str, torch.Tensor] = _StateDictOnDevice(output_device) if output_device is not None else {}
     quality_layers = []
     group_scale_comparisons = []
     applied_int4_parameters = []
@@ -1183,8 +1216,6 @@ def load_safetensors_dynamic_int4_convrot(
                                 scale_refine_steps=layer_parameters.scale_refine_steps,
                             )
                         )
-                    if output_device is not None:
-                        q, scale, shape = q.to(output_device), scale.to(output_device), shape.to(output_device)
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
                     sd[base + ".scale_weight"] = scale
@@ -1276,6 +1307,8 @@ def load_safetensors_dynamic_int4_convrot(
             layers=[],
         )
         logger.warning("INT4 ConvRot quality report requested, but no layers were quantized.")
+    if isinstance(sd, _StateDictOnDevice):
+        sd = sd.finish()
     return sd
 
 

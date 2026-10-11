@@ -52,3 +52,20 @@ def test_results_follow_output_device(tmp_path, kind):
     assert kept[QUANTIZED_KEY].dtype not in (torch.bfloat16, torch.float32), "the target weight was not quantized"
     for key, tensor in kept.items():
         assert (moved[key].dtype, moved[key].shape) == (tensor.dtype, tensor.shape), key
+
+
+def test_transfers_are_batched_and_finished():
+    """Copies to the output device are batched (one synchronous copy per tensor would serialize GPU quantization
+    with reading the checkpoint); finish() moves the rest and returns a plain dict."""
+    from musubi_tuner.ltx2_model_loading import _StateDictOnDevice
+
+    sd = _StateDictOnDevice(torch.device("meta"), batch_bytes=64)
+    sd["a"] = torch.zeros(8, dtype=torch.float32)  # 32 bytes: waits for the batch
+    assert sd["a"].device.type == "cpu"
+    sd["b"] = torch.zeros(8, dtype=torch.float32)  # 64 bytes: the batch moves
+    assert {tensor.device.type for tensor in sd.values()} == {"meta"}
+    sd["c"] = torch.zeros(2)
+    result = sd.finish()
+    assert type(result) is dict
+    assert sorted(result) == ["a", "b", "c"]
+    assert {tensor.device.type for tensor in result.values()} == {"meta"}
