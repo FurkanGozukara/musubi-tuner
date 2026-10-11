@@ -81,6 +81,7 @@ from musubi_tuner.minimax_h3.text_encoder import (
 )
 from musubi_tuner.minimax_h3.video_vae import VIDEO_VAE_DECODE_DTYPE, VIDEO_VAE_ENCODE_DTYPE, load_video_vae
 from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
+from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.networks import lora_minimax_h3
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
@@ -1367,6 +1368,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return float(args.h3_guidance_loss_scale_audio)
         return float(args.h3_guidance_loss_scale)
 
+    @staticmethod
+    def _reset_block_swap_after_probe(accelerator: Accelerator, transformer) -> None:
+        """Put swapped blocks back in their start-of-forward places after a forward without backward.
+
+        The standard offloader streams blocks during the forward and relies on the backward pass to bring
+        them back; after a no-grad probe (guidance uncond, teacher) the training forward found its first
+        blocks on the CPU ("block 0 ... is on cpu, expected cuda after wait"). H2D-only streaming handles
+        repeated forwards itself.
+        """
+        model = accelerator.unwrap_model(transformer)
+        if getattr(model, "blocks_to_swap", 0) and isinstance(getattr(model, "offloader", None), ModelOffloader):
+            model.prepare_block_swap_before_forward()
+
     def _apply_guidance_loss_targets(
         self,
         args: argparse.Namespace,
@@ -1433,6 +1447,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 visual_condition_clean=args.h3_visual_cond_clean,
                 audio_condition_clean=args.h3_audio_cond_clean,
             )
+        self._reset_block_swap_after_probe(accelerator, transformer)
         uncond_video = uncond.video.detach().float()
         uncond_audio = uncond.audio.detach().float()
         video_gap = video_target.float() - uncond_video
@@ -1535,6 +1550,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 )
         finally:
             base_network.set_enabled(True)
+        self._reset_block_swap_after_probe(accelerator, transformer)
         teacher_video = teacher.video.detach().float()
         teacher_audio = teacher.audio.detach().float()
         # the flow-gap magnitudes measure how far the teacher deviates from the raw velocity
