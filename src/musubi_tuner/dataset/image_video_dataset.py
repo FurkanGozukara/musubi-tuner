@@ -4015,6 +4015,40 @@ class VideoDataset(BaseDataset):
             raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
+    def drop_stale_video_caches(self, cache_files: list[str], bucket_selector: "BucketSelector") -> list[str]:
+        """Training loads every *_<arch>.safetensors in the cache folder, so clips cached for another resolution
+        or frame count would be trained on alongside the current ones. Video cache names carry the clip's bucket
+        and frame count: keep the files the current settings would produce. When none match (caching was not
+        re-run), everything is kept as before, with a warning."""
+        target_frames = set(self.target_frames or ())
+        check_frames = bool(target_frames) and self.frame_extraction in ("head", "chunk", "slide", "uniform")
+        current, stale = [], []
+        for cache_file in cache_files:
+            tokens = os.path.basename(cache_file).split("_")
+            try:
+                width, height = map(int, tokens[-2].split("x"))
+                frame_count = int(tokens[-3].split("-")[1])
+            except (IndexError, ValueError):
+                current.append(cache_file)
+                continue
+            bucket = tuple(bucket_selector.get_bucket_resolution((width, height))[:2])
+            if bucket != (width, height) or (check_frames and frame_count not in target_frames):
+                stale.append(cache_file)
+            else:
+                current.append(cache_file)
+        if stale and current:
+            logger.warning(
+                f"{self.cache_directory}: ignoring {len(stale)} cached clip(s) encoded for another resolution or frame count "
+                f"(training uses the {len(current)} matching the current settings)"
+            )
+            return current
+        if stale:
+            logger.warning(
+                f"{self.cache_directory}: every cached clip was encoded for another resolution or frame count; "
+                "re-run latent caching for the current settings"
+            )
+        return cache_files
+
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         bucket_selector = BucketSelector(
             self.resolution,
@@ -4026,6 +4060,7 @@ class VideoDataset(BaseDataset):
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        latent_cache_files = self.drop_stale_video_caches(latent_cache_files, bucket_selector)
 
         # assign cache files to item info
         bucketed_item_info: dict[tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]
