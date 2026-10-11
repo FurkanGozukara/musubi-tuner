@@ -156,3 +156,22 @@ def test_minimax_h3_model_accepts_resolved_flash_auto_mode():
         "MiniMaxH3Model.__init__ attn_mode validation must accept 'flash_auto' "
         "(the SECourses resolve_sdpa_backend() result for --sdpa without native flash SDPA)"
     )
+
+
+def test_qwen_image_21_segmented_attention_accepts_resolved_flash_auto_mode():
+    """Guardrail 3: Qwen-Image 2.1 dispatches attention per segment and must accept the fork's
+    "flash_auto" mode (resolve_sdpa_backend() result for --sdpa) instead of raising
+    "Unknown attention backend"."""
+    import torch
+
+    from musubi_tuner.qwen_image_21.qwen_image_21_model import segmented_attention
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 6, 2, 16)
+    k = torch.randn(1, 6, 2, 16)
+    v = torch.randn(1, 6, 2, 16)
+    segments = [[(0, 2, True), (2, 6, False)]]
+    expected = segmented_attention(q, k, v, segments, attn_mode="torch")
+    for mode in ("flash_auto", "sdpa"):
+        out = segmented_attention(q, k, v, segments, attn_mode=mode)
+        assert torch.allclose(out, expected, atol=1e-5), mode

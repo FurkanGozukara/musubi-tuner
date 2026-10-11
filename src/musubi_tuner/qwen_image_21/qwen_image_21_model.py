@@ -107,9 +107,15 @@ def segmented_attention(q, k, v, segments, attn_mode="torch"):
             # Text segments need an offset causal mask. Image segments use all
             # keys up to the end of the image, so no mask is needed.
             backend = attn_mode
+            if backend == "sdpa":
+                backend = "torch"
             if is_text or (backend == "sageattn" and torch.is_grad_enabled()):
                 backend = "torch"  # SageAttention has no autograd kernel.
             qs, ks, vs = q[b : b + 1, start:end], k[b : b + 1, :end], v[b : b + 1, :end]
+            if backend == attention_backends.AUTO_FLASH_ATTENTION_MODE:
+                # fork: --sdpa resolves to "flash_auto" on machines without native flash SDPA but with a
+                # working FlashAttention package; pick flash or torch for these concrete tensors
+                backend = attention_backends.resolve_automatic_flash_mode(qs, ks, vs)
             if backend in {"flash", "flash3"}:
                 func = (
                     attention_backends.flash_attn_func
