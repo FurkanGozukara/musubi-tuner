@@ -114,6 +114,25 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
         )
         return frozen_params, frozen_numel
 
+    @staticmethod
+    def _freeze_text_embeddings(transformer) -> int:
+        """Keep the text token embedding table (151936 x 4096, never block-swapped) frozen.
+
+        Its dense gradient and full-precision optimizer update need several GB at once, independent of the
+        resolution; freezing it is like not training a text encoder while every transformer layer still trains.
+        """
+        frozen = 0
+        for name, module in transformer.named_modules():
+            if name.endswith("embed_tokens") and isinstance(module, torch.nn.Embedding):
+                for parameter in module.parameters():
+                    if parameter.requires_grad:
+                        parameter.requires_grad_(False)
+                        frozen += parameter.numel()
+        if frozen == 0:
+            raise ValueError("--freeze_text_embeddings: no trainable HiDream-O1 embed_tokens table was found.")
+        logger.info(f"Froze HiDream-O1 text token embeddings ({frozen} parameters).")
+        return frozen
+
     def train(self, args):
         args.full_finetune = True
         if torch.cuda.is_available():
@@ -199,6 +218,8 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
         )
 
         frozen_visual_params, frozen_visual_numel = self._freeze_inactive_modules_for_dataset(transformer, has_control)
+        if getattr(args, "freeze_text_embeddings", False):
+            self._freeze_text_embeddings(transformer)
 
         if blocks_to_swap > 0:
             logger.info(
@@ -654,6 +675,14 @@ def hidream_o1_finetune_setup_parser(parser: argparse.ArgumentParser) -> argpars
         help=(
             "Patch optimizer parameters for block swap when blocks_to_swap > 0. Only works for some optimizers. "
             "Not needed when using --fused_backward_pass."
+        ),
+    )
+    parser.add_argument(
+        "--freeze_text_embeddings",
+        action="store_true",
+        help=(
+            "Keep the 0.6B-parameter text token embedding table frozen (all transformer layers still train). Its "
+            "gradient and optimizer update otherwise need several GB of VRAM at once, whatever the resolution."
         ),
     )
     return parser
