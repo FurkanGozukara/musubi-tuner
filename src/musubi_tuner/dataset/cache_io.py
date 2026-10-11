@@ -19,6 +19,8 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_KREA2_FULL,
     ARCHITECTURE_MINIMAX_H3_FULL,
     ARCHITECTURE_KANDINSKY6_FULL,
+    ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
+    ARCHITECTURE_MAGE_FLOW_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_QWEN_IMAGE_21_FULL,
     ARCHITECTURE_WAN_FULL,
@@ -38,6 +40,8 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+CACHE_FORMAT_VERSION = "1.0.1"
 
 SOURCE_PATH_METADATA_KEY = "source_path"
 SOURCE_PATH_FORMAT_METADATA_KEY = "source_path_format"
@@ -344,6 +348,40 @@ def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_latent_cache_mage_flow(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    control_latent: Optional[list[torch.Tensor]],
+    *,
+    is_edit: bool,
+):
+    """Save one MageVAE posterior realization without silently repairing it."""
+
+    controls = [] if control_latent is None else list(control_latent)
+    if is_edit and not 1 <= len(controls) <= 3:
+        raise ValueError(f"Mage-Flow-Edit requires between 1 and 3 control latents, got {len(controls)}")
+    if not is_edit and controls:
+        raise ValueError("Mage-Flow T2I cache cannot contain control latents")
+
+    def validate(name: str, value: torch.Tensor) -> None:
+        if value.ndim != 3 or value.shape[0] != 128:
+            raise ValueError(f"{name} must have shape [128,H,W] with 128 channels, got {tuple(value.shape)}")
+        if value.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must use torch.bfloat16, got {value.dtype}")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} must contain only finite values")
+
+    validate("target latent", latent)
+    _, height, width = latent.shape
+    state_dict = {f"latents_1x{height}x{width}_bfloat16": latent.detach().cpu().contiguous()}
+    for index, control in enumerate(controls):
+        validate(f"control latent {index}", control)
+        _, control_height, control_width = control.shape
+        state_dict[f"latents_control_{index}_1x{control_height}x{control_width}_bfloat16"] = control.detach().cpu().contiguous()
+    architecture = ARCHITECTURE_MAGE_FLOW_EDIT_FULL if is_edit else ARCHITECTURE_MAGE_FLOW_FULL
+    save_latent_cache_common(item_info, state_dict, architecture)
+
+
 def save_latent_cache_kandinsky5(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -473,7 +511,7 @@ def save_latent_cache_common(
             "architecture": arch_fullname,
             "width": f"{item_info.original_size[0]}",
             "height": f"{item_info.original_size[1]}",
-            "format_version": "1.0.1",
+            "format_version": CACHE_FORMAT_VERSION,
         },
         additional_metadata,
     )
@@ -664,6 +702,26 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     sd[f"varlen_krea2_vl_embed_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+
+
+def save_text_encoder_output_cache_mage_flow(item_info: ItemInfo, embed: torch.Tensor, *, is_edit: bool):
+    """Save the unpadded final Qwen3-VL backbone hidden state used by Mage-Flow."""
+
+    if embed.ndim != 2 or embed.shape[1] != 2560:
+        raise ValueError(f"Mage-Flow text embedding must have shape [L,2560], got {tuple(embed.shape)}")
+    if not 1 <= embed.shape[0] <= 2048:
+        raise ValueError(f"Mage-Flow text embedding length must be between 1 and 2048, got {embed.shape[0]}")
+    if embed.dtype != torch.bfloat16:
+        raise ValueError(f"Mage-Flow text embedding must use torch.bfloat16, got {embed.dtype}")
+    if not torch.isfinite(embed).all():
+        raise ValueError("Mage-Flow text embedding must contain only finite values")
+    architecture = ARCHITECTURE_MAGE_FLOW_EDIT_FULL if is_edit else ARCHITECTURE_MAGE_FLOW_FULL
+    save_text_encoder_output_cache_common(
+        item_info,
+        {"varlen_mage_flow_embed_bfloat16": embed.detach().cpu().contiguous()},
+        architecture,
+        merge_existing=False,
+    )
 
 
 def save_text_encoder_output_cache_kandinsky5(
@@ -938,7 +996,7 @@ def save_text_encoder_output_cache_common(
         {
             "architecture": arch_fullname,
             "caption1": item_info.caption,
-            "format_version": "1.0.1",
+            "format_version": CACHE_FORMAT_VERSION,
         },
         additional_metadata,
     )

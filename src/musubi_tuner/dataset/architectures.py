@@ -41,6 +41,10 @@ ARCHITECTURE_MINIMAX_H3 = "mmh3"
 ARCHITECTURE_MINIMAX_H3_FULL = "minimax_h3"
 ARCHITECTURE_ERNIE_IMAGE = "ei"
 ARCHITECTURE_ERNIE_IMAGE_FULL = "ernie_image"
+ARCHITECTURE_MAGE_FLOW = "mf"
+ARCHITECTURE_MAGE_FLOW_FULL = "mage_flow"
+ARCHITECTURE_MAGE_FLOW_EDIT = "mfe"
+ARCHITECTURE_MAGE_FLOW_EDIT_FULL = "mage_flow_edit"
 
 
 def round_down_frame_count(frame_count: int, architecture: str, vae_frame_stride: int) -> int:

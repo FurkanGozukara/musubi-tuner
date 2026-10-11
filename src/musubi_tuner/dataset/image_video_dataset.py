@@ -43,6 +43,10 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_KANDINSKY6,
     ARCHITECTURE_MINIMAX_H3,
+    ARCHITECTURE_MAGE_FLOW,
+    ARCHITECTURE_MAGE_FLOW_EDIT,
+    ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
+    ARCHITECTURE_MAGE_FLOW_FULL,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_QWEN_IMAGE_21,
     ARCHITECTURE_WAN,
@@ -50,6 +54,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
 )
 from musubi_tuner.dataset.audio_utils import AudioSpec, audio_window_start, slice_audio_window
 from musubi_tuner.dataset.datasources import ItemExtras, _extra_fields
+from musubi_tuner.dataset.cache_io import CACHE_FORMAT_VERSION
 from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
 from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
 
@@ -253,6 +258,23 @@ def _normalize_optional_path_list(
         values.append(normalized)
 
     return values
+
+
+def _validate_mage_cache_metadata(path: str, expected_architecture: str) -> None:
+    with safetensors_utils.MemoryEfficientSafeOpen(path) as handle:
+        metadata = handle.metadata() or {}
+    actual_architecture = metadata.get("architecture")
+    if actual_architecture != expected_architecture:
+        raise ValueError(
+            f"Mage-Flow cache architecture mismatch for {path}: "
+            f"expected {expected_architecture}, got {actual_architecture or '<missing>'}"
+        )
+    actual_format_version = metadata.get("format_version")
+    if actual_format_version != CACHE_FORMAT_VERSION:
+        raise ValueError(
+            f"Mage-Flow cache format version mismatch for {path}: "
+            f"expected {CACHE_FORMAT_VERSION}, got {actual_format_version or '<missing>'}"
+        )
 
 
 class ItemInfo:
@@ -2646,7 +2668,7 @@ class ImageDataset(BaseDataset):
             or self.architecture == ARCHITECTURE_FLUX_2_KLEIN_9B
         ):
             control_count_per_image = None  # can be multiple control images
-        elif self.architecture in (ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_21):
+        elif self.architecture in (ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_21, ARCHITECTURE_MAGE_FLOW_EDIT):
             control_count_per_image = None  # can be multiple control images
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
@@ -2920,6 +2942,10 @@ class ImageDataset(BaseDataset):
             self.architecture,
             reference_downscale=getattr(self, "reference_downscale", 1),
         )
+        expected_cache_architecture = {
+            ARCHITECTURE_MAGE_FLOW: ARCHITECTURE_MAGE_FLOW_FULL,
+            ARCHITECTURE_MAGE_FLOW_EDIT: ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
+        }.get(self.architecture)
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -2946,6 +2972,10 @@ class ImageDataset(BaseDataset):
                     logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                     continue
                 text_encoder_output_cache_file = None
+            if expected_cache_architecture is not None:
+                _validate_mage_cache_metadata(cache_file, expected_cache_architecture)
+                if text_encoder_output_cache_file is not None:
+                    _validate_mage_cache_metadata(text_encoder_output_cache_file, expected_cache_architecture)
 
             audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
 

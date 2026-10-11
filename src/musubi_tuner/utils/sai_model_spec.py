@@ -26,6 +26,8 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_KANDINSKY6,
     ARCHITECTURE_KREA2,
     ARCHITECTURE_MINIMAX_H3,
+    ARCHITECTURE_MAGE_FLOW,
+    ARCHITECTURE_MAGE_FLOW_EDIT,
     ARCHITECTURE_Z_IMAGE,
 )
 from musubi_tuner.dataset.architectures import ARCHITECTURE_ERNIE_IMAGE
@@ -107,6 +109,8 @@ ARCH_IDEOGRAM4 = "Ideogram-4"
 ARCH_KREA2 = "Krea-2"
 ARCH_MINIMAX_H3 = "MiniMax-H3"
 ARCH_ERNIE_IMAGE = "ERNIE-Image"
+ARCH_MAGE_FLOW = "Mage-Flow"
+ARCH_MAGE_FLOW_EDIT = "Mage-Flow-Edit"
 
 ADAPTER_LORA = "lora"
 
@@ -129,6 +133,7 @@ IMPL_IDEOGRAM4 = "https://huggingface.co/Comfy-Org/Ideogram-4"
 IMPL_KREA2 = "https://github.com/krea-ai/krea-2"
 IMPL_MINIMAX_H3 = "https://huggingface.co/MiniMaxAI/MiniMax-H3"
 IMPL_ERNIE_IMAGE = "https://github.com/baidu/ERNIE-Image"
+IMPL_MAGE_FLOW = "https://github.com/microsoft/Mage"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -264,6 +269,12 @@ def build_metadata(
     elif architecture == ARCHITECTURE_ERNIE_IMAGE:
         arch = ARCH_ERNIE_IMAGE
         impl = IMPL_ERNIE_IMAGE
+    elif architecture == ARCHITECTURE_MAGE_FLOW:
+        arch = ARCH_MAGE_FLOW
+        impl = IMPL_MAGE_FLOW
+    elif architecture == ARCHITECTURE_MAGE_FLOW_EDIT:
+        arch = ARCH_MAGE_FLOW_EDIT
+        impl = IMPL_MAGE_FLOW
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
