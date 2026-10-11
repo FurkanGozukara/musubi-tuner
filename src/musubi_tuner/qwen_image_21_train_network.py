@@ -104,7 +104,11 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
 
     def compile_transformer(self, args, transformer):
         return model_utils.compile_transformer(
-            args, transformer, [transformer.transformer_blocks], disable_linear=self.blocks_to_swap > 0
+            args,
+            transformer,
+            [transformer.transformer_blocks],
+            disable_linear=self.blocks_to_swap > 0,
+            offloaders=[getattr(transformer, "offloader", None) if self.blocks_to_swap > 0 else None],
         )
 
     def scale_shift_latents(self, latents: torch.Tensor) -> torch.Tensor:

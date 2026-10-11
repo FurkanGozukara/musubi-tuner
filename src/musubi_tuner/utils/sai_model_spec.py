@@ -23,6 +23,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_2_KLEIN_4B,
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_KANDINSKY6,
     ARCHITECTURE_KREA2,
     ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_Z_IMAGE,
@@ -97,6 +98,7 @@ ARCH_QWEN_IMAGE_LAYERED = "Qwen-Image-Layered"
 ARCH_KANDINSKY5 = "Kandinsky-5"
 ARCH_LTX2 = "LTX2"
 
+ARCH_KANDINSKY6 = "Kandinsky-6"
 ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
 ARCH_Z_IMAGE = "Z-Image"
 ARCH_HIDREAM_O1 = "HiDream-O1-Image"
@@ -117,6 +119,7 @@ IMPL_QWEN_IMAGE_LAYERED = "https://github.com/QwenLM/Qwen-Image-Layered"
 IMPL_KANDINSKY5 = "https://github.com/kandinskylab/kandinsky-5"
 IMPL_LTX2 = "https://github.com/Lightricks/LTX-Video"
 
+IMPL_KANDINSKY6 = "https://github.com/kandinskylab/kandinsky-6"
 IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
 IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
 IMPL_HIDREAM_O1 = "https://github.com/HiDream-ai/HiDream-O1-Image"
@@ -234,6 +237,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_LTX2:
         arch = ARCH_LTX2
         impl = IMPL_LTX2
+    elif architecture == ARCHITECTURE_KANDINSKY6:
+        arch = ARCH_KANDINSKY6
+        impl = IMPL_KANDINSKY6
     elif architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
         arch = ARCH_HUNYUAN_VIDEO_1_5
         impl = IMPL_HUNYUAN_VIDEO_1_5
