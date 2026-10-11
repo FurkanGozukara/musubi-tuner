@@ -18,6 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -309,8 +310,34 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         return hidden_states
 
 
+_CREATE_CAUSAL_MASK_PARAMS = set(inspect.signature(create_causal_mask).parameters)
+
+
+def _create_causal_mask_compat(*, config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids):
+    """transformers 4 takes `input_embeds` + `cache_position`; transformers 5 takes `inputs_embeds` only."""
+    kwargs = {"config": config, "attention_mask": attention_mask, "past_key_values": past_key_values, "position_ids": position_ids}
+    kwargs["inputs_embeds" if "inputs_embeds" in _CREATE_CAUSAL_MASK_PARAMS else "input_embeds"] = inputs_embeds
+    if "cache_position" in _CREATE_CAUSAL_MASK_PARAMS:
+        kwargs["cache_position"] = cache_position
+    return create_causal_mask(**kwargs)
+
+
+def _compute_default_rope_parameters(config, device=None, *args, **kwargs):
+    """Original RoPE inverse frequencies (transformers 4 "default" entry / transformers 5 compute_default_rope_parameters)."""
+    rope_parameters = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+    base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", None))
+    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+    return inv_freq.to(device), 1.0
+
+
 class Qwen3VLTextRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, *args, **kwargs):
+        # transformers >= 5 re-initializes rotary buffers through this hook (PreTrainedModel._init_weights)
+        return _compute_default_rope_parameters(config, device, *args, **kwargs)
 
     def __init__(self, config: Qwen3VLTextConfig, device=None):
         super().__init__()
@@ -322,7 +349,11 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if self.rope_type == "default" and "default" not in ROPE_INIT_FUNCTIONS:
+            # transformers >= 5 removed "default" from ROPE_INIT_FUNCTIONS (models compute it themselves)
+            self.rope_init_fn = _compute_default_rope_parameters
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -893,9 +924,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = create_causal_mask(
+        attention_mask = _create_causal_mask_compat(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,

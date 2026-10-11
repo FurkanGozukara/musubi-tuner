@@ -13,8 +13,6 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KANDINSKY6, ARCHITECTURE_KANDINSKY6_FULL
 from musubi_tuner.dataset.audio_utils import AudioSpec
 from musubi_tuner.hv_train_network import (
-    DiTOutput,
-    NetworkTrainer,
     clean_memory_on_device,
     load_prompts,
     read_config_from_file,
@@ -26,6 +24,9 @@ from musubi_tuner.kandinsky6.defaults import DEFAULT_NEGATIVE_PROMPT
 from musubi_tuner.kandinsky6.model import _resolve_weight_file
 from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
+# The upstream loop (like MiniMax H3): it routes every step through process_batch(), which this trainer
+# overrides to feed the audio latents/noise. The fork's extended loop calls call_dit() directly.
+from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
 from musubi_tuner.utils import model_utils
 
 logger = logging.getLogger(__name__)

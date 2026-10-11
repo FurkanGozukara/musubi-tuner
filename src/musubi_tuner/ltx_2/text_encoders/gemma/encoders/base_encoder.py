@@ -363,6 +363,27 @@ def _materialize_meta_buffer(
         except Exception as e:
             logger.warning("Failed to rebuild rotary buffer %s: %s", dotted_name, e)
 
+    # transformers >= 5: Gemma3RotaryEmbedding keeps one buffer pair per layer type
+    # ("full_attention_inv_freq", "sliding_attention_original_inv_freq", ...).
+    if attr_name.endswith("_inv_freq") and isinstance(getattr(submodule, "rope_type", None), dict) and hasattr(submodule, "config"):
+        suffix = "_original_inv_freq" if attr_name.endswith("_original_inv_freq") else "_inv_freq"
+        layer_type = attr_name[: -len(suffix)]
+        rope_type = submodule.rope_type.get(layer_type)
+        if rope_type is not None:
+            try:
+                if rope_type == "default":
+                    init_fn = submodule.compute_default_rope_parameters
+                else:
+                    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+                    init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+                inv_freq, attention_scaling = init_fn(submodule.config, device, layer_type=layer_type)
+                setattr(submodule, attr_name, inv_freq.to(device=device))
+                setattr(submodule, f"{layer_type}_attention_scaling", attention_scaling)
+                return
+            except Exception as e:
+                logger.warning("Failed to rebuild rotary buffer %s: %s", dotted_name, e)
+
     if attr_name == "embed_scale" and hasattr(submodule, "embedding_dim"):
         replacement = torch.tensor(float(submodule.embedding_dim**0.5), dtype=reference.dtype, device=device)
         setattr(submodule, attr_name, replacement)
@@ -709,7 +730,8 @@ def module_ops_from_gemma_root(
                 required_prefixes = ("model.language_model.", "lm_head.")
                 missing_required_params = [name for name, _ in meta_params if name.startswith(required_prefixes)]
                 missing_required_buffers = [name for name, _ in meta_buffers if name.startswith(required_prefixes)]
-                derivable_required_buffer_suffixes = (".embed_scale", ".inv_freq")
+                # ".inv_freq" (transformers 4) and "<layer_type>_inv_freq" (transformers 5) are rebuilt from config
+                derivable_required_buffer_suffixes = (".embed_scale", ".inv_freq", "_inv_freq")
                 non_derivable_required_buffers = [
                     name for name in missing_required_buffers if not name.endswith(derivable_required_buffer_suffixes)
                 ]

@@ -772,14 +772,19 @@ def save_text_encoder_output_cache_hidream_o1(
     input_embeds: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
     token_types: Optional[torch.Tensor] = None,
+    pixel_values: Optional[torch.Tensor] = None,
     image_grid_thw: Optional[torch.Tensor] = None,
 ):
-    """HiDream-O1 architecture."""
+    """HiDream-O1 architecture. Cache tokenized prompt and optional initial text token embeddings."""
+    # The dtype suffix is parsed back on load (see bucket.py), so it must be built per tensor here; absent optionals
+    # are simply skipped. HiDream-O1 writes its full key set in a single pass, so the cache is overwritten fresh
+    # (merge_existing=False) instead of merged, dropping any stale optional/dtype keys left from a previous run.
     tensors = {
         "varlen_input_ids": input_ids,
         "varlen_input_embeds": input_embeds,
         "varlen_position_ids": position_ids,
         "varlen_token_types": token_types,
+        "varlen_pixel_values": pixel_values,
         "varlen_image_grid_thw": image_grid_thw,
     }
     sd = {f"{name}_{dtype_to_str(t.dtype)}": t.detach().cpu() for name, t in tensors.items() if t is not None}
