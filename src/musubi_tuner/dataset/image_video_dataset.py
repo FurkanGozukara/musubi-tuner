@@ -2068,6 +2068,7 @@ class BaseDataset(torch.utils.data.Dataset):
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        skip_corrupted_cache: bool = False,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -2154,6 +2155,7 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             self.spatial_crop_region = None
         self.spatial_crop_enabled = False
+        self.skip_corrupted_cache = skip_corrupted_cache
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -2258,6 +2260,15 @@ class BaseDataset(torch.utils.data.Dataset):
             latidx_strength if has_latidx else 1.0,
             kf_signature,
         )
+
+    @staticmethod
+    def _is_cache_file_loadable(path: str) -> bool:
+        try:
+            BucketBatchManager._load_cache_file(path)
+            return True
+        except Exception as e:  # noqa: BLE001 - any load failure means the cache file is corrupted/unreadable
+            logger.warning(f"Skipping corrupted cache file: {e}")
+            return False
 
     def get_all_latent_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -2572,6 +2583,7 @@ class ImageDataset(BaseDataset):
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        skip_corrupted_cache: bool = False,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -2611,6 +2623,7 @@ class ImageDataset(BaseDataset):
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
             bucket_batch_sizes=bucket_batch_sizes,
+            skip_corrupted_cache=skip_corrupted_cache,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -3001,7 +3014,13 @@ class ImageDataset(BaseDataset):
             # resized to the bucket resolution share that resolution but can still differ in *count*.
             # find_keys returns the keys sorted, so the per-control order (and the index<->shape pairing,
             # which remove_dtype_suffix keeps in each element) is deterministic across cache files.
-            control_keys = safetensors_utils.find_keys(cache_file, starts_with="latents_control_")
+            try:
+                control_keys = safetensors_utils.find_keys(cache_file, starts_with="latents_control_")
+            except Exception as e:  # noqa: BLE001 - any read failure means the cache file is corrupted/unreadable
+                if self.skip_corrupted_cache:
+                    logger.warning(f"Skipping corrupted cache file: {cache_file}: {e}")
+                    continue
+                raise RuntimeError(f"Failed to read cache file, it may be corrupted: {cache_file}: {e}") from None
             if control_keys:
                 # key: latents_control_{i}_FxHxW_dtype -> "latents_control_{i}_FxHxW" (index + shape)
                 control_shapes = [remove_dtype_suffix(key) for key in control_keys]
@@ -3057,6 +3076,12 @@ class ImageDataset(BaseDataset):
                 if reference_cache_paths:
                     item_info.reference_latent_cache_paths = reference_cache_paths
                     item_info.reference_latent_cache_path = reference_cache_paths[0]
+
+            if self.skip_corrupted_cache and (
+                not self._is_cache_file_loadable(item_info.latent_cache_path)
+                or not self._is_cache_file_loadable(item_info.text_encoder_output_cache_path)
+            ):
+                continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -3525,6 +3550,7 @@ class VideoDataset(BaseDataset):
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
         reference_target_frame_ranges: Optional[Sequence[Sequence[int]]] = None,
         audio_spec: Optional["AudioSpec"] = None,
+        skip_corrupted_cache: bool = False,
     ):
         from musubi_tuner.ltx2_conditioning_routing import normalize_reference_target_frame_ranges
 
@@ -3574,6 +3600,7 @@ class VideoDataset(BaseDataset):
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
             bucket_batch_sizes=bucket_batch_sizes,
+            skip_corrupted_cache=skip_corrupted_cache,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -4097,6 +4124,12 @@ class VideoDataset(BaseDataset):
                 if reference_audio_cache_paths:
                     item_info.reference_audio_latent_cache_paths = reference_audio_cache_paths
                     item_info.reference_audio_latent_cache_path = reference_audio_cache_paths[0]
+
+            if self.skip_corrupted_cache and (
+                not self._is_cache_file_loadable(item_info.latent_cache_path)
+                or not self._is_cache_file_loadable(item_info.text_encoder_output_cache_path)
+            ):
+                continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

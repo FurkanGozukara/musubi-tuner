@@ -93,6 +93,7 @@ class BaseDatasetParams:
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    skip_corrupted_cache: bool = False
 
 
 @dataclass
@@ -216,6 +217,7 @@ class ConfigSanitizer:
         # keyframe_guide_extra_* / target_frames idiom; returns a list.
         "spatial_crop_region": [int],
         "cache_only": bool,
+        "skip_corrupted_cache": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "bucket_batch_sizes": {str: int},

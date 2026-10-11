@@ -429,6 +429,16 @@ class BucketBatchManager:
     def __len__(self):
         return len(self.bucket_batch_indices)
 
+    @staticmethod
+    def _load_cache_file(path: str) -> dict[str, torch.Tensor]:
+        try:
+            return load_file(path)
+        except Exception as e:  # noqa: BLE001 - any load failure means the cache file is corrupted/unreadable
+            # safetensors raises safetensors_rust.SafetensorError, a Rust-extension exception that fails to
+            # pickle when a DataLoader worker sends it back to the main process, silently killing the worker's
+            # feeder thread and hanging training with no visible error. Re-raise as a plain, picklable exception.
+            raise RuntimeError(f"Failed to load cache file, it may be corrupted: {path}: {e}") from None
+
     def __getitem__(self, idx):
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
@@ -457,7 +467,7 @@ class BucketBatchManager:
         text_cache_paths = []
         captions: list[str] = []
         for item_info in bucket[start:end]:
-            sd_latent = load_file(item_info.latent_cache_path)
+            sd_latent = self._load_cache_file(item_info.latent_cache_path)
             audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
             if audio_latent_cache_path is not None and os.path.exists(audio_latent_cache_path):
                 sd_audio = load_file(audio_latent_cache_path)
@@ -559,7 +569,11 @@ class BucketBatchManager:
                         )
                     sd_latent = {**sd_latent, **sd_ref_audio}
 
-            sd_te = load_file(item_info.text_encoder_output_cache_path) if item_info.text_encoder_output_cache_path else {}
+            sd_te = (
+                self._load_cache_file(item_info.text_encoder_output_cache_path)
+                if item_info.text_encoder_output_cache_path
+                else {}
+            )
             sd = {**sd_latent, **sd_te}
             # When the text encoder is trained (full fine-tune), Gemma runs live at train
             # time and needs the original caption string. Training-item enumeration leaves
