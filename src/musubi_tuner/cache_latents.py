@@ -1,5 +1,8 @@
 import argparse
+import json
 import os
+import re
+import struct
 import zlib
 from typing import Callable, Optional, Union
 
@@ -324,6 +327,69 @@ def resolve_distributed_cache_shard(args: argparse.Namespace, device):
     return device, (rank, world)
 
 
+_LATENT_KEY = re.compile(r"^latents_(?:\d+x)?(\d+)x(\d+)_[0-9a-z]+$")
+
+
+def read_cache_header(path: str) -> Optional[dict]:
+    """safetensors header (tensor entries + "__metadata__") without loading tensors, or None."""
+    try:
+        with open(path, "rb") as handle:
+            length = struct.unpack("<Q", handle.read(8))[0]
+            if not 0 < length <= 64 * 1024 * 1024:
+                return None
+            header = json.loads(handle.read(length))
+    except (OSError, ValueError, struct.error, MemoryError):
+        return None
+    return header if isinstance(header, dict) else None
+
+
+def cached_latent_grid(header: dict) -> Optional[tuple[int, int]]:
+    """(height, width) of the latent grid named in a cache header, or None."""
+    for key in header:
+        match = _LATENT_KEY.match(key)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def latent_cache_matches_bucket(item: ItemInfo) -> bool:
+    """--skip_existing test: the cache exists *and* was encoded for the item's current bucket.
+
+    Image cache names carry the source image size, not the training bucket, so after a resolution change the old
+    file would otherwise be reused silently (training then runs at the old resolution). New caches record their
+    bucket in the metadata and are compared exactly; older caches fall back to the latent grid, which must equal
+    the bucket divided by one compression factor. Unreadable caches keep the plain exists test.
+    """
+    path = item.latent_cache_path
+    if not os.path.exists(path):
+        return False
+    bucket = item.bucket_size
+    try:
+        width, height = int(bucket[0]), int(bucket[1])
+    except (TypeError, ValueError, IndexError):
+        return True
+    header = read_cache_header(path)
+    if header is None:
+        return True
+    recorded = (header.get("__metadata__") or {}).get("bucket_size")
+    if recorded:
+        matches = recorded == f"{width}x{height}"
+        cached = recorded
+    else:
+        grid = cached_latent_grid(header)
+        if grid is None:
+            return True
+        grid_height, grid_width = grid
+        matches = any(
+            abs(grid_width * factor - width) < factor and abs(grid_height * factor - height) < factor
+            for factor in (1, 2, 4, 8, 16, 32, 64)
+        )
+        cached = f"latent grid {grid_width}x{grid_height}"
+    if not matches:
+        logger.info(f"Re-encoding {os.path.basename(path)}: cached for {cached}, current bucket is {width}x{height}")
+    return matches
+
+
 def encode_datasets(
     datasets: list[BaseDataset],
     encode: callable,
@@ -333,8 +399,9 @@ def encode_datasets(
 ):
     """Common function to encode datasets. This function is called from multiple architecture scripts.
 
-    With --skip_existing, an item whose latent cache file exists is skipped; an architecture can
-    replace that test with `cache_is_current(item)` (e.g. to also compare cache metadata).
+    With --skip_existing, an item whose latent cache file exists for its current bucket is skipped
+    (`latent_cache_matches_bucket`); an architecture can replace that test with `cache_is_current(item)`
+    (e.g. to also compare cache metadata).
     """
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     # Opt-in multi-process cache sharding: (rank, world_size). Default (0, 1) = single
@@ -343,7 +410,7 @@ def encode_datasets(
     shard_rank, shard_world = getattr(args, "_cache_shard", (0, 1)) or (0, 1)
     progress_writer = create_cache_progress_writer_from_env()
     if cache_is_current is None:
-        cache_is_current = lambda item: os.path.exists(item.latent_cache_path)  # noqa: E731
+        cache_is_current = latent_cache_matches_bucket
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []

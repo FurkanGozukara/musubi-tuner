@@ -607,6 +607,10 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+    bucket = item_info.bucket_size
+    if bucket and len(bucket) >= 2 and all(isinstance(value, int) for value in bucket[:2]):
+        # cache names carry the source image size; the bucket lets --skip_existing spot a resolution change
+        metadata["bucket_size"] = f"{bucket[0]}x{bucket[1]}"
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
