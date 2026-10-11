@@ -489,5 +489,9 @@ class Ideogram4Transformer(nn.Module):
                 assert self.offloader is not None
                 self.offloader.submit_move_blocks_forward(self.layers, index)
 
+        # activation CPU offloading returns each block's output on the CPU (like Qwen-Image and Krea 2)
+        if h.device != adaln_input.device:
+            h = h.to(adaln_input.device)
+
         out = self.final_layer(h, c=adaln_input)
         return out.to(torch.float32)
