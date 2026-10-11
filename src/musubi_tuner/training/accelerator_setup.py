@@ -132,7 +132,10 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
                 ),
                 timeout=timedelta(minutes=args.ddp_timeout) if args.ddp_timeout else None,
             )
-            if torch.cuda.device_count() > 1
+            # Only for a real multi-process launch: on a multi-GPU machine a single-process run
+            # (e.g. pytest or a plain `python` call without CUDA_VISIBLE_DEVICES) would otherwise hand
+            # Accelerate a process-group backend that is never initialized.
+            if torch.cuda.device_count() > 1 and int(os.environ.get("WORLD_SIZE", "1")) > 1
             else None
         ),
         (
