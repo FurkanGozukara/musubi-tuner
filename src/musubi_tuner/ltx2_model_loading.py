@@ -551,6 +551,7 @@ def load_safetensors_dynamic_int8(
     exclude_keys: List[str],
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
+    output_device: Union[str, torch.device, None] = None,
     key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, torch.Tensor]:
     """Stream a standard checkpoint and quantize the targeted Linear weights to per-row
@@ -561,10 +562,15 @@ def load_safetensors_dynamic_int8(
     model's naming. Each targeted ``<name>.weight`` becomes int8 plus a per-row
     ``<name>.scale_weight`` (float32 [out, 1]); other tensors are cast to ``non_quant_dtype``.
     Output keys are final (the caller must not rename again).
+
+    ``output_device`` (default: wherever the quantization ran) stores the results elsewhere than
+    ``calc_device``: with block swap the model is loaded on the CPU, and quantizing on the GPU must not
+    leave every block there (LTX-2.3 22B held 25.8 GB on the GPU before block swap could move any block).
     """
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 
     calc_device = torch.device(calc_device)
+    output_device = torch.device(output_device) if output_device is not None else None
     sd: dict[str, torch.Tensor] = {}
     quantized = 0
     for model_file in model_files:
@@ -585,6 +591,8 @@ def load_safetensors_dynamic_int8(
                     w = value.to(device=calc_device, dtype=torch.float32)
                     scale = (w.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
                     q = (w / scale).round_().clamp_(-127, 127).to(torch.int8)
+                    if output_device is not None:
+                        q, scale = q.to(output_device), scale.to(output_device)
                     sd[mkey] = q
                     sd[mkey[: -len(".weight")] + ".scale_weight"] = scale.to(torch.float32)
                     quantized += 1
@@ -592,7 +600,9 @@ def load_safetensors_dynamic_int8(
                 else:
                     if value.is_floating_point() and non_quant_dtype is not None:
                         value = value.to(non_quant_dtype)
-                    if calc_device.type == "cuda":
+                    if output_device is not None:
+                        value = value.to(output_device)
+                    elif calc_device.type == "cuda":
                         value = value.to(calc_device)
                     sd[mkey] = value
     logger.info("int8 dynamic: quantized %d Linear weights to per-row int8 (%d tensors total)", quantized, len(sd))
@@ -699,13 +709,20 @@ def load_safetensors_dynamic_int8_convrot(
     quality_report: Optional[str] = None,
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
+    output_device: Union[str, torch.device, None] = None,
     key_filter: Optional[Callable[[str], bool]] = None,
     policy: ConvRotPolicy | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Stream a standard checkpoint and quantize targeted Linear weights to INT8 ConvRot."""
+    """Stream a standard checkpoint and quantize targeted Linear weights to INT8 ConvRot.
+
+    ``output_device`` (default: wherever the quantization ran) stores the results elsewhere than
+    ``calc_device``: with block swap the model is loaded on the CPU, and quantizing on the GPU must not
+    leave every block there (LTX-2.3 22B held 25.8 GB on the GPU before block swap could move any block).
+    """
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 
     calc_device = torch.device(calc_device)
+    output_device = torch.device(output_device) if output_device is not None else None
     group_candidates = parse_int8_convrot_groupsizes(groupsizes)
     collect_quality = bool(quality_report)
     sd: dict[str, torch.Tensor] = {}
@@ -764,6 +781,8 @@ def load_safetensors_dynamic_int8_convrot(
                         collect_quality=collect_quality,
                         key=mkey,
                     )
+                    if output_device is not None:
+                        q, scale = q.to(output_device), scale.to(output_device)
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
                     sd[base + ".scale_weight"] = scale
@@ -774,7 +793,9 @@ def load_safetensors_dynamic_int8_convrot(
                 else:
                     if value.is_floating_point() and non_quant_dtype is not None:
                         value = value.to(non_quant_dtype)
-                    if calc_device.type == "cuda":
+                    if output_device is not None:
+                        value = value.to(output_device)
+                    elif calc_device.type == "cuda":
                         value = value.to(calc_device)
                     sd[mkey] = value
 
@@ -1002,6 +1023,7 @@ def load_safetensors_dynamic_int4_convrot(
     stabilizer_rank: int = 0,
     non_quant_dtype: Optional[torch.dtype] = torch.bfloat16,
     calc_device: Union[str, torch.device] = "cpu",
+    output_device: Union[str, torch.device, None] = None,
     key_filter: Optional[Callable[[str], bool]] = None,
     policy: ConvRotPolicy | None = None,
     scale_refine_steps: int = 0,
@@ -1015,10 +1037,15 @@ def load_safetensors_dynamic_int4_convrot(
     low-rank SVD outlier branch (shared ``compute_int4_convrot_stabilizer`` implementation), so
     the produced state dict matches what ``ltx2_quantize_int4_convrot --stabilizer_rank`` would
     write (packed residual + scales + shape + ``.int4_stabilizer_l1/l2``).
+
+    ``output_device`` (default: wherever the quantization ran) stores the results elsewhere than
+    ``calc_device``: with block swap the model is loaded on the CPU, and quantizing on the GPU must not
+    leave every block there (LTX-2.3 22B held 25.8 GB on the GPU before block swap could move any block).
     """
     from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 
     calc_device = torch.device(calc_device)
+    output_device = torch.device(output_device) if output_device is not None else None
     group_scales = validate_int4_convrot_scale_group_size(group_scales)
     if group_ratio_q8 and not group_scales:
         raise ValueError("group_ratio_q8 requires group_scales")
@@ -1156,14 +1183,16 @@ def load_safetensors_dynamic_int4_convrot(
                                 scale_refine_steps=layer_parameters.scale_refine_steps,
                             )
                         )
+                    if output_device is not None:
+                        q, scale, shape = q.to(output_device), scale.to(output_device), shape.to(output_device)
                     base = mkey[: -len(".weight")]
                     sd[mkey] = q
                     sd[base + ".scale_weight"] = scale
                     sd[base + ".int4_shape"] = shape
                     sd[base + ".int4_convrot_groupsize"] = torch.tensor(int(group_size), dtype=torch.int32, device=q.device)
                     if group_scale_state is not None:
-                        sd[base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX] = group_scale_state.ratio
-                        sd[base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX] = group_scale_state.group_size
+                        sd[base + INT4_CONVROT_GROUP_SCALE_RATIO_SUFFIX] = group_scale_state.ratio.to(device=q.device)
+                        sd[base + INT4_CONVROT_GROUP_SCALE_SIZE_SUFFIX] = group_scale_state.group_size.to(device=q.device)
                     if awq_scale is not None:
                         sd[base + INT4_CONVROT_AWQ_SCALE_SUFFIX] = awq_scale.to(device=q.device, dtype=torch.float32)
                     if stabilizer is not None:
@@ -1175,7 +1204,9 @@ def load_safetensors_dynamic_int4_convrot(
                 else:
                     if value.is_floating_point() and non_quant_dtype is not None:
                         value = value.to(non_quant_dtype)
-                    if calc_device.type == "cuda":
+                    if output_device is not None:
+                        value = value.to(output_device)
+                    elif calc_device.type == "cuda":
                         value = value.to(calc_device)
                     sd[mkey] = value
 
@@ -1760,6 +1791,7 @@ def load_ltx2_model(
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
+            output_device=state_device,
             key_filter=state_dict_key_filter,
         )
     elif int8_convrot_dynamic:
@@ -1775,6 +1807,7 @@ def load_ltx2_model(
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
+            output_device=state_device,
             key_filter=state_dict_key_filter,
             policy=resolved_convrot_policy,
         )
@@ -1809,6 +1842,7 @@ def load_ltx2_model(
             # Frozen base: keep non-quantized weights at bf16; these tensors are not trained.
             non_quant_dtype=torch.bfloat16 if torch_dtype in (None, torch.float32) else torch_dtype,
             calc_device=_resolved_quant_device,
+            output_device=state_device,
             key_filter=state_dict_key_filter,
             policy=resolved_convrot_policy,
         )
