@@ -192,12 +192,18 @@ def _linear_dequant_fallback(module, x, convrot_groupsize: int = 0):
 
 
 def _int_mm_allow_small_m(a, b):
-    """torch._int_mm requires M > 16 on CUDA; pad tiny batches instead of dequantizing weights."""
+    """torch._int_mm for any row count. CUDA needs M > 16, and with a row-major right-hand side (the backward
+    pass's [out, in] weight) cuBLASLt's INT8 kernels on Ampere only take an M that is a multiple of 32:
+    CUBLAS_STATUS_NOT_SUPPORTED for 935, 936 or 944 rows on an RTX A6000 (an LTX-2 LoRA backward with 935 tokens),
+    while the forward pass's column-major right-hand side takes any M. Pad the rows with zeros instead of
+    dequantizing the weights; the padded rows are sliced off the result."""
     m = a.shape[0]
-    if m > SMALL_BATCH_THRESHOLD:
+    padded_m = max(m, SMALL_BATCH_THRESHOLD + 1)
+    if a.is_cuda and b.dim() == 2 and b.stride(-1) == 1:
+        padded_m += -padded_m % 32
+    if padded_m == m:
         return torch._int_mm(a, b)
 
-    padded_m = SMALL_BATCH_THRESHOLD + 1
     padding = torch.zeros((padded_m - m, a.shape[1]), device=a.device, dtype=a.dtype)
     padded = torch.cat((a, padding), dim=0)
     return torch._int_mm(padded, b)[:m]
