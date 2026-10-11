@@ -195,9 +195,9 @@ The maximum values of `blocks_to_swap` per model when combined with the `--fp8_b
 
 |Model Type|Maximum blocks_to_swap|
 |----|----|
-|flux.2-dev|29|
+|flux.2-dev|30|
 |flux.2-klein-4b|13|
-|flux.2-klein-9b|16|
+|flux.2-klein-9b|18|
 
 <details>
 <summary>日本語</summary>
@@ -224,9 +224,9 @@ FLUX.2ではDoubleStreamBlockのメモリ使用量がSingleStreamBlockよりも�
 
 |モデル種類|blocks_to_swapの最大値|
 |----|----|
-|flux.2-dev|29|
+|flux.2-dev|30|
 |flux.2-klein-4b|13|
-|flux.2-klein-9b|16|
+|flux.2-klein-9b|18|
 
 </details>
 
