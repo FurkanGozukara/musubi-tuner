@@ -454,7 +454,7 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
@@ -463,7 +463,9 @@ class T5EncoderModel:
     ):
         self.text_len = text_len
         self.dtype = dtype if not fp8 else torch.float8_e4m3fn
-        self.device = device
+        # resolved here, not in the signature: a default evaluated at import made importing any Wan module
+        # initialize CUDA, so CPU-only processes (tests, tools) could not import it
+        self.device = torch.cuda.current_device() if device is None else device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
