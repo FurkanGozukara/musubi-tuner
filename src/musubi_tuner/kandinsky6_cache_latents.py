@@ -141,6 +141,13 @@ def main() -> None:
     vae_action.help = "Kandinsky6 HunyuanVideo VAE directory"
     parser.add_argument("--audio_vae", required=True, help="Kandinsky6 MMAudio VAE checkpoint")
     parser.add_argument("--audio_vae_scaling_factor", type=float, default=0.5302)
+    parser.add_argument(
+        "--vae_tiling_memory_gb",
+        type=float,
+        default=None,
+        help="plan the video VAE's encode tiles for at most this much GPU memory (default: all free memory); "
+        "lower values cache with less VRAM, tiles are blended",
+    )
     parser.add_argument("--upstream", help="deprecated compatibility option; ignored because the runtime is bundled")
     parser.add_argument("--sr_upstream", help="deprecated compatibility option; ignored because the runtime is bundled")
     add_audio_tolerance_arguments(parser)
@@ -166,6 +173,8 @@ def main() -> None:
         return
 
     video_vae = build_vae(args.vae, device=device)
+    if args.vae_tiling_memory_gb:
+        video_vae.tiling_memory_budget = float(args.vae_tiling_memory_gb) * 1024**3
     audio_vae = build_audio_vae(
         tod_vae_ckpt=args.audio_vae,
         device=device,

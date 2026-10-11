@@ -1019,6 +1019,10 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
             device = next(self.parameters()).device
         device = torch.device(device)
         free_mem = torch.cuda.mem_get_info(device=device)[0] if device.type == "cuda" else float("inf")
+        # optional cap in bytes: plan smaller tiles than the free memory allows, so caching fits low-VRAM budgets
+        budget = getattr(self, "tiling_memory_budget", None)
+        if budget:
+            free_mem = min(free_mem, float(budget))
         max_area = free_mem / 256 / 17 / 8
         num_vals = 256 * 17 * (h + 32) * (w + 32)
 
