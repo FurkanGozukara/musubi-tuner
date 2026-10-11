@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 from .layers import AdaLayerNormContinuous, MageFlowEmbedRope, MageFlowTimestepProjEmbeddings, MageFlowTransformerBlock
 from .utils import ComponentValidationError, MageFlowConfig, PackedMageFlowInputs, inspect_component, normalize_dit_state_dict
@@ -61,16 +62,18 @@ class MageFlow(nn.Module):
         self.proj_out = nn.Linear(config.hidden_size, config.patch_size * config.patch_size * config.out_channels)
         self.blocks_to_swap = 0
         self.offloader = None
+        self.activation_cpu_offloading = False
 
     def set_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.checkpoint = enabled
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False) -> None:
-        if cpu_offload:
-            raise ValueError("Mage-Flow activation CPU offload is not implemented; use block swap instead")
+        # activation CPU offload: each checkpointed block's inputs are kept on the CPU (same scheme as Qwen-Image)
+        self.activation_cpu_offloading = bool(cpu_offload)
         self.set_gradient_checkpointing(True)
 
     def disable_gradient_checkpointing(self) -> None:
+        self.activation_cpu_offloading = False
         self.set_gradient_checkpointing(False)
 
     def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig) -> None:
@@ -130,13 +133,15 @@ class MageFlow(nn.Module):
         image = self.img_in(packed.image_tokens)
         text = self.txt_in(self.txt_norm(packed.text_tokens))
         timestep_embedding = self.time_text_embed(packed.timesteps.to(image.dtype), image)
+        device = image.device
+        offload_activations = self.training and self.checkpoint and self.activation_cpu_offloading
 
         for block_index, block in enumerate(self.transformer_blocks):
             if self.offloader is not None:
                 self.offloader.wait_for_block(block_index)
             if self.training and self.checkpoint:
                 text, image = torch.utils.checkpoint.checkpoint(
-                    block,
+                    create_cpu_offloading_wrapper(block, device) if offload_activations else block,
                     image,
                     text,
                     timestep_embedding,
@@ -157,6 +162,8 @@ class MageFlow(nn.Module):
             if self.offloader is not None:
                 self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_index)
 
+        if offload_activations:
+            image = image.to(device)  # the last offloaded block returned CPU tensors
         image = self.norm_out(image, timestep_embedding, cu_seqlens=packed.image_cu_seqlens)
         return self.proj_out(image)
 

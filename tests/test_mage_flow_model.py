@@ -137,3 +137,33 @@ def test_checkpointed_tiny_model_has_finite_backward():
     assert torch.isfinite(loss)
     assert model.img_in.weight.grad is not None
     assert torch.isfinite(model.img_in.weight.grad).all()
+
+
+def test_activation_cpu_offload_matches_plain_checkpointing():
+    """gradient_checkpointing_cpu_offload keeps block inputs on the CPU; loss and gradients must not change."""
+    torch.manual_seed(789)
+    model = MageFlow(tiny_config()).train()
+    packed = pack_training_batch(
+        torch.randn(2, 4, 2, 2),
+        [torch.randn(2, 7), torch.randn(3, 7)],
+        torch.tensor([0.4, 0.6]),
+        image_dim=4,
+        text_dim=7,
+        text_max_length=16,
+    )
+
+    results = []
+    for cpu_offload in (False, True):
+        model.zero_grad(set_to_none=True)
+        model.enable_gradient_checkpointing(cpu_offload=cpu_offload)
+        assert model.activation_cpu_offloading is cpu_offload
+        loss = model(packed).square().mean()
+        loss.backward()
+        results.append((loss.detach(), {name: param.grad.clone() for name, param in model.named_parameters() if param.grad is not None}))
+
+    torch.testing.assert_close(results[0][0], results[1][0])
+    assert results[0][1].keys() == results[1][1].keys()
+    for name, grad in results[0][1].items():
+        torch.testing.assert_close(grad, results[1][1][name])
+    model.disable_gradient_checkpointing()
+    assert model.activation_cpu_offloading is False
