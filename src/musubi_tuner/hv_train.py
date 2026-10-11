@@ -59,6 +59,7 @@ from musubi_tuner.training.compile_setup import (
 import logging
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
+from musubi_tuner.training.accelerator_setup import warn_if_tensorboard_unavailable
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -139,6 +140,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
                 os.environ["WANDB_DIR"] = logging_dir
             if args.wandb_api_key is not None:
                 wandb.login(key=args.wandb_api_key)
+    warn_if_tensorboard_unavailable(log_with)
 
     kwargs_handlers = [
         (
@@ -762,6 +764,12 @@ class FineTuningTrainer:
 
     def train(self, args):
         args.full_finetune = True
+        # check required arguments
+        if args.output_dir is None:
+            raise ValueError("output_dir is required / output_dirが必要です")
+        if args.output_name is None:
+            raise ValueError("output_name is required / output_nameが必要です")
+
         if args.seed is None:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)

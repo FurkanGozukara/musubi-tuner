@@ -1,7 +1,7 @@
 import argparse
 import os
 import zlib
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from tqdm import tqdm
@@ -86,12 +86,16 @@ def process_text_encoder_batches(
     encode: callable,
     requires_content: Optional[bool] = False,
     shard: Optional[tuple] = None,
+    cache_is_current: Optional[Callable[[ItemInfo], bool]] = None,
 ):
     """
     Architecture independent processing of text encoder batches.
 
     shard: optional (rank, world_size) for opt-in multi-process sharding. Default None →
     single process, no change. When world_size > 1 each rank encodes a disjoint subset.
+
+    With skip_existing, an item whose cache file already exists is skipped; an architecture can
+    replace that test with `cache_is_current(item)` (e.g. to also compare cache metadata).
     """
 
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
@@ -130,9 +134,12 @@ def process_text_encoder_batches(
 
             # skip existing cache files
             if skip_existing:
-                filtered_batch = [
-                    item for item in batch if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
-                ]
+                if cache_is_current is None:
+                    filtered_batch = [
+                        item for item in batch if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
+                    ]
+                else:
+                    filtered_batch = [item for item in batch if not cache_is_current(item)]
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:
                     processed_items += original_batch_size

@@ -11,7 +11,7 @@ import time
 import torch
 from packaging.version import Version
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, DataLoaderConfiguration
-from accelerate.utils import TorchDynamoPlugin, DynamoBackend
+from accelerate.utils import TorchDynamoPlugin, DynamoBackend, is_tensorboard_available
 
 from musubi_tuner.training.compile_setup import (
     disable_unavailable_dynamo_backend,
@@ -35,6 +35,24 @@ def clean_memory_on_device(device: torch.device):
         torch.xpu.empty_cache()
     if device.type == "mps":
         torch.mps.empty_cache()
+
+
+def warn_if_tensorboard_unavailable(log_with: str | None) -> None:
+    """Warn when TensorBoard logging is requested but neither ``tensorboard`` nor ``tensorboardX`` is importable.
+
+    accelerate silently drops trackers whose package is missing (``filter_trackers`` only emits a debug log),
+    so training would run without ever writing a log. Warn rather than raise so that an existing command
+    keeps working.
+    """
+    if log_with in ["tensorboard", "all"] and not is_tensorboard_available():
+        logger.warning(
+            "TensorBoard logging was requested (--logging_dir / --log_with) but neither tensorboard nor tensorboardX"
+            " is installed. Training will continue without writing logs. Install one of them"
+            " (e.g. `pip install tensorboard`) or remove --logging_dir if logging is not needed."
+            " / TensorBoardへのログ出力が指定されていますが、tensorboardもtensorboardXもインストールされていません。"
+            "ログを出力せずに学習を続行します。いずれかをインストールする (例: `pip install tensorboard`) か、"
+            "ログが不要なら--logging_dirを外してください。"
+        )
 
 
 # for collate_fn: epoch and step is multiprocessing.Value
@@ -103,6 +121,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
                 os.environ["WANDB_DIR"] = logging_dir
             if args.wandb_api_key is not None:
                 wandb.login(key=args.wandb_api_key)
+    warn_if_tensorboard_unavailable(log_with)
 
     kwargs_handlers = [
         (

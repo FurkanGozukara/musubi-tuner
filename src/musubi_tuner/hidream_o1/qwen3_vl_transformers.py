@@ -56,7 +56,10 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+try:
+    from transformers.utils.generic import merge_with_config_defaults as check_model_inputs  # transformers >= 5.x
+except ImportError:
+    from transformers.utils.generic import check_model_inputs  # transformers 4.x
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader

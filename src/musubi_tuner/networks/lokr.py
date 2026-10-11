@@ -251,11 +251,23 @@ class LoKrModule(torch.nn.Module):
 
         factor = int(factor)
         self.decompose_both = lora_module._parse_bool_network_arg(decompose_both)
-        self.use_w2 = False
 
-        # Factorize dimensions
-        in_m, in_n = factorization(in_dim, factor)
-        out_l, out_k = factorization(out_dim, factor)
+        # From a checkpoint (create_network_from_weights): use the exact split
+        # already recorded in the saved shapes instead of re-guessing via factor.
+        lokr_shapes = kwargs.pop("lokr_shapes", None)
+        hint = lokr_shapes.get(lora_name) if lokr_shapes else None
+        if hint is not None and "w1_shape" in hint and "use_w2" in hint:
+            out_l, in_m = hint["w1_shape"]
+            out_k = out_dim // out_l
+            in_n = in_dim // in_m
+            use_w2 = hint["use_w2"]
+        else:
+            # Factorize dimensions
+            in_m, in_n = factorization(in_dim, factor)
+            out_l, out_k = factorization(out_dim, factor)
+            use_w2 = lora_dim >= max(out_k, in_n) / 2
+
+        self.use_w2 = use_w2
 
         # w1 is usually a full matrix (the "scale" factor, small), but can
         # also be decomposed for higher-order Kronecker structure.
@@ -267,20 +279,19 @@ class LoKrModule(torch.nn.Module):
             self.lokr_w1 = nn.Parameter(torch.empty(out_l, in_m))
 
         # w2: low-rank decomposition if rank is small enough, otherwise full matrix
-        if lora_dim < max(out_k, in_n) / 2:
+        if not use_w2:
             self.lokr_w2_a = nn.Parameter(torch.empty(out_k, lora_dim))
             self.lokr_w2_b = nn.Parameter(torch.empty(lora_dim, in_n))
         else:
-            self.use_w2 = True
             self.lokr_w2 = nn.Parameter(torch.empty(out_k, in_n))
-            if lora_dim >= max(out_k, in_n) / 2:
+            if hint is None:
                 logger.warning(
                     f"LoKr: lora_dim {lora_dim} is large for dim={max(in_dim, out_dim)} "
                     f"and factor={factor}, using full matrix mode."
                 )
 
         if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()
+            alpha = alpha.detach().float().cpu().item()
         alpha = lora_dim if alpha is None or alpha == 0 else alpha
         # scale = 1 only when both Kronecker factors are full; honor alpha if w1 is decomposed.
         if self.use_w2 and not self.decompose_both:
@@ -390,10 +401,11 @@ class LoKrInfModule(LoKrModule):
         alpha=1,
         **kwargs,
     ):
-        # no dropout for inference; pass factor from kwargs if present
+        # no dropout for inference; pass factor and lokr_shapes from kwargs if present
         factor = kwargs.pop("factor", -1)
         decompose_both = kwargs.pop("decompose_both", False)
         decompose_w1_rank = kwargs.pop("decompose_w1_rank", None)
+        lokr_shapes = kwargs.pop("lokr_shapes", None)
         super().__init__(
             lora_name,
             org_module,
@@ -403,6 +415,7 @@ class LoKrInfModule(LoKrModule):
             factor=factor,
             decompose_both=decompose_both,
             decompose_w1_rank=decompose_w1_rank,
+            lokr_shapes=lokr_shapes,
         )
 
         self.org_module_ref = [org_module]
@@ -994,6 +1007,8 @@ def create_network_from_weights(
     has_dokr_oft_weights = lora_module._parse_bool_network_arg(kwargs.get("use_dora_oft", False))
     decompose_both = lora_module._parse_bool_network_arg(kwargs.get("decompose_both", False))
     per_module_kwargs: Dict[str, Dict[str, object]] = {}
+    # Per-module w1 shape / w2 mode, read from the checkpoint (see LoKrModule).
+    lokr_shapes: Dict[str, Dict[str, object]] = {}
     for key, value in weights_sd.items():
         if "." not in key:
             continue
@@ -1009,16 +1024,28 @@ def create_network_from_weights(
             decompose_both = True
             module_kwargs_for_name = per_module_kwargs.setdefault(lora_name, {})
             module_kwargs_for_name["decompose_w1_rank"] = int(value.shape[1])
+            lokr_shapes.setdefault(lora_name, {})["w1_out"] = int(value.shape[0])
+        elif "lokr_w1_b" in key:
+            lokr_shapes.setdefault(lora_name, {})["w1_in"] = int(value.shape[1])
+        elif key.endswith(".lokr_w1"):
+            lokr_shapes.setdefault(lora_name, {})["w1_shape"] = tuple(value.shape)
         elif "lokr_w2_a" in key:
             # low-rank mode: dim = w2_a.shape[1]
             dim = value.shape[1]
             modules_dim[lora_name] = dim
+            lokr_shapes.setdefault(lora_name, {})["use_w2"] = False
         elif "lokr_w2" in key and "lokr_w2_a" not in key and "lokr_w2_b" not in key:
             # full matrix mode: set dim large enough to trigger full-matrix path
             if lora_name not in modules_dim:
                 modules_dim[lora_name] = max(value.shape)
+            lokr_shapes.setdefault(lora_name, {})["use_w2"] = True
         elif key.endswith(".lokr_dim"):
             modules_dim[lora_name] = int(value.item())  # explicit dim for decompose_both + full-w2
+
+    # decompose_both checkpoints store w1 as two factors; rebuild the exact w1 shape from them
+    for shape_hint in lokr_shapes.values():
+        if "w1_shape" not in shape_hint and "w1_out" in shape_hint and "w1_in" in shape_hint:
+            shape_hint["w1_shape"] = (shape_hint["w1_out"], shape_hint["w1_in"])
 
     if has_dokr_oft_weights:
         for lora_name in {key.split(".")[0] for key in weights_sd.keys() if "." in key and key.startswith("lora_")}:
@@ -1037,7 +1064,7 @@ def create_network_from_weights(
                 default=True,  # legacy DoKr-OFT was always scaled
             )
 
-    # extract factor for LoKr (user must specify via --network_args factor=N if different from default)
+    # fallback only; every module above should already have a shape hint
     factor = int(kwargs.pop("factor", -1))
 
     if has_dokr_oft_weights:
@@ -1046,7 +1073,7 @@ def create_network_from_weights(
         module_class = DoKrInfModule if for_inference else DoKrModule
     else:
         module_class = LoKrInfModule if for_inference else LoKrModule
-    module_kwargs = {"factor": factor, "decompose_both": decompose_both}
+    module_kwargs = {"factor": factor, "decompose_both": decompose_both, "lokr_shapes": lokr_shapes}
     if per_module_kwargs:
         module_kwargs["per_module_kwargs"] = per_module_kwargs
     if has_dokr_oft_weights:

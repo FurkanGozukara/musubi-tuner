@@ -159,6 +159,8 @@ def attention(
     q, k, v = q_or_qkv_list if type(q_or_qkv_list) == list else (q_or_qkv_list, k, v)
     if type(q_or_qkv_list) == list:
         q_or_qkv_list.clear()
+    if mode == "sdpa":
+        mode = "torch"
     if mode == AUTO_FLASH_ATTENTION_MODE:
         mode = resolve_automatic_flash_mode(q, k, v)
     split_attn = total_len is not None

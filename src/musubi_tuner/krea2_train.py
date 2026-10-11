@@ -28,6 +28,8 @@ class Krea2Trainer(FullFineTuningTrainerMixin, Krea2NetworkTrainer):
             temporary_turbo_options.append("--turbo_dit")
         if args.turbo_dit_cache:
             temporary_turbo_options.append("--turbo_dit_cache")
+        if getattr(args, "turbo_lora", None):
+            temporary_turbo_options.append("--turbo_lora")
         if temporary_turbo_options:
             raise ValueError(
                 "full finetuning does not support LoRA-only temporary Turbo weight swapping: "

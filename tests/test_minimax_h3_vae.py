@@ -121,6 +121,46 @@ def test_video_condition_uses_seed_42_and_fp16_round_trip_before_normalization()
     torch.testing.assert_close(actual, expected)
 
 
+def _decode_routing_vae():
+    vae = MiniMaxH3VideoVAE.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.register_buffer("latents_mean", torch.zeros(24))
+    vae.register_buffer("latents_std", torch.full((24,), 2.0))
+    vae.register_buffer("pixel_mean", torch.zeros(1, 3, 1, 1, 1))
+    vae.register_buffer("pixel_std", torch.ones(1, 3, 1, 1, 1))
+    seen = {}
+
+    def fake_decode_video(latents):
+        seen["latents"] = latents
+        return (torch.arange(1.0, 6.0).view(1, 1, 5, 1, 1) / 10.0).expand(1, 3, 5, 2, 2)
+
+    vae._decode_video = fake_decode_video
+    return vae, seen
+
+
+def test_video_vae_decode_duplicates_a_single_token_and_keeps_pixel_frame_zero():
+    vae, seen = _decode_routing_vae()
+    latents = torch.randn(1, 24, 1, 2, 2)
+
+    pixels = vae.decode(latents)
+
+    assert seen["latents"].shape == (1, 24, 2, 2, 2)
+    torch.testing.assert_close(seen["latents"][:, :, 0], latents[:, :, 0] * 2.0)
+    torch.testing.assert_close(seen["latents"][:, :, 1], seen["latents"][:, :, 0])
+    assert pixels.shape == (1, 3, 1, 2, 2)
+    torch.testing.assert_close(pixels, torch.full((1, 3, 1, 2, 2), 0.1 * 2.0 - 1.0))
+
+
+def test_video_vae_decode_keeps_multi_token_latents_and_frames_unchanged():
+    vae, seen = _decode_routing_vae()
+    latents = torch.randn(1, 24, 2, 2, 2)
+
+    pixels = vae.decode(latents)
+
+    torch.testing.assert_close(seen["latents"], latents * 2.0)
+    assert pixels.shape == (1, 3, 5, 2, 2)
+
+
 def test_causal_conv_single_frame_truncates_temporal_kernel():
     conv = CausalConv3d(1, 1, kernel_size=3, padding=1)
     nn.init.ones_(conv.weight)
@@ -152,6 +192,43 @@ def test_tiny_vit3d_decoder_runs_without_comfy_runtime():
 
     assert output.shape == (1, 3, 1, 4, 4)
     assert torch.isfinite(output).all()
+
+
+def _tiny_video_vae_classes(monkeypatch):
+    """Shrink the published architecture so a checkpoint round trip fits in a test."""
+    import functools
+
+    monkeypatch.setattr(
+        video_vae, "ViT3DDecoder", functools.partial(ViT3DDecoder, num_layers=1, heads=2, dim_head=8, num_register_tokens=1)
+    )
+    monkeypatch.setattr(video_vae, "MiniMaxH3VideoVAE", functools.partial(MiniMaxH3VideoVAE, ch=32))
+
+
+def test_load_video_vae_without_decoder_reads_only_encoder_tensors(tmp_path: Path, monkeypatch):
+    _tiny_video_vae_classes(monkeypatch)
+    full = video_vae.MiniMaxH3VideoVAE()
+    # parameters and the persistent mask_token buffer; the normalization buffers keep their constants
+    for tensor in list(full.parameters()) + [full.decoder.mask_token]:
+        nn.init.uniform_(tensor, -0.1, 0.1)
+    path = tmp_path / "video_vae.safetensors"
+    save_file({f"vae.{key}": value for key, value in full.state_dict().items()}, str(path))
+
+    encoder_only = video_vae.load_video_vae(path, device="cpu", dtype=torch.float32, load_decoder=False)
+
+    assert encoder_only.decoder is None and encoder_only.post_quant_conv is None
+    assert not any(key.startswith(video_vae.VIDEO_VAE_DECODER_KEY_PREFIXES) for key in encoder_only.state_dict())
+    assert all(not parameter.is_meta for parameter in encoder_only.parameters())
+    pixels = torch.rand(1, 3, 17, 32, 32) * 2 - 1
+    with torch.no_grad():
+        expected = full.encode_moments(pixels)
+        got = encoder_only.encode_moments(pixels)
+    assert torch.equal(got, expected)
+    with pytest.raises(RuntimeError, match="without its decoder"):
+        encoder_only.decode(got.chunk(2, dim=1)[0])
+
+    reloaded = video_vae.load_video_vae(path, device="cpu", dtype=torch.float32)
+    assert reloaded.decoder is not None
+    assert set(reloaded.state_dict()) == set(full.state_dict())
 
 
 def test_resolve_safetensors_files_expands_first_shard_and_accepts_single_files(tmp_path: Path):

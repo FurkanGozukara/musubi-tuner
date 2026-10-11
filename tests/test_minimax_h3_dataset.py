@@ -1,6 +1,7 @@
 import inspect
 from pathlib import Path
 import pickle
+import re
 import sys
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from musubi_tuner.dataset.architectures import (
     round_down_frame_count,
 )
 from musubi_tuner.dataset.bucket import BucketSelector
-from musubi_tuner.dataset.image_video_dataset import VideoDataset
+from musubi_tuner.dataset.image_video_dataset import ImageDataset, VideoDataset
 from musubi_tuner.training import trainer_base
 from musubi_tuner.training.trainer_base import NetworkTrainer
 
@@ -34,7 +35,8 @@ def test_h3_documentation_does_not_ask_users_to_set_source_fps():
     documentation = (ROOT / "docs" / "minimax_h3.md").read_text(encoding="utf-8")
 
     assert "source_fps = " not in documentation
-    assert "`source_fps` is not needed" in documentation
+    # the guide states that the option is ignored (the exact wording may change)
+    assert re.search(r"`source_fps`[^.\n]*ignored", documentation)
 
 
 @pytest.mark.parametrize(
@@ -143,6 +145,162 @@ def test_h3_full_frame_extraction_preserves_valid_frame_count(tmp_path: Path):
     assert Path(items[0].text_encoder_output_cache_path).name == "clip_00000-056_mmh3_te.safetensors"
 
 
+def _h3_image_dataset(tmp_path: Path, **overrides):
+    parameters = dict(
+        resolution=(64, 64),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=True,
+        bucket_no_upscale=False,
+        image_directory=str(tmp_path),
+        cache_directory=str(tmp_path),
+        architecture=ARCHITECTURE_MINIMAX_H3,
+    )
+    parameters.update(overrides)
+    return ImageDataset(**parameters)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"multiple_target": True}, "multiple targets"),
+        ({"no_resize_control": True}, "no_resize_control"),
+        ({"control_resolution": (512, 512)}, "control_resolution"),
+        ({"fp_1f_target_index": -1}, "nonnegative"),
+        # time-annotated control validation: indices need controls, an explicit target index and
+        # 1..2 nonnegative entries (controls without indices are untimed references, accepted)
+        ({"fp_1f_clean_indices": [0]}, "explicit fp_1f_target_index"),
+        ({"fp_1f_clean_indices": [0], "fp_1f_target_index": 24}, "requires control images"),
+        ({"fp_1f_clean_indices": [], "fp_1f_target_index": 24}, "at least one entry"),
+        ({"fp_1f_clean_indices": [-1], "fp_1f_target_index": 24}, "nonnegative"),
+    ],
+)
+def test_h3_image_dataset_rejects_unsupported_one_frame_features(tmp_path: Path, overrides: dict, message: str):
+    with pytest.raises(ValueError, match=message):
+        _h3_image_dataset(tmp_path, **overrides)
+
+
+def test_h3_image_dataset_controls_without_indices_are_untimed_references_of_any_count(tmp_path: Path):
+    jsonl = tmp_path / "items.jsonl"
+    jsonl.write_text(
+        '{"image_path": "target.png", "caption": "c", "control_path_0": "char.png", "control_path_1": "pose.png", "control_path_2": "bg.png"}\n',
+        encoding="utf-8",
+    )
+
+    dataset = _h3_image_dataset(tmp_path, image_directory=None, image_jsonl_file=str(jsonl))
+
+    assert dataset.has_control
+    assert dataset.fp_1f_clean_indices is None
+    assert dataset.datasource.control_count_per_image is None
+    assert dataset.datasource.get_control_paths() == {"target.png": ["char.png", "pose.png", "bg.png"]}
+
+    # with indices the count is pinned to the indices (time-annotated FL2VA controls)
+    one = jsonl.with_name("one.jsonl")
+    one.write_text('{"image_path": "target.png", "caption": "c", "control_path": "char.png"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="do not have control paths"):
+        _h3_image_dataset(
+            tmp_path, image_directory=None, image_jsonl_file=str(one), fp_1f_clean_indices=[0, 48], fp_1f_target_index=24
+        )
+
+
+def test_h3_jsonl_datasource_exposes_control_paths_for_fingerprinting(tmp_path: Path):
+    jsonl = tmp_path / "items.jsonl"
+    jsonl.write_text(
+        '{"image_path": "a.png", "caption": "c", "control_path": "s0.png", "control_path_1": "s1.png"}\n',
+        encoding="utf-8",
+    )
+    dataset = _h3_image_dataset(
+        tmp_path,
+        image_directory=None,
+        image_jsonl_file=str(jsonl),
+        fp_1f_clean_indices=[0, 48],
+        fp_1f_target_index=24,
+    )
+
+    assert dataset.datasource.get_control_paths() == {"a.png": ["s0.png", "s1.png"]}
+
+
+def test_h3_image_dataset_with_controls_splits_buckets_and_forwards_indices(tmp_path: Path):
+    dataset = _h3_image_dataset(
+        tmp_path,
+        control_directory=str(tmp_path / "ctrl"),
+        fp_1f_clean_indices=[0],
+        fp_1f_target_index=24,
+    )
+    assert dataset.has_control
+
+    class FakeImageDatasource:
+        has_control = True
+
+        def __iter__(self):
+            from PIL import Image
+
+            image = Image.new("RGB", (64, 64))
+            control = Image.new("RGB", (128, 128))  # resized to the bucket resolution
+            yield lambda: (str(tmp_path / "target.png"), [image], "caption", [control])
+
+    dataset.datasource = FakeImageDatasource()
+
+    batches = list(dataset.retrieve_latent_cache_batches(num_workers=1))
+
+    assert len(batches) == 1
+    bucket, items = batches[0]
+    # (W, H) + control count + per-control bucket-resized shape
+    assert bucket == (64, 64, 1, 64, 64)
+    assert items[0].fp_1f_clean_indices == [0]
+    assert items[0].fp_1f_target_index == 24
+    assert len(items[0].control_content) == 1
+    assert items[0].control_content[0].shape == (64, 64, 3)
+
+
+def test_h3_image_prepare_for_training_splits_buckets_by_control_count(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    for stem in ("edit", "plain"):
+        # the control-key scan reads real safetensors headers, so the caches must be well-formed
+        save_file({"latents": torch.zeros(1)}, str(tmp_path / f"{stem}_0064x0064_mmh3.safetensors"))
+        save_file({"rows": torch.zeros(1)}, str(tmp_path / f"{stem}_mmh3_te.safetensors"))
+    with_controls = _h3_image_dataset(
+        tmp_path,
+        control_directory=str(tmp_path / "ctrl"),
+        fp_1f_clean_indices=[0, 48],
+        fp_1f_target_index=24,
+    )
+    without_controls = _h3_image_dataset(tmp_path)
+
+    with_controls.prepare_for_training()
+    without_controls.prepare_for_training()
+
+    assert set(with_controls.batch_manager.buckets) == {(64, 64, 2)}
+    assert set(without_controls.batch_manager.buckets) == {(64, 64)}
+
+
+def test_h3_image_dataset_forwards_the_target_index_to_items(tmp_path: Path):
+    dataset = _h3_image_dataset(tmp_path, fp_1f_target_index=24)
+
+    class FakeImageDatasource:
+        has_control = False
+
+        def __iter__(self):
+            from PIL import Image
+
+            image = Image.new("RGB", (64, 64))
+            yield lambda: (str(tmp_path / "portrait.png"), [image], "caption", None)
+
+    dataset.datasource = FakeImageDatasource()
+
+    batches = list(dataset.retrieve_latent_cache_batches(num_workers=1))
+
+    assert len(batches) == 1
+    bucket, items = batches[0]
+    assert bucket == (64, 64)
+    assert items[0].fp_1f_target_index == 24
+    assert items[0].content.shape == (64, 64, 3)
+    assert Path(items[0].latent_cache_path).name == "portrait_0064x0064_mmh3.safetensors"
+    assert Path(items[0].text_encoder_output_cache_path).name == "portrait_mmh3_te.safetensors"
+
+
 def test_h3_prepare_for_training_pairs_each_crop_with_its_own_text_cache(tmp_path: Path):
     dataset = VideoDataset(
         resolution=(64, 64),
@@ -187,9 +345,7 @@ def test_h3_training_sample_preserves_valid_frame_count(tmp_path: Path, monkeypa
 
     class FakeAccelerator:
         device = torch.device("cpu")
-
-        def get_tracker(self, name):
-            raise ValueError(name)
+        trackers = []  # no tracker registered
 
     monkeypatch.setattr(trainer_base, "save_videos_grid", lambda *args, **kwargs: None)
 
@@ -212,3 +368,52 @@ def test_h3_training_sample_preserves_valid_frame_count(tmp_path: Path, monkeypa
     )
 
     assert captured["frame_count"] == 56
+
+
+def test_video_latent_cache_honours_enable_bucket(tmp_path: Path):
+    """A video dataset with bucketing off must cache at its single configured bucket.
+
+    ImageDataset.retrieve_latent_cache_batches and both prepare_for_training pass
+    enable_bucket / bucket_no_upscale to BucketSelector; the video caching path used
+    to build its selector with the defaults instead. A block asking for one bucket
+    therefore had its latents cached at an area-derived one, while get_metadata()
+    recorded enable_bucket: false either way.
+    """
+    dataset = VideoDataset(
+        resolution=(1792, 768),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=False,
+        bucket_no_upscale=False,
+        target_frames=[5],
+        video_directory=str(tmp_path),
+        cache_directory=str(tmp_path),
+        architecture=ARCHITECTURE_MINIMAX_H3,
+    )
+
+    assert list(dataset.retrieve_latent_cache_batches(1)) == []
+
+    selector = dataset.datasource.bucket_selector
+    assert selector.bucket_resolutions == [(1792, 768)]
+    assert selector.get_bucket_resolution((3840, 1080)) == (1792, 768)
+
+
+def test_video_latent_cache_still_buckets_when_asked_to(tmp_path: Path):
+    """The other half of the contract: enable_bucket=True keeps the area search."""
+    dataset = VideoDataset(
+        resolution=(1792, 768),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=True,
+        bucket_no_upscale=False,
+        target_frames=[5],
+        video_directory=str(tmp_path),
+        cache_directory=str(tmp_path),
+        architecture=ARCHITECTURE_MINIMAX_H3,
+    )
+
+    assert list(dataset.retrieve_latent_cache_batches(1)) == []
+
+    assert len(dataset.datasource.bucket_selector.bucket_resolutions) > 1
