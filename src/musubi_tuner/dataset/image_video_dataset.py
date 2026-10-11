@@ -1905,6 +1905,10 @@ class VideoDirectoryDatasource(VideoDatasource):
     def _audio_resolution_inputs(self, idx: int) -> tuple[str, Optional[str]]:
         return self.video_paths[idx], None
 
+    def get_item_extras(self, idx: int) -> ItemExtras:
+        # a directory item has no place for fields beyond the shared schema (upstream datasources.py)
+        return ItemExtras(fields={}, base_directory=self.video_directory, label=self.video_paths[idx])
+
     def __iter__(self):
         self.current_idx = 0
         return self
@@ -1928,6 +1932,8 @@ class VideoDirectoryDatasource(VideoDatasource):
 
 
 class VideoJsonlDatasource(VideoDatasource):
+    SHARED_KEYS = ("video_path", "caption", "control_path", "audio_path", "loss_mask_path", "video_loss_mask_path")
+
     def __init__(
         self,
         video_jsonl_file: str,
@@ -2014,6 +2020,15 @@ class VideoJsonlDatasource(VideoDatasource):
     def _audio_resolution_inputs(self, idx: int) -> tuple[str, Optional[str]]:
         data = self.data[idx]
         return data["video_path"], data.get("audio_path")
+
+    def get_item_extras(self, idx: int) -> ItemExtras:
+        # upstream's shared video JSONL schema plus the fork's loss-mask keys; every other key is an item extra
+        shared = VideoJsonlDatasource.SHARED_KEYS + ((self.caption_field,) if self.caption_field else ())
+        return ItemExtras(
+            fields=_extra_fields(self.data[idx], shared),
+            base_directory=os.path.dirname(os.path.abspath(self.video_jsonl_file)),
+            label=f"{os.path.basename(self.video_jsonl_file)} line {idx + 1}",
+        )
 
     def __iter__(self):
         self.current_idx = 0
