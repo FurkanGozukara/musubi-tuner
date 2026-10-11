@@ -1,0 +1,101 @@
+"""Low-VRAM LTX-2 text encoding and the leaner per-token RMS feature extraction.
+
+LTX-2.3 text caching with the single-file FP8 Gemma peaked at 12.8 GB (11.5 after loading the FP8 weights straight
+to the CPU): the Gemma embedding table, the text projection and the video connector (1.9 / 2.2 / 3.0 GB) stayed on the
+GPU together, and the feature extractor made float32 copies of all 49 hidden-state layers. Low-VRAM text encoding
+moves each module to the GPU only while it runs; on an RTX A6000 the peak fell to 4.0 GB with bit-identical caches.
+"""
+
+import pytest
+import torch
+
+from musubi_tuner.ltx_2.text_encoders.gemma import feature_extractor
+from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import enable_low_vram_text_encoding
+
+
+def _reference_per_token_rms(encoded_text, attention_mask):
+    # the previous implementation
+    b, _t, d, l = encoded_text.shape  # noqa: E741
+    variance = torch.mean(encoded_text**2, dim=2, keepdim=True)
+    normed = encoded_text * torch.rsqrt(variance + 1e-6)
+    normed = normed.reshape(b, attention_mask.shape[1], d * l)
+    mask_3d = attention_mask.bool().unsqueeze(-1)
+    return torch.where(mask_3d, normed, torch.zeros_like(normed))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_per_token_rms_matches_the_previous_implementation(dtype):
+    torch.manual_seed(0)
+    encoded = torch.randn(2, 7, 16, 5, dtype=dtype)
+    mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]])
+    out = feature_extractor._norm_and_concat_per_token_rms(encoded, mask)
+    assert torch.equal(out, _reference_per_token_rms(encoded, mask))
+
+
+class _TinyGemma(torch.nn.Module):
+    """Embedding table tied to the LM head, like Gemma 3."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(11, 8)
+        self.norm = torch.nn.LayerNorm(8)
+        self.lm_head = torch.nn.Linear(8, 11, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def forward(self, input_ids):
+        hidden = self.norm(self.embed(input_ids))
+        return hidden, self.lm_head(hidden[:, -1:])
+
+
+class _DualProjection(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.video_aggregate_embed = torch.nn.Linear(8, 6)
+        self.audio_aggregate_embed = torch.nn.Linear(8, 4)
+
+    def forward(self, hidden):
+        audio = self.audio_aggregate_embed(hidden) if self.audio_aggregate_embed is not None else None
+        return self.video_aggregate_embed(hidden), audio
+
+
+class _TinyVideoEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _TinyGemma()
+        self.feature_extractor_linear = _DualProjection()
+        self.embeddings_connector = torch.nn.Linear(6, 6)
+
+    def forward(self, input_ids):
+        hidden, _logits = self.model(input_ids)
+        video, _audio = self.feature_extractor_linear(hidden)
+        return self.embeddings_connector(video)
+
+
+def test_low_vram_encoding_keeps_outputs_and_drops_the_unused_audio_projection():
+    torch.manual_seed(0)
+    encoder = _TinyVideoEncoder()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    expected = encoder(input_ids)
+    managed = enable_low_vram_text_encoding(encoder, "cpu")
+    assert managed == ["Gemma embeddings", "feature_extractor_linear", "embeddings_connector"]
+    assert encoder.feature_extractor_linear.audio_aggregate_embed is None  # video-only: output never used
+    assert encoder._execution_device == torch.device("cpu")
+    assert encoder.model.lm_head.weight is encoder.model.embed.weight  # tied weights stay tied
+    assert torch.equal(encoder(input_ids), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_low_vram_encoding_keeps_weights_in_cpu_ram_between_forwards():
+    torch.manual_seed(0)
+    encoder = _TinyVideoEncoder().cuda()
+    input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    expected = encoder(input_ids)
+    enable_low_vram_text_encoding(encoder, "cuda")
+    for module in (encoder.model.embed, encoder.feature_extractor_linear, encoder.embeddings_connector):
+        assert all(param.device.type == "cpu" for param in module.parameters())
+    assert torch.equal(encoder(input_ids), expected)
+    assert encoder.model.norm.weight.device.type == "cuda"  # unmanaged Gemma weights stay where they run
+    assert all(param.device.type == "cpu" for param in encoder.embeddings_connector.parameters())

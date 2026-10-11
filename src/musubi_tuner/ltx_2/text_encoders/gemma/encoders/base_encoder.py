@@ -1,4 +1,5 @@
 import functools
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -42,6 +43,10 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         self.feature_extractor_linear = feature_extractor_linear.to(dtype=dtype)
 
     def _text_model_device(self) -> torch.device:
+        # low-VRAM text encoding keeps the embedding table in CPU RAM between forwards (enable_low_vram_text_encoding)
+        execution_device = getattr(self, "_execution_device", None)
+        if execution_device is not None:
+            return execution_device
         model = getattr(self, "model", None)
         if model is None:
             return torch.device("cpu")
@@ -84,7 +89,10 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=text_device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=text_device)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        # only the hidden states are used: logits for every position (up to 1024 tokens x 262k vocabulary, soft-capped)
+        # cost about 1.5 GB of VRAM per prompt, so keep the last position's only
+        extra = {"logits_to_keep": 1} if _forward_accepts(self.model, "logits_to_keep") else {}
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **extra)
         projected = self._run_feature_extractor(
             hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
         )
@@ -289,6 +297,104 @@ def _infer_safetensors_dtype(path: str) -> torch.dtype | None:
             if isinstance(dt, torch.dtype) and dt.is_floating_point:
                 return dt
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _forward_parameters(model_class: type) -> frozenset[str]:
+    try:
+        return frozenset(inspect.signature(model_class.forward).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
+def _forward_accepts(model, name: str) -> bool:
+    return name in _forward_parameters(type(model))
+
+
+def _keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.device) -> None:
+    """Keep ``params`` in pinned CPU RAM and give them a GPU copy only while ``module`` runs (forward hooks).
+
+    Assigning ``.data`` keeps every Parameter object, so tied weights (the Gemma LM head shares the embedding table)
+    follow, and dropping the GPU copy after the forward frees it for the next phase."""
+    params = list({id(param): param for param in params}.values())
+    cpu_copies = []
+    for param in params:
+        cpu = param.data.to("cpu")
+        if device.type == "cuda":
+            cpu = cpu.pin_memory()
+        param.data = cpu
+        cpu_copies.append(cpu)
+
+    def load(_module, _args):
+        with torch.inference_mode(False):
+            for param, cpu in zip(params, cpu_copies):
+                param.data = cpu.to(device, non_blocking=True)
+
+    def release(_module, _args, _output):
+        for param, cpu in zip(params, cpu_copies):
+            param.data = cpu
+
+    module.register_forward_pre_hook(load)
+    module.register_forward_hook(release)
+
+
+def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", device) -> list[str]:
+    """Keep the Gemma embedding table, the text projection and the embeddings connectors in CPU RAM and move each
+    to the GPU only while it runs, so at most one of them (1.9 / 2.2 / 3.0 GB for LTX-2.3) is resident at a time.
+
+    With FP8 Gemma weights offloaded too (``--gemma_fp8_weight_offload``, the default for the single-file FP8
+    Gemma) LTX-2.3 text caching then fits GPUs with 8-12 GB; each prompt pays a few GB of extra host-to-device
+    copies. Returns the names of the modules that are now kept in CPU RAM."""
+    device = torch.device(device)
+    managed = []
+    model = getattr(text_encoder, "model", None)
+    if model is not None:
+        quantized = (
+            bool(getattr(model, "is_loaded_in_8bit", False))
+            or bool(getattr(model, "is_loaded_in_4bit", False))
+            or bool(getattr(text_encoder, "_has_fp8_model", False))
+        )
+        if not quantized:
+            # the bundle may have been built on the CPU; an unquantized Gemma runs on the GPU as a whole
+            model.to(device)
+        embeddings = model.get_input_embeddings()
+        if embeddings is not None and getattr(embeddings, "weight", None) is not None:
+            # hooked on the whole Gemma forward: the LM head reuses this table at the end of the forward
+            _keep_weights_in_cpu_ram(model, [embeddings.weight], device)
+            managed.append("Gemma embeddings")
+    projection = getattr(text_encoder, "feature_extractor_linear", None)
+    if getattr(text_encoder, "audio_embeddings_connector", None) is None and getattr(projection, "audio_aggregate_embed", None) is not None:
+        # a video-only encoder discards the audio projection's output (LTX-2.3: 0.7 GB of weights plus its activations);
+        # the video output is unchanged
+        projection.audio_aggregate_embed = None
+    for name in ("feature_extractor_linear", "embeddings_connector", "audio_embeddings_connector"):
+        module = getattr(text_encoder, name, None)
+        if module is None:
+            continue
+        for buffer in module.buffers():
+            buffer.data = buffer.data.to(device)
+        _keep_weights_in_cpu_ram(module, list(module.parameters()), device)
+        managed.append(name)
+    text_encoder._execution_device = device
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return managed
+
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _fp8_weight_load_device(tensor: torch.Tensor, owner, param_name: str, load_device, offload_fp8_weights: bool):
+    """Device a loaded Gemma tensor is placed on: the CPU for an FP8 Linear weight that FP8Linear will keep
+    offloaded (replace_linear_with_fp8 wraps exactly those), ``load_device`` for everything else."""
+    if (
+        offload_fp8_weights
+        and tensor.dtype in _FP8_DTYPES
+        and param_name == "weight"
+        and isinstance(owner, torch.nn.Linear)
+    ):
+        return torch.device("cpu")
+    return load_device
 
 
 def _has_fp8_weights(path: str) -> bool:
@@ -520,8 +626,20 @@ def module_ops_from_gemma_root(
         gemma_weights_path = gemma_safetensors
         gemma_root = None
         keep_fp8 = _has_fp8_weights(gemma_safetensors)
-        if keep_fp8:
-            logger.info("Detected fp8 weights in %s — will keep fp8 in VRAM", gemma_safetensors)
+
+    # FP8Linear can keep its FP8 weight in CPU RAM and move it per forward; resolved before loading so the loader
+    # puts those weights there directly
+    if fp8_weight_offload is None:
+        offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in ("1", "true", "yes", "on")
+    else:
+        offload_fp8_weights = bool(fp8_weight_offload)
+    offload_fp8_weights = keep_fp8 and offload_fp8_weights
+    if keep_fp8:
+        logger.info(
+            "Detected fp8 weights in %s — keeping them in fp8 (%s)",
+            gemma_safetensors,
+            "Linear weights in CPU RAM, moved to the GPU per layer" if offload_fp8_weights else "in VRAM",
+        )
 
     if os.getenv("LTX2_REQUIRE_GEMMA_ROOT", "0") == "1" and gemma_root is None and not gemma_safetensors:
         raise ValueError("gemma_root is required for this configuration")
@@ -691,8 +809,13 @@ def module_ops_from_gemma_root(
                                     # Cast fp8→compute dtype when not keeping fp8 in VRAM
                                     tensor = tensor.to(torch_dtype)
 
-                                # Materialize param on target device
-                                new_param = torch.nn.Parameter(tensor.to(device=load_device), requires_grad=param.requires_grad)
+                                # Materialize param on target device. FP8 Linear weights that FP8Linear offloads go
+                                # straight to the CPU: loading them onto the GPU first held the whole FP8 model there
+                                # until replace_linear_with_fp8 moved it (12.8 GB peak for Gemma 3 12B text caching).
+                                target_device = _fp8_weight_load_device(
+                                    tensor, sub_mod, param_name, load_device, offload_fp8_weights
+                                )
+                                new_param = torch.nn.Parameter(tensor.to(device=target_device), requires_grad=param.requires_grad)
                                 # Replace the meta parameter with the materialized one
                                 setattr(sub_mod, param_name, new_param)
 
@@ -770,15 +893,6 @@ def module_ops_from_gemma_root(
                 if keep_fp8:
                     from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import replace_linear_with_fp8
 
-                    if fp8_weight_offload is None:
-                        offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
-                            "1",
-                            "true",
-                            "yes",
-                            "on",
-                        )
-                    else:
-                        offload_fp8_weights = bool(fp8_weight_offload)
                     n_replaced = replace_linear_with_fp8(
                         module.model,
                         torch_dtype,

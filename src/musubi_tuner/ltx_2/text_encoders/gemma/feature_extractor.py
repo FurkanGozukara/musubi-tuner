@@ -50,7 +50,9 @@ def _norm_and_concat_per_token_rms(
     normed = encoded_text * torch.rsqrt(variance + 1e-6)
     normed = normed.reshape(b, attention_mask.shape[1], d * l)
     mask_3d = attention_mask.bool().unsqueeze(-1)
-    return torch.where(mask_3d, normed, torch.zeros_like(normed))
+    # in place, same values as torch.where(mask, normed, zeros): under autocast normed is float32 (49 Gemma layers x
+    # 3840 x 1024 tokens = 0.72 GB), and the zeros plus the where output were two more copies of it
+    return normed.masked_fill_(~mask_3d, 0.0)
 
 
 class GemmaFeaturesExtractorProjDualLinear(torch.nn.Module):

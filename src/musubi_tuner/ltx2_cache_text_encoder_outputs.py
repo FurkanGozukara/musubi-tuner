@@ -505,6 +505,7 @@ def main() -> None:
     )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
         apply_text_encoder_checkpoint_overrides,
+        enable_low_vram_text_encoding,
         module_ops_from_gemma_root,
     )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
@@ -532,6 +533,8 @@ def main() -> None:
     elif bnb_compute_dtype_arg == "fp32":
         bnb_compute_dtype = torch.float32
 
+    # the projection and connectors are built in CPU RAM and moved to the GPU per forward
+    low_vram_text_encoding = bool(getattr(args, "low_vram_text_encoding", False)) and device.type == "cuda"
     text_encoder = SingleGPUModelBuilder(
         model_path=str(text_encoder_checkpoint),
         model_class_configurator=configurator,
@@ -548,9 +551,12 @@ def main() -> None:
             bnb_4bit_compute_dtype=bnb_compute_dtype,
             fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
         ),
-    ).build(device=device, dtype=dtype)
+    ).build(device=torch.device("cpu") if low_vram_text_encoding else device, dtype=dtype)
     apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
     text_encoder.eval()
+    if low_vram_text_encoding:
+        managed = enable_low_vram_text_encoding(text_encoder, device)
+        logger.info("Low-VRAM text encoding: %s stay in CPU RAM and move to the GPU only while they run", ", ".join(managed))
 
     # If connector weights are missing, SingleGPUModelBuilder returns a meta-device model.
     # That will make caching appear to hang or behave unpredictably. Fail fast with a clear error.
@@ -835,6 +841,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
             "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--low_vram_text_encoding",
+        action="store_true",
+        help=(
+            "Keep the Gemma embedding table, the text projection and the embeddings connectors in CPU RAM and move "
+            "each to the GPU only while it runs (LTX-2.3: about 11.5 -> 3.5 GB with the FP8 Gemma, a few GB of extra "
+            "host-to-device copies per prompt)."
         ),
     )
     parser.add_argument(
