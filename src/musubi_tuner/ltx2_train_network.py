@@ -1797,6 +1797,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             return None
         try:
             from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+            from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
             from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
                 AudioDecoderConfigurator,
                 AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
@@ -1806,6 +1807,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 model_path=str(ckpt),
                 model_class_configurator=AudioDecoderConfigurator,
                 model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+                model_loader=in_process_checkpoint_loader(),
             ).build(device=torch.device("cpu"), dtype=torch.bfloat16)
             decoder.eval()
             decoder.requires_grad_(False)
@@ -4589,6 +4591,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         """Load VAE for LTX2"""
         logger.info(f"Loading VAE from {vae_path}")
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.model.video_vae import VideoDecoderConfigurator, VAE_DECODER_COMFY_KEYS_FILTER
 
         class _LTX2VideoVAE(torch.nn.Module):
@@ -4667,6 +4670,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             model_path=str(vae_path),
             model_class_configurator=VideoDecoderConfigurator,
             model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=torch.device("cpu"), dtype=vae_dtype)
         decoder.eval()
         decoder.requires_grad_(False)

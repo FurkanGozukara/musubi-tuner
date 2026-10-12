@@ -303,6 +303,7 @@ class LTX2SamplingMixin:
         device = device or torch.device("cpu")
         logger.info("Loading LTX-2 audio decoder/vocoder from %s (device=%s)", checkpoint_path, device)
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
             AudioDecoderConfigurator,
             VocoderConfigurator,
@@ -314,11 +315,13 @@ class LTX2SamplingMixin:
             model_path=str(checkpoint_path),
             model_class_configurator=AudioDecoderConfigurator,
             model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=device, dtype=audio_dtype)
         vocoder = SingleGPUModelBuilder(
             model_path=str(checkpoint_path),
             model_class_configurator=VocoderConfigurator,
             model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=device, dtype=audio_dtype)
 
         audio_decoder.eval()
@@ -906,6 +909,7 @@ class LTX2SamplingMixin:
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required for LTX-2 sample prompts")
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.av_encoder import (
             AVGemmaTextEncoderModelConfigurator,
             AV_GEMMA_TEXT_ENCODER_KEY_OPS,
@@ -946,6 +950,7 @@ class LTX2SamplingMixin:
             model_path=str(args.ltx2_checkpoint),
             model_class_configurator=configurator,
             model_sd_ops=key_ops,
+            model_loader=in_process_checkpoint_loader(),
             module_ops=module_ops_from_gemma_root(
                 args.gemma_root,
                 gemma_safetensors=gemma_safetensors,
@@ -1512,6 +1517,7 @@ class LTX2SamplingMixin:
             video_tensor = torch.cat([video_tensor, last], dim=2)
 
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
 
         logger.info("Loading VAE encoder for V2V reference")
@@ -1519,6 +1525,7 @@ class LTX2SamplingMixin:
             model_path=str(vae_checkpoint_path),
             model_class_configurator=VideoEncoderConfigurator,
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=device, dtype=dtype)
         vae_encoder.eval()
 
@@ -1642,6 +1649,7 @@ class LTX2SamplingMixin:
         # Load VAE encoder (training only loads decoder, we need encoder for I2V)
         # Same approach as ltx2_cache_latents.py
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
 
         logger.info("Loading VAE encoder for I2V conditioning")
@@ -1649,6 +1657,7 @@ class LTX2SamplingMixin:
             model_path=str(vae_checkpoint_path),
             model_class_configurator=VideoEncoderConfigurator,
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=device, dtype=dtype)
         vae_encoder.eval()
 
@@ -1681,6 +1690,7 @@ class LTX2SamplingMixin:
             raise RuntimeError("torchaudio is required for reference-audio sampling") from e
 
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.loader.sft_loader import in_process_checkpoint_loader
         from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
             AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
             AudioEncoderConfigurator,
@@ -1705,6 +1715,7 @@ class LTX2SamplingMixin:
             model_path=str(checkpoint_path),
             model_class_configurator=AudioEncoderConfigurator,
             model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            model_loader=in_process_checkpoint_loader(),
         ).build(device=device, dtype=dtype)
         encoder.eval()
 
