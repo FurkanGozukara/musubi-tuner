@@ -87,7 +87,7 @@ class X2Finisher(nn.Module):
 
 
 class X2Branch(nn.Module):
-    """Modules exclusive to the frozen-e115 x2 adaptation path."""
+    """Modules exclusive to the frozen-base x2 adaptation path."""
 
     def __init__(
         self,

@@ -69,9 +69,8 @@ def _ensure_nabla_compatible_flex_bwd_configs() -> None:
     config's OWN block sizes — ``kernel_options`` cannot inject one. On torch
     builds whose head_dim=64 backward configs use ``BLOCK_N=128`` (e.g. the sm90
     default ``FlexBwDConfig(64, 128, 128, 64)``) every choice is filtered out and
-    backward compilation aborts with ``NoValidChoicesError``. This is hit only by
-    nabla TRAINING — forward-only validation never compiles the backward, which
-    is why nabla validation worked but training did not.
+    backward compilation aborts with ``NoValidChoicesError``. Forward-only
+    evaluation does not compile this backward path.
 
     Harmless for non-nabla (flash) runs: ``flex_attention`` is only reached from
     ``attention_flex`` under ``sparse_params is not None``, so a flash run never
@@ -851,7 +850,7 @@ class MultiheadSelfAttention(nn.Module):
             Attention output, or tuple of (output, sparsity percentage) if requested.
         """
         if self.cached_k is not None:
-            msg = "KV-cache on the flex/NABLA path is out of scope (dense flash only in M0.2; see LAY-429)."
+            msg = "KV-cache is supported only by dense flash attention; flex/NABLA attention does not support it."
             raise NotImplementedError(msg)
 
         query = query.unsqueeze(0).transpose(1, 2).contiguous()

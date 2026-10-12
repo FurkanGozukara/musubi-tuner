@@ -1,4 +1,4 @@
-"""LoRA training for Krea 2 (K2). Phase 4: minimal trainable loop.
+"""LoRA training for Krea 2 (K2).
 
 Implements the architecture-specific hooks of the shared NetworkTrainer for K2:
 build/load the single-stream MMDiT, reuse the Qwen-Image VAE, and run flow-matching
@@ -47,8 +47,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.vae_frame_stride = 1  # single image
-        # M1 (resident) weight stashes for RAW-train / Turbo-sample. Both None when unused or
-        # in M2 (per-validation streaming) mode; built lazily on the first sample step.
+        # Resident weight stashes for RAW training and Turbo sampling. Both are None when
+        # unused or when streaming per validation; built lazily on the first sample step.
         # _turbo_stash holds the (fp8-quantized) Turbo weights; _raw_stash a one-time snapshot
         # of the RAW base weights to restore after sampling (the fp8 base is frozen for LoRA,
         # so a single snapshot stays valid for the whole run).
@@ -98,7 +98,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         if args.turbo_dit and turbo_lora:
             raise ValueError("--turbo_dit and --turbo_lora are mutually exclusive: choose one turbo source for sample generation.")
         if args.turbo_dit_cache and not args.turbo_dit:
-            raise ValueError("--turbo_dit_cache (M1, resident Turbo weights) requires --turbo_dit.")
+            raise ValueError("--turbo_dit_cache (resident Turbo weights) requires --turbo_dit.")
         # --turbo_dit swaps base weights from outside the model; the block-swap offloader's own
         # CPU master never sees that swap, producing a RAW/Turbo weight mix. --turbo_lora never
         # swaps weights (only composes a LoRA hook), so it is not restricted here.
@@ -285,14 +285,13 @@ class Krea2NetworkTrainer(NetworkTrainer):
         return {k: t.detach().to("cpu", copy=True) for k, t in self._named_live_tensors(model).items()}
 
     def _overwrite_weights(self, model, src: dict):
-        """Copy ``src`` into the model's base weights in place (used by BOTH M1 and M2).
+        """Copy ``src`` into the model's base weights in place.
 
-        Critically this writes through ``copy_`` and never reassigns ``weight.data``: the live
+        This writes through ``copy_`` and preserves ``weight.data``: the live
         tensor keeps its exact storage object and device, so it composes with the block-swap
         offloader (which itself recycles the ``weight.data`` storages) and with fp8 (where the
-        streamed ``weight`` and the resident ``scale_weight`` must stay consistent). Reassigning
-        ``.data`` instead — the old M1 ping-pong — corrupts that recycling and produced pure
-        noise specifically in the M1 x fp8 x block-swap case. ``copy_`` casts dtype and crosses
+        streamed ``weight`` and the resident ``scale_weight`` must stay consistent).
+        ``copy_`` casts dtype and crosses
         devices, so block-swapped weights that currently live on CPU stay on CPU.
         """
         for k, t in self._named_live_tensors(model).items():
@@ -301,9 +300,9 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def _free_base_weights(self, model):
         """Release the live base weight/buffer storages (set ``.data`` to a 0-size tensor).
 
-        Used by the M2 GPU-direct swap to free the current weights *before* loading the
-        replacement to the same device, so the GPU never holds both copies at once (~1x peak
-        instead of ~2x). Each tensor keeps its dtype/device. This reassigns ``.data`` and is
+        Used by GPU-direct streaming to free current weights before loading their replacement
+        on the same device, keeping peak memory low. Each tensor keeps its dtype/device.
+        This reassigns ``.data`` and is
         therefore only safe without the block-swap offloader — which ``--turbo_dit`` forbids
         via ``--blocks_to_swap`` (see handle_model_specific_args), so there is no offloader to
         collide with here (cf. the copy_-only requirement of _overwrite_weights under swap).
@@ -351,26 +350,25 @@ class Krea2NetworkTrainer(NetworkTrainer):
             # applies on top automatically).
             model = accelerator.unwrap_model(transformer)
             if args.turbo_dit_cache:
-                # M1: build the resident (fp8-quantized at startup) Turbo stash once and snapshot
+                # Build the resident (fp8-quantized at startup) Turbo stash once and snapshot
                 # the RAW base once, then copy Turbo into the live weights (storage preserved,
                 # see _overwrite_weights). The snapshot must be taken before the first overwrite.
                 if self._turbo_stash is None:
-                    logger.info(f"Krea 2: caching Turbo weights for sampling (M1) from {args.turbo_dit}")
+                    logger.info(f"Krea 2: caching Turbo weights for sampling (resident cache) from {args.turbo_dit}")
                     self._turbo_stash = krea2_utils.load_krea2_dit_state_dict(
                         args.turbo_dit, fp8_scaled=args.fp8_scaled, calc_device=accelerator.device, result_device="cpu"
                     )
                 if self._raw_stash is None:
-                    logger.info("Krea 2: snapshotting RAW weights for restore (M1)")
+                    logger.info("Krea 2: snapshotting RAW weights for restore (resident cache)")
                     self._raw_stash = self._snapshot_weights(model)
-                logger.info("Krea 2: swapping in Turbo weights for sampling (M1)")
+                logger.info("Krea 2: swapping in Turbo weights for sampling (resident cache)")
                 self._overwrite_weights(model, self._turbo_stash)
             else:
-                # M2: free the RAW base weights, then load the Turbo weights (re-quantized if
-                # fp8) straight onto the GPU and reassign them. Freeing first keeps the GPU at
-                # ~1x the model size; loading directly to the GPU keeps the CPU peak at ~1
-                # tensor (no full intermediate CPU dict). Safe to reassign here because
+                # Free the RAW base weights, then load the Turbo weights (re-quantized if
+                # fp8) straight onto the GPU and reassign them. Loading streams one tensor
+                # at a time without a full intermediate CPU dict. Safe to reassign because
                 # --turbo_dit forbids block swap.
-                logger.info(f"Krea 2: loading Turbo weights for sampling (M2, GPU-direct) from {args.turbo_dit}")
+                logger.info(f"Krea 2: loading Turbo weights for sampling (GPU-direct streaming) from {args.turbo_dit}")
                 self._free_base_weights(model)
                 clean_memory_on_device(accelerator.device)
                 turbo_sd = krea2_utils.load_krea2_dit_state_dict(
@@ -389,14 +387,14 @@ class Krea2NetworkTrainer(NetworkTrainer):
             # Restore RAW base weights after sampling.
             model = accelerator.unwrap_model(transformer)
             if args.turbo_dit_cache:
-                logger.info("Krea 2: restoring RAW weights after sampling (M1)")
+                logger.info("Krea 2: restoring RAW weights after sampling (resident cache)")
                 self._overwrite_weights(model, self._raw_stash)  # copy RAW back in place (storage preserved)
             else:
-                # M2: free the Turbo base weights, then reload RAW (re-quantized if fp8) straight
-                # onto the GPU and reassign -- same GPU-direct, CPU-peak-~1-tensor path as
+                # Free the Turbo base weights, then reload RAW (re-quantized if fp8) straight
+                # onto the GPU and reassign using the same streaming path as
                 # swap-in. RAW is frozen during training, so reloading it from disk reproduces
                 # it exactly.
-                logger.info(f"Krea 2: restoring RAW weights after sampling (M2, GPU-direct) from {args.dit}")
+                logger.info(f"Krea 2: restoring RAW weights after sampling (GPU-direct streaming) from {args.dit}")
                 self._free_base_weights(model)
                 clean_memory_on_device(accelerator.device)
                 raw_sd = krea2_utils.load_krea2_dit_state_dict(
@@ -579,9 +577,9 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument(
         "--turbo_dit_cache",
         action="store_true",
-        help="M1 memory mode for --turbo_dit: keep the (fp8-quantized at startup) Turbo weights resident in "
-        "CPU RAM and ping-pong-swap them in (~1x extra CPU, faster). Default (M2) streams Turbo from disk each "
-        "sample step (re-quantizing if fp8) for ~0x steady CPU at the cost of per-validation load time.",
+        help="Cache mode for --turbo_dit: keep Turbo weights resident in CPU RAM and copy them in for sampling "
+        "(quantized once when fp8 is enabled). Without this flag, stream Turbo from disk each sample step "
+        "and quantize during loading when fp8 is enabled.",
     )
     parser.add_argument(
         "--turbo_lora",

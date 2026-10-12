@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
+import os
 
 import numpy as np
 import torch
@@ -11,6 +14,7 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.audio_utils import AudioSpec, add_audio_tolerance_arguments, apply_audio_tolerance_arguments
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.kandinsky6.reference import DEFAULT_REF_PAD_VALUE, DEFAULT_REFERENCE_SLOTS, encode_reference_paths
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +22,8 @@ logging.basicConfig(level=logging.INFO)
 K6_SAMPLE_RATE = 44100
 K6_AUDIO_DOWNSAMPLE = 1024
 K6_VIDEO_FPS = 24
+K6_REFERENCE_CACHE_FINGERPRINT = "kandinsky6_reference_fingerprint"
+K6_REFERENCE_CACHE_FINGERPRINT_VERSION = "1"
 
 
 def audio_samples_for_frames(frame_count: int) -> int:
@@ -72,14 +78,91 @@ def first_control_frame(content: np.ndarray | list[np.ndarray]) -> np.ndarray:
     return frame
 
 
+def reference_paths_for_item(dataset, item: ItemInfo) -> list[str]:
+    """Absolute image paths of the record's R2AV ``references`` field ([] when absent).
+
+    Each entry is ``{"type": "image", "path": ...}`` or a bare path string; relative paths
+    resolve from the JSONL's directory. Video references are not supported yet.
+    """
+    datasource = getattr(dataset, "datasource", None)
+    if datasource is None or item.datasource_index is None or not hasattr(datasource, "get_item_extras"):
+        return []
+    extras = datasource.get_item_extras(item.datasource_index)
+    entries = extras.fields.get("references")
+    if not entries:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError(f"{extras.label}: 'references' must be a list")
+    paths = []
+    for entry in entries:
+        if isinstance(entry, str):
+            kind, path = "image", entry
+        elif isinstance(entry, dict):
+            kind, path = str(entry.get("type", "image")).lower(), entry.get("path")
+        else:
+            raise ValueError(f"{extras.label}: invalid reference entry {entry!r}")
+        if kind != "image":
+            raise ValueError(f"{extras.label}: Kandinsky 6 R2AV supports image references only, got type {kind!r}")
+        if not path:
+            raise ValueError(f"{extras.label}: reference entry without a path")
+        if not os.path.isabs(path):
+            path = os.path.join(extras.base_directory, path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{extras.label}: reference image not found: {path}")
+        paths.append(path)
+    return paths
+
+
+def reference_cache_fingerprint(reference_paths: list[str], width: int, height: int, ref_pad_value: int) -> str:
+    """Fingerprint the ordered reference inputs and every setting that affects their latents."""
+    references = []
+    for path in reference_paths:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        references.append({"path": os.path.normcase(os.path.abspath(path)), "sha256": digest.hexdigest()})
+    payload = {
+        "version": K6_REFERENCE_CACHE_FINGERPRINT_VERSION,
+        "references": references,
+        "canvas": [width, height],
+        "ref_pad_value": ref_pad_value,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def reference_canvas_for_item(item: ItemInfo) -> tuple[int, int]:
+    if item.content is not None:
+        data = item.content[0] if isinstance(item.content, list) else item.content
+        if data.ndim == 3:
+            height, width = data.shape[:2]
+        elif data.ndim == 4:
+            height, width = data.shape[1:3]
+        else:
+            raise ValueError(f"Kandinsky6 content must be [F,H,W,C], got {data.shape}")
+        return int(width), int(height)
+    if item.bucket_size is None:
+        raise ValueError(f"{item.item_key}: cannot determine the reference cache canvas")
+    width, height = item.bucket_size
+    return int(width), int(height)
+
+
 @torch.no_grad()
-def encode_batch(video_vae, audio_vae, batch: list[ItemInfo]) -> None:
+def encode_batch(
+    video_vae,
+    audio_vae,
+    batch: list[ItemInfo],
+    dataset=None,
+    ref_pad_value: int = DEFAULT_REF_PAD_VALUE,
+    max_references: int | None = None,
+) -> None:
     from musubi_tuner.dataset.cache_io import save_latent_cache_kandinsky6
 
     for item in batch:
         if item.content is None:
             raise ValueError(f"Content not loaded for item {item.item_key}")
-        latent = _encode_pixels(video_vae, prepare_video_pixels(item.content))  # [C,T,H,W]
+        pixels = prepare_video_pixels(item.content)
+        latent = _encode_pixels(video_vae, pixels)  # [C,T,H,W]
 
         audio_latent = None
         audio_present = False
@@ -119,6 +202,24 @@ def encode_batch(video_vae, audio_vae, batch: list[ItemInfo]) -> None:
                     "Kandinsky6 image condition must match the target latent canvas, got "
                     f"{tuple(image_latent.shape[2:])} versus {tuple(latent.shape[2:])}"
                 )
+
+        reference_latents = None
+        reference_paths = reference_paths_for_item(dataset, item) if dataset is not None else []
+        height, width = int(pixels.shape[2]), int(pixels.shape[3])
+        reference_fingerprint = reference_cache_fingerprint(reference_paths, width, height, ref_pad_value)
+        if reference_paths:
+            if image_latent is not None:
+                raise ValueError(f"{item.item_key}: a Kandinsky 6 item cannot carry both a TI2AV control image and references")
+            if max_references is not None and len(reference_paths) > max_references:
+                raise ValueError(f"{item.item_key}: {len(reference_paths)} references exceed --max_references {max_references}")
+            # letterbox onto the (bucketed) target canvas so references share its latent grid
+            reference_latents = encode_reference_paths(video_vae, reference_paths, width, height, ref_pad_value)
+            if reference_latents.shape[2:] != latent.shape[2:]:
+                raise ValueError(
+                    f"{item.item_key}: reference latents {tuple(reference_latents.shape[2:])} do not match the "
+                    f"target canvas {tuple(latent.shape[2:])}"
+                )
+            reference_latents = reference_latents.to(latent.dtype)
         save_latent_cache_kandinsky6(
             item,
             video_latent=latent.cpu(),
@@ -130,8 +231,31 @@ def encode_batch(video_vae, audio_vae, batch: list[ItemInfo]) -> None:
                 "audio_vae_scaling_factor": str(float(audio_vae.scaling_factor)),
                 "audio_sample_rate": str(K6_SAMPLE_RATE),
                 "video_fps": str(K6_VIDEO_FPS),
+                K6_REFERENCE_CACHE_FINGERPRINT: reference_fingerprint,
             },
+            reference_latents=None if reference_latents is None else reference_latents.cpu(),
         )
+
+
+def reference_cache_is_current(dataset, item: ItemInfo, ref_pad_value: int = DEFAULT_REF_PAD_VALUE) -> bool:
+    """Return whether the cache matches the item's ordered reference inputs and encoding settings."""
+    if not os.path.exists(item.latent_cache_path):
+        return False
+    reference_paths = reference_paths_for_item(dataset, item)
+    from safetensors import safe_open
+
+    with safe_open(item.latent_cache_path, framework="pt") as handle:
+        keys = [key for key in handle.keys() if key.startswith("varlen_latents_refs_")]
+        cached_fingerprint = (handle.metadata() or {}).get(K6_REFERENCE_CACHE_FINGERPRINT)
+
+    if not reference_paths and cached_fingerprint is None:
+        # Pre-fingerprint caches are safe only for ordinary items that never held references.
+        return not keys
+    if len(keys) != (1 if reference_paths else 0):
+        return False
+    width, height = reference_canvas_for_item(item)
+    expected_fingerprint = reference_cache_fingerprint(reference_paths, width, height, ref_pad_value)
+    return cached_fingerprint == expected_fingerprint
 
 
 def main() -> None:
@@ -141,10 +265,24 @@ def main() -> None:
     vae_action.help = "Kandinsky6 HunyuanVideo VAE directory"
     parser.add_argument("--audio_vae", required=True, help="Kandinsky6 MMAudio VAE checkpoint")
     parser.add_argument("--audio_vae_scaling_factor", type=float, default=0.5302)
+    parser.add_argument(
+        "--ref_pad_value",
+        type=int,
+        default=DEFAULT_REF_PAD_VALUE,
+        help="R2AV: grey level (0-255) of the letterbox around reference images; keep it equal at inference",
+    )
+    parser.add_argument(
+        "--max_references",
+        type=int,
+        default=DEFAULT_REFERENCE_SLOTS,
+        help="R2AV: reject records with more reference images than the model's reference slots",
+    )
     parser.add_argument("--upstream", help="deprecated compatibility option; ignored because the runtime is bundled")
     parser.add_argument("--sr_upstream", help="deprecated compatibility option; ignored because the runtime is bundled")
     add_audio_tolerance_arguments(parser)
     args = parser.parse_args()
+    if not 0 <= args.ref_pad_value <= 255:
+        raise ValueError("--ref_pad_value must be in [0, 255]")
 
     try:
         from musubi_tuner.kandinsky6.runtime.core.components.vae_audio import build_audio_vae
@@ -172,7 +310,16 @@ def main() -> None:
         need_vae_decoder=False,
         scaling_factor=args.audio_vae_scaling_factor,
     )
-    cache_latents.encode_datasets(datasets, lambda batch: encode_batch(video_vae, audio_vae, batch), args)
+    # One dataset at a time so encode_batch can read each record's JSONL `references`.
+    for dataset in datasets:
+        cache_latents.encode_datasets(
+            [dataset],
+            lambda batch, dataset=dataset: encode_batch(
+                video_vae, audio_vae, batch, dataset, args.ref_pad_value, args.max_references
+            ),
+            args,
+            cache_is_current=lambda item, dataset=dataset: reference_cache_is_current(dataset, item, args.ref_pad_value),
+        )
 
 
 if __name__ == "__main__":

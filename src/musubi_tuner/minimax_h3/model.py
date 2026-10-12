@@ -832,7 +832,7 @@ class MiniMaxH3Model(nn.Module):
         per_axis = positions.unsqueeze(-1) * self.rope.inv_freq.reshape(1, 1, 1, -1)
         temporal, height, width = per_axis.unbind(dim=2)
         if fine_position_ids is not None and fine_bands:
-            # temporal-stretch experiment: the leading (sub-lattice) bands rotate by the
+            # Temporal stretching: the leading (sub-lattice) bands rotate by the
             # unstretched grid so the per-token lattice phase stays as trained, while the
             # remaining bands carry the stretched physical timeline
             if fine_bands >= self.rope.inv_freq.shape[0]:
@@ -1156,7 +1156,7 @@ def _load_h3_transformer_convrot_int8(
             sd[key] = sd[key].to(torch.bfloat16)
         if device.type != "cpu":
             sd[key] = sd[key].to(device)
-    # strict load keeps the R1 key verification: missing/unexpected keys raise
+    # Strict loading rejects missing or unexpected keys
     model.load_state_dict(sd, strict=True, assign=True)
     model.eval()
     return model

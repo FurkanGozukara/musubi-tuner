@@ -141,8 +141,9 @@ class CacheDiT(MagCache, NaviCache, nn.Module):
                 raise
             return getattr(module, name)
 
+    # Compatibility naming alias.
 
-# CLAUDE.md naming alias
+
 MagCacheDiT = CacheDiT
 
 __all__ = (

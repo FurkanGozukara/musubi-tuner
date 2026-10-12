@@ -1643,7 +1643,7 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
         self.enable_teacache = enable_teacache
         self.cnt = 0
         self.num_steps = num_steps
-        self.rel_l1_thresh = rel_l1_thresh  # 0.1 for 1.6x speedup, 0.15 for 2.1x speedup
+        self.rel_l1_thresh = rel_l1_thresh  # Larger thresholds allow more cached steps
         self.accumulated_rel_l1_distance = 0
         self.previous_modulated_input = None
         self.previous_residual = None
@@ -2060,7 +2060,7 @@ def load_packed_model(
     loading_device = torch.device(loading_device)
 
     if os.path.isdir(dit_path):
-        # we don't support from_pretrained for now, so loading safetensors directly
+        # Load safetensors directly; from_pretrained is unsupported
         safetensor_files = glob.glob(os.path.join(dit_path, "*.safetensors"))
         if len(safetensor_files) == 0:
             raise ValueError(f"Cannot find safetensors file in {dit_path}")

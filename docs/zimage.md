@@ -299,7 +299,7 @@ When using `--mem_eff_save`, please note that traditional saving methods are sti
 
 ### Recommended Settings
 
-We are still exploring the optimal settings. The configurations above are just examples, so please adjust them as needed. We welcome your feedback.
+The configurations above are examples; adjust them for your model, dataset, and available memory.
 
 If you have ample VRAM, you can use any optimizer of your choice. `--full_bf16` is not recommended.
 
@@ -341,7 +341,7 @@ Finetuningは専用のスクリプト`zimage_train.py`を使用します。こ�
 
 ### 推奨設定
 
-最適な設定はまだ調査中です。上記の構成はあくまで一例ですので、必要に応じて調整してください。フィードバックをお待ちしております。
+上記の構成は一例です。モデル、データセット、使用可能なメモリに応じて調整してください。
 
 十分なVRAMがある場合は、お好みのオプティマイザを使用できます。`--full_bf16`は推奨されません。
 

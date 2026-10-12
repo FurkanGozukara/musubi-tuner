@@ -47,9 +47,8 @@ src/musubi_tuner/
 
 Each architecture follows the same pattern: an architecture-specific subdirectory for model code, plus top-level scripts for caching/training/inference that share the common `training/` and `dataset/` infrastructure.
 
-## Development Notes
+## Configuration and Documentation
 
-- No formal test suite — manual testing via training and inference scripts
 - Uses `accelerate` for distributed training
 - Dataset configuration uses TOML format (see `docs/dataset_config.md` for schema)
 - User-facing documentation is in `docs/`

@@ -149,7 +149,7 @@ def load_bnb4bit_state_dict(
 # stored as float8 with a per-output-channel (per-row) float32 scale. At forward
 # time the weight is dequantized back to the compute dtype and a normal bf16
 # matmul runs, so this needs no FP8 tensor-core hardware and works on any device
-# that can store float8 (CPU included). The win is ~2x smaller Linear weights.
+# that can store float8 (CPU included). Float8 storage reduces the Linear weight footprint.
 # ---------------------------------------------------------------------------
 
 

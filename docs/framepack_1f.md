@@ -99,7 +99,7 @@ If you change whether to use one frame training or these options, please overwri
 
 Specify `--one_frame` in `fpack_train_network.py` to change the inference method during sample generation. 
 
-The optimal training settings are currently unknown. Feedback is welcome.
+Adjust training settings for your dataset and target output.
 
 ### Example of prompt file description for sample generation
 
@@ -134,7 +134,7 @@ JSONLファイルを用いる場合は、`{"image_path": "/path/to/target_image1
 
 また、`fpack_train_network.py`に`--one_frame`を指定してサンプル画像生成時の推論方法を変更してください。
 
-最適な学習設定は今のところ不明です。フィードバックを歓迎します。
+データセットと目標の出力に応じて学習設定を調整してください。
 
 **サンプル生成のプロンプトファイル記述例**
 

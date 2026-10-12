@@ -1,4 +1,4 @@
-"""Tests for ConvRot int8 base-weight quantization (Krea 2, Phase 1).
+"""Tests for ConvRot int8 base-weight quantization (Krea 2).
 
 Covers the numerical contract of the custom autograd (forward parity vs the
 dequantized reference, grad_x in both backward modes, LoRA branch gradient parity),

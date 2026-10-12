@@ -1,38 +1,23 @@
 """Compiled (torch.compile-optimized) causal video KVAE.
 
-SR inference with the KVAE is decode-bound: the eager segment-cached
-``CachedDecoder3D`` runs ~1.5x slower than a fully compiled decode path
-(178s vs 115s per 5s 512x768 video), while ``vae.encode`` is ~15s. Earlier
-accelerated KVAE variants compiled only the encoder for dataset encoding, so
-the decoder was everywhere the same eager loop.
+The decoder compiles whole ``CachedCausalResnetBlock3D`` forwards and the
+standalone convs/norms/upsamples between them. The mutable temporal segment
+cache stays eager, and convolution weights use ``channels_last_3d``.
 
-Whole-graph compilation of the decoder is not feasible: the temporal segment
-cache is a python dict of per-layer padding tensors mutated across chunks
-(``None`` on the first segment, tensors afterwards). Instead the decoder is
-compiled REGION-wise by default — whole ``CachedCausalResnetBlock3D`` forwards
-plus the standalone convs/norms/upsamples between them — with the cache
-plumbing staying eager, and its conv weights converted to ``channels_last_3d``.
-
-Measured on the tiled SR pipeline (5s 512x768 video, 25 tiles, 7 steps):
-``vae.decode`` 178.6s eager → 135s per-leaf compile → **90.8s** region compile
-(compiled reference: 115s). Env knobs:
+Environment options:
 
 * ``KVAE_COMPILE=0`` — fully eager fallback;
 * ``KVAE_COMPILE_DYNAMIC=1`` — compile dynamic symbolic temporal slices
   instead of the default static segment shapes (one graph per segment length
-  and tile aspect, cached by inductor on disk). Static is the default because
-  it is faster (x2 clip on an A100, torch 2.10: 45 s static vs 75-85 s dynamic)
-  and torch <= 2.9's dynamo cannot build the dynamic guards at all;
+  and tile aspect, cached by inductor on disk);
 * ``KVAE_COMPILE_DYNAMIC_MODE=regions`` — dynamic resblock regions (default
   of the dynamic mode);
 * ``KVAE_COMPILE_DYNAMIC_MODE=inner_conv`` — dynamic stateless inner-conv
   wrapping (the conservative fallback);
 * ``KVAE_COMPILE_RESBLOCKS=0`` — per-leaf granularity instead of regions;
-* ``KVAE_COMPILE_ENCODER=1`` — also compile the encoder (measured SLOWER:
-  14.5s → 22s, hence off);
-* ``KVAE_COMPILE_AUTOTUNE=1`` — inductor max_autotune (measured no effect);
-* ``KVAE_DECODE_SEG`` — pixel frames per decoder temporal segment (default 16;
-  32 measured slightly slower).
+* ``KVAE_COMPILE_ENCODER=1`` — also compile the encoder;
+* ``KVAE_COMPILE_AUTOTUNE=1`` — enable inductor max_autotune;
+* ``KVAE_DECODE_SEG`` — pixel frames per decoder temporal segment (default 16).
 
 The first decode pays a one-time compile cost (mirroring the compiled
 VAE); shapes are stable across SR tile chunks, so no recompiles afterwards.
@@ -92,8 +77,7 @@ _AUTOTUNE_OPTIONS = {
 def kvae_compile_kwargs() -> dict:
     """Return the ``torch.compile`` kwargs for leaf wrapping.
 
-    Static shapes by default (the faster mode, and the only one torch <= 2.9
-    can compile); ``KVAE_COMPILE_DYNAMIC=1`` opts into dynamic symbolic shapes.
+    Static shapes by default; ``KVAE_COMPILE_DYNAMIC=1`` opts into dynamic symbolic shapes.
     ``KVAE_COMPILE_AUTOTUNE=1`` adds the inductor autotune options.
     """
     dynamic = os.environ.get("KVAE_COMPILE_DYNAMIC", "0") == "1"
@@ -107,7 +91,7 @@ def kvae_dynamic_compile_mode() -> str:
     """Return the dynamic KVAE compile boundary.
 
     ``regions`` compiles resblocks while graph-breaking around cache-aware
-    wrappers.  ``inner_conv`` keeps the earlier conservative mode that only
+    wrappers. ``inner_conv`` only
     compiles stateless convolution kernels and GroupNorm leaves.
     """
     mode = os.environ.get("KVAE_COMPILE_DYNAMIC_MODE", "regions")
@@ -118,12 +102,9 @@ def kvae_dynamic_compile_mode() -> str:
 
 
 def kvae_encoder_compile_enabled() -> bool:
-    """Whether to also compile/channels-last the ENCODER (default off).
+    """Whether to also compile/channels-last the encoder (default off).
 
-    Measured on the SR assess pipeline, compiling the encoder REGRESSED
-    ``vae.encode`` 14.5s -> 22s per video (many small high-res convs; the
-    per-segment wrapper overhead outweighs the fusion gains), so the encoder
-    stays eager unless ``KVAE_COMPILE_ENCODER=1`` is set.
+    The encoder stays eager unless ``KVAE_COMPILE_ENCODER=1`` is set.
     """
     return os.environ.get("KVAE_COMPILE_ENCODER", "0") == "1"
 
@@ -257,10 +238,7 @@ def compile_kvae_leaves(module: torch.nn.Module, *, enabled: bool = True) -> int
         # Region mode (DEFAULT): compile whole resblocks — norm+silu+conv
         # chains fuse into fewer, larger kernels with fewer graph breaks — and
         # skip their inner leaves (nesting compiled fns would just duplicate
-        # the same regions). Measured on the SR assess pipeline this is the
-        # single biggest decode win: 178.6s (eager) / 135s (per-leaf) → 90.8s
-        # per 5s 512x768 video. Set KVAE_COMPILE_RESBLOCKS=0 for the per-leaf
-        # granularity.
+        # the same regions). Set KVAE_COMPILE_RESBLOCKS=0 for per-leaf granularity.
         for block in module.modules():
             if isinstance(block, CachedCausalResnetBlock3D):
                 wrapped += wrap(block)
@@ -285,7 +263,7 @@ class CompiledCachedCausalVAE(CachedCausalVAE):
         Call AFTER weights are loaded and the model is cast to its inference
         dtype — compiled artifacts are specialized to parameter dtype/layout.
         The encoder stays eager by default (see
-        :func:`kvae_encoder_compile_enabled` — compiling it measured SLOWER);
+        :func:`kvae_encoder_compile_enabled`);
         set ``KVAE_COMPILE_ENCODER=1`` to include it.
         """
         self.decoder = torch.nn.utils.convert_conv3d_weight_memory_format(self.decoder, torch.channels_last_3d)
@@ -315,10 +293,8 @@ class CompiledCachedCausalVAE(CachedCausalVAE):
         """Segment-cached decode under a lifted dynamo cache limit.
 
         ``KVAE_DECODE_SEG`` (pixel frames per temporal segment, default 16 —
-        identical to the eager auto-split) enlarges the decoder segments:
-        e.g. ``32`` halves the number of decoder invocations per call at the
-        cost of ~2x decoder activation memory. Larger kernels utilize the GPU
-        better; tune against available VRAM.
+        identical to the eager auto-split) controls the decoder segment size.
+        Larger segments retain more activations; tune against available VRAM.
         """
         if split_list is None:
             tc = int(self.conf["enc"]["temporal_compress_times"])

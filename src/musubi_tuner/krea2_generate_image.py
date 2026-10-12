@@ -13,8 +13,8 @@ Memory model: the DiT stays resident on the GPU (with block swap as needed), whi
 Text Encoder and VAE shuttle between CPU and GPU. The encoder is kept on CPU and moved
 to the GPU only to encode each prompt (use ``--text_encoder_cpu`` to encode on CPU when
 even that does not fit); the VAE is kept on CPU and moved to the GPU only to decode. So
-on a 24GB card the headroom for encoding/decoding comes from running the DiT under fp8
-and/or block swap, rather than from evacuating the ~24GB DiT to host RAM.
+FP8 and/or block swap provide headroom for encoding and decoding while the DiT remains
+on its assigned device.
 
 Three input modes (mirroring zimage_generate_image.py):
   * single prompt — positional ``prompt`` argument

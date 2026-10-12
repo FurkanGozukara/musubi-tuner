@@ -1,4 +1,4 @@
-"""Few-step π-Flow inference sampler for validation (LAY-396).
+"""Few-step π-Flow inference sampler for validation.
 
 ``piflow_generate`` replaces the Euler ``generate()`` denoise loop with the
 π-Flow segment loop: ``nfe`` network calls, each building a network-free

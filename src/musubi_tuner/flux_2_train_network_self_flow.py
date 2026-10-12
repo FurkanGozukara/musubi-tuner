@@ -1,15 +1,13 @@
 """Self-Flow training entry point for FLUX.2.
 
-Skeleton for Self-Supervised Flow Matching (Self-Flow) on the FLUX.2 backbone.
-Each base-class extension seam is overridden here as a stub showing how the
-algorithm hooks in. Actual algorithmic logic is intentionally left as
-``NotImplementedError`` / ``# TODO`` markers — to be filled in by porting
-rockerBOO's PR #913 implementation onto these seams.
+Extension interfaces for Self-Supervised Flow Matching (Self-Flow) on FLUX.2.
+The algorithm hooks are stubs that raise ``NotImplementedError``; this module
+does not implement the training algorithm.
 
 Reference: https://github.com/kohya-ss/musubi-tuner/pull/913
 
-This file is the proposed extension surface, not a runnable trainer. Do not
-use it to start a training run yet.
+This module is not a runnable trainer. Training entry points raise
+``NotImplementedError``.
 
 Internal extension point — no API stability guarantees. Subclasses live in
 this repo; if you fork, expect breakage on updates.
@@ -177,9 +175,8 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
           timestep support inside the FLUX.2 transformer — out of scope of
           this skeleton, see open question (3) below.
 
-        For the skeleton we delegate to the parent and ignore kwargs; once
-        the FLUX.2 model side is wired up, this override forwards
-        per_token_timesteps and surfaces captured features.
+        This stub delegates to the parent and ignores these kwargs; per-token
+        timesteps and captured features are unsupported.
         """
         return super().call_dit(
             args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs

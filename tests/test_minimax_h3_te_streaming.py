@@ -2,8 +2,7 @@
 
 Covers the generalized multi-tensor streaming of ``LoRAStreamOffloader`` (swap-tensor
 selectors, flat-buffer layout, hook-driven forwarding) on the CPU, plus a CUDA
-end-to-end check of the offloader itself. The numerical gate (streaming on/off produces
-bit-identical hidden states on the real model) runs in the machine smoke tests.
+end-to-end check of the offloader itself.
 """
 
 from pathlib import Path

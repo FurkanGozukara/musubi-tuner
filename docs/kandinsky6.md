@@ -4,7 +4,7 @@
 
 ## Overview / 概要
 
-This is an unofficial LoRA trainer and generator for [Kandinsky 6](https://github.com/kandinskylab/kandinsky-6). It supports the released regular Lite and Pro checkpoints, joint text-to-video-with-audio (`t2av`), first-frame-conditioned video-with-audio (`ti2av`), and image datasets for appearance or identity LoRAs.
+This is an unofficial LoRA and full fine-tuning trainer and generator for [Kandinsky 6](https://github.com/kandinskylab/kandinsky-6). It supports the released regular Lite and Pro checkpoints, joint text-to-video-with-audio (`t2av`), first-frame-conditioned video-with-audio (`ti2av`), multi-reference video-with-audio (`r2av`), and image datasets for appearance or identity LoRAs. R2AV adds reference embeddings that need full fine-tuning before they can be used with LoRA.
 
 Distilled checkpoints are available for inference, but training them is rejected because they use a different PiFlow objective. Train with a regular Lite or Pro checkpoint.
 
@@ -23,7 +23,7 @@ Follow the [main installation guide](../README.md#installation), then run:
 pip install -e ".[kandinsky6]"
 ```
 
-The runtime is bundled; no separate Kandinsky source checkout is needed. ConvRot INT8 additionally requires Triton (`triton` on Linux or a compatible `triton-windows` package on Windows).
+The runtime is bundled; no separate Kandinsky source checkout is needed. ConvRot INT8 and `--adafactor_triton` additionally require Triton (`triton` on Linux or a compatible `triton-windows` package on Windows).
 
 <details><summary>日本語</summary>
 
@@ -317,4 +317,119 @@ Add the following to the training command:
 <details><summary>日本語</summary>
 
 上の形式で `sample_prompts.txt` を作成します。`--f` は出力フレーム数で `4n+1` にし、TI2AVでは `--i` で先頭画像を指定します。学習コマンドには例のsampling option、VAE、audio VAE、vocoder、両text encoderを追加します。実行時期は `--sample_at_first` や `--sample_every_n_epochs` でも指定できます。詳細は[Sampling during training](sampling_during_training.md)を参照してください。`--quantized_qwen` はtext cacheでは利用できますが、device固定のため学習中samplingでは利用できません。
+</details>
+
+## Full fine-tuning
+
+`kandinsky6_train.py` trains the transformer weights directly in BF16 for Lite or Pro.
+The video/audio VAEs and text encoders stay frozen. The defaults enable gradient
+checkpointing and fused Adafactor updates: each tensor is updated during backward,
+then its gradient is freed. Use a single process/GPU and `--max_grad_norm 0`.
+
+Add `--flash_attn` for FlashAttention 2 or `--flash3` for FlashAttention 3 on the
+unmasked visual, audio, and cross-attention operations in full fine-tuning or LoRA
+training. Select at most one. FlashAttention 3 requires its optional Hopper package,
+an H100/H800 GPU, and CUDA 12.3 or newer (upstream recommends CUDA 12.8). It imports the current `flash_attn_3`
+namespace, with compatibility for older top-level `flash_attn_interface` installs.
+Missing packages fail at startup with an actionable error. Text attention that
+carries a padding mask continues to use PyTorch SDPA so padding semantics are
+preserved. Omit both flags to keep the default SDPA path.
+
+```bash
+accelerate launch --num_processes 1 --mixed_precision bf16 kandinsky6_train.py \
+  --dataset_config dataset.toml --dit /models/k6-pro/transformer/diffusion_pytorch_model.safetensors \
+  --task t2av --learning_rate 1e-6 --max_train_steps 2000 \
+  --blocks_to_swap 40 --use_pinned_memory_for_block_swap \
+  --block_swap_trainable_ring --adafactor_triton \
+  --output_dir output --output_name k6-pro-full
+```
+
+`--adafactor_triton` enables the CUDA/Triton fast path for BF16 matrices, with the
+ordinary fused Adafactor implementation handling other tensor shapes. It requires
+manual learning rates (`scale_parameter=False relative_step=False warmup_init=False`,
+the defaults). Omit it to use PyTorch fused Adafactor throughout.
+
+`--block_swap_trainable_ring` streams trainable block weights through pinned CPU
+masters and reusable GPU buffers, including writeback after updates. It requires
+`--blocks_to_swap`, `--use_pinned_memory_for_block_swap`, gradient checkpointing, and
+fused backward. Omit it for ordinary bidirectional block swapping. Frozen-weight
+`--block_swap_h2d_only`, FP8 and ConvRot INT8 bases cannot train the full transformer.
+
+`--gradient_checkpointing_cpu_offload` stores checkpointed block-input activations
+in pinned CPU memory and restores them for backward recomputation. Block outputs
+and shared conditioning tensors stay on the GPU. Omit this option when activation
+memory fits on the GPU; gradient checkpointing remains available independently.
+
+`--k6_freeze_blocks 0-9,59` freezes selected visual blocks; `--k6_freeze_params` takes
+parameter-name regexes. Frozen weights are still included in the dense checkpoint.
+`--no-fused_backward_pass` permits other optimizers only without block swapping.
+Gradient accumulation is supported. Dense checkpoints use native model keys and
+can be loaded with `--dit`; `--save_state` / `--save_state_on_train_end` and `--resume`
+also restore optimizer, scheduler, training RNG and the next batch position.
+`--max_train_steps` remains the total target after resume. Keep the original seed,
+gradient accumulation, dataset length and trainable parameter selection when
+resuming; incompatible changes are rejected. Adafactor moments retain FP32
+precision on resume. Checkpoints stream tensor by tensor by default; use
+`--no-mem_eff_save` for the ordinary safetensors writer.
+
+Accumulation keeps dense gradients until the update boundary; block swapping
+offloads weights, not those gradients. Use one microstep per update to limit
+gradient memory residency.
+
+## Multi-reference generation (R2AV) / 複数参照生成 (R2AV)
+
+`--task r2av` teaches Kandinsky 6 to generate a video (with audio) from a prompt plus up to 8 reference images. The prompt refers to them as `@Image 1`, `@Image 2`, ... in reference order. The text encoders stay frozen: the tags are plain text, and each reference gets a learned slot embedding (`visual_ref_slot_embeddings[k]` for `@Image k+1`) plus a new token type, so the DiT learns which image a tag means. References are letterboxed onto the target canvas, VAE-encoded, and appended after the generated frames as clean, masked frames at RoPE times after the clip. This is the same mechanism TI2AV uses for its first frame. Video references are not supported yet.
+
+A released checkpoint has no reference tables, so R2AV must start with **full fine-tuning** (`kandinsky6_train.py`, BF16). That run adds and trains the new tables. LoRA, FP8 and ConvRot INT8 can only be used on a checkpoint that already has trained reference slots.
+
+**1. Dataset.** Each JSONL video record takes an extra `references` list:
+
+```json
+{"video_path": "/data/v.mp4", "caption": "@Image 1 throws a ball to @Image 2 in a park", "references": [{"type": "image", "path": "/data/girl.png"}, {"type": "image", "path": "/data/dog.png"}]}
+```
+
+Choose your own video and reference-image dataset. Point `video_jsonl_file` in `dataset.toml` at the JSONL file. The order of `references` determines the `@Image k` tags used in each caption.
+
+**2. Caching.** Run `kandinsky6_cache_latents.py` as usual. It encodes the references of each record onto that record's bucket canvas (`--ref_pad_value`, default 255 = white letterbox; `--max_references`, default 8). `--skip_existing` checks reference contents, paths, order, canvas and padding, and rebuilds caches when these change or references are removed. Older reference caches without a fingerprint are rebuilt. Cache the text encoder outputs as usual; regenerate the text cache if captions change.
+
+**3. Training** (batch size 1 recommended, because a batch cannot mix reference counts):
+
+```bash
+accelerate launch --num_processes 1 --mixed_precision bf16 kandinsky6_train.py \
+  --dataset_config dataset.toml \
+  --dit /models/k6-lite/transformer/diffusion_pytorch_model.safetensors \
+  --task r2av --max_reference_slots 8 --ref_drop_prob 0.1 \
+  --optimizer_type Adafactor --learning_rate 1e-5 --max_grad_norm 0 \
+  --gradient_checkpointing --blocks_to_swap 16 --use_pinned_memory_for_block_swap \
+  --block_swap_trainable_ring --adafactor_triton \
+  --max_train_steps 2000 --output_dir output --output_name k6-r2av
+```
+
+`--ref_drop_prob` drops the whole reference set for some steps. This keeps a reference-free branch for `--ref_guidance_scale`. The saved checkpoint contains the reference tables, and later runs detect them automatically: omit `--max_reference_slots`, or pass the same value.
+
+**4. Sampling.** In-training sample prompts take repeated `--ref` options (cannot be combined with `--i`). `--ref_guidance_scale` (default 0) adds extra guidance toward the references, at the cost of one extra forward per step:
+
+```text
+@Image 1 throws a ball to @Image 2 in a park. --w 768 --h 512 --f 121 --s 30 --g 4.0 --ref refs/girl.png --ref refs/dog.png
+```
+
+Standalone generation:
+
+```bash
+python kandinsky6_generate_reference_video.py --dit output/k6-r2av.safetensors \
+  --vae /models/k6-lite/vae --audio_vae /models/k6-lite/audio_vae --vocoder /models/k6-lite/vocoder \
+  --text_encoder_qwen /models/k6-lite/text_encoder --text_encoder_clip /models/k6-lite/text_encoder_2 \
+  --ref refs/girl.png --ref refs/dog.png --prompt "@Image 1 throws a ball to @Image 2 in a park" \
+  --width 768 --height 512 --frame_count 121 --steps 50 --output out.mp4 [--blocks_to_swap 16] [--lora_weight ...]
+```
+
+Use the same `--ref_pad_value` as during caching.
+
+<details><summary>日本語</summary>
+
+`--task r2av` は、プロンプトと最大8枚の参照画像から音声付き動画を生成するよう学習します。プロンプトでは参照順に `@Image 1`、`@Image 2` … と呼びます。text encoderは凍結したままです。各参照には学習されるslot embeddingと新しいtoken typeが付き、参照は対象canvasにletterboxしてVAE encodeした後、生成フレームの後ろにclean・maskedフレームとして追加されます(TI2AVの先頭フレームと同じ仕組み)。動画参照は未対応です。
+
+公開checkpointには参照用tableがないため、最初は**full fine-tuning**(`kandinsky6_train.py`、BF16)が必要です。LoRA／FP8／ConvRot INT8は、参照slotが学習済みのcheckpointでのみ使えます。
+
+任意の動画・参照画像データセットを使用できます。JSONLの各レコードに `references` を追加し、`dataset.toml` の `video_jsonl_file` にそのJSONLを指定します。`references` の順序をcaption内の `@Image k` と対応させてください。`kandinsky6_cache_latents.py` は参照も同じbucket canvasでencodeします。学習はbatch size 1を推奨します。サンプルプロンプトでは `--ref` を繰り返し指定し、単体生成には `kandinsky6_generate_reference_video.py` を使います。`--ref_pad_value` はキャッシュ時と同じ値にしてください。
 </details>

@@ -1,10 +1,9 @@
 """Post-load warmup: compile nabla flex_attention kernels and the VAE decode.
 
-Mirrors musubi_tuner.kandinsky6.runtime.sr/validate.py: strip the ``log_for_sparsity`` wrapper that
-forces ``return_sparsity=True`` (a recompile cascade that ends in eager
-flex_attention OOM), bump the dynamo recompile limit, then run a tiny flex
-forward so fused kernels are cached before the first real tile. A best-effort
-dummy VAE decode triggers the compiled-VAE compile.
+Strip the ``log_for_sparsity`` wrapper that forces ``return_sparsity=True``,
+raise the dynamo recompile limit, and run a small flex forward so fused
+kernels are cached before the first tile. A dummy VAE decode triggers
+compiled-VAE compilation.
 """
 
 from __future__ import annotations

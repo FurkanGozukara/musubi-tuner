@@ -129,11 +129,9 @@ def attention(
         attn_params = AttentionParams.create_attention_params("torch", False)
 
     # GQA: q may carry more heads than k/v (e.g. Krea 2 = 48 query / 12 kv heads). flash and
-    # sageattn group heads natively inside the kernel (verified), so they ignore this. For the
-    # torch (SDPA) path we expand k/v to q's head count below instead of passing enable_gqa=True,
-    # because enable_gqa forces SDPA onto the slow math kernel (~7x slower than the fused kernels
-    # at K2 scale); the repeat is numerically identical. Revert to enable_gqa=True once PyTorch's
-    # fused (flash / mem-efficient) kernels gain native GQA support. (q/k/v here are [B, L, H, D].)
+    # sageattn group heads natively inside the kernel. For the torch (SDPA) path, expand
+    # k/v to q's head count to keep fused kernels available. Repetition preserves grouped
+    # attention semantics. q/k/v here are [B, L, H, D].
     enable_gqa = q.shape[-2] != k.shape[-2]
 
     # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence

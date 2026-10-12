@@ -67,6 +67,68 @@ from musubi_tuner.training.timesteps import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DenseResumeCursor:
+    global_step: int = 0
+    epoch: int = 0
+    step_in_epoch: int = 0
+    optimizer_signature: str = ""
+    gradient_accumulation_steps: int = 1
+    data_seed: int | None = None
+    num_batches_per_epoch: int = 0
+
+    def state_dict(self):
+        return {
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "step_in_epoch": self.step_in_epoch,
+            "optimizer_signature": self.optimizer_signature,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "data_seed": self.data_seed,
+            "num_batches_per_epoch": self.num_batches_per_epoch,
+        }
+
+    def load_state_dict(self, state):
+        self.global_step = int(state.get("global_step", 0))
+        self.epoch = int(state.get("epoch", 0))
+        self.step_in_epoch = int(state.get("step_in_epoch", 0))
+        saved_signature = str(state.get("optimizer_signature", ""))
+        if self.optimizer_signature and saved_signature and self.optimizer_signature != saved_signature:
+            raise RuntimeError("dense resume optimizer parameter mapping differs from the checkpoint")
+        self.optimizer_signature = saved_signature or self.optimizer_signature
+        saved_ga = int(state.get("gradient_accumulation_steps", 1))
+        saved_seed = state.get("data_seed")
+        if saved_ga != self.gradient_accumulation_steps:
+            raise RuntimeError("dense resume gradient_accumulation_steps differs from the checkpoint")
+        if saved_seed != self.data_seed:
+            raise RuntimeError("dense resume data seed differs from the checkpoint")
+        self.num_batches_per_epoch = int(state.get("num_batches_per_epoch", 0))
+
+
+def seed_dense_dataloader_for_epoch(dataloader, seed: int) -> None:
+    """Give loader/sampler wrappers isolated deterministic generators."""
+    pending = [dataloader]
+    seen = set()
+    while pending:
+        obj = pending.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if hasattr(obj, "generator"):
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(seed)
+            try:
+                obj.generator = generator
+            except (AttributeError, TypeError):
+                pass
+        for attribute in ("sampler", "batch_sampler", "base_dataloader", "dataloader"):
+            child = getattr(obj, attribute, None)
+            if child is not obj:
+                pending.append(child)
+
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -2053,11 +2115,27 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
-
-        epoch_to_start = 0
-        global_step = 0
+        dense_cursor = getattr(self, "_dense_resume_cursor", None)
+        if dense_cursor is not None:
+            current_batches = len(train_dataloader)
+            if dense_cursor.num_batches_per_epoch not in (0, current_batches):
+                raise RuntimeError(
+                    "dense resume dataloader length differs from the checkpoint: "
+                    f"saved {dense_cursor.num_batches_per_epoch}, current {current_batches}"
+                )
+            dense_cursor.num_batches_per_epoch = current_batches
+        global_step = dense_cursor.global_step if dense_cursor is not None else 0
+        epoch_to_start = dense_cursor.epoch if dense_cursor is not None else 0
+        steps_to_skip_in_epoch = dense_cursor.step_in_epoch if dense_cursor is not None else 0
+        if steps_to_skip_in_epoch >= len(train_dataloader):
+            epoch_to_start += steps_to_skip_in_epoch // len(train_dataloader)
+            steps_to_skip_in_epoch %= len(train_dataloader)
+        progress_bar = tqdm(
+            range(global_step, args.max_train_steps),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
         last_sampled_step = None
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
@@ -2161,6 +2239,8 @@ class NetworkTrainer:
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
+            if global_step >= args.max_train_steps:
+                break
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
@@ -2168,7 +2248,26 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            epoch_dataloader = train_dataloader
+            enumerate_start = 0
+            if epoch == epoch_to_start and steps_to_skip_in_epoch:
+                epoch_dataloader = accelerator.skip_first_batches(train_dataloader, steps_to_skip_in_epoch)
+                enumerate_start = steps_to_skip_in_epoch
+            resume_rng_state = getattr(self, "_dense_resume_rng_state", None)
+            if dense_cursor is not None:
+                seed_dense_dataloader_for_epoch(
+                    epoch_dataloader,
+                    (int(args.seed) if args.seed is not None else 0) + epoch * 1009,
+                )
+            epoch_iterator = iter(epoch_dataloader)
+            if epoch == epoch_to_start and resume_rng_state is not None:
+                random.setstate(resume_rng_state["python"])
+                np.random.set_state(resume_rng_state["numpy"])
+                torch.set_rng_state(resume_rng_state["torch"])
+                if resume_rng_state["cuda"] is not None:
+                    torch.cuda.set_rng_state_all(resume_rng_state["cuda"])
+                self._dense_resume_rng_state = None
+            for step, batch in enumerate(epoch_iterator, start=enumerate_start):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
@@ -2231,6 +2330,10 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    if dense_cursor is not None:
+                        dense_cursor.global_step = global_step
+                        dense_cursor.epoch = epoch
+                        dense_cursor.step_in_epoch = step + 1
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -2281,6 +2384,9 @@ class NetworkTrainer:
                     break
 
             self.on_epoch_end(args, accelerator, network, transformer, epoch + 1)
+            if dense_cursor is not None and dense_cursor.step_in_epoch >= len(train_dataloader):
+                dense_cursor.epoch = epoch + 1
+                dense_cursor.step_in_epoch = 0
 
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}

@@ -587,7 +587,7 @@ def main() -> None:
         device=device,
         dtype=VIDEO_VAE_ENCODE_DTYPE,
         disable_numpy_memmap=args.disable_numpy_memmap,
-        load_decoder=False,  # caching never decodes; the ViT decoder is ~9 GB in fp32
+        load_decoder=False,  # latent caching only requires the encoder
     )
     logger.info("Loading MiniMax-H3 audio VAE from %s", args.audio_vae)
     audio_vae = load_audio_vae(args.audio_vae, device=device, dtype=torch.float32, disable_numpy_memmap=args.disable_numpy_memmap)

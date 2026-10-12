@@ -52,8 +52,8 @@ RESAMPLE_FPS_TOLERANCE: float = 1.5
 LATENT_NDIM: int = 4
 # Defensive dynamo recompile ceiling for the nabla flex_attention path.
 SPARSE_RECOMPILE_LIMIT: int = 256
-# Frames per interpolate call when downscaling the output (a 2K clip is
-# ~2.4 GB as uint8, so the resize walks the clip in chunks).
+# Frames per interpolate call when downscaling the output; chunking limits
+# the resize's peak memory residency.
 RESIZE_FRAME_CHUNK: int = 8
 # Delivery tiers for --target-resolution: (H, W) candidates per tier —
 # landscape 16:9, square, portrait 9:16; the closest-aspect entry wins.

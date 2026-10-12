@@ -188,10 +188,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         vae.eval()
         conditional_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
         # Sampling runs under the caller's accelerator.autocast() (see NetworkTrainer.sample_images), so
-        # it follows --mixed_precision exactly like training's call_dit(). This used to force autocast off
-        # to dodge a checkerboard, but the real cause was Ideogram4MRoPE losing precision under autocast;
-        # now that MRoPE pins its frequency matmul to fp32, autocast sampling is safe and we let the
-        # mixed-precision regime match between training and sampling.
+        # it follows --mixed_precision exactly like training's call_dit(). MRoPE keeps its
+        # frequency matmul in fp32 to preserve positional precision under autocast.
         images = ideogram4_utils.generate_images(
             conditional_transformer=conditional_transformer,
             unconditional_transformer=self.unconditional_transformer,

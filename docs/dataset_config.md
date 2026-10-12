@@ -509,7 +509,7 @@ fp_1f_no_post = false
 
 **Advanced Settings:**
 
-**Note that these parameters are still experimental, and the optimal values are not yet known.** The parameters may also change in the future.
+**These parameters are experimental.** Adjust their values for your dataset and model.
 
 `fp_1f_clean_indices` sets the `clean_indices` value passed to the FramePack model. You can specify multiple indices. `fp_1f_target_index` sets the index of the frame to be trained (generated). `fp_1f_no_post` sets whether to add a zero value as `clean_latent_post`, default is `false` (add zero value).
 
@@ -546,7 +546,7 @@ The 2x indices are `1 + fp1_latent_window_size + 1` for two indices (usually `11
 <details>
 <summary>日本語</summary>
 
-※ **以下のパラメータは研究中で最適値はまだ不明です。** またパラメータ自体も変更される可能性があります。
+※ **以下のパラメータは実験的なものです。** データセットとモデルに応じて値を調整してください。
 
 デフォルトの1フレーム学習を行う場合、`fp_1f_clean_indices`に`[0]`を、`fp_1f_target_index`に`9`（または5から15程度の値）を、`no_post`に`false`を設定してください。（記述例は英語版ドキュメントを参照、以降同じ。）
 

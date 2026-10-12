@@ -8,7 +8,9 @@ import torch
 
 from musubi_tuner.dataset.cache_io import save_latent_cache_kandinsky6
 from musubi_tuner.dataset.bucket import BucketSelector
+from musubi_tuner.kandinsky6 import dit as k6_dit
 from musubi_tuner.kandinsky6.dit import DiffusionTransformer3D
+from musubi_tuner.kandinsky6 import attention as k6_attention
 from musubi_tuner.kandinsky6_train_network import (
     Kandinsky6NetworkTrainer,
     build_ti2av_video_input,
@@ -98,6 +100,245 @@ def test_kandinsky6_parser_supplies_complete_base_trainer_precision_and_attentio
     assert args.disable_numpy_memmap is False
     args.dit_dtype = "bfloat16"
     Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_flash_attention_overrides_k6_sdpa_default(monkeypatch):
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", lambda q, k, v: q + k + v)
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args(["--flash_attn"])
+    args.dit_dtype = "bfloat16"
+
+    Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.flash_attn is True
+    assert args.sdpa is False
+
+
+def test_flash3_overrides_k6_sdpa_default(monkeypatch):
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", SimpleNamespace(flash_attn_func=lambda q, k, v: q))
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args(["--flash3"])
+    args.dit_dtype = "bfloat16"
+
+    Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.flash3 is True
+    assert args.sdpa is False
+
+
+def test_k6_rejects_simultaneous_flash_attention_versions():
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args(["--flash_attn", "--flash3"])
+    args.dit_dtype = "bfloat16"
+
+    with pytest.raises(ValueError, match="only one of --flash_attn and --flash3"):
+        Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_flash_attention_missing_dependency_fails_before_checkpoint_inspection(monkeypatch):
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", None)
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args(["--flash_attn"])
+    args.dit = "does-not-exist.safetensors"
+    args.dit_dtype = "bfloat16"
+
+    with pytest.raises(RuntimeError, match="optional flash-attn package"):
+        Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_flash3_missing_dependency_fails_before_checkpoint_inspection(monkeypatch):
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", None)
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args(["--flash3"])
+    args.dit = "does-not-exist.safetensors"
+    args.dit_dtype = "bfloat16"
+
+    with pytest.raises(RuntimeError, match="from flash_attn_3 import flash_attn_interface"):
+        Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_flash_attention_dispatch_preserves_output_shape_and_gradients(monkeypatch):
+    calls = []
+
+    def fake_flash(q, k, v):
+        calls.append((q.shape, k.shape, v.shape))
+        return q + k + v
+
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", fake_flash)
+    attention = k6_attention.SelfAttentionEngine("flash_attention_2").get_attention()
+    q = torch.randn(2, 5, 3, 8, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+
+    output = attention(q=q, k=k, v=v)
+    output.square().mean().backward()
+
+    assert output.shape == q.shape
+    assert calls == [(q.shape, k.shape, v.shape)]
+    assert all(tensor.grad is not None for tensor in (q, k, v))
+
+
+@pytest.mark.parametrize("engine", ["flash_attention_2", "flash_attention_3"])
+def test_flash_attention_casts_fp32_normalized_qk_to_bf16_value_dtype(monkeypatch, engine):
+    calls = []
+
+    def fake_flash(q, k, v):
+        calls.append((q.dtype, k.dtype, v.dtype))
+        return q + k + v
+
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", fake_flash)
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", SimpleNamespace(flash_attn_func=fake_flash))
+    attention = k6_attention.SelfAttentionEngine(engine).get_attention()
+    q = torch.randn(2, 5, 3, 8, dtype=torch.float32, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn(2, 5, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+
+    output = attention(q=q, k=k, v=v)
+    output.float().square().mean().backward()
+
+    assert output.dtype == torch.bfloat16
+    assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16)]
+    assert q.grad is not None and q.grad.dtype == torch.float32
+    assert k.grad is not None and k.grad.dtype == torch.float32
+    assert v.grad is not None and v.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("engine", ["flash_attention_2", "flash_attention_3"])
+def test_flash_attention_does_not_downcast_fp32_values(monkeypatch, engine):
+    calls = []
+
+    def fake_flash(q, k, v):
+        calls.append((q.dtype, k.dtype, v.dtype))
+        return q + k + v
+
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", fake_flash)
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", SimpleNamespace(flash_attn_func=fake_flash))
+    attention = k6_attention.SelfAttentionEngine(engine).get_attention()
+    q = torch.randn(2, 5, 3, 8)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    attention(q=q, k=k, v=v)
+
+    assert calls == [(torch.float32, torch.float32, torch.float32)]
+
+
+@pytest.mark.parametrize("tuple_result", [False, True])
+def test_flash3_dispatch_normalizes_output_and_preserves_gradients(monkeypatch, tuple_result):
+    calls = []
+
+    def fake_flash(q, k, v):
+        calls.append((q.shape, k.shape, v.shape))
+        output = q + k + v
+        return (output, torch.zeros(1)) if tuple_result else output
+
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", SimpleNamespace(flash_attn_func=fake_flash))
+    attention = k6_attention.SelfAttentionEngine("flash_attention_3").get_attention()
+    q = torch.randn(2, 5, 3, 8, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+
+    output = attention(q=q, k=k, v=v)
+    output.square().mean().backward()
+
+    assert output.shape == q.shape
+    assert calls == [(q.shape, k.shape, v.shape)]
+    assert all(tensor.grad is not None for tensor in (q, k, v))
+
+
+@pytest.mark.parametrize("attn_mode,expected_engine", [("flash", "flash_attention_2"), ("flash3", "flash_attention_3")])
+@pytest.mark.parametrize(
+    "quantization,loader_name",
+    [(None, "load_dit"), ("convrot_int8", "load_dit_convrot_int8"), ("fp8_base", "load_dit_fp8")],
+)
+def test_flash_attention_engine_reaches_every_k6_loader(monkeypatch, quantization, loader_name, attn_mode, expected_engine):
+    seen = {}
+
+    def fake_loader(*args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(is_multimodal=True)
+
+    monkeypatch.setattr(f"musubi_tuner.kandinsky6_train_network.{loader_name}", fake_loader)
+    args = SimpleNamespace(
+        task="t2av",
+        convrot_int8=quantization == "convrot_int8",
+        convrot_int8_bwd="bf16",
+        fp8_base=quantization == "fp8_base",
+        model_variant="pro",
+        disable_numpy_memmap=False,
+    )
+    accelerator = SimpleNamespace(device=torch.device("cpu"))
+
+    transformer = Kandinsky6NetworkTrainer().load_transformer(
+        accelerator, args, "checkpoint.safetensors", attn_mode, False, "cpu", torch.bfloat16
+    )
+
+    assert transformer.is_multimodal
+    assert seen["attention_engine"] == expected_engine
+
+
+@pytest.mark.parametrize("engine", ["flash_attention_2", "flash_attention_3"])
+def test_masked_cross_attention_keeps_sdpa_fallback_with_flash_engine(monkeypatch, engine):
+    calls = []
+
+    def fake_flash(q, k, v):
+        raise AssertionError("masked attention must not call FlashAttention")
+
+    def fake_sdpa(q, k, v, attn_mask=None):
+        calls.append(attn_mask)
+        return q
+
+    monkeypatch.setattr(k6_attention, "_flash_attention_2", fake_flash)
+    monkeypatch.setattr(k6_attention, "_flash_attention_3_interface", SimpleNamespace(flash_attn_func=fake_flash))
+    monkeypatch.setattr(k6_dit, "_sdpa", fake_sdpa)
+    module = k6_dit.MultiheadCrossAttention(q_dim=8, head_dim=4, engine=engine)
+    mask = torch.ones(2, 1, 3, 4, dtype=torch.bool)
+
+    output = module(torch.randn(2, 3, 8), torch.randn(2, 4, 8), attn_mask=mask)
+
+    assert output.shape == (2, 3, 8)
+    assert calls == [mask]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or k6_attention._flash_attention_2 is None,
+    reason="requires CUDA and the optional flash-attn package",
+)
+def test_flash_attention_cuda_matches_sdpa_outputs_and_gradients():
+    q = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 77, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    q_sdpa, k_sdpa, v_sdpa = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    flash_output = k6_attention.SelfAttentionEngine("flash_attention_2").get_attention()(q=q, k=k, v=v)
+    sdpa_output = k6_attention._sdpa(q_sdpa, k_sdpa, v_sdpa)
+    output_grad = torch.randn_like(flash_output)
+
+    flash_output.backward(output_grad)
+    sdpa_output.backward(output_grad)
+
+    assert flash_output.shape == sdpa_output.shape == q.shape
+    assert torch.allclose(flash_output, sdpa_output, rtol=0.04, atol=0.04)
+    for flash_tensor, sdpa_tensor in zip((q, k, v), (q_sdpa, k_sdpa, v_sdpa)):
+        assert flash_tensor.grad is not None and torch.isfinite(flash_tensor.grad).all()
+        assert torch.allclose(flash_tensor.grad, sdpa_tensor.grad, rtol=0.08, atol=0.08)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or k6_attention._flash_attention_3_interface is None or torch.cuda.get_device_capability()[0] < 9,
+    reason="requires a Hopper GPU and the optional FlashAttention 3 package",
+)
+def test_flash3_cuda_matches_sdpa_outputs_and_gradients():
+    q = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 77, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    q_sdpa, k_sdpa, v_sdpa = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    flash_output = k6_attention.SelfAttentionEngine("flash_attention_3").get_attention()(q=q, k=k, v=v)
+    sdpa_output = k6_attention._sdpa(q_sdpa, k_sdpa, v_sdpa)
+    output_grad = torch.randn_like(flash_output)
+
+    flash_output.backward(output_grad)
+    sdpa_output.backward(output_grad)
+
+    assert flash_output.shape == sdpa_output.shape == q.shape
+    assert torch.allclose(flash_output, sdpa_output, rtol=0.04, atol=0.04)
+    for flash_tensor, sdpa_tensor in zip((q, k, v), (q_sdpa, k_sdpa, v_sdpa)):
+        assert flash_tensor.grad is not None and torch.isfinite(flash_tensor.grad).all()
+        assert torch.allclose(flash_tensor.grad, sdpa_tensor.grad, rtol=0.08, atol=0.08)
 
 
 def test_kandinsky6_parser_enables_independent_time_by_default_and_can_disable_it():

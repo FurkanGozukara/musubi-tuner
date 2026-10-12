@@ -35,8 +35,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# We use simple if-else approach to support multiple architectures.
-# Maybe we can use a plugin system in the future.
+# Architecture-specific branches define each cache format.
 
 # the keys of the dict are `<content_type>_FxHxW_<dtype>` for latents
 # and `<content_type>_<dtype|mask>` for other tensors
@@ -623,8 +622,13 @@ def save_latent_cache_kandinsky6(
     audio_present: bool,
     image_latent: Optional[torch.Tensor] = None,
     metadata: Optional[dict[str, str]] = None,
+    reference_latents: Optional[torch.Tensor] = None,
 ):
-    """Save a Kandinsky 6 joint AV target in channel-first cache layout."""
+    """Save a Kandinsky 6 joint AV target in channel-first cache layout.
+
+    `reference_latents` ([N,C,H,W], R2AV) are stored under a `varlen_` key so the collator yields
+    `batch["latents_refs"]` as a per-item list instead of stacking records with different N.
+    """
     if video_latent.ndim != 4:
         raise ValueError(f"Kandinsky 6 video latent must be [C,T,H,W], got {tuple(video_latent.shape)}")
     if audio_latent.ndim != 2:
@@ -639,6 +643,17 @@ def save_latent_cache_kandinsky6(
         if image_latent.ndim != 4 or image_latent.shape[0] != c or image_latent.shape[1] != 1:
             raise ValueError("Kandinsky 6 image latent must be [C,1,H,W] and match the video channels")
         sd[f"latents_image_1x{height}x{width}_{dtype_to_str(image_latent.dtype)}"] = image_latent
+    if reference_latents is not None:
+        if (
+            reference_latents.ndim != 4
+            or reference_latents.shape[0] < 1
+            or tuple(reference_latents.shape[1:]) != (c, height, width)
+        ):
+            raise ValueError(
+                f"Kandinsky 6 reference latents must be [N,{c},{height},{width}], got {tuple(reference_latents.shape)}"
+            )
+        count = reference_latents.shape[0]
+        sd[f"varlen_latents_refs_{count}x{height}x{width}_{dtype_to_str(reference_latents.dtype)}"] = reference_latents
     sd = {key: value.detach().cpu().contiguous() for key, value in sd.items()}
     append_audio_present_entry(sd, audio_present)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KANDINSKY6_FULL, metadata)

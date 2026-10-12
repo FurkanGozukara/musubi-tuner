@@ -196,7 +196,7 @@ def export_module(
     *,
     dynamic_shapes: Any | None = None,
 ) -> ExportedProgram:
-    """``torch.export`` a module; skip Dynamo weight clones (OOM on large DiT)."""
+    """``torch.export`` a module without cloning its weights."""
     import torch._dynamo.utils as _dyn_utils
     import torch._dynamo.variables.builder as _builder
 
@@ -249,14 +249,13 @@ def export_visual_block(
         block = block.to(device)
         args = _to_device(args, device)
 
-    # Static shapes only (K5 pad-to-max). Dynamic text_len was dropped.
+    # Static shapes only (K5 pad-to-max).
     return export_module(block, args=args)
 
 
 def _configure_aoti_compile_parallelism() -> int:
-    """Size Inductor compile workers for fat CPU nodes.
+    """Size Inductor compile workers for the available CPU capacity.
 
-    PyTorch defaults to ``min(32, ncpu)`` — leaves most of a 96-core box idle.
     Use half the usable CPUs (cap 64); pin BLAS/OMP to 1 per worker so the pool
     does not oversubscribe. Honors an existing ``TORCHINDUCTOR_COMPILE_THREADS``.
     """
@@ -412,6 +411,7 @@ def bind_aoti_to_visual_blocks(
     logger.info("bound AOTI to %d visual_transformer_blocks from %s", len(blocks), package_path)
     return dit
 
+    # Backward-compatible function alias.
 
-# Backward-compat alias used by older notes / scripts.
+
 bind_aoti_to_dit = bind_aoti_to_visual_blocks

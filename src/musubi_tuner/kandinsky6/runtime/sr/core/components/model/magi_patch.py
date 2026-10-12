@@ -156,11 +156,8 @@ def patch_magi_mark_static_shapes(*, mark_owner: bool = False):
         for arg_val in bound.arguments.values():
             traverse_and_mark(arg_val)
 
-        # Recommended: skip owner traversal.
-        #
-        # Your errors happen because Magi recursively walks `owner`,
-        # i.e. the module / pipeline object graph, and reaches unrelated objects
-        # such as urllib3 containers.
+        # Owner traversal includes the module / pipeline object graph and can
+        # reach unrelated objects such as urllib3 containers.
         if mark_owner and owner is not None:
             traverse_and_mark(owner)
 

@@ -992,9 +992,7 @@ def _recording_randn(monkeypatch) -> list[torch.Tensor]:
 
 
 def test_condition_noise_is_drawn_from_the_global_rng_per_condition_and_step(monkeypatch):
-    # per-role condition seeds (visuals from seed, audio from seed + 1) made one item's audio noise
-    # the next item's visual noise; training now draws from the global RNG like the target noise,
-    # so every condition tensor and every step gets its own independent draw
+    # Global-RNG draws give each condition tensor and training step independent noise.
     trainer = MiniMaxH3NetworkTrainer()
     args = _trainer_args(task="ref2va", h3_visual_cond_clean=0.5, h3_audio_cond_clean=0.5)
     trainer.handle_model_specific_args(args)
@@ -2124,7 +2122,7 @@ def test_guidance_loss_uncond_layout_carries_the_one_frame_overrides(tmp_path, m
 
 def test_guidance_loss_uncond_layout_carries_one_frame_fl_condition_roles(tmp_path, monkeypatch):
     # a K=1 one-frame FL2VA layout cannot be rebuilt without explicit condition roles, so the
-    # uncond probe must recover them from the segments (the PR-A layout-rebuild lesson)
+    # uncond probe must recover them from the segments
     trainer = MiniMaxH3NetworkTrainer()
     args = _trainer_args(
         task="fl2va",
@@ -2573,8 +2571,7 @@ def test_compute_loss_keeps_full_dc_and_applies_the_preservation_weight_on_ancho
 
 
 def test_compute_loss_keeps_the_full_magnitude_term_on_anchor_steps():
-    # regression for a one-frame teacher-matching A/B finding: an ungated magnitude down-weight
-    # also weakened the anchor's norm-restoring pull and worsened de-amplification at high sigma
+    # Anchor steps retain the full magnitude contribution to preserve norm restoration.
     trainer = MiniMaxH3NetworkTrainer()
     args = _trainer_args(h3_teacher_matching=True, h3_teacher_loss_mag_weight=0.0)
 
@@ -2591,7 +2588,7 @@ def test_compute_loss_keeps_the_full_magnitude_term_on_anchor_steps():
 def test_preservation_density_compensation_restores_the_anchor_share_under_focus():
     from musubi_tuner.minimax_h3_train_network import _preservation_density_compensation
 
-    # run3 coordinates: anchor width 0.25, focus band [0.4,0.8) at prob 0.5 leaves the anchor 0.1875
+    # Anchor width 0.25, focus band [0.4,0.8) at prob 0.5 leaves the anchor 0.1875.
     assert _preservation_density_compensation(0.75, 0.4, 0.8, 0.5) == pytest.approx(0.25 / 0.1875)
     assert _preservation_density_compensation(0.75, 0.4, 0.8, 0.0) == 1.0  # focus off = no correction
     assert _preservation_density_compensation(1.0, 0.4, 0.8, 0.5) == 1.0  # no anchor band
@@ -3089,8 +3086,7 @@ def test_teacher_matching_metadata_is_recorded_only_when_active():
 
 
 def test_lora_set_enabled_bypasses_training_modules():
-    # regression guard for the teacher-matching smoke bug: only LoRAInfModule honored
-    # `enabled`, so set_enabled(False) silently kept the LoRA active in training forwards
+    # set_enabled(False) must disable LoRA updates during teacher forwards.
     model = _tiny_model(num_layers=1)
     network = lora_minimax_h3.create_arch_network(1.0, 2, 2.0, None, None, model)
     network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)

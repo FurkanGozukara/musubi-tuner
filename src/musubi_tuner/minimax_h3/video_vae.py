@@ -29,8 +29,8 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 VIDEO_VAE_ENCODE_DTYPE = torch.float32
 VIDEO_VAE_DECODE_DTYPE = torch.float16
-# State-dict prefixes of the ViT decoder, which encode-only users (latent caching) leave unloaded:
-# the decoder holds ~2.4B of the VAE's ~2.6B parameters.
+# State-dict prefixes of the ViT decoder, left unloaded for encode-only latent caching
+# to keep the weight footprint low.
 VIDEO_VAE_DECODER_KEY_PREFIXES = ("decoder.", "post_quant_conv.")
 
 LATENTS_MEAN = [

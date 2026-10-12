@@ -629,12 +629,9 @@ def normalize_teacher_conditions(value: str) -> str:
 
 # The subject-reference teacher caption wrap: the official full-reference declaration blocks
 # that make the base read each picture as a *subject* (identity/appearance) reference rather
-# than a frame of the target. Modeled on the presentation that extracted a character's
-# identity on the released FL2VA weights (probe A, 2026-09-02) with the appearance clauses
-# removed, so it is content-independent boilerplate around the user caption like the
-# ref-teacher wrap; `attribute_transfer` is the empirically validated marker and the
-# "pose, framing, outfit and setting follow the description" clause is what keeps the
-# picture from acting as a copy source.
+# than a frame of the target. Content-independent boilerplate wraps the user caption;
+# `attribute_transfer` selects appearance transfer, while the pose, framing, outfit and
+# setting follow the description so the picture is not a copy source.
 SUBJECT_REF_SUMMARY_IMAGE = "The target is a single still image with no motion, a static shot of {subjects} as described below."
 SUBJECT_REF_SUMMARY_VIDEO = "The target video shows {subjects} as described below."
 
@@ -668,9 +665,8 @@ def wrap_subject_reference_caption(caption: str, image_count: int, *, still_imag
 # The ref-teacher caption wrap: the official editing-prompt declaration blocks that make the
 # base model treat the reference as a 1:1 copy source. subject_definitions / summary /
 # retention_analysis are content-independent boilerplate, so the cache script wraps the user
-# caption automatically, like the FL2VA Picture prefix. Probe-validated on the released FL2VA
-# weights: the video copy semantics saturate even without any declaration, but the
-# `<Audio 1>: fully_copy` declaration is what opens audio education across the teaching band.
+# caption automatically, like the FL2VA Picture prefix. The `<Audio 1>: fully_copy`
+# declaration makes the synchronized reference audio a copy source for teacher matching.
 REF_TEACHER_CAPTION_HEADER = """subject_definitions:
 <Video 1> is the source video for the target video edit.
 <Audio 1> is the synchronized audio track of <Video 1> and is reused in the target video.

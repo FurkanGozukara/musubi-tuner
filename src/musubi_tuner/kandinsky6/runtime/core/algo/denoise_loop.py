@@ -103,7 +103,7 @@ def _raw_dit(dit: nn.Module) -> nn.Module:
 
 
 def _rebuild_text_rope(dit: nn.Module, template: Tensor | list[Tensor]) -> Tensor | list[Tensor]:
-    """Recompute 1-D text RoPE(s) matching template length(s) — A/B vs cached tensors."""
+    """Recompute 1-D text RoPE(s) matching template length(s)."""
     raw = _raw_dit(dit)
     if isinstance(template, list):
         if getattr(raw, "is_multimodal", False):
@@ -144,8 +144,7 @@ def denoise_loop(
     """Single-device Euler denoising loop for T2V and T2VA.
 
     RoPE tensors are normally precomputed by the caller (pipeline). Set
-    ``recompute_ropes_each_step=True`` to rebuild them every DiT forward (A/B
-    vs pipeline cache; not for production).
+    ``recompute_ropes_each_step=True`` to rebuild them every DiT forward.
     """
     video = bundle.video  # (sum_T, H, W, C) or (sum_T, H, W, C+extra) for instruct
     audio = bundle.audio  # (sum_A, audio_dim) or None

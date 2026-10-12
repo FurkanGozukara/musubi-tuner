@@ -125,7 +125,7 @@ class MultiScaleModelConfig(_BaseModelConfig):
         enable_x2_entry: Build the ``mid_input_proj`` submodule and allow
             ``forward(entry="x2")`` — a second entry that injects an already-2x LQ
             latent after ``mid_blocks`` for a single 2x upscale through the shared
-            second stage (LAY-462). Off by default so the x4 module set and its
+            second stage. Off by default so the x4 module set and its
             checkpoints stay unchanged.
         x2_adapter_blocks: Number of x2-only residual blocks before the second stage.
         x2_tail_mode: Amount of scale-specific capacity in the second stage;
@@ -258,7 +258,7 @@ class MultiScaleModelConfig(_BaseModelConfig):
             msg = "motion_attention requires dims=3"
             raise ValueError(msg)
         if self.enable_x2_entry:
-            msg = "motion_attention Round 23 is x4-only and cannot enable the x2 entry"
+            msg = "motion_attention is x4-only and cannot enable the x2 entry"
             raise ValueError(msg)
         if motion.after_mid_blocks[-1] > self.num_mid_blocks:
             msg = "motion after_mid_blocks must not exceed num_mid_blocks"

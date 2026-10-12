@@ -987,7 +987,7 @@ class VideoDataset(BaseDataset):
                 result = op()
 
                 decoded_audio = None
-                if len(result) == 3:  # for backward compatibility TODO remove this in the future
+                if len(result) == 3:  # Preserve compatibility with existing cache files
                     video_key, video, caption = result
                     control = None
                 elif len(result) == 4:

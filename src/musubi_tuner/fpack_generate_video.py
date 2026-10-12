@@ -496,7 +496,7 @@ def load_dit_model(args: argparse.Namespace, device: torch.device) -> HunyuanVid
     if args.lycoris:
         # merge LoRA weights statically
         if args.lora_weight is not None and len(args.lora_weight) > 0:
-            # ugly hack to common merge_lora_weights function
+            # Adapt the model interface for the shared merge_lora_weights function
             merge_lora_weights(
                 lora_framepack,
                 model,
@@ -1301,7 +1301,7 @@ def generate(
         else:
             start_latent = context_img[0]["start_latent"]
             history_latents = torch.cat([history_latents, start_latent], dim=2)
-            total_generated_latent_frames = 1  # a bit hacky, but we employ the same logic as in official code
+            total_generated_latent_frames = 1  # Use the official indexing convention
             latent_paddings = [0] * total_latent_sections  # dummy paddings for F1 mode
 
         latent_paddings = list(latent_paddings)  # make sure it's a list

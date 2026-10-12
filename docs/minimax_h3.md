@@ -118,7 +118,7 @@ The released H3 checkpoints are CFG-distilled: they predict in an amplified "gui
 | Guidance loss | Re-anchors the flow target in the guided space using the model's own no-grad unconditional prediction. | text cache: `--uncond_output uncond.safetensors`; training: `--h3_guidance_loss_scale 4.0 --h3_guidance_loss_sigma_min 0.15 --h3_guidance_loss_uncond_cache uncond.safetensors` | +1 no-grad forward on ~85% of steps | any base, including INT8; not with teacher matching |
 | Teacher matching | Trains a text-only student against the frozen base's prediction under privileged conditions (the clip's endpoints, the clip itself, or other pictures of the subject). | `--h3_teacher_matching --h3_teacher_conditions first,last` / `ref` / `subject_ref` plus the per-teacher settings in [Training](#training--学習) | +1 no-grad forward per step | student is always `--task t2va`; image targets: `subject_ref` only; not with the guidance loss |
 
-Choosing between them: the adapter is the cheapest (no extra forward) and the least to configure; the guidance loss costs about 1.5x per step but needs no third-party file and works on a pre-quantized INT8 base; teacher matching is the recipe for identity training when the appearance is kept out of the captions (the teacher sees it, the student has to learn it). `--base_weights` also has ordinary uses (a style LoRA under a character LoRA), so combining it with the other two only logs a warning: the adapter authors advise against the guidance loss on top of it, and under teacher matching the merged base becomes the teacher.
+Choosing between them: the adapter is the cheapest (no extra forward) and the least to configure; the guidance loss adds an unconditional forward but needs no third-party file and works on a pre-quantized INT8 base; teacher matching is the recipe for identity training when the appearance is kept out of the captions (the teacher sees it, the student has to learn it). `--base_weights` also has ordinary uses (a style LoRA under a character LoRA), so combining it with the other two only logs a warning: the adapter authors advise against the guidance loss on top of it, and under teacher matching the merged base becomes the teacher.
 
 <details>
 <summary>日本語</summary>
@@ -148,7 +148,7 @@ Choosing between them: the adapter is the cheapest (no extra forward) and the le
 | Image: editing / inbetween | image + timed controls (`fp_1f_clean_indices`, `fp_1f_target_index`) | FL2VA | `--task fl2va --one_frame` | `--task fl2va --one_frame` | `--task fl2va --one_frame --video_only` | Adapter or GL |
 | Image: reference-conditioned at inference | image + untimed references | Ref2VA (FL2VA also works) | `--task ref2va --one_frame` | `--task ref2va --one_frame` | `--task ref2va --one_frame --video_only` | Adapter or GL |
 
-Use the same `--task` for latent caching, text caching, and training unless the row says otherwise (the teacher-matching rows deliberately cache with a richer task than the student trains with). The image rows are described in detail in `docs/minimax_h3_1f.md`, including how the time indices and the timed-versus-untimed control distinction work. Mixed image+video training in one run is expected to work but is untested.
+Use the same `--task` for latent caching, text caching, and training unless the row says otherwise (the teacher-matching rows deliberately cache with a richer task than the student trains with). The image rows are described in detail in `docs/minimax_h3_1f.md`, including how the time indices and the timed-versus-untimed control distinction work. Compatibility of mixed image+video training in one run is not guaranteed.
 
 <details>
 <summary>日本語</summary>
@@ -164,7 +164,7 @@ Table B の列は、目的 / データセットの形 / base / latent キャッ�
 7. 画像: 編集・中割り（adapter または GL）
 8. 画像: 推論時に参照画像で条件付け（adapter または GL）
 
-行に別の指定がない限り、latent キャッシュ・テキストキャッシュ・学習で同じ `--task` を使ってください（teacher matching の行は、teacher に与える条件も含めてキャッシュするため、student の学習タスクより情報の多いタスクで意図的にキャッシュします）。画像の行の詳細（時間インデックス、時間付き control と時間なし参照の違い）は `docs/minimax_h3_1f.md` にあります。画像と動画を 1 回の学習で混ぜることは動作する見込みですが未検証です。
+行に別の指定がない限り、latent キャッシュ・テキストキャッシュ・学習で同じ `--task` を使ってください（teacher matching の行は、teacher に与える条件も含めてキャッシュするため、student の学習タスクより情報の多いタスクで意図的にキャッシュします）。画像の行の詳細（時間インデックス、時間付き control と時間なし参照の違い）は `docs/minimax_h3_1f.md` にあります。画像と動画を1回の学習で混ぜる場合の互換性は保証されません。
 
 </details>
 
@@ -502,12 +502,12 @@ All options combine with each other and with every recipe. Sizes are transformer
 
 | Option | Effect | Notes |
 | --- | --- | --- |
-| Pruned transformer (`*_pruned_*` files, or `--prune_adaln` on a full BF16 file) | ~66 → ~40 GB BF16, ~34 → ~21 GB INT8; each swapped block ~40% smaller, block-swap steps faster by the same fraction | detected automatically; `--prune_adaln` prunes at load time with slightly better reconstruction than the published files and combines with `--convrot_int8` |
-| ConvRot INT8 transformer (`*_int8_convrot` files, or `--convrot_int8` on a BF16 file) | ~66 → ~34 GB; block-swap step time roughly halved (transfer-bound) | bit-identical to the published INT8 files; `--base_weights` needs the BF16 file + `--convrot_int8`; requires triton for the fused kernels (`triton-windows` on Windows), otherwise a slower dequantizing fallback with the same memory saving |
+| Pruned transformer (`*_pruned_*` files, or `--prune_adaln` on a full BF16 file) | Reduces AdaLN weight storage and block-swap transfers | detected automatically; `--prune_adaln` prunes at load time and combines with `--convrot_int8` |
+| ConvRot INT8 transformer (`*_int8_convrot` files, or `--convrot_int8` on a BF16 file) | Reduces base-weight storage and block-swap transfers | bit-identical to the published INT8 files; `--base_weights` needs the BF16 file + `--convrot_int8`; requires triton for the fused kernels (`triton-windows` on Windows), otherwise a slower dequantizing fallback with the same memory saving |
 | `--blocks_to_swap N` (up to 48 of 50) | streams N blocks from CPU | `--gradient_checkpointing` recommended |
 | `--block_swap_h2d_only` | faster block swap for frozen-base LoRA training (no device-to-host copies) | requires `--gradient_checkpointing`; see `docs/block_swap.md` |
-| ConvRot INT8 text encoder | text encoder ~48 → ~25 GB | wherever `--text_encoder` is accepted |
-| NVFP4+AWQ text encoder | text encoder ~48 → ~15 GB | inference-only artifact (the text encoder is always frozen); `--nvfp4_scaled_mm` opts into faster W4A4 matmuls on Blackwell GPUs with PyTorch 2.10+ |
+| ConvRot INT8 text encoder | Reduces text-encoder weight storage | wherever `--text_encoder` is accepted |
+| NVFP4+AWQ text encoder | Reduces text-encoder weight storage | inference-only artifact (the text encoder is always frozen); `--nvfp4_scaled_mm` opts into faster W4A4 matmuls on Blackwell GPUs with PyTorch 2.10+ |
 | `--text_encoder_blocks_to_swap N` (up to 50) | streams N of the 50 Qwen3-VL layers from CPU; at 50 only embedding, vision tower, norms, and two one-layer buffers stay resident | requires CUDA; combines with the quantized encoders; add `--text_encoder_attn_mode flash_attention_2` for long Ref2VA presentations, where SDPA can fall back to an O(L^2) FP32 kernel |
 | `--compile` (training and generation) | torch.compile on the 50 DiT blocks | with block swap or an INT8 base the Linears stay eager; each new latent shape recompiles (`--compile_dynamic true` for varying shapes) |
 

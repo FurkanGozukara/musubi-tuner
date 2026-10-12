@@ -1389,8 +1389,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         (de-distillation drift). Instead the target is rebuilt as
         ``u + scale*(v - u)`` where ``u`` is the model's own prediction under the uncond
         probe -- the true velocity slots into the CFG identity where the conditional
-        prediction would go. The probe (a single space by default) was screened against
-        the released checkpoint: see docs/minimax_h3.md.
+        prediction would go. The default probe is a single space; see docs/minimax_h3.md.
 
         The uncond forward is no_grad but keeps the LoRA active, matching how the
         adapted model will be run at inference; only the text condition is swapped, all
@@ -1676,10 +1675,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # steps the DC penalty is exactly what pulls palette drift back to the base
             if attenuate_dc and conditioned and dc_weight != 1.0:
                 pred = _dc_attenuated_prediction(pred, target, dc_weight)
-            # the magnitude down-weight is likewise education-only: on anchor steps the
-            # magnitude term is what pulls learned de-amplification back to the base norm
-            # (measured on a one-frame TM A/B: ungated mag 0.25 sank the anchor norm ratio)
-            return _decomposed_flow_loss(pred, target, mag_weight if conditioned else 1.0, 1.0)
+                # the magnitude down-weight is likewise education-only: on anchor steps the
+                # magnitude term is what pulls learned de-amplification back to the base norm
+                return _decomposed_flow_loss(pred, target, mag_weight if conditioned else 1.0, 1.0)
 
         # the DC attenuation targets the video palette axis; the audio anchor keeps its full DC
         video_loss = flow_loss(output.pred.to(network_dtype), output.target.to(network_dtype), attenuate_dc=True)
@@ -1894,7 +1892,7 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         action="store_true",
         help="prune the AdaLN projections of a full BF16 DiT at load time (mean-centered rank-8 basis of the "
         "time-embedding curve, computed on the fly; the time embedder is retained, so timesteps stay exact and "
-        "continuous). Cuts the AdaLN weights from ~26 GB to a few MB with near-identical outputs. Published pruned "
+        "continuous). Uses compact AdaLN weights while preserving the timestep interface. Published pruned "
         "checkpoints are already pruned and do not need this flag; pre-quantized ConvRot INT8 checkpoints are "
         "rejected. Combines with --convrot_int8 to reproduce the published pruned INT8 scope from a full BF16 file.",
     )

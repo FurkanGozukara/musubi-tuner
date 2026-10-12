@@ -385,9 +385,8 @@ def split_lu_bank_by_scales(conf: Any, eager_scales: tuple[str, ...] | None) -> 
     ``eager_scales`` is the configured ``lu_load_scales``: entries whose ``target_scale``
     is listed load at startup; every other entry becomes a single-entry conf
     that :class:`LazyLatentUpscalerBank` materializes on the first run at that
-    scale. An x2-only host thus never spends memory on the 1.45B-param x4
-    cascade, yet an unexpected x4 run still works — it just pays the load on
-    first use instead of at startup.
+    scale. An x2-only host avoids keeping the x4 cascade resident; an x4 run
+    loads it on first use instead of at startup.
 
     Args:
         conf: Loaded bank conf (``_load_lu_bank_conf`` result, not ``None``).

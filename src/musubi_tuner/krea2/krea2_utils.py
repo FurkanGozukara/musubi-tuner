@@ -131,8 +131,8 @@ def load_krea2_dit(
                 sd[key] = sd[key].to(loading_device)
         dit.load_state_dict(sd, strict=True, assign=True)
     else:
-        # Load without mmap (disable_mmap=True) to avoid the official load_file's transient ~2x
-        # RAM (mmap page cache + materialized tensor), file locking, and lazy disk reads. Load
+        # Load without mmap (disable_mmap=True) to limit peak memory use, file locking,
+        # and lazy disk reads. Load
         # directly to the target device+dtype (assign=True) so the loaded tensors become the params.
         sd = load_safetensors(dit_path, device=loading_device, disable_mmap=True, dtype=dtype)
         dit.load_state_dict(sd, strict=True, assign=True)
@@ -157,15 +157,15 @@ def load_krea2_dit_state_dict(
     the live model's ``named_parameters()`` + ``named_buffers()``. The result is moved to
     ``result_device``.
 
-    When ``result_device`` equals ``calc_device`` (e.g. both the GPU, used by the M2 turbo/raw
-    swap), the dict is built straight on that device with no full intermediate CPU dict — the
-    CPU peak stays at ~1 tensor. When ``result_device`` is CPU (e.g. the M1 resident stash),
+    When ``result_device`` equals ``calc_device`` (e.g. both the GPU during Turbo/RAW
+    streaming), tensors load directly to that device without a full intermediate CPU dict.
+    When ``result_device`` is CPU (e.g. the resident weight stash),
     the fp8 path quantizes on ``calc_device`` and then lands the dict on CPU.
     """
     calc_dev = torch.device(calc_device)
     rd = torch.device(result_device)
     # Keep the fp8-quantized tensors on calc_device when that is also the result device, so the
-    # dict never round-trips through a full CPU copy (the M2 GPU-direct swap path).
+    # dict never round-trips through a full CPU copy (GPU-direct streaming).
     move_to_device = calc_dev == rd
 
     if fp8_scaled:
@@ -181,8 +181,8 @@ def load_krea2_dit_state_dict(
             exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS,
         )
     else:
-        # Load without mmap (disable_mmap=True) to avoid the official load_file's transient ~2x
-        # RAM, file locking, and lazy disk reads. Load directly to result_device in bf16.
+        # Load without mmap (disable_mmap=True) to limit peak memory use, file locking,
+        # and lazy disk reads. Load directly to result_device in bf16.
         sd = load_safetensors(dit_path, device=result_device, disable_mmap=True, dtype=torch.bfloat16)
 
     sd = {k: v.to(rd) for k, v in sd.items()}
