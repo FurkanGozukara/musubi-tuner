@@ -10,6 +10,7 @@ path; model-backed rewards may require their optional runtime libraries and chec
 """
 
 import argparse
+from musubi_tuner.utils.arg_utils import parse_literal_args, parse_text_args
 import os
 import sys
 
@@ -85,9 +86,7 @@ class LTX2RolloutCacher:
 
         network_module = importlib.import_module(args.network_module)
         net_kwargs = {}
-        for net_arg in args.network_args or []:
-            key, val = net_arg.split("=")
-            net_kwargs[key] = val
+        net_kwargs.update(parse_text_args(args.network_args))
         if getattr(args, "lora_target_preset", None) is not None:
             net_kwargs.setdefault("lora_target_preset", args.lora_target_preset)
         network = network_module.create_arch_network(

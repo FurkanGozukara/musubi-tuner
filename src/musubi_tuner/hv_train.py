@@ -1,4 +1,5 @@
 import ast
+from musubi_tuner.utils.arg_utils import parse_literal_args, parse_text_args
 import asyncio
 from datetime import timedelta
 import gc
@@ -388,10 +389,7 @@ class FineTuningTrainer:
         # split optimizer_type and optimizer_args
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
-            for arg in args.optimizer_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                optimizer_kwargs[key] = value
+            optimizer_kwargs.update(parse_literal_args(args.optimizer_args, "--optimizer_args"))
 
         lr = args.learning_rate
         optimizer = None
@@ -529,10 +527,7 @@ class FineTuningTrainer:
 
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
-            for arg in args.lr_scheduler_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                lr_scheduler_kwargs[key] = value
+            lr_scheduler_kwargs.update(parse_literal_args(args.lr_scheduler_args, "--lr_scheduler_args"))
 
         def wrap_check_needless_num_warmup_steps(return_vals):
             if num_warmup_steps is not None and num_warmup_steps != 0:
@@ -1427,7 +1422,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3, AutomagicEXPERIMENT. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(

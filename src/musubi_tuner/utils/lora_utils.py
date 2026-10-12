@@ -25,17 +25,21 @@ from musubi_tuner.utils.safetensors_utils import (
 
 
 def detect_network_type(lora_sd: Dict[str, torch.Tensor]) -> str:
-    """Detect network type (lora, dora_oft, loha, lokr, dokr) from state dict keys."""
+    """Detect network type (lora, dora, dora_oft, loha, lokr, dokr) from state dict keys."""
     has_lokr = any("lokr_w1" in key for key in lora_sd)
     has_dora_magnitude = any("lora_magnitude_vector" in key for key in lora_sd)
     has_oft = any(".oft_R.weight" in key for key in lora_sd)
-    has_dora_oft = any(".dora_scale" in key for key in lora_sd) and has_oft
+    has_dora_scale = any(".dora_scale" in key for key in lora_sd)
     if has_lokr and has_dora_magnitude:
         return "dokr"
     if has_lokr:
         return "lokr"
-    if has_dora_oft or has_oft:
+    if has_oft:
         return "dora_oft"
+    if has_dora_scale or has_dora_magnitude:
+        # LoRA matrices with a magnitude (input-axis dora_scale or PEFT lora_magnitude_vector): merged as a plain
+        # LoRA the magnitude would be dropped, so these go through networks.lora.merge_weights_to_tensor
+        return "dora"
     for key in lora_sd:
         if "lora_down" in key:
             return "lora"
@@ -226,7 +230,7 @@ def load_safetensors_with_lora_and_fp8(
                     from musubi_tuner.networks.lokr import merge_weights_to_tensor as dokr_merge
 
                     model_weight = dokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
-                elif net_type == "dora_oft":
+                elif net_type in ("dora_oft", "dora"):
                     from musubi_tuner.networks.lora import merge_weights_to_tensor as lora_merge
 
                     model_weight = lora_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)

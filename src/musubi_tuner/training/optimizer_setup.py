@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from musubi_tuner.utils.arg_utils import parse_literal_args, parse_text_args
 from collections import defaultdict
 import importlib
 import logging
@@ -90,15 +91,7 @@ def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tup
 
     optimizer_kwargs = {}
     if args.optimizer_args is not None and len(args.optimizer_args) > 0:
-        for arg in args.optimizer_args:
-            if "=" not in arg:
-                raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {arg}")
-            key, value = arg.split("=", 1)
-            try:
-                value = ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                pass
-            optimizer_kwargs[key] = value
+        optimizer_kwargs.update(parse_literal_args(args.optimizer_args, "--optimizer_args"))
 
     lr = args.learning_rate
     optimizer = None
@@ -713,12 +706,7 @@ def get_lr_scheduler(self, args, optimizer: torch.optim.Optimizer, num_processes
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
-        for arg in args.lr_scheduler_args:
-            if "=" not in arg:
-                raise ValueError(f"Invalid --lr_scheduler_args entry (expected key=value): {arg}")
-            key, value = arg.split("=", 1)
-            value = ast.literal_eval(value)
-            lr_scheduler_kwargs[key] = value
+        lr_scheduler_kwargs.update(parse_literal_args(args.lr_scheduler_args, "--lr_scheduler_args"))
 
     def wrap_check_needless_num_warmup_steps(return_vals):
         if num_warmup_steps is not None and num_warmup_steps != 0:

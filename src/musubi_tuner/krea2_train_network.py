@@ -134,6 +134,12 @@ class Krea2NetworkTrainer(NetworkTrainer):
         assert args.text_encoder is not None, "--text_encoder is required for sample generation during training"
         logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
+        for prompt_dict in prompts:
+            # musubi runs CFG only with a negative prompt; the official Krea 2 sampler uses an empty one whenever the
+            # CFG scale is above 1 (default 5.5). Without it RAW samples were generated without CFG.
+            cfg_scale = prompt_dict.get("cfg_scale")
+            if prompt_dict.get("negative_prompt") is None and (5.5 if cfg_scale is None else cfg_scale) > 1.0:
+                prompt_dict["negative_prompt"] = ""
 
         encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
 
@@ -394,6 +400,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
                 gc.collect()
                 clean_memory_on_device(accelerator.device)
         elif getattr(args, "turbo_lora", None):
+            if self._turbo_lora_network is None:  # the fork training loop creates its network without _build_network
+                self._build_turbo_lora_network(args, accelerator, accelerator.unwrap_model(transformer))
             logger.info("Krea 2: enabling Turbo LoRA for sampling")
             self._turbo_lora_network.set_enabled(True)
 

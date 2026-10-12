@@ -293,6 +293,7 @@ def _infer_network_metadata(
         "lora_down.weight" in module_state or "lora_up.weight" in module_state for module_state in grouped_modules.values()
     )
     has_dora = any("lora_magnitude_vector.weight" in module_state for module_state in grouped_modules.values())
+    has_input_dora = any(_is_input_axis_dora_module(module_state) for module_state in grouped_modules.values())
     has_oft = any("oft_R.weight" in module_state for module_state in grouped_modules.values())
     has_dora_oft = any("dora_scale" in module_state for module_state in grouped_modules.values()) and has_oft
 
@@ -321,12 +322,18 @@ def _infer_network_metadata(
         network_args.pop("use_dora", None)
         network_args.pop("use_dora_oft", None)
         network_args.pop("use_oft", None)
+    elif has_input_dora:
+        network_args["use_dora"] = "true"
+        network_args["dora_axis"] = "input"
+        network_args.pop("use_dora_oft", None)
     elif has_dora:
         network_args["use_dora"] = "true"
+        network_args["dora_axis"] = "output"
         network_args.pop("use_dora_oft", None)
     else:
         network_args.pop("use_dora", None)
         network_args.pop("use_dora_oft", None)
+        network_args.pop("dora_axis", None)
     network_args.pop("factor", None)
     return network_module, network_args
 
@@ -341,11 +348,30 @@ def _convert_comfy_state_dict_to_intermediate(comfy_state_dict: Dict[str, torch.
     return converted_intermediate
 
 
-def _grouped_modules_need_base_model(grouped_modules: Dict[str, Dict[str, torch.Tensor]]) -> bool:
-    return any(
-        "dora_scale" in module_state and ("oft_R.weight" not in module_state or _module_state_is_lokr(module_state))
-        for module_state in grouped_modules.values()
+def _is_input_axis_dora_module(module_state: Dict[str, torch.Tensor]) -> bool:
+    """LoRA with a (1, in) dora_scale: Musubi's input-axis DoRA trains that tensor itself, no base weights needed."""
+    scale = module_state.get("dora_scale")
+    return (
+        isinstance(scale, torch.Tensor)
+        and "lora_down.weight" in module_state
+        and "oft_R.weight" not in module_state
+        and not _module_state_is_lokr(module_state)
+        and scale.dim() >= 2
+        and scale.shape[0] == 1
+        and scale.shape[1] > 1
     )
+
+
+def _needs_magnitude_reconstruction(module_state: Dict[str, torch.Tensor]) -> bool:
+    return (
+        "dora_scale" in module_state
+        and ("oft_R.weight" not in module_state or _module_state_is_lokr(module_state))
+        and not _is_input_axis_dora_module(module_state)
+    )
+
+
+def _grouped_modules_need_base_model(grouped_modules: Dict[str, Dict[str, torch.Tensor]]) -> bool:
+    return any(_needs_magnitude_reconstruction(module_state) for module_state in grouped_modules.values())
 
 
 def _comfy_state_dict_needs_base_model(comfy_state_dict: Dict[str, torch.Tensor]) -> bool:
@@ -379,7 +405,7 @@ def convert_ltx2_comfy_to_musubi_state_dict(
     converted_state_dict = {}
     for module_name, module_state in grouped_modules.items():
         module_state = dict(module_state)
-        if "dora_scale" in module_state and ("oft_R.weight" not in module_state or _module_state_is_lokr(module_state)):
+        if _needs_magnitude_reconstruction(module_state):
             magnitude = _reconstruct_musubi_magnitude(module_name, module_state, base_lookup)
             module_state["lora_magnitude_vector.weight"] = magnitude
             module_state.pop("dora_scale", None)

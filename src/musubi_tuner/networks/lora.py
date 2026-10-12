@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import weakref
 from typing import Any, Dict, List, Optional, Type, Union
 from transformers import CLIPTextModel
 import torch
@@ -24,6 +25,15 @@ from musubi_tuner.networks.lora_adaptive_rank import (
 )
 from musubi_tuner.networks.lora_oft import DoRAOFTInfModule, DoRAOFTModule, OFTModule, OFTRotationModule
 from musubi_tuner.networks.lora_shared import (
+    DORA_CHECK_TOLERANCE,
+    DORA_EPS,
+    DoRABaseWeight,
+    dora_column_norm,
+    dora_column_norm_sq_of,
+    dora_input_axis_merge,
+    dora_input_factor,
+    scale_input_channels,
+    scaled_down_projection,
     _apply_dora_weight_merge,
     _convert_absolute_dora_oft_scales_to_ratios,
     _get_dora_weight_norm,
@@ -226,9 +236,19 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
             if torch.rand(1, device=x.device) < self.module_dropout:
                 return org_forwarded
 
+        return self._add_lora_output(x, org_forwarded)
+
+    def _down(self, lora_down, x, factor=None):
+        """The down projection (DoRA passes its input-channel factor)."""
+        return lora_down(x)
+
+    def _add_lora_output(self, x, org_forwarded, down_factor=None):
+        """org_forwarded + the LoRA path on ``x`` (dropout, rank dropout and adaptive rank included). ``down_factor``
+        goes to ``_down`` as an argument: a forward that sets attributes cannot be compiled under activation
+        checkpointing (Dynamo refuses side effects inside torch.utils.checkpoint and then runs the block eagerly)."""
         lora_input = self._lora_input(x)
         if self.split_dims is None:
-            lx = self.lora_down(lora_input)
+            lx = self._down(self.lora_down, lora_input, down_factor)
 
             # normal dropout
             if self.dropout is not None and self.training and self.dropout_enabled:
@@ -252,7 +272,7 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
             return self._match_org_dtype(org_forwarded + lx * self.multiplier * scale, org_forwarded)
         else:
-            lxs = [lora_down(lora_input) for lora_down in self.lora_down]
+            lxs = [self._down(lora_down, lora_input, down_factor) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training and self.dropout_enabled:
@@ -576,6 +596,14 @@ class DoRAModule(LoRAModule):
         state_dict[f"{self.lora_name}.lora_magnitude_vector.weight"] = self.lora_magnitude_vector.weight.detach().clone()
         return state_dict
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if f"{prefix}dora_scale" in state_dict:
+            raise ValueError(
+                f"{prefix.rstrip('.')}: these weights hold input-axis DoRA scales (dora_scale); "
+                "train or load them with network_args dora_axis=input"
+            )
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def forward(self, x):
         if not self.enabled:
             return self.org_forward(x)
@@ -694,6 +722,325 @@ class DoRAInfModule(DoRAModule):
         return self.default_forward(x)
 
 
+def _lora_delta_weight(down_weight: torch.Tensor, up_weight: torch.Tensor) -> torch.Tensor:
+    """up @ down as an (out, in, *kernel) weight (Linear, or ConvNd with its 1x1 up projection)."""
+    delta = up_weight.reshape(up_weight.shape[0], -1) @ down_weight.reshape(down_weight.shape[0], -1)
+    return delta.reshape(up_weight.shape[0], *down_weight.shape[1:])
+
+
+def _parse_dora_axis(value) -> str:
+    """``dora_axis``: input (default; ComfyUI / LyCORIS ``dora_scale``) or output (PEFT ``lora_magnitude_vector``)."""
+    text = str(value if value is not None else "").strip().strip("'\"").casefold()
+    if text in ("", "input", "in", "column", "columns", "col"):
+        return "input"
+    if text in ("output", "out", "row", "rows", "peft"):
+        return "output"
+    raise ValueError(f"dora_axis must be input or output, got {value!r}")
+
+
+class DoRABaseCheckError(RuntimeError):
+    """The base weight DoRA reads differs from what the layer computes."""
+
+
+def run_dora_base_checks(loras) -> None:
+    """Run the one-time base check of every DoRA layer that needs one (quantized bases) now, eagerly.
+
+    Inside a compiled block the check would be a side effect, and Dynamo stops compiling a block whose activation-
+    checkpointed forward has one, for good. One layer per storage format vouches for the others of that format,
+    preferably one whose weight is on the GPU (block swap keeps the other blocks on the CPU)."""
+    groups = {}
+    for lora in loras:
+        if isinstance(lora, DoRAInputModule) and not lora._dora_checked:
+            groups.setdefault(lora.dora_format_key(), []).append(lora)
+    for members in groups.values():
+        lora = ([member for member in members if member.dora_base.module.weight.is_cuda] or members)[0]
+        weight = lora.dora_base.module.weight
+        dtype = torch.float32 if weight.dtype == torch.float32 else torch.bfloat16
+        try:
+            lora._dora_check_base(torch.empty(0, device=weight.device, dtype=dtype))
+        except DoRABaseCheckError:
+            raise
+        except Exception as error:  # the layer cannot run where its weight is now (a CUDA kernel, a CPU weight)
+            lora._dora_checked = False
+            logger.info(f"DoRA: the base check of {lora.lora_name} waits for its first eager forward ({error})")
+            continue
+        for member in members:
+            member._dora_checked = True
+
+
+class DoRAInputModule(LoRAModule):
+    """DoRA with the magnitude on the input axis: W' = (W + s*B@A) * dora_scale / ||W + s*B@A||_col.
+
+    ``dora_scale`` is (1, in) [ConvNd: (1, in, 1, ...)], the LyCORIS / kohya layout that ComfyUI, SwarmUI, Forge and
+    A1111 apply exactly, so a saved file needs no conversion. The forward scales the layer's input channels and runs the
+    base layer and the LoRA on the scaled input: no dense weight is built and quantized bases keep their own kernels.
+    ``dora_axis=output`` selects DoRAModule (PEFT's ``lora_magnitude_vector``) instead."""
+
+    @staticmethod
+    def supports_module(org_module: torch.nn.Module) -> bool:
+        # ComfyUI reads the (1, in) dora_scale of a single-output layer as an output-axis scale.
+        out_features = getattr(org_module, "out_features", getattr(org_module, "out_channels", None))
+        return out_features != 1 and getattr(org_module, "groups", 1) == 1
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        split_dims: Optional[List[int]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            lora_name,
+            org_module,
+            multiplier,
+            lora_dim,
+            alpha,
+            dropout=dropout,
+            rank_dropout=rank_dropout,
+            module_dropout=module_dropout,
+            split_dims=split_dims,
+            **kwargs,
+        )
+        self.org_module_ref = [org_module]
+        self.dora_base = DoRABaseWeight(org_module)
+        self.dora_detach_norm = bool(kwargs.get("dora_detach_norm", False))
+        is_conv = org_module.__class__.__name__ in ("Conv2d", "Conv3d")
+        kernel_size = tuple(org_module.kernel_size) if is_conv else ()
+        self._dora_channel_dim = 1 if is_conv else -1
+        self._dora_weight_shape = (self.dora_base.out_features, self.dora_base.in_features, *kernel_size)
+
+        with torch.no_grad():
+            # once per layer; a block-swapped weight still on the CPU is read through the GPU (dequantizing and
+            # un-rotating a ConvRot weight on the CPU is far slower than the copy)
+            weight = org_module.weight
+            device = None
+            if not weight.is_cuda and weight.device.type != "meta" and torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            self._dora_col_sq = dora_column_norm_sq_of(self.dora_base, device=device)
+            magnitude = self._dora_col_sq.view(-1, self.dora_base.kernel).sum(dim=1).sqrt()
+        reference = self.lora_down[0].weight if self.split_dims is not None else self.lora_down.weight
+        magnitude = magnitude.reshape(1, -1, *([1] * len(kernel_size))).to(device=reference.device, dtype=reference.dtype)
+        self.dora_scale = torch.nn.Parameter(magnitude)
+        self.dora_scale._is_dora_scale = True
+        self._dora_checked = not self.dora_base.needs_check
+        self._dora_cache = None
+        self._dora_from_lora_prefix = None
+        self._dora_weight_ref = weakref.ref(org_module.weight)
+        self.register_load_state_dict_post_hook(DoRAInputModule._dora_after_load)
+
+    def _dora_down(self, weight: torch.Tensor) -> torch.Tensor:
+        if not self.adaptive_rank:
+            return weight
+        rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=weight.dtype, device=weight.device)
+        return weight * rank_weights.view(-1, *([1] * (weight.dim() - 1)))
+
+    def _dora_lora_weights(self):
+        if self.split_dims is None:
+            return [self._dora_down(self.lora_down.weight)], [self.lora_up.weight]
+        return [self._dora_down(module.weight) for module in self.lora_down], [module.weight for module in self.lora_up]
+
+    def _dora_base_norm_sq(self, device: torch.device) -> torch.Tensor:
+        # nothing is stored while torch.compile traces (no side effects under activation checkpointing)
+        compiling = torch.compiler.is_compiling()
+        weight = self.dora_base.module.weight
+        if self._dora_weight_ref() is not weight:
+            # the layer's weight was replaced (a state dict loaded with assign=True): its column norms are new
+            with torch.no_grad():
+                col_sq = dora_column_norm_sq_of(self.dora_base, device=device)
+            if compiling:
+                return col_sq
+            self._dora_col_sq = col_sq
+            self._dora_weight_ref = weakref.ref(weight)
+        col_sq = self._dora_col_sq
+        if col_sq.device != device:
+            col_sq = col_sq.to(device)
+            if not compiling:
+                self._dora_col_sq = col_sq
+        return col_sq
+
+    def dora_factor(self, device=None, multiplier=None) -> torch.Tensor:
+        """dora_scale / (||W + s*B@A||_col + eps) for every input channel: fp32 (in,). Eager forwards without
+        gradients (sampling, validation) reuse it until a parameter changes."""
+        device = self.dora_scale.device if device is None else torch.device(device)
+        multiplier = self.multiplier if multiplier is None else multiplier
+        compiling = torch.compiler.is_compiling()
+        if not compiling and self._dora_weight_ref() is not self.dora_base.module.weight:
+            self._dora_cache = None  # another base weight (see _dora_base_norm_sq)
+        key = None
+        if not torch.is_grad_enabled() and not compiling:
+            key = (device, float(multiplier), tuple((p.data_ptr(), p._version) for p in self.parameters()))
+            if self._dora_cache is not None and self._dora_cache[0] == key:
+                return self._dora_cache[1]
+        downs, ups = self._dora_lora_weights()
+        factor = dora_input_factor(
+            self.dora_base,
+            downs,
+            ups,
+            multiplier * self.scale,
+            self._dora_base_norm_sq(device),
+            self.dora_scale,
+            detach_norm=self.dora_detach_norm and torch.is_grad_enabled(),
+        )
+        if key is not None:
+            self._dora_cache = (key, factor)
+        return factor
+
+    def dora_format_key(self) -> tuple:
+        """Layers with the same key read their base weight the same way and run the same forward."""
+        forward = getattr(self.org_forward, "__func__", self.org_forward)
+        return (*self.dora_base.format_key(), getattr(forward, "__qualname__", type(forward).__name__))
+
+    def _dora_check_base(self, x: torch.Tensor) -> None:
+        """Compare the dequantized weight DoRA reads with the layer's own output once (quantized bases only).
+        ``x`` gives the device and dtype of the probe."""
+        self._dora_checked = True
+        base = self.dora_base
+        if self._dora_channel_dim != -1:
+            return
+        with torch.no_grad():
+            generator = torch.Generator(device=x.device).manual_seed(0)
+            probe = torch.randn(16, base.in_features, generator=generator, device=x.device, dtype=torch.float32)
+            expected = self.org_forward(probe.to(x.dtype if x.is_floating_point() else torch.bfloat16)).to(torch.float32)
+            bias = getattr(base.module, "bias", None)
+            if isinstance(bias, torch.Tensor):
+                expected = expected - bias.detach().to(device=expected.device, dtype=torch.float32)
+            actual = probe @ base.dense(device=x.device).t()
+            error = float((expected - actual).norm() / actual.norm().clamp_min(1e-30))
+        if not math.isfinite(error) or error > DORA_CHECK_TOLERANCE:
+            raise DoRABaseCheckError(
+                f"DoRA cannot read the base weight of {self.lora_name} ({base.describe()}): the weight it reads differs "
+                f"from the layer's own output by {error:.1%}. Train this model with LoRA or choose another base precision."
+            )
+
+    def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
+        if self.module_dropout is not None and self.training and self.dropout_enabled:
+            if torch.rand(1, device=x.device) < self.module_dropout:
+                return self.org_forward(x)
+        if not self._dora_checked and not torch.compiler.is_compiling():
+            # compiled runs are checked before their first block runs (run_dora_base_checks, a root pre-hook)
+            self._dora_check_base(x)
+        factor = self.dora_factor(x.device)
+        # The frozen base layer gets the scaled input (it keeps no activation for backward); the LoRA path keeps x
+        # itself and scales A's columns instead, B (A f) x = B A (f x): layers that share one input (q, k, v) then
+        # keep that one tensor for backward, as with LoRA, instead of one scaled copy each.
+        org_forwarded = self.org_forward(scale_input_channels(x, factor, self._dora_channel_dim))
+        return self._add_lora_output(x, org_forwarded, factor)
+
+    def _down(self, lora_down, x, factor=None):
+        if factor is None:
+            return lora_down(x)
+        if isinstance(lora_down, torch.nn.Linear):
+            return scaled_down_projection(x, lora_down.weight, factor)
+        weight = lora_down.weight
+        weight = (weight.float() * factor.view(1, -1, *([1] * (weight.dim() - 2)))).to(weight.dtype)
+        return lora_down._conv_forward(x, weight, None)
+
+    def export_state_dict(self) -> Dict[str, torch.Tensor]:
+        state_dict = super().export_state_dict()
+        state_dict[f"{self.lora_name}.dora_scale"] = self.dora_scale.detach().clone()
+        return state_dict
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if f"{prefix}lora_magnitude_vector.weight" in state_dict:
+            raise ValueError(
+                f"{prefix.rstrip('.')}: these weights hold output-axis DoRA magnitudes (lora_magnitude_vector); "
+                "train or load them with network_args dora_axis=output"
+            )
+        # a plain LoRA continued as DoRA gets magnitudes ||W + s*B@A||_col (its first step reproduces the LoRA); the
+        # child modules (lora_down / lora_up) load after this module's own tensors, so that happens in the post hook
+        if f"{prefix}dora_scale" not in state_dict and any(key.startswith(f"{prefix}lora_up") for key in state_dict):
+            self._dora_from_lora_prefix = prefix
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @staticmethod
+    def _dora_after_load(module, incompatible_keys) -> None:
+        prefix = getattr(module, "_dora_from_lora_prefix", None)
+        if prefix is None:
+            return
+        module._dora_from_lora_prefix = None
+        with torch.no_grad():
+            downs, ups = module._dora_lora_weights()
+            norm = dora_column_norm(module.dora_base, downs, ups, module.multiplier * module.scale, module._dora_col_sq)
+            module.dora_scale.copy_(norm.reshape(module.dora_scale.shape).to(module.dora_scale.device, module.dora_scale.dtype))
+        module._dora_cache = None
+        if f"{prefix}dora_scale" in incompatible_keys.missing_keys:
+            incompatible_keys.missing_keys.remove(f"{prefix}dora_scale")
+        logger.info(f"{module.lora_name}: DoRA magnitudes initialized from the loaded LoRA weights")
+
+    def _dora_delta_weight(self, multiplier: float, device=None) -> torch.Tensor:
+        """multiplier * s * B @ A as an (out, in, *kernel) fp32 weight."""
+        downs, ups = self._dora_lora_weights()
+        parts = [_lora_delta_weight(d.detach().to(device, torch.float32), u.detach().to(device, torch.float32)) for d, u in zip(downs, ups)]
+        delta = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        return delta.reshape(self._dora_weight_shape) * (multiplier * self.scale)
+
+    def get_merged_weight(self, multiplier=None, device=None) -> torch.Tensor:
+        """The DoRA-merged weight (out, in, *kernel) in fp32, as ComfyUI computes it at strength 1."""
+        multiplier = self.multiplier if multiplier is None else multiplier
+        base = self.dora_base.dense(device=device).reshape(self._dora_weight_shape)
+        delta = self._dora_delta_weight(multiplier, device=base.device)
+        return dora_input_axis_merge(base, delta, self.dora_scale.detach().to(base.device, torch.float32))
+
+
+class DoRAInputInfModule(DoRAInputModule):
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        **kwargs,
+    ):
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, **kwargs)
+        self.network: LoRANetwork = None
+
+    def set_network(self, network):
+        self.network = network
+
+    def merge_to(self, sd, dtype, device, non_blocking=False):
+        org_module = self.org_module_ref[0]
+        org_sd = org_module.state_dict()
+        org_dtype = org_sd["weight"].dtype
+        org_device = org_sd["weight"].device
+        device = org_device if device is None else device
+        dtype = org_dtype if dtype is None else dtype
+
+        base = self.dora_base.dense(device=device).reshape(self._dora_weight_shape)
+        if self.split_dims is None:
+            pairs = [(sd["lora_down.weight"], sd["lora_up.weight"])]
+        else:
+            pairs = [(sd[f"lora_down.{i}.weight"], sd[f"lora_up.{i}.weight"]) for i in range(len(self.split_dims))]
+        parts = [
+            _lora_delta_weight(
+                down.to(device, dtype=torch.float, non_blocking=non_blocking), up.to(device, dtype=torch.float, non_blocking=non_blocking)
+            )
+            for down, up in pairs
+        ]
+        delta = (parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)).reshape(self._dora_weight_shape)
+        merged = dora_input_axis_merge(
+            base, delta * (self.multiplier * self.scale), sd["dora_scale"].to(device, dtype=torch.float, non_blocking=non_blocking)
+        )
+        org_sd["weight"] = merged.to(org_device, dtype=dtype)
+        org_module.load_state_dict(org_sd)
+
+    def get_weight(self, multiplier=None):
+        merged = self.get_merged_weight(multiplier)
+        return merged - self.dora_base.dense(device=merged.device).reshape(self._dora_weight_shape)
+
+
+DoRAInputModule.fallback_class = LoRAModule
+DoRAInputInfModule.fallback_class = LoRAInfModule
+
+
 def create_arch_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -752,6 +1099,7 @@ def create_network(
         network_alpha = 1.0
 
     use_dora = _parse_bool_network_arg(kwargs.get("use_dora", False))
+    dora_axis = _parse_dora_axis(kwargs.get("dora_axis", None))
     use_dora_oft = _parse_bool_network_arg(kwargs.get("use_dora_oft", False))
     use_oft = _parse_bool_network_arg(kwargs.get("use_oft", False)) or use_dora_oft
     use_rslora = _parse_bool_network_arg(kwargs.get("use_rslora", kwargs.get("rslora", False)))
@@ -843,14 +1191,21 @@ def create_network(
             module_class = DoRAOFTModule
         elif use_oft:
             module_class = OFTModule
+        elif use_dora:
+            module_class = DoRAInputModule if dora_axis == "input" else DoRAModule
+            logger.info(f"DoRA: magnitude on the {dora_axis} axis ({module_class.__name__})")
         else:
-            module_class = DoRAModule if use_dora else LoRAModule
+            module_class = LoRAModule
 
     effective_module_kwargs = dict(module_kwargs or {})
     if use_rslora:
         effective_module_kwargs["use_rslora"] = True
     if kwargs.get("dora_scale_lr_ratio", None) is not None:
         effective_module_kwargs["dora_scale_lr_ratio"] = kwargs.get("dora_scale_lr_ratio")
+    if use_dora and kwargs.get("dora_detach_norm", None) is not None:
+        # DoRA paper section 4.3 / PEFT: no gradient through the column norm (faster backward)
+        effective_module_kwargs["dora_detach_norm"] = _parse_bool_network_arg(kwargs.get("dora_detach_norm"))
+        logger.info(f"DoRA: detach_norm={effective_module_kwargs['dora_detach_norm']}")
     if use_oft:
         if use_dora_oft:
             effective_module_kwargs["scaled_oft"] = True
@@ -1223,7 +1578,13 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                             adaptive_rank_target_value = resolve_adaptive_rank_target(original_name)
                             adaptive_rank_weight_value = resolve_adaptive_rank_weight(original_name)
 
-                            lora = module_class(
+                            lora_class = module_class
+                            supports_module = getattr(module_class, "supports_module", None)
+                            if supports_module is not None and not supports_module(child_module):
+                                lora_class = module_class.fallback_class
+                                logger.info(f"{lora_name}: {module_class.__name__} does not apply to this layer; plain LoRA")
+
+                            lora = lora_class(
                                 lora_name,
                                 child_module,
                                 self.multiplier,
@@ -1401,6 +1762,18 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.apply_to()
             self.add_module(lora.lora_name, lora)
+
+        pending = [lora for lora in self.unet_loras if isinstance(lora, DoRAInputModule) and not lora._dora_checked]
+        if pending and isinstance(unet, nn.Module):
+            # the trainers compile blocks, not the model: its first forward runs the checks before any block does
+            handle = None
+
+            @torch.compiler.disable
+            def check_dora_bases(module, args):
+                handle.remove()
+                run_dora_base_checks(pending)
+
+            handle = unet.register_forward_pre_hook(check_dora_bases)
 
     # マージできるかどうかを返す
     def is_mergeable(self):
@@ -1659,7 +2032,9 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         if dtype is not None:
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                # A DoRA scale multiplies the whole base weight: bf16 would round every column by up to 0.4%.
+                key_dtype = torch.float32 if key.endswith(".dora_scale") and v.is_floating_point() else dtype
+                v = v.detach().clone().to("cpu").to(key_dtype)
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":
@@ -1915,7 +2290,16 @@ def merge_weights_to_tensor(
     scale = (alpha if alpha is not None else dim) / dim
     delta_weight = _get_lora_weight_from_tensors(down_weight, up_weight) * (multiplier * scale)
 
-    if magnitude_key in lora_weight_keys:
+    if dora_oft_scale_key in lora_weight_keys:  # input-axis DoRA (no oft_R key here): fp32, the scale rescales all of W
+        delta_weight = _get_lora_weight_from_tensors(down_weight.float(), up_weight.float()) * (multiplier * scale)
+        merged = dora_input_axis_merge(
+            model_weight.to(calc_device, dtype=torch.float32),
+            delta_weight,
+            lora_sd[dora_oft_scale_key].to(calc_device, dtype=torch.float32),
+        )
+        model_weight = merged.to(model_weight.dtype)
+        lora_weight_keys.discard(dora_oft_scale_key)
+    elif magnitude_key in lora_weight_keys:
         weight_norm = _get_dora_weight_norm(model_weight, down_weight, up_weight, multiplier * scale)
         magnitude = lora_sd[magnitude_key].to(calc_device, dtype=weight_norm.dtype)
         model_weight = _apply_dora_weight_merge(model_weight, delta_weight, magnitude, weight_norm)
@@ -1975,7 +2359,8 @@ def create_network_from_weights(
     modules_dim = {}
     modules_alpha = {}
     oft_elements = {}
-    has_dora_weights = _parse_bool_network_arg(kwargs.get("use_dora", False))
+    has_dora_weights = False
+    has_dora_scale_keys = False
     has_dora_oft_weights = _parse_bool_network_arg(kwargs.get("use_dora_oft", False))
     has_oft_weights = False
     per_module_kwargs: Dict[str, Dict[str, object]] = {}
@@ -1996,7 +2381,21 @@ def create_network_from_weights(
         elif "lora_magnitude_vector" in key:
             has_dora_weights = True
         elif "dora_scale" in key:
+            has_dora_scale_keys = True
+
+    # dora_scale: input-axis DoRA next to lora_down / lora_up, DoRA-OFT next to oft_R. Without weights to tell, the
+    # network arguments decide (use_dora, dora_axis).
+    has_input_dora_weights = False
+    if has_dora_scale_keys:
+        if has_oft_weights or has_dora_oft_weights:
             has_dora_oft_weights = True
+        else:
+            has_input_dora_weights = True
+    elif not has_dora_weights and _parse_bool_network_arg(kwargs.get("use_dora", False)):
+        if _parse_dora_axis(kwargs.get("dora_axis", None)) == "input":
+            has_input_dora_weights = True
+        else:
+            has_dora_weights = True
 
     for lora_name, n_elements in oft_elements.items():
         module_state = {key.split(".", 1)[1]: tensor for key, tensor in weights_sd.items() if key.startswith(lora_name + ".")}
@@ -2026,6 +2425,8 @@ def create_network_from_weights(
             module_class = DoRAOFTInfModule if for_inference else DoRAOFTModule
         elif has_oft_weights:
             module_class = OFTModule
+        elif has_input_dora_weights:
+            module_class = DoRAInputInfModule if for_inference else DoRAInputModule
         elif has_dora_weights:
             module_class = DoRAInfModule if for_inference else DoRAModule
         else:

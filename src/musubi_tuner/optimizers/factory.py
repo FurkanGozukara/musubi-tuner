@@ -8,6 +8,7 @@ import torch
 from .automagic import Automagic
 from .automagic2 import Automagic2
 from .automagic3 import Automagic3
+from .automagic_experiment import AutomagicEXPERIMENT
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,7 @@ AUTOMAGIC_OPTIMIZER_CLASSES = {
     "automagic": Automagic,
     "automagic2": Automagic2,
     "automagic3": Automagic3,
+    "automagicexperiment": AutomagicEXPERIMENT,
 }
 
 _ADAFACTOR_ONLY_KWARGS = {"relative_step", "scale_parameter", "warmup_init"}
@@ -110,22 +112,25 @@ def prepare_automagic_optimizer(
         if problems:
             raise ValueError("Automagic2 uses fused backward updates and is incompatible with this configuration: " + "; ".join(problems))
         logger.info("use Automagic2 fused-backward optimizer | %s", resolved_kwargs)
-    elif normalized_type == "automagic3":
+    elif normalized_type in ("automagic3", "automagicexperiment"):
+        # AutomagicEXPERIMENT is Automagic3 with a full int8 second moment: the same fused-mode rules
+        name = optimizer_class.__name__
         explicitly_configured = "fused" in resolved_kwargs
         if not explicitly_configured:
             resolved_kwargs["fused"] = not problems
             if problems:
                 logger.info(
-                    "Automagic3 selected safe non-fused mode because fused mode is incompatible: %s",
+                    "%s selected safe non-fused mode because fused mode is incompatible: %s",
+                    name,
                     "; ".join(problems),
                 )
             else:
-                logger.info("Automagic3 selected fused mode for this compatible single-process configuration")
+                logger.info("%s selected fused mode for this compatible single-process configuration", name)
         elif bool(resolved_kwargs["fused"]) and problems:
-            raise ValueError("Automagic3 fused=True is incompatible with this configuration: " + "; ".join(problems))
+            raise ValueError(f"{name} fused=True is incompatible with this configuration: " + "; ".join(problems))
         if not resolved_kwargs["fused"] and offload_block_swap_gradients:
             resolved_kwargs.setdefault("offload_gradients", True)
-        logger.info("use Automagic3 optimizer | %s", resolved_kwargs)
+        logger.info("use %s optimizer | %s", name, resolved_kwargs)
     else:
         explicitly_configured = "fused" in resolved_kwargs
         if explicitly_configured and bool(resolved_kwargs["fused"]) and problems:

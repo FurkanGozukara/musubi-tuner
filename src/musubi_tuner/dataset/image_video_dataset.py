@@ -2987,7 +2987,8 @@ class ImageDataset(BaseDataset):
         }.get(self.architecture)
 
         # glob cache files
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        # sorted: glob follows the directory order, sorted on NTFS but not on Linux file systems (same batches everywhere)
+        latent_cache_files = sorted(glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors")))
 
         # assign cache files to item info
         # (width, height) -> [ItemInfo] or (width, height, other conds...) -> [ItemInfo]
@@ -3379,7 +3380,7 @@ class AudioDataset(BaseDataset):
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
-        audio_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_audio.safetensors"))
+        audio_cache_files = sorted(glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_audio.safetensors")))
         bucketed_item_info: dict[tuple[int, int], list[ItemInfo]] = {}
 
         for audio_cache_file in audio_cache_files:
@@ -4074,7 +4075,8 @@ class VideoDataset(BaseDataset):
         )
 
         # glob cache files
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        # sorted: glob follows the directory order, sorted on NTFS but not on Linux file systems (same batches everywhere)
+        latent_cache_files = sorted(glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors")))
         latent_cache_files = self.drop_stale_video_caches(latent_cache_files, bucket_selector)
 
         # assign cache files to item info

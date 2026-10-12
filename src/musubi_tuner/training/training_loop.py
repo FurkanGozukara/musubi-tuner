@@ -1,6 +1,7 @@
 """Shared NetworkTrainer training loop."""
 
 import copy
+from musubi_tuner.utils.arg_utils import parse_literal_args, parse_text_args
 import importlib
 import inspect
 import json
@@ -464,11 +465,7 @@ def train(self, args):
     # prepare network
     net_kwargs = {}
     if args.network_args is not None:
-        for net_arg in args.network_args:
-            if "=" not in net_arg:
-                raise ValueError(f"Invalid --network_args entry (expected key=value): {net_arg}")
-            key, value = net_arg.split("=", 1)
-            net_kwargs[key] = value
+        net_kwargs.update(parse_text_args(args.network_args))
 
     # Inject pre-computed LoftQ data if available (computed during model loading).
     # Use a separate dict so loftq_data (tensors) doesn't end up in net_kwargs
@@ -2013,12 +2010,32 @@ def train(self, args):
         network.train()
         set_trainer_train_mode()
 
+    last_sampled_step = None
+
     def sample_images_with_optional_ema(epoch_no, step_no):
+        nonlocal last_sampled_step
+        if not should_sample_images(args, step_no, epoch_no) or step_no == last_sampled_step:
+            return  # nothing due, or the step trigger already sampled this step when it ended an epoch
+        last_sampled_step = step_no
         ema_original_params = apply_ema_weights_for_eval()
         self_flow_original_params = apply_self_flow_weights_for_eval()
+        # LoRA network / rank / module dropout only act in training mode: samples show the trained weights as saved
+        network_was_training = network.training
+        network.eval()
         try:
-            self.sample_images(accelerator, args, epoch_no, step_no, vae, transformer, sample_parameters, dit_dtype)
+            # the trainers' own sampling setup (Krea 2 Turbo sampling, Ideogram 4 unconditional DiT)
+            self.on_before_sample_images(
+                accelerator, args, epoch_no, step_no, vae, transformer, network, sample_parameters, dit_dtype
+            )
+            try:
+                self.sample_images(accelerator, args, epoch_no, step_no, vae, transformer, sample_parameters, dit_dtype)
+            finally:
+                self.on_after_sample_images(
+                    accelerator, args, epoch_no, step_no, vae, transformer, network, sample_parameters, dit_dtype
+                )
         finally:
+            if network_was_training:
+                network.train()
             restore_self_flow_weights_for_eval(self_flow_original_params)
             restore_ema_weights_for_eval(ema_original_params)
 

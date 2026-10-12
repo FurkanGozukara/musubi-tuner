@@ -51,7 +51,10 @@ def convert_from_diffusers(prefix, weights_sd):
 
     # note: Diffusers has no alpha, so alpha is set to rank
     def restore_special_suffixes(key: str) -> str:
-        return key.replace("_lora_magnitude_vector_", ".lora_magnitude_vector.")
+        key = key.replace("_lora_magnitude_vector_", ".lora_magnitude_vector.")
+        if key.endswith("_dora_scale"):  # input-axis DoRA magnitude, (1, in)
+            key = key[: -len("_dora_scale")] + ".dora_scale"
+        return key
 
     new_weights_sd = {}
     lora_dims = {}
@@ -176,6 +179,12 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
                 new_key = f"{diffusers_prefix}.{module_name}.{weight_name}"
                 estimated_type = "DoKr" if lora_name in lokr_lora_names else "DoRA"
                 copy_alpha = lora_name in lokr_lora_names
+            elif weight_name == "dora_scale":
+                # input-axis DoRA: ComfyUI reads "<module>.dora_scale" next to lora_A / lora_B as is
+                new_key = f"{diffusers_prefix}.{module_name}.dora_scale"
+                estimated_type = "DoRA"
+                new_weights_sd[new_key] = weight
+                continue
             else:
                 logger.warning(f"unexpected key: {key} in default LoRA format")
                 continue

@@ -1439,9 +1439,9 @@ class LTX2SliderTrainer:
 
         net_kwargs = {}
         if args.network_args is not None:
-            for net_arg in args.network_args:
-                key, value = net_arg.split("=")
-                net_kwargs[key] = value
+            from musubi_tuner.utils.arg_utils import parse_text_args
+
+            net_kwargs.update(parse_text_args(args.network_args))
 
         if hasattr(network_module_imported, "create_arch_network"):
             network = network_module_imported.create_arch_network(

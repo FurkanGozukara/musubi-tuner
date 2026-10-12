@@ -8,6 +8,7 @@ wan_train_network.py, ...).
 """
 
 import ast
+from musubi_tuner.utils.arg_utils import parse_literal_args, parse_text_args
 import asyncio
 import importlib
 import argparse
@@ -239,10 +240,7 @@ class NetworkTrainer:
         # split optimizer_type and optimizer_args
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
-            for arg in args.optimizer_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                optimizer_kwargs[key] = value
+            optimizer_kwargs.update(parse_literal_args(args.optimizer_args, "--optimizer_args"))
 
         lr = args.learning_rate
         optimizer = None
@@ -380,10 +378,7 @@ class NetworkTrainer:
 
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
-            for arg in args.lr_scheduler_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                lr_scheduler_kwargs[key] = value
+            lr_scheduler_kwargs.update(parse_literal_args(args.lr_scheduler_args, "--lr_scheduler_args"))
 
         def wrap_check_needless_num_warmup_steps(return_vals):
             if num_warmup_steps is not None and num_warmup_steps != 0:
@@ -1720,9 +1715,7 @@ class NetworkTrainer:
         # prepare network
         net_kwargs = {}
         if args.network_args is not None:
-            for net_arg in args.network_args:
-                key, value = net_arg.split("=")
-                net_kwargs[key] = value
+            net_kwargs.update(parse_text_args(args.network_args))
 
         if args.dim_from_weights:
             if args.network_weights is None:
@@ -1979,9 +1972,7 @@ class NetworkTrainer:
         # reconstruct net_kwargs for metadata
         net_kwargs = {}
         if args.network_args is not None:
-            for net_arg in args.network_args:
-                key, value = net_arg.split("=")
-                net_kwargs[key] = value
+            net_kwargs.update(parse_text_args(args.network_args))
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2155,17 +2146,24 @@ class NetworkTrainer:
         def _do_sample(epoch_arg, steps_arg):
             if not should_sample_images(args, steps_arg, epoch_arg):
                 return
-            self.on_before_sample_images(
-                accelerator, args, epoch_arg, steps_arg, sample_resources, transformer, network, sample_parameters, dit_dtype
-            )
+            # LoRA network / rank / module dropout only act in training mode: samples show the trained weights
+            network_was_training = network.training
+            network.eval()
             try:
-                self.sample_images(
-                    accelerator, args, epoch_arg, steps_arg, sample_resources, transformer, sample_parameters, dit_dtype
-                )
-            finally:
-                self.on_after_sample_images(
+                self.on_before_sample_images(
                     accelerator, args, epoch_arg, steps_arg, sample_resources, transformer, network, sample_parameters, dit_dtype
                 )
+                try:
+                    self.sample_images(
+                        accelerator, args, epoch_arg, steps_arg, sample_resources, transformer, sample_parameters, dit_dtype
+                    )
+                finally:
+                    self.on_after_sample_images(
+                        accelerator, args, epoch_arg, steps_arg, sample_resources, transformer, network, sample_parameters, dit_dtype
+                    )
+            finally:
+                if network_was_training:
+                    network.train()
 
         # For --sample_at_first
         if should_sample_images(args, global_step, epoch=0):

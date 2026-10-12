@@ -77,6 +77,17 @@ class WanNetworkTrainer(NetworkTrainer):
         self.high_low_training = self.dit_high_noise_path is not None
 
         if self.high_low_training:
+            network_args = args.network_args if isinstance(args.network_args, (list, tuple)) else [args.network_args or ""]
+            if any(
+                str(item).partition("=")[0].strip().lower() == "use_dora"
+                and str(item).partition("=")[2].strip().strip("'\"").lower() in ("1", "true", "yes", "on")
+                for item in network_args
+            ):
+                raise ValueError(
+                    "DoRA learns magnitudes for one base model, but Wan 2.2 high + low noise training shares one "
+                    "network between both experts (and ComfyUI applies one dora_scale to each). Train with LoRA, or "
+                    "train each expert on its own (without dit_high_noise)."
+                )
             if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
                 assert not args.offload_inactive_dit, (
                     "Block swap is not supported with offloading inactive DiT / 非アクティブDiTをオフロードする設定ではブロックスワップはサポートされていません"

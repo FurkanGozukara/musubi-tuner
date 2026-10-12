@@ -2,6 +2,7 @@ import ast
 import os
 import subprocess
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,11 @@ def _make_cuda_root(path: Path) -> Path:
     return cuda_bin
 
 
+# These tests fake Windows by patching sys.platform, which also switches shutil.which to its Windows code
+# (_winapi), so they can only run on Windows.
+WINDOWS_ONLY = "simulates Windows through sys.platform"
+
+
 class CudaAndNinjaDiscoveryTests(unittest.TestCase):
     def test_generic_lib64_directory_is_not_cuda(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,6 +132,7 @@ class CudaAndNinjaDiscoveryTests(unittest.TestCase):
         self.assertTrue(status.ok)
         self.assertEqual(str(cuda_13_1.resolve()), env["CUDA_HOME"])
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_versioned_cuda_installer_variable_is_discovered(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cuda_root = Path(temp_dir) / "v13.1"
@@ -345,6 +352,7 @@ class WindowsDiscoveryTests(unittest.TestCase):
         self.assertEqual("developer-path", env["PATH"])
         self.assertNotIn("Path", env)
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_partial_path_compiler_activates_developer_environment(self):
         env = {"PATH": r"C:\VS\bin"}
 
@@ -458,7 +466,8 @@ class PosixDiscoveryTests(unittest.TestCase):
                 return_value=ExecutableStatus(True, "ninja ready", "/usr/bin/ninja"),
             ),
         ):
-            status = ensure_compile_environment(env, require_openmp=True)
+            # force_probe: a verification persisted by another run on this machine (the GUI suite) must not skip it
+            status = ensure_compile_environment(env, require_openmp=True, force_probe=True)
 
         self.assertTrue(status.ok)
         self.assertEqual("linux", status.platform)
@@ -580,6 +589,7 @@ class ProbeVerificationCacheTests(unittest.TestCase):
             )
         return status, host_probe, cuda_probe
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_successful_probe_is_reused_from_disk_without_running_probe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -620,6 +630,7 @@ class ProbeVerificationCacheTests(unittest.TestCase):
         self.assertEqual(str(ninja), second_env["NINJA"])
         self.assertNotIn("do-not-persist", cache_text)
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_inherited_verified_environment_skips_child_process_probe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -653,6 +664,7 @@ class ProbeVerificationCacheTests(unittest.TestCase):
         skipped_cuda.assert_not_called()
         self.assertIn("inherited toolchain verification reused", child.detail)
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_changed_compiler_invalidates_persisted_probe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -683,6 +695,7 @@ class ProbeVerificationCacheTests(unittest.TestCase):
         self.assertEqual(1, host_probe.call_count)
         self.assertEqual(1, cuda_probe.call_count)
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_force_probe_bypasses_a_valid_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -713,6 +726,7 @@ class ProbeVerificationCacheTests(unittest.TestCase):
         self.assertEqual(1, host_probe.call_count)
         self.assertEqual(1, cuda_probe.call_count)
 
+    @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
     def test_validation_cache_stays_install_local_when_artifact_cache_is_redirected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

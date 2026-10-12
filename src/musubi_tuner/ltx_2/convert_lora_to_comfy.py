@@ -519,6 +519,11 @@ def convert_lora_to_comfy_state_dict(
     return comfy_state_dict
 
 
+def _is_input_axis_dora_scale(tensor) -> bool:
+    """An input-axis dora_scale is (1, in[, 1, ...]); the output-axis scale this converter writes is (out, 1[, ...])."""
+    return tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.shape[1] > 1
+
+
 def convert_lora_from_comfy_state_dict(comfy_state_dict):
     """
     Convert a ComfyUI-format LTX-2 LoRA state dict back to training format.
@@ -527,7 +532,10 @@ def convert_lora_from_comfy_state_dict(comfy_state_dict):
     native ``.alpha`` buffers with ``alpha=rank``. This preserves the effective
     LoRA delta when the checkpoint is warm-started for further training.
     """
-    if any(key.startswith("diffusion_model.") and key.endswith(".dora_scale") for key in comfy_state_dict.keys()):
+    if any(
+        key.startswith("diffusion_model.") and key.endswith(".dora_scale") and not _is_input_axis_dora_scale(tensor)
+        for key, tensor in comfy_state_dict.items()
+    ):
         raise ValueError(
             "ComfyUI DoRA dora_scale cannot be converted back to native Musubi magnitude vectors without base weights. "
             "Use the original Musubi DoRA checkpoint for Musubi inference or resume."
@@ -540,6 +548,8 @@ def convert_lora_from_comfy_state_dict(comfy_state_dict):
         new_key = convert_key_from_comfy(key)
         if new_key is None:
             continue
+        if key.endswith(".dora_scale"):  # input-axis DoRA: Musubi trains this exact tensor
+            new_key = new_key[: -len("lora_magnitude_vector.weight")] + "dora_scale"
         converted_state_dict[new_key] = tensor
         if new_key.endswith(".lora_down.weight"):
             lora_name = new_key.rsplit(".", 2)[0]

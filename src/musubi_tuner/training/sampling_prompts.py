@@ -20,6 +20,11 @@ def line_to_prompt_dict(line: str) -> dict:
     for parg in prompt_args[1:]:
         if not parg.strip():
             continue
+        if parg.strip().lower() == "n":
+            # "--n " with a blank negative prompt loses its value when the line is stripped; the blank negative
+            # (" ", which turns CFG on for the trainers that need a negative prompt) is what was written
+            prompt_dict["negative_prompt"] = " "
+            continue
         try:
             m = re.match(r"w (\d+)", parg, re.IGNORECASE)
             if m:

@@ -23,6 +23,16 @@ def main(args):
 
     logger.info("Converting...")
 
+    if any(key.endswith(".dora_scale") for key in state_dict.keys()) and not any(".oft_R." in key for key in state_dict):
+        # Input-axis DoRA: its magnitude belongs to each of to_q / to_k / to_v, so they cannot be fused into one qkv
+        # LoRA. ComfyUI maps the diffusers names under "lycoris_" onto slices of its fused qkv weight and decomposes
+        # each slice on its own, which is exactly what was trained; only the prefix changes.
+        source, target = ("lycoris_", "lora_unet_") if args.reverse else ("lora_unet_", "lycoris_")
+        state_dict = {(target + key[len(source) :] if key.startswith(source) else key): value for key, value in state_dict.items()}
+        logger.info(f"DoRA LoRA: renamed the {source} prefix to {target}; q, k and v stay separate")
+        _save(state_dict, metadata, args.dst_path)
+        return
+
     # Key mapping tables: (sd-scripts format, ComfyUI format)
     blocks_mappings = [
         ("attention_to_out_0", "attention_out"),
@@ -278,7 +288,10 @@ def main(args):
 
     logger.info(f"Direct key renames applied: {count}")
     logger.info(f"QKV layers processed: {qkv_count}")
+    _save(state_dict, metadata, args.dst_path)
 
+
+def _save(state_dict, metadata, dst_path):
     # Calculate hash
     if metadata is not None:
         logger.info("Calculating hashes and creating metadata...")
@@ -287,8 +300,8 @@ def main(args):
         metadata["sshs_legacy_hash"] = legacy_hash
 
     # save destination safetensors
-    logger.info(f"Saving destination file {args.dst_path}")
-    save_file(state_dict, args.dst_path, metadata=metadata)
+    logger.info(f"Saving destination file {dst_path}")
+    save_file(state_dict, dst_path, metadata=metadata)
 
 
 if __name__ == "__main__":

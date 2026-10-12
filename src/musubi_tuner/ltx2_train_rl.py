@@ -107,9 +107,9 @@ class LTX2RLTrainer:
 
         network_module = importlib.import_module(args.network_module)
         net_kwargs = {}
-        for net_arg in args.network_args or []:
-            k, v = net_arg.split("=")
-            net_kwargs[k] = v
+        from musubi_tuner.utils.arg_utils import parse_text_args
+
+        net_kwargs.update(parse_text_args(args.network_args))
         if getattr(args, "lora_target_preset", None) is not None:
             net_kwargs.setdefault("lora_target_preset", args.lora_target_preset)
         network = network_module.create_arch_network(
