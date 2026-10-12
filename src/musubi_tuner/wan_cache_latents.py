@@ -1,4 +1,5 @@
 import argparse
+import os
 from typing import Optional
 
 import torch
@@ -267,7 +268,37 @@ def main():
     def encode(one_batch: list[ItemInfo]):
         encode_and_save_batch(vae, clip, args.i2v, one_batch, args.one_frame)
 
-    cache_latents.encode_datasets(datasets, encode, args)
+    cache_latents.encode_datasets(datasets, encode, args, cache_is_current=wan_cache_is_current(args))
+
+
+def wan_cache_is_current(args: argparse.Namespace):
+    """--skip_existing test: the bucket matches and, for image-to-video, the cache holds what I2V training reads.
+
+    Text-to-video and image-to-video caches share one file name; an I2V cache adds the first frame's latents
+    (``latents_image_*``) and, with a CLIP model, ``clip_*``. Reusing a T2V cache for I2V training failed at the first
+    step with ``KeyError: 'latents_image'``."""
+    needs_image = bool(args.i2v) and not bool(getattr(args, "one_frame", False))
+    needs_clip = args.clip is not None
+
+    def is_current(item: ItemInfo) -> bool:
+        if not cache_latents.latent_cache_matches_bucket(item):
+            return False
+        if not needs_image and not needs_clip:
+            return True
+        header = cache_latents.read_cache_header(item.latent_cache_path)
+        if header is None:
+            return False
+        missing = []
+        if needs_image and not any(key.startswith("latents_image_") for key in header):
+            missing.append("first-frame latents")
+        if needs_clip and not any(key.startswith("clip_") for key in header):
+            missing.append("CLIP features")
+        if missing:
+            logger.info(f"Re-encoding {os.path.basename(item.latent_cache_path)}: no {' / '.join(missing)} (cached for text-to-video)")
+            return False
+        return True
+
+    return is_current
 
 
 def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
