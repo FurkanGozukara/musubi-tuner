@@ -37,3 +37,15 @@ def test_file_reads_match_the_mapped_load_while_earlier_views_are_alive(tmp_path
     assert read.size == mapped.size and read.dtype == {torch.bfloat16}
     assert in_process_checkpoint_loader().metadata(path) == {"transformer": {"layers": 1}}
     assert torch.equal(kept, tensors["model.transformer.0"])
+
+
+def test_text_encoder_caching_reads_the_checkpoint_with_plain_reads():
+    # the Gemma weights stay memory-mapped (FP8 weight offload) while the connectors load from the 46 GB checkpoint:
+    # mapping that file as well failed on Windows ("invalid python storage", 2026-10-13)
+    import argparse
+
+    from musubi_tuner.ltx2_cache_text_encoder_outputs import _checkpoint_model_loader
+
+    for staged in (False, True):
+        loader = _checkpoint_model_loader(argparse.Namespace(cpu_staged_checkpoint_loading=staged))
+        assert loader.weight_loader.file_reads

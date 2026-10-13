@@ -25,7 +25,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     save_text_encoder_output_cache_ltx2_gemma,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
-from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader, in_process_checkpoint_loader
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.preservation import (
     DOP_CACHE_VERSION,
@@ -47,7 +47,11 @@ DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
 
 
 def _checkpoint_model_loader(args: argparse.Namespace) -> SafetensorsModelStateDictLoader:
-    return SafetensorsModelStateDictLoader(cpu_staging=bool(getattr(args, "cpu_staged_checkpoint_loading", False)))
+    """Plain file reads for the projection and connectors: the Gemma weights stay memory-mapped in CPU RAM (FP8 weight
+    offload) while they load, and memory-mapping the 46 GB single-file checkpoint as well failed on Windows ("Attempted
+    to access the data pointer on an invalid python storage" for a CUDA open, a process crash for a CPU one; safetensors
+    0.7 and 0.8, 2026-10-13). Only the connector tensors are read; --cpu_staged_checkpoint_loading has nothing to do here."""
+    return in_process_checkpoint_loader()
 
 
 def _all_declared_datasets_are_audio(user_config: dict) -> bool:
