@@ -28,6 +28,23 @@ def encode_and_save_batch(text_embedder: torch.nn.Module, batch: list[ItemInfo],
         save_text_encoder_output_cache_flux_2(item, _ctx_vec, arch_full=arch_full)
 
 
+def precache_sample_prompts(text_embedder: torch.nn.Module, args: argparse.Namespace, device: torch.device) -> None:
+    """Encode the sample prompts (and their negative prompts) the training run will sample into --sample_prompts_cache,
+    keeping the outputs already cached for this model version and text encoder."""
+    from musubi_tuner.training.sampling_prompts import load_prompts
+
+    key = flux2_utils.sample_prompts_cache_key(args.model_version, args.text_encoder)
+    cached = flux2_utils.load_sample_prompts_cache(args.sample_prompts_cache, key)
+    texts = flux2_utils.sample_prompt_texts(load_prompts(args.sample_prompts))
+    missing = [text for text in texts if text not in cached]
+    logger.info(f"Sample prompts: {len(texts)} texts, {len(missing)} to encode into {args.sample_prompts_cache}")
+    autocast_dtype = torch.bfloat16 if text_embedder.dtype.itemsize == 1 else text_embedder.dtype
+    for text in missing:
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype), torch.no_grad():
+            cached[text] = text_embedder([text]).cpu()  # [1, 512, D], as training encodes them
+    flux2_utils.save_sample_prompts_cache(args.sample_prompts_cache, key, {text: cached[text] for text in texts})
+
+
 def main():
     parser = cache_text_encoder_outputs.setup_parser_common()
     parser = flux_2_setup_parser(parser)
@@ -72,6 +89,8 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
     )
+    if args.sample_prompts and args.sample_prompts_cache:
+        precache_sample_prompts(text_embedder, args, device)
     del text_embedder
 
     # remove cache files not in dataset
@@ -83,6 +102,13 @@ def main():
 def flux_2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder", type=str, default=None, required=True, help="text encoder (mistral 3) checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model")
+    parser.add_argument("--sample_prompts", type=str, default=None, help="also encode this sample prompt file (with --sample_prompts_cache)")
+    parser.add_argument(
+        "--sample_prompts_cache",
+        type=str,
+        default=None,
+        help="file for the sample prompts' text encoder outputs; training with the same --sample_prompts_cache does not load the text encoder for them",
+    )
     flux2_utils.add_model_version_args(parser)
     return parser
 

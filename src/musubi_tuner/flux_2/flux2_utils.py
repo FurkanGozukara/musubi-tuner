@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import numpy as np
 import torch
 import math
@@ -116,6 +117,51 @@ FLUX2_MODEL_INFO = {
 def add_model_version_args(parser: argparse.ArgumentParser):
     choices = list(FLUX2_MODEL_INFO.keys())
     parser.add_argument("--model_version", type=str, default="dev", choices=choices, help="model version")
+
+
+# Sample prompts encoded by the text encoder caching step (--sample_prompts_cache): training then samples without
+# loading the text encoder on the GPU (Mistral 3 in BF16 alone is about 45 GB). Keyed by model version and text encoder
+# file, so another model's or encoder's outputs are never used.
+SAMPLE_PROMPTS_CACHE_VERSION = 1
+
+
+def sample_prompts_cache_key(model_version: str, text_encoder: Optional[str]) -> str:
+    path = str(text_encoder or "")
+    size = os.path.getsize(path) if os.path.isfile(path) else -1
+    return f"{model_version}|{os.path.basename(path)}|{size}"
+
+
+def sample_prompt_texts(prompts: list[dict]) -> list[str]:
+    """The texts training encodes for its sample prompts: each prompt and its negative prompt (" " when unset)."""
+    texts = []
+    for prompt_dict in prompts:
+        for text in (prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", " ")):
+            if text is not None and text not in texts:
+                texts.append(text)
+    return texts
+
+
+def load_sample_prompts_cache(path: Optional[str], key: str) -> dict:
+    """Prompt text -> text encoder output saved for ``key``; empty when the file is missing, unreadable or another key's."""
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - a damaged cache only means encoding again
+        logger.warning(f"Sample prompt cache {path} could not be read ({exc}); it is ignored")
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != SAMPLE_PROMPTS_CACHE_VERSION or payload.get("key") != key:
+        return {}
+    embeds = payload.get("embeds")
+    return dict(embeds) if isinstance(embeds, dict) else {}
+
+
+def save_sample_prompts_cache(path: str, key: str, embeds: dict) -> None:
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    temporary = f"{path}.tmp"
+    torch.save({"version": SAMPLE_PROMPTS_CACHE_VERSION, "key": key, "embeds": embeds}, temporary)
+    os.replace(temporary, path)
 
 
 def is_fp8(dt):

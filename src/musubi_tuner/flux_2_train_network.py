@@ -49,7 +49,42 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
         logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
+        for prompt_dict in prompts:
+            # add negative prompt if not present even if the model is guidance distilled for simplicity
+            if "negative_prompt" not in prompt_dict:
+                prompt_dict["negative_prompt"] = " "
 
+        # outputs encoded by the text encoder caching step (--sample_prompts_cache): no text encoder on the GPU
+        cache_path = getattr(args, "sample_prompts_cache", None)
+        cache_key = flux2_utils.sample_prompts_cache_key(args.model_version, args.text_encoder)
+        cached = flux2_utils.load_sample_prompts_cache(cache_path, cache_key) if cache_path else {}
+        texts = flux2_utils.sample_prompt_texts(prompts)
+        missing = [text for text in texts if text not in cached]
+        if cache_path and not missing:
+            logger.info(f"Sample prompts: text encoder outputs from {cache_path}; the text encoder is not loaded")
+            sample_prompts_te_outputs = {text: cached[text] for text in texts}
+        else:
+            if cache_path:
+                logger.info(f"Sample prompt cache {cache_path} lacks {len(missing)} of {len(texts)} texts: loading the text encoder")
+            sample_prompts_te_outputs = self._encode_sample_prompt_texts(args, device, prompts)
+
+        # prepare sample parameters
+        sample_parameters = []
+        for prompt_dict in prompts:
+            prompt_dict_copy = prompt_dict.copy()
+
+            p = prompt_dict.get("prompt", "")
+            prompt_dict_copy["ctx_vec"] = sample_prompts_te_outputs[p]
+            p = prompt_dict.get("negative_prompt", " ")
+            prompt_dict_copy["negative_ctx_vec"] = sample_prompts_te_outputs[p]
+
+            sample_parameters.append(prompt_dict_copy)
+
+        clean_memory_on_device(accelerator.device)
+
+        return sample_parameters
+
+    def _encode_sample_prompt_texts(self, args: argparse.Namespace, device: torch.device, prompts: list[dict]) -> dict:
         # Load Text Encoder (Mistral 3 or Qwen-3)
         te_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
         text_embedder = flux2_utils.load_text_embedder(
@@ -61,10 +96,6 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
         sample_prompts_te_outputs = {}  # prompt -> encoded tensor
         for prompt_dict in prompts:
-            # add negative prompt if not present even if the model is guidance distilled for simplicity
-            if "negative_prompt" not in prompt_dict:
-                prompt_dict["negative_prompt"] = " "
-
             for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", " ")]:
                 if p is None or p in sample_prompts_te_outputs:
                     continue
@@ -84,22 +115,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
         del text_embedder
         clean_memory_on_device(device)
-
-        # prepare sample parameters
-        sample_parameters = []
-        for prompt_dict in prompts:
-            prompt_dict_copy = prompt_dict.copy()
-
-            p = prompt_dict.get("prompt", "")
-            prompt_dict_copy["ctx_vec"] = sample_prompts_te_outputs[p]
-            p = prompt_dict.get("negative_prompt", " ")
-            prompt_dict_copy["negative_ctx_vec"] = sample_prompts_te_outputs[p]
-
-            sample_parameters.append(prompt_dict_copy)
-
-        clean_memory_on_device(accelerator.device)
-
-        return sample_parameters
+        return sample_prompts_te_outputs
 
     def do_inference(
         self,
@@ -348,6 +364,12 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument("--text_encoder", type=str, default=None, help="text encoder checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model")
+    parser.add_argument(
+        "--sample_prompts_cache",
+        type=str,
+        default=None,
+        help="sample prompts' text encoder outputs written by flux_2_cache_text_encoder_outputs.py --sample_prompts_cache: used when they cover every sample prompt, so the text encoder is not loaded",
+    )
     flux2_utils.add_model_version_args(parser)
     return parser
 
