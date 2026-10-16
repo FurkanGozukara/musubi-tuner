@@ -16,6 +16,7 @@ import itertools
 from typing import Optional
 
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 import torch.nn.functional as F
 from accelerate import Accelerator
 from safetensors.torch import load_file
@@ -267,7 +268,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         vae.to(device)
         vae.eval()
         with torch.no_grad():
-            pixels = vae.decode_to_pixels(latent.to(vae.dtype))  # (1, C, H, W) in [0, 1]
+            pixels = decode_sample(vae, vae.decode_to_pixels, latent.to(vae.dtype))  # (1, C, H, W) in [0, 1]
         vae.to("cpu")
         clean_memory_on_device(device)
 

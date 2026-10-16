@@ -2,6 +2,7 @@ import logging
 
 import numpy as np
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from PIL import Image
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -124,6 +125,6 @@ def sample_image(
             return latents.cpu()
         vae.to(device)
         logger.info(f"Decoding image from latents: {latents.shape}")
-        pixels = qwen_image_21_utils.decode_latents(vae, latents)
+        pixels = decode_sample(vae, lambda z: qwen_image_21_utils.decode_latents(vae, z), latents)
     logger.info("Decoding complete")
     return pixels.float().cpu()

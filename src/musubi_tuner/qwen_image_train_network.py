@@ -6,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
 
@@ -360,7 +361,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         with torch.no_grad():
             for i in range(latents.shape[0]):
                 latents_i = latents[i : i + 1].to(device)
-                pixels_i = vae.decode_to_pixels(latents_i)  # decode to pixels, 0-1
+                pixels_i = decode_sample(vae, vae.decode_to_pixels, latents_i)  # decode to pixels, 0-1
                 pixels_list.append(pixels_i.to(torch.float32).cpu())
                 del latents_i, pixels_i
         latents = None

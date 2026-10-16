@@ -4,6 +4,7 @@ from PIL import Image
 
 import numpy as np
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -448,7 +449,7 @@ class WanNetworkTrainer(NetworkTrainer):
         if one_frame_mode:
             latent = latent[:, :, one_frame_inference_index : one_frame_inference_index + 1, :, :]  # select the one frame
         with torch.amp.autocast(device_type=device.type, dtype=vae.dtype), torch.no_grad():
-            video = vae.decode(latent)[0]  # vae returns list
+            video = decode_sample(vae, vae.decode, latent)[0]  # vae returns list
         video = video.unsqueeze(0)  # add batch dim
         del latent
 

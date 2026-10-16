@@ -8,6 +8,7 @@ from typing import Optional
 
 from PIL import Image
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from accelerate import Accelerator
 
 from musubi_tuner.hv_train_network import (
@@ -233,7 +234,7 @@ class MageFlowNetworkTrainer(NetworkTrainer):
             renormalize_cfg=False,
         )
         vae.to(device)
-        pixels = decode_mage_vae_latents(vae, latents[0].unsqueeze(0))
+        pixels = decode_sample(vae, lambda z: decode_mage_vae_latents(vae, z), latents[0].unsqueeze(0))
         pixels = pixels.float().cpu().clamp(-1, 1).add(1).div(2)
         vae.to("cpu")
         clean_memory_on_device(device)

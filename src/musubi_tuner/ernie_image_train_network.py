@@ -2,6 +2,7 @@ import argparse
 from typing import Optional
 
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
 
@@ -189,7 +190,7 @@ class ErnieImageNetworkTrainer(NetworkTrainer):
         vae.eval()
 
         with torch.no_grad():
-            pixels = vae.decode(latents.to(vae.dtype))
+            pixels = decode_sample(vae, vae.decode, latents.to(vae.dtype))
 
         pixels = pixels.to(torch.float32).cpu()
         pixels = (pixels.clamp(-1, 1) + 1) / 2

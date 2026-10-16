@@ -1,6 +1,7 @@
 import argparse
 from typing import Optional
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 
 
 from accelerate import Accelerator
@@ -218,7 +219,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
         # Decode latents to video
         logger.info(f"Decoding video from latents: {latent.shape}")
         with torch.no_grad():
-            pixels = vae.decode(latent)  # decode to pixels
+            pixels = decode_sample(vae, vae.decode, latent)  # decode to pixels
         del latent
 
         logger.info("Decoding complete")

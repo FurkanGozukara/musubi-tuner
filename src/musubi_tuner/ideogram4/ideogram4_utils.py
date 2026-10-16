@@ -6,6 +6,7 @@ import os
 from typing import Optional
 
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from accelerate import init_empty_weights
 from PIL import Image
 from tqdm import tqdm
@@ -594,7 +595,7 @@ def encode_pixels_to_vae_latents(autoencoder: AutoEncoder, pixels: torch.Tensor)
 def decode_tokens_to_images(autoencoder: AutoEncoder, tokens: torch.Tensor, grid_h: int, grid_w: int) -> list[Image.Image]:
     tokens = denormalize_tokens(tokens)
     z = unpatchify_vae_latents(tokens, grid_h, grid_w).to(autoencoder.dtype)
-    decoded = autoencoder.decoder(z)
+    decoded = decode_sample(autoencoder, autoencoder.decoder, z)
     decoded = decoded.float().clamp(-1.0, 1.0)
     decoded = ((decoded + 1.0) * 127.5).round().to(torch.uint8)
     decoded = decoded.permute(0, 2, 3, 1).cpu().numpy()

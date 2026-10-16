@@ -3,6 +3,7 @@ from typing import Optional
 import math
 
 import torch
+from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
 
@@ -203,7 +204,7 @@ class ZImageNetworkTrainer(NetworkTrainer):
         logger.info(f"Decoding image from latents: {latents.shape}")
         latents = zimage_utils.shift_scale_latents_for_decode(latents)
         with torch.no_grad():
-            pixels = vae.decode(latents)
+            pixels = decode_sample(vae, vae.decode, latents)
 
         pixels = pixels.to(torch.float32).cpu()
         pixels = (pixels / 2 + 0.5).clamp(0, 1)
