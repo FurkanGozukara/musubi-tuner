@@ -399,6 +399,12 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
     )
     parser.add_argument(
+        "--sample_text_encoder_device",
+        type=str,
+        default=None,
+        help="cpu: encode the sample prompts with the text encoder on the CPU (BF16), for text encoders that do not fit the GPU",
+    )
+    parser.add_argument(
         "--validate_every_n_steps",
         type=int,
         default=None,

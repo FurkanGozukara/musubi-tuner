@@ -49,6 +49,7 @@ from musubi_tuner.optimizers.factory import (
     move_optimizer_gradients_to_parameters,
     should_patch_block_swap_gradients,
 )
+from musubi_tuner.training.sample_text_encoder import sample_prompt_inputs
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
@@ -363,7 +364,7 @@ def train(self, args):
         or getattr(args, "use_precached_sample_prompts", False)
     ):
         sample_prompt_path = args.sample_prompts or ""
-        sample_parameters = self.process_sample_prompts(args, accelerator, sample_prompt_path)
+        sample_parameters = self.process_sample_prompts(*sample_prompt_inputs(args, accelerator), sample_prompt_path)
 
         # Load VAE model for sampling images: VAE is loaded to cpu to save gpu memory
         vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)

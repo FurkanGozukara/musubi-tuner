@@ -21,6 +21,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.qwen_image_21_train_network import QwenImage21NetworkTrainer
+from musubi_tuner.training.sample_text_encoder import sample_prompt_inputs
 from musubi_tuner.training.accelerator_setup import collator_class, prepare_accelerator
 from musubi_tuner.training.parser_common import add_argument_if_absent, read_config_from_file
 from musubi_tuner.training.sampling_prompts import should_sample_images
@@ -133,7 +134,7 @@ class QwenImage21Trainer(QwenImage21NetworkTrainer):
         sample_parameters = None
         vae = None
         if args.sample_prompts:
-            sample_parameters = self.process_sample_prompts(args, accelerator, args.sample_prompts)
+            sample_parameters = self.process_sample_prompts(*sample_prompt_inputs(args, accelerator), args.sample_prompts)
 
             # Load VAE model for sampling images: VAE is loaded to cpu to save gpu memory
             vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)

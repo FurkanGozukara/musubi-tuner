@@ -63,6 +63,7 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 
 # Helpers that used to live alongside NetworkTrainer in hv_train_network.py.
 # Imported by name so existing method bodies keep working unchanged.
+from musubi_tuner.training.sample_text_encoder import sample_prompt_inputs
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
@@ -1416,7 +1417,7 @@ class NetworkTrainer:
         sample_parameters = None
         vae = None
         if args.sample_prompts:
-            sample_parameters = self.process_sample_prompts(args, accelerator, args.sample_prompts)
+            sample_parameters = self.process_sample_prompts(*sample_prompt_inputs(args, accelerator), args.sample_prompts)
 
             # Load VAE model for sampling images: VAE is loaded to cpu to save gpu memory
             vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)

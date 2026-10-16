@@ -26,6 +26,7 @@ from musubi_tuner.optimizers.factory import (
     should_patch_block_swap_gradients,
 )
 from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
+from musubi_tuner.training.sample_text_encoder import sample_prompt_inputs
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
@@ -236,7 +237,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
         sample_parameters = None
         vae = None
         if args.sample_prompts:
-            sample_parameters = self.process_sample_prompts(args, accelerator, args.sample_prompts)
+            sample_parameters = self.process_sample_prompts(*sample_prompt_inputs(args, accelerator), args.sample_prompts)
 
             # Load VAE model for sampling images: VAE is loaded to cpu to save gpu memory
             vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)

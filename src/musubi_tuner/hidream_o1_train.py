@@ -1,5 +1,6 @@
 import argparse
 from musubi_tuner.training.parser_common import add_argument_if_absent
+from musubi_tuner.training.sample_text_encoder import sample_prompt_inputs
 import json
 import math
 from multiprocessing import Value
@@ -201,7 +202,7 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
         sample_parameters = None
         vae = None
         if args.sample_prompts:
-            sample_parameters = self.process_sample_prompts(args, accelerator, args.sample_prompts)
+            sample_parameters = self.process_sample_prompts(*sample_prompt_inputs(args, accelerator), args.sample_prompts)
             vae = self.load_vae(args, vae_dtype=torch.float32, vae_path=args.vae)
             vae.requires_grad_(False)
             vae.eval()
