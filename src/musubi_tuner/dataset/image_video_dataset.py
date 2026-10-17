@@ -814,6 +814,7 @@ save_text_encoder_output_cache_ideogram4 = _cache_io.save_text_encoder_output_ca
 save_latent_cache_krea2 = _cache_io.save_latent_cache_krea2  # noqa: F811
 save_text_encoder_output_cache_krea2 = _cache_io.save_text_encoder_output_cache_krea2  # noqa: F811
 save_text_encoder_output_cache_flux_3 = _cache_io.save_text_encoder_output_cache_flux_3  # noqa: F811
+save_text_encoder_output_cache_moss_image = _cache_io.save_text_encoder_output_cache_moss_image  # noqa: F811
 save_pixel_cache_hidream_o1 = _cache_io.save_pixel_cache_hidream_o1  # noqa: F811
 save_text_encoder_output_cache_hidream_o1 = _cache_io.save_text_encoder_output_cache_hidream_o1  # noqa: F811
 

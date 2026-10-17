@@ -51,6 +51,11 @@ def detect_arch_config(unet):
             r".*audio_embeddings_connector\..*",
         ]
 
+    if "MossImageBlock" in module_class_names:
+        from .lora_moss_image import MOSS_IMAGE_TARGET_REPLACE_MODULES
+
+        return MOSS_IMAGE_TARGET_REPLACE_MODULES, [r".*(norm).*"]
+
     if "Flux3JointBlock" in module_class_names:
         from .lora_flux_3 import FLUX_3_TARGET_REPLACE_MODULES
 

@@ -32,6 +32,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.dataset.architectures import ARCHITECTURE_ERNIE_IMAGE
 from musubi_tuner.dataset.architectures import ARCHITECTURE_FLUX_3
+from musubi_tuner.dataset.architectures import ARCHITECTURE_MOSS_IMAGE
 
 # LTX-2 fork addition — separate import so upstream's inserts into the sorted block above don't conflict
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
@@ -109,6 +110,7 @@ ARCH_HIDREAM_O1 = "HiDream-O1-Image"
 ARCH_IDEOGRAM4 = "Ideogram-4"
 ARCH_KREA2 = "Krea-2"
 ARCH_FLUX_3_KLEIN = "Flux.3-klein"
+ARCH_MOSS_IMAGE = "MOSS-Image"
 ARCH_MINIMAX_H3 = "MiniMax-H3"
 ARCH_ERNIE_IMAGE = "ERNIE-Image"
 ARCH_MAGE_FLOW = "Mage-Flow"
@@ -134,6 +136,7 @@ IMPL_HIDREAM_O1 = "https://github.com/HiDream-ai/HiDream-O1-Image"
 IMPL_IDEOGRAM4 = "https://huggingface.co/Comfy-Org/Ideogram-4"
 IMPL_KREA2 = "https://github.com/krea-ai/krea-2"
 IMPL_FLUX_3 = "https://huggingface.co/black-forest-labs/flux-3-image-klein-base"
+IMPL_MOSS_IMAGE = "https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base"
 IMPL_MINIMAX_H3 = "https://huggingface.co/MiniMaxAI/MiniMax-H3"
 IMPL_ERNIE_IMAGE = "https://github.com/baidu/ERNIE-Image"
 IMPL_MAGE_FLOW = "https://github.com/microsoft/Mage"
@@ -269,6 +272,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_FLUX_3:
         arch = ARCH_FLUX_3_KLEIN
         impl = IMPL_FLUX_3
+    elif architecture == ARCHITECTURE_MOSS_IMAGE:
+        arch = ARCH_MOSS_IMAGE
+        impl = IMPL_MOSS_IMAGE
     elif architecture == ARCHITECTURE_MINIMAX_H3:
         arch = ARCH_MINIMAX_H3
         impl = IMPL_MINIMAX_H3
@@ -353,6 +359,8 @@ def build_metadata(
         elif architecture == ARCHITECTURE_KREA2:
             reso = (1024, 1024)
         elif architecture == ARCHITECTURE_FLUX_3:
+            reso = (1024, 1024)
+        elif architecture == ARCHITECTURE_MOSS_IMAGE:
             reso = (1024, 1024)
         elif architecture == ARCHITECTURE_ERNIE_IMAGE:
             reso = (1024, 1024)

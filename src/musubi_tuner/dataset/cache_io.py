@@ -18,6 +18,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
     ARCHITECTURE_FLUX_3_FULL,
+    ARCHITECTURE_MOSS_IMAGE_FULL,
     ARCHITECTURE_MINIMAX_H3_FULL,
     ARCHITECTURE_KANDINSKY6_FULL,
     ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
@@ -715,6 +716,14 @@ def save_text_encoder_output_cache_flux_3(item_info: ItemInfo, ctx: torch.Tensor
     assert ctx.dim() == 2, "ctx should be a 2D tensor (tokens, 20480)"
     sd = {f"varlen_ctx_vec_{dtype_to_str(ctx.dtype)}": ctx.detach().cpu().contiguous()}
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FLUX_3_FULL)
+
+
+def save_text_encoder_output_cache_moss_image(item_info: ItemInfo, ctx: torch.Tensor):
+    """MOSS-Image: one caption's (L, 4096) Qwen3.5-9B final state, L its own token count (unpadded, as the vendor
+    encodes); a batch is right-padded with the padding masked out of the DiT's attention."""
+    assert ctx.dim() == 2, "ctx should be a 2D tensor (tokens, 4096)"
+    sd = {f"varlen_ctx_vec_{dtype_to_str(ctx.dtype)}": ctx.detach().cpu().contiguous()}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MOSS_IMAGE_FULL)
 
 
 def save_text_encoder_output_cache_mage_flow(item_info: ItemInfo, embed: torch.Tensor, *, is_edit: bool):
