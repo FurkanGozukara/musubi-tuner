@@ -17,6 +17,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
+    ARCHITECTURE_FLUX_3_FULL,
     ARCHITECTURE_MINIMAX_H3_FULL,
     ARCHITECTURE_KANDINSKY6_FULL,
     ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
@@ -706,6 +707,14 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     sd[f"varlen_krea2_vl_embed_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+
+
+def save_text_encoder_output_cache_flux_3(item_info: ItemInfo, ctx: torch.Tensor):
+    """FLUX.3 [klein]: one caption's (L, 20480) context, L its own multiple of 80 tokens (the pad tokens' states are part
+    of the condition: the DiT has no text mask). Stored varlen; a batch is zero-padded to its longest context."""
+    assert ctx.dim() == 2, "ctx should be a 2D tensor (tokens, 20480)"
+    sd = {f"varlen_ctx_vec_{dtype_to_str(ctx.dtype)}": ctx.detach().cpu().contiguous()}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FLUX_3_FULL)
 
 
 def save_text_encoder_output_cache_mage_flow(item_info: ItemInfo, embed: torch.Tensor, *, is_edit: bool):

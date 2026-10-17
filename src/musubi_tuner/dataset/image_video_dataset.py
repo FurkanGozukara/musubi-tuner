@@ -35,6 +35,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_FLUX_2_DEV,
     ARCHITECTURE_FLUX_2_KLEIN_4B,
     ARCHITECTURE_FLUX_2_KLEIN_9B,
+    ARCHITECTURE_FLUX_3,
     ARCHITECTURE_FLUX_KONTEXT,
     ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_HIDREAM_O1,
@@ -812,6 +813,7 @@ save_latent_cache_ideogram4 = _cache_io.save_latent_cache_ideogram4  # noqa: F81
 save_text_encoder_output_cache_ideogram4 = _cache_io.save_text_encoder_output_cache_ideogram4  # noqa: F811
 save_latent_cache_krea2 = _cache_io.save_latent_cache_krea2  # noqa: F811
 save_text_encoder_output_cache_krea2 = _cache_io.save_text_encoder_output_cache_krea2  # noqa: F811
+save_text_encoder_output_cache_flux_3 = _cache_io.save_text_encoder_output_cache_flux_3  # noqa: F811
 save_pixel_cache_hidream_o1 = _cache_io.save_pixel_cache_hidream_o1  # noqa: F811
 save_text_encoder_output_cache_hidream_o1 = _cache_io.save_text_encoder_output_cache_hidream_o1  # noqa: F811
 
@@ -2705,6 +2707,7 @@ class ImageDataset(BaseDataset):
             self.architecture == ARCHITECTURE_FLUX_2_DEV
             or self.architecture == ARCHITECTURE_FLUX_2_KLEIN_4B
             or self.architecture == ARCHITECTURE_FLUX_2_KLEIN_9B
+            or self.architecture == ARCHITECTURE_FLUX_3
         ):
             control_count_per_image = None  # can be multiple control images
         elif self.architecture in (ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_21, ARCHITECTURE_MAGE_FLOW_EDIT):

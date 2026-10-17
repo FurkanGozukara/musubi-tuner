@@ -51,6 +51,11 @@ def detect_arch_config(unet):
             r".*audio_embeddings_connector\..*",
         ]
 
+    if "Flux3JointBlock" in module_class_names:
+        from .lora_flux_3 import FLUX_3_TARGET_REPLACE_MODULES
+
+        return FLUX_3_TARGET_REPLACE_MODULES, [r".*(norm).*"]
+
     # Kandinsky5 is not supported in auto-detection (uses include_patterns, requires special handling)
 
     if "DoubleStreamBlock" in module_class_names:

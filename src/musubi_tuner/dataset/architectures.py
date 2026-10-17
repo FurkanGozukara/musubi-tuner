@@ -45,6 +45,8 @@ ARCHITECTURE_MAGE_FLOW = "mf"
 ARCHITECTURE_MAGE_FLOW_FULL = "mage_flow"
 ARCHITECTURE_MAGE_FLOW_EDIT = "mfe"
 ARCHITECTURE_MAGE_FLOW_EDIT_FULL = "mage_flow_edit"
+ARCHITECTURE_FLUX_3 = "f3k"
+ARCHITECTURE_FLUX_3_FULL = "flux_3_klein"
 
 
 def round_down_frame_count(frame_count: int, architecture: str, vae_frame_stride: int) -> int:
