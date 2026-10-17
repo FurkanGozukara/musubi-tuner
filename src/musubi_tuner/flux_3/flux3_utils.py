@@ -25,6 +25,7 @@ import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
 from torch import Tensor
+from tqdm import tqdm
 
 from musubi_tuner.flux_2.flux2_utils import load_ae  # noqa: F401  (the FLUX.2 VAE is FLUX.3's VAE)
 from musubi_tuner.flux_3 import flux3_model
@@ -218,7 +219,7 @@ def denoise(
     ids = flux3_model.image_ids(batch, height, width, 0, device)
     do_cfg = neg_ctx is not None and guidance > 1.0
     timesteps = get_schedule(num_steps, alpha).to(device)
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+    for t_curr, t_prev in zip(tqdm(timesteps[:-1], desc="Sampling"), timesteps[1:]):
         t_vec = torch.full((batch,), float(t_curr), device=device, dtype=torch.float32)
         v = model(ctx, x.to(dtype), ids, t_vec, image_cond=image_cond, image_cond_ids=image_cond_ids).float()
         if do_cfg:

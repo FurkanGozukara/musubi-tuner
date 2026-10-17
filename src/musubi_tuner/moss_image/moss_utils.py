@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from accelerate import init_empty_weights
 from safetensors import safe_open
 from torch import Tensor
+from tqdm import tqdm
 
 from musubi_tuner.flux_2.flux2_utils import load_ae  # noqa: F401  (the FLUX.2 VAE is MOSS-Image's VAE)
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -273,7 +274,7 @@ def denoise(
     latents = noise.float()
     do_cfg = neg_ctx is not None and guidance != 1.0
     sigmas = moss_sigmas(num_steps, shift=shift).to(latents.device)
-    for index in range(len(sigmas) - 1):
+    for index in tqdm(range(len(sigmas) - 1), desc="Sampling"):
         sigma, sigma_next = sigmas[index], sigmas[index + 1]
         timestep = (sigma * moss_model.NUM_TRAIN_TIMESTEPS).reshape(1).expand(latents.shape[0])
         pred = model(latents, timestep, ctx, ctx_mask).float()
