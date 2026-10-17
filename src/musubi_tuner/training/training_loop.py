@@ -541,6 +541,11 @@ def train(self, args):
         if surplus_network is not None:
             frozen_networks.append(surplus_network)
 
+    # trainer-specific network setup before the optimizer sees the parameters (Wan 2.2 high + low noise DoRA experts)
+    on_network_applied = getattr(self, "on_network_applied", None)
+    if callable(on_network_applied):
+        on_network_applied(args, accelerator, transformer, network)
+
     # LyCORIS + FP8 backend compatibility:
     # keep most base model in FP8, but upcast adapted base layers that LyCORIS touches.
     self._enable_lycoris_fp8_forward_compat(args, network)
@@ -1429,6 +1434,10 @@ def train(self, args):
         upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
         if args.huggingface_repo_id is not None and upload_original:
             huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+            # the other DoRA experts' files of this save (Wan 2.2 high + low noise: <name>_high_noise.safetensors)
+            expert_files = getattr(unwrapped_nw, "dora_expert_files", None)
+            for expert_file in expert_files(ckpt_file) if callable(expert_files) else []:
+                huggingface_utils.upload(args, expert_file, "/" + os.path.basename(expert_file), force_sync_upload=force_sync_upload)
 
         if getattr(args, "save_checkpoint_metadata", False):
             from datetime import datetime
@@ -1518,6 +1527,10 @@ def train(self, args):
     def remove_model(old_ckpt_name):
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
         ckpt_files = [old_ckpt_file]
+        # the other DoRA experts' files of that save (Wan 2.2 high + low noise: <name>_high_noise.safetensors)
+        expert_files = getattr(accelerator.unwrap_model(network), "dora_expert_files", None)
+        if callable(expert_files):
+            ckpt_files.extend(expert_files(old_ckpt_file))
         if not old_ckpt_name.endswith("_ema.safetensors"):
             ckpt_files.append(os.path.join(args.output_dir, _ema_ckpt_name(old_ckpt_name)))
             ckpt_files.append(os.path.join(args.output_dir, _self_flow_ema_ckpt_name(old_ckpt_name)))

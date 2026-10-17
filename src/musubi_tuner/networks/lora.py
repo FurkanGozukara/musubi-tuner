@@ -832,6 +832,9 @@ class DoRAInputModule(LoRAModule):
         self._dora_cache = None
         self._dora_from_lora_prefix = None
         self._dora_weight_ref = weakref.ref(org_module.weight)
+        # experts: base models that share these LoRA matrices, one magnitude each (enable_dora_experts)
+        self._dora_expert = 0
+        self._dora_expert_names = ("dora_scale",)
         self.register_load_state_dict_post_hook(DoRAInputModule._dora_after_load)
 
     def _dora_down(self, weight: torch.Tensor) -> torch.Tensor:
@@ -844,6 +847,63 @@ class DoRAInputModule(LoRAModule):
         if self.split_dims is None:
             return [self._dora_down(self.lora_down.weight)], [self.lora_up.weight]
         return [self._dora_down(module.weight) for module in self.lora_down], [module.weight for module in self.lora_up]
+
+    # region experts: several base models sharing the LoRA matrices (Wan 2.2 high + low noise training). A magnitude
+    # belongs to the column norms of one base weight and ComfyUI applies a file's dora_scale as absolute magnitudes,
+    # so every expert gets its own magnitude, trained on that expert's steps and saved to its own file.
+    def _active_dora_scale(self) -> torch.nn.Parameter:
+        return getattr(self, self._dora_expert_names[self._dora_expert])
+
+    def dora_expert_scale(self, index: int) -> torch.nn.Parameter:
+        """The magnitude of expert ``index`` (0: ``dora_scale``)."""
+        if not 0 <= index < len(self._dora_expert_names):
+            raise IndexError(f"{self.lora_name}: DoRA expert {index} of {len(self._dora_expert_names)}")
+        return getattr(self, self._dora_expert_names[index])
+
+    def dora_expert_parameters(self) -> List[torch.nn.Parameter]:
+        return [getattr(self, name) for name in self._dora_expert_names]
+
+    def enable_dora_experts(self, count: int) -> None:
+        """Magnitudes for ``count`` base models: ``dora_scale`` is expert 0, ``dora_scale_expert<i>`` the others,
+        starting as copies of expert 0 (init_dora_expert_from_current_weights reads an expert's own weights)."""
+        if count < 1:
+            raise ValueError(f"DoRA expert count must be at least 1, got {count}")
+        names = list(self._dora_expert_names)
+        for index in range(len(names), count):
+            name = f"dora_scale_expert{index}"
+            param = torch.nn.Parameter(self.dora_scale.detach().clone(), requires_grad=self.dora_scale.requires_grad)
+            param._is_dora_scale = True
+            self.register_parameter(name, param)
+            names.append(name)
+        self._dora_expert_names = tuple(names)
+
+    def set_dora_expert(self, index: int) -> None:
+        """Use expert ``index``'s magnitude (call between steps, never inside a traced forward)."""
+        self.dora_expert_scale(index)
+        if index != self._dora_expert:
+            self._dora_expert = index
+            self._dora_cache = None
+
+    def _dora_magnitude_of_current_weight(self) -> torch.Tensor:
+        """||W||_col of the base weight the layer holds now, per input channel (fp32), as __init__ computes it."""
+        with torch.no_grad():
+            weight = self.dora_base.module.weight
+            device = None
+            if not weight.is_cuda and weight.device.type != "meta" and torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            col_sq = dora_column_norm_sq_of(self.dora_base, device=device)
+            return col_sq.view(-1, self.dora_base.kernel).sum(dim=1).sqrt()
+
+    def init_dora_expert_from_current_weights(self, index: int) -> None:
+        """Expert ``index``'s magnitude from the base weight the layer holds now (its ``||W||_col``, so the expert's
+        first step reproduces its base model, as DoRA's own initialization does)."""
+        target = self.dora_expert_scale(index)
+        magnitude = self._dora_magnitude_of_current_weight()
+        with torch.no_grad():
+            target.copy_(magnitude.reshape(target.shape).to(target.device, target.dtype))
+        self._dora_cache = None
+
+    # endregion
 
     def _dora_base_norm_sq(self, device: torch.device) -> torch.Tensor:
         # nothing is stored while torch.compile traces (no side effects under activation checkpointing)
@@ -867,14 +927,15 @@ class DoRAInputModule(LoRAModule):
     def dora_factor(self, device=None, multiplier=None) -> torch.Tensor:
         """dora_scale / (||W + s*B@A||_col + eps) for every input channel: fp32 (in,). Eager forwards without
         gradients (sampling, validation) reuse it until a parameter changes."""
-        device = self.dora_scale.device if device is None else torch.device(device)
+        magnitude = self._active_dora_scale()
+        device = magnitude.device if device is None else torch.device(device)
         multiplier = self.multiplier if multiplier is None else multiplier
         compiling = torch.compiler.is_compiling()
         if not compiling and self._dora_weight_ref() is not self.dora_base.module.weight:
             self._dora_cache = None  # another base weight (see _dora_base_norm_sq)
         key = None
         if not torch.is_grad_enabled() and not compiling:
-            key = (device, float(multiplier), tuple((p.data_ptr(), p._version) for p in self.parameters()))
+            key = (device, float(multiplier), self._dora_expert, tuple((p.data_ptr(), p._version) for p in self.parameters()))
             if self._dora_cache is not None and self._dora_cache[0] == key:
                 return self._dora_cache[1]
         downs, ups = self._dora_lora_weights()
@@ -884,7 +945,7 @@ class DoRAInputModule(LoRAModule):
             ups,
             multiplier * self.scale,
             self._dora_base_norm_sq(device),
-            self.dora_scale,
+            magnitude,
             detach_norm=self.dora_detach_norm and torch.is_grad_enabled(),
         )
         if key is not None:
@@ -943,9 +1004,10 @@ class DoRAInputModule(LoRAModule):
         weight = (weight.float() * factor.view(1, -1, *([1] * (weight.dim() - 2)))).to(weight.dtype)
         return lora_down._conv_forward(x, weight, None)
 
-    def export_state_dict(self) -> Dict[str, torch.Tensor]:
+    def export_state_dict(self, expert: Optional[int] = None) -> Dict[str, torch.Tensor]:
+        """The ComfyUI / kohya layout; ``expert`` picks whose magnitude becomes ``dora_scale`` (default expert 0)."""
         state_dict = super().export_state_dict()
-        state_dict[f"{self.lora_name}.dora_scale"] = self.dora_scale.detach().clone()
+        state_dict[f"{self.lora_name}.dora_scale"] = self.dora_expert_scale(expert or 0).detach().clone()
         return state_dict
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -969,7 +1031,8 @@ class DoRAInputModule(LoRAModule):
         with torch.no_grad():
             downs, ups = module._dora_lora_weights()
             norm = dora_column_norm(module.dora_base, downs, ups, module.multiplier * module.scale, module._dora_col_sq)
-            module.dora_scale.copy_(norm.reshape(module.dora_scale.shape).to(module.dora_scale.device, module.dora_scale.dtype))
+            magnitude = module._active_dora_scale()
+            magnitude.copy_(norm.reshape(magnitude.shape).to(magnitude.device, magnitude.dtype))
         module._dora_cache = None
         if f"{prefix}dora_scale" in incompatible_keys.missing_keys:
             incompatible_keys.missing_keys.remove(f"{prefix}dora_scale")
@@ -987,7 +1050,7 @@ class DoRAInputModule(LoRAModule):
         multiplier = self.multiplier if multiplier is None else multiplier
         base = self.dora_base.dense(device=device).reshape(self._dora_weight_shape)
         delta = self._dora_delta_weight(multiplier, device=base.device)
-        return dora_input_axis_merge(base, delta, self.dora_scale.detach().to(base.device, torch.float32))
+        return dora_input_axis_merge(base, delta, self._active_dora_scale().detach().to(base.device, torch.float32))
 
 
 class DoRAInputInfModule(DoRAInputModule):
@@ -1002,6 +1065,10 @@ class DoRAInputInfModule(DoRAInputModule):
     ):
         super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, **kwargs)
         self.network: LoRANetwork = None
+
+    def enable_dora_experts(self, count: int) -> None:
+        if count != 1:
+            raise ValueError("DoRA experts are a training feature: merge each expert's file into its own model")
 
     def set_network(self, network):
         self.network = network
@@ -1664,6 +1731,71 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
 
+    # region DoRA experts: base models that share this network's LoRA matrices (Wan 2.2 high + low noise training),
+    # one input-axis magnitude each. save_weights writes expert 0 to the given file and expert i to
+    # <stem>_<name i><ext> (ComfyUI applies a file's dora_scale as the absolute magnitudes of the model it loads on).
+    def _dora_expert_modules(self) -> List["DoRAInputModule"]:
+        return [lora for lora in self.text_encoder_loras + self.unet_loras if isinstance(lora, DoRAInputModule)]
+
+    def enable_dora_experts(self, count: int, names=None) -> int:
+        """Give every input-axis DoRA module ``count`` magnitudes; returns how many modules have them (0: plain LoRA,
+        nothing changes). ``names`` name the experts' files (default low_noise / high_noise for two)."""
+        names = tuple(names) if names is not None else (("low_noise", "high_noise") if count == 2 else tuple(f"expert{i}" for i in range(count)))
+        if len(names) != count:
+            raise ValueError(f"{count} DoRA experts need {count} names, got {names}")
+        single = [
+            lora.lora_name
+            for lora in self.text_encoder_loras + self.unet_loras
+            if not isinstance(lora, DoRAInputModule) and (hasattr(lora, "lora_magnitude_vector") or isinstance(lora, (DoRAOFTModule, DoRAOFTInfModule)))
+        ]
+        if single and count > 1:
+            raise ValueError(
+                f"DoRA experts need input-axis DoRA (the default dora_axis); {single[0]} and {len(single) - 1} more keep one "
+                "magnitude (output-axis DoRA / DoRA-OFT), which cannot belong to several base models"
+            )
+        modules = self._dora_expert_modules()
+        for module in modules:
+            module.enable_dora_experts(count)
+        self.dora_expert_names = names if modules else names[:1]
+        return len(modules)
+
+    @property
+    def dora_expert_count(self) -> int:
+        return len(getattr(self, "dora_expert_names", ("",)))
+
+    def set_dora_expert(self, index: int) -> None:
+        """Train and sample with expert ``index``'s magnitudes (between steps, never inside a traced forward)."""
+        for module in self._dora_expert_modules():
+            module.set_dora_expert(index)
+
+    def init_dora_expert_from_current_weights(self, index: int) -> None:
+        """Expert ``index``'s magnitudes from the base weights the model holds now (load that expert first)."""
+        for module in self._dora_expert_modules():
+            module.init_dora_expert_from_current_weights(index)
+
+    def dora_expert_files(self, file: str) -> List[str]:
+        """The files save_weights writes next to ``file`` for experts 1.. (none without experts)."""
+        if self.dora_expert_count <= 1:
+            return []
+        stem, ext = os.path.splitext(file)
+        return [f"{stem}_{name}{ext}" for name in self.dora_expert_names[1:]]
+
+    def load_dora_expert_weights(self, index: int, state_dict: Dict[str, torch.Tensor]) -> int:
+        """Expert ``index``'s magnitudes from an exported file's ``<lora_name>.dora_scale``; returns how many loaded."""
+        loaded = 0
+        for module in self._dora_expert_modules():
+            value = state_dict.get(f"{module.lora_name}.dora_scale")
+            if value is None:
+                continue
+            target = module.dora_expert_scale(index)
+            with torch.no_grad():
+                target.copy_(value.reshape(target.shape).to(target.device, target.dtype))
+            module._dora_cache = None
+            loaded += 1
+        return loaded
+
+    # endregion
+
     def set_dropout_enabled(self, is_enabled):
         """Toggle LoRA dropout independently of ``.train()`` mode.
 
@@ -2014,7 +2146,8 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
     def _apply_trainable_param_overrides(self):
         for lora in self.unet_loras:
             if getattr(lora, "freeze_dora_scale", False) and hasattr(lora, "dora_scale"):
-                lora.dora_scale.requires_grad_(False)
+                for param in getattr(lora, "dora_expert_parameters", lambda: [lora.dora_scale])():
+                    param.requires_grad_(False)
 
     def on_epoch_start(self, unet):
         self.train()
@@ -2037,20 +2170,35 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
                 v = v.detach().clone().to("cpu").to(key_dtype)
                 state_dict[key] = v
 
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import save_file
-            from musubi_tuner.utils import model_utils
+        def write(state_dict, file, metadata):
+            if os.path.splitext(file)[1] == ".safetensors":
+                from safetensors.torch import save_file
+                from musubi_tuner.utils import model_utils
 
-            # Precalculate model hashes to save time on indexing
-            if metadata is None:
-                metadata = {}
-            model_hash, legacy_hash = model_utils.precalculate_safetensors_hashes(state_dict, metadata)
-            metadata["sshs_model_hash"] = model_hash
-            metadata["sshs_legacy_hash"] = legacy_hash
+                # Precalculate model hashes to save time on indexing
+                if metadata is None:
+                    metadata = {}
+                model_hash, legacy_hash = model_utils.precalculate_safetensors_hashes(state_dict, metadata)
+                metadata["sshs_model_hash"] = model_hash
+                metadata["sshs_legacy_hash"] = legacy_hash
 
-            save_file(state_dict, file, metadata)
+                save_file(state_dict, file, metadata)
+            else:
+                torch.save(state_dict, file)
+
+        expert_files = self.dora_expert_files(file)
+        if not expert_files:
+            write(state_dict, file, metadata)
         else:
-            torch.save(state_dict, file)
+            # every expert's file: the shared LoRA matrices with that expert's magnitudes
+            modules = self._dora_expert_modules()
+            for index, path in enumerate([file] + expert_files):
+                expert_state = dict(state_dict)
+                for module in modules:
+                    expert_state[f"{module.lora_name}.dora_scale"] = module.dora_expert_scale(index).detach().to("cpu", torch.float32).clone()
+                expert_metadata = dict(metadata or {})
+                expert_metadata["ss_dora_expert"] = self.dora_expert_names[index]
+                write(expert_state, path, expert_metadata)
 
         if adaptive_rank_report is not None:
             with open(self._adaptive_rank_report_path(file), "w", encoding="utf-8") as f:

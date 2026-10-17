@@ -1,4 +1,5 @@
 import argparse
+import os
 from typing import List, Optional
 from PIL import Image
 
@@ -38,6 +39,9 @@ from musubi_tuner.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 class WanNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+        # Wan 2.2 high + low noise DoRA: the network whose magnitudes follow the loaded expert (on_network_applied)
+        self._dora_experts_expected = False
+        self._dora_expert_network = None
 
     # region model specific
 
@@ -79,16 +83,13 @@ class WanNetworkTrainer(NetworkTrainer):
 
         if self.high_low_training:
             network_args = args.network_args if isinstance(args.network_args, (list, tuple)) else [args.network_args or ""]
-            if any(
+            # DoRA: the experts share the LoRA matrices and get one magnitude each (on_network_applied); the run
+            # writes <output_name>.safetensors for the low-noise model and <output_name>_high_noise.safetensors
+            self._dora_experts_expected = any(
                 str(item).partition("=")[0].strip().lower() == "use_dora"
                 and str(item).partition("=")[2].strip().strip("'\"").lower() in ("1", "true", "yes", "on")
                 for item in network_args
-            ):
-                raise ValueError(
-                    "DoRA learns magnitudes for one base model, but Wan 2.2 high + low noise training shares one "
-                    "network between both experts (and ComfyUI applies one dora_scale to each). Train with LoRA, or "
-                    "train each expert on its own (without dit_high_noise)."
-                )
+            )
             if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
                 assert not args.offload_inactive_dit, (
                     "Block swap is not supported with offloading inactive DiT / 非アクティブDiTをオフロードする設定ではブロックスワップはサポートされていません"
@@ -596,6 +597,41 @@ class WanNetworkTrainer(NetworkTrainer):
 
         return final_noisy_model_input, final_timesteps
 
+    def on_network_applied(self, args: argparse.Namespace, accelerator: Accelerator, transformer, network) -> None:
+        """Wan 2.2 high + low noise DoRA. The experts share the LoRA matrices, not the magnitudes: a magnitude belongs
+        to one base model's column norms, and ComfyUI applies a file's dora_scale as absolute magnitudes. Expert 0 is
+        the low-noise model (<output_name>.safetensors), expert 1 the high-noise model (<output_name>_high_noise)."""
+        if not self.high_low_training:
+            return
+        enable = getattr(network, "enable_dora_experts", None)
+        if not callable(enable):
+            if self._dora_experts_expected:
+                raise ValueError(
+                    "Wan 2.2 high + low noise training with DoRA needs musubi's LoRA network (networks.lora_wan): "
+                    "it keeps one magnitude per expert"
+                )
+            return
+        if enable(2, ("low_noise", "high_noise")) == 0:
+            return  # plain LoRA: one network for both experts
+        logger.info("DoRA with Wan 2.2 high + low noise experts: shared LoRA matrices, one magnitude per expert")
+        # the high-noise expert's magnitudes start from its own weights, as DoRA's initialization does for one model
+        self.next_model_is_high_noise = True
+        self.swap_high_low_weights(args, accelerator, transformer)
+        network.init_dora_expert_from_current_weights(1)
+        self.next_model_is_high_noise = False
+        self.swap_high_low_weights(args, accelerator, transformer)
+        network.set_dora_expert(0)
+        self._dora_expert_network = network
+        if args.network_weights:
+            companion = network.dora_expert_files(args.network_weights)[0]
+            if os.path.isfile(companion):
+                from safetensors.torch import load_file
+
+                loaded = network.load_dora_expert_weights(1, load_file(companion))
+                logger.info(f"High-noise DoRA magnitudes of {loaded} modules loaded from {companion}")
+            else:
+                logger.warning(f"{companion} not found: the high-noise DoRA magnitudes start from the high-noise model")
+
     def swap_high_low_weights(self, args: argparse.Namespace, accelerator: Accelerator, model: WanModel):
         if self.current_model_is_high_noise != self.next_model_is_high_noise:
 
@@ -646,6 +682,9 @@ class WanNetworkTrainer(NetworkTrainer):
                 self.dit_inactive_state_dict = state_dict  # swap the state dict
 
             self.current_model_is_high_noise = self.next_model_is_high_noise
+            if self._dora_expert_network is not None:
+                # the DoRA magnitudes of the expert now loaded (its column norms are re-read with the new weights)
+                self._dora_expert_network.set_dora_expert(1 if self.current_model_is_high_noise else 0)
 
     def call_dit(
         self,
@@ -662,6 +701,11 @@ class WanNetworkTrainer(NetworkTrainer):
     ) -> DiTOutput:
         if self.high_low_training:
             # high-low training case
+            if self._dora_experts_expected and self._dora_expert_network is None:
+                raise RuntimeError(
+                    "Wan 2.2 high + low noise DoRA: the training loop did not call on_network_applied, so both experts "
+                    "would share one set of magnitudes"
+                )
             self.swap_high_low_weights(args, accelerator, transformer)
 
         # Call the DiT model

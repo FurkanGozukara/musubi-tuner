@@ -165,6 +165,17 @@ class NetworkTrainer(UpstreamNetworkTrainer):
     ) -> None:
         pass
 
+    def on_network_applied(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+    ) -> None:
+        """After the network is applied to the DiT and its weights are loaded, before the optimizer sees its
+        parameters (Wan 2.2 high + low noise DoRA adds the high-noise expert's magnitudes here)."""
+        pass
+
     def on_train_start(
         self,
         args: argparse.Namespace,
