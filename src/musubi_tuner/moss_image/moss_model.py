@@ -349,7 +349,9 @@ class MossImage(nn.Module):
         text_rope = rope[:, num_image:]
         for block in self.text_embedder.blocks:
             text = block(text, text_rope, text_mask)
-        x = torch.cat((video, text), 1)
+        # activation CPU offloading returns each checkpointed block's output on the CPU (the next block brings its
+        # input back), so the refined text joins the image tokens on the GPU
+        x = torch.cat((video, text.to(device)), 1)
         del video, text, context
 
         for index, layer in enumerate(self.layers):

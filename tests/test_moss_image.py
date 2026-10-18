@@ -47,6 +47,20 @@ def test_a_padded_batch_equals_one_forward_per_item():
     assert torch.allclose(batched[1:], single, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="activation CPU offloading moves block outputs between CUDA and the CPU")
+def test_activation_cpu_offloading_matches_and_trains():
+    """The 6 GB preset candidates (activation CPU offloading) failed at the first step: the text refiner's last output
+    came back on the CPU and was joined with the image tokens on the GPU."""
+    model = _tiny().cuda().train()
+    x, t, ctx, mask = (value.cuda() for value in _inputs())
+    expected = model(x, t, ctx, mask).detach()
+    model.enable_gradient_checkpointing(activation_cpu_offloading=True)
+    out = model(x, t, ctx, mask)
+    out.square().mean().backward()
+    assert out.device.type == "cuda" and torch.allclose(out, expected, atol=1e-5)
+    assert all(p.grad is not None for p in model.layers[0].parameters())
+
+
 def test_skipping_a_layer_changes_the_prediction():
     model = _tiny()
     x, t, ctx, mask = _inputs()
