@@ -328,14 +328,19 @@ def preprocess_control_image(
             - None: Placeholder for compatibility (no additional data returned).
     """
     control_image = Image.open(control_image_path)
+    width, height = control_image.size
 
-    if limit_size is None or limit_size[0] * limit_size[1] >= control_image.size[0] * control_image.size[1]:  # No resizing needed
+    if limit_size is None or limit_size[0] * limit_size[1] >= width * height:  # No resizing needed
         # All FLUX 2 architectures require dimensions to be multiples of 16
         resize_size = BucketSelector.calculate_bucket_resolution(
             control_image.size, control_image.size, architecture=ARCHITECTURE_FLUX_2_DEV
         )
     else:
-        resize_size = limit_size
+        # limit_size caps the pixel count, as BFL's reference caps a reference at 2024 ** 2 pixels (1024 ** 2 for
+        # several): the aspect ratio is kept and both sides become multiples of 16. Resizing to (2024, 2024) itself
+        # squared every larger reference and gave a 253-wide latent that the 2x2 patching cannot split.
+        scale = math.sqrt(limit_size[0] * limit_size[1] / (width * height))
+        resize_size = (max(16, int(width * scale) // 16 * 16), max(16, int(height * scale) // 16 * 16))
 
     control_image_tensor, control_image_np, _ = image_utils.preprocess_image(control_image, *resize_size, handle_alpha=False)
     return control_image_tensor, control_image_np, None
