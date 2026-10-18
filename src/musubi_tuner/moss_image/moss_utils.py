@@ -31,7 +31,7 @@ from musubi_tuner.flux_2.flux2_utils import load_ae  # noqa: F401  (the FLUX.2 V
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 from musubi_tuner.modules.int8_convrot_utils import dequantize_int8_convrot_weight, parse_comfy_quant_tensor
 from musubi_tuner.moss_image import moss_model
-from musubi_tuner.utils.model_utils import keep_weights_in_cpu_ram
+from musubi_tuner.utils.model_utils import cpu_bf16_is_slow, keep_weights_in_cpu_ram
 from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 logger = logging.getLogger(__name__)
@@ -188,6 +188,7 @@ def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Un
     (CUDA only) keeps the tower in CPU RAM and runs it on ``device`` one decoder layer at a time (stream_text_encoder)."""
     from transformers import AutoTokenizer, Qwen3_5TextConfig, Qwen3_5TextModel
 
+    device, dtype, stream = text_encoder_plan(device, dtype, stream)
     config = Qwen3_5TextConfig(**QWEN35_9B_TEXT_CONFIG)
     with init_empty_weights():
         model = Qwen3_5TextModel(config)
@@ -209,6 +210,20 @@ def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Un
         model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(MOSS_TOKENIZER_REPO, subfolder="tokenizer", revision=MOSS_TOKENIZER_REVISION)
     return model.eval().requires_grad_(False), tokenizer
+
+
+def text_encoder_plan(device: Union[str, torch.device], dtype: torch.dtype, stream: bool) -> tuple[torch.device, torch.dtype, bool]:
+    """Where and in which dtype Qwen3.5-9B runs. BF16 on a CPU without fast BF16 (AVX2-only: 16 minutes per caption on
+    a Broadwell Xeon) is replaced by low-VRAM streaming on the GPU when there is one (12 s per caption there, under
+    1 GB of VRAM), else by FP32 on the CPU (22 s, about 36 GB of RAM)."""
+    device = torch.device(device)
+    if device.type != "cpu" or dtype != torch.bfloat16 or stream or not cpu_bf16_is_slow():
+        return device, dtype, stream
+    if torch.cuda.is_available():
+        logger.warning("This CPU multiplies BF16 far slower than FP32: Qwen3.5-9B runs on the GPU one layer at a time instead (--low_vram_text_encoding)")
+        return torch.device("cuda"), dtype, True
+    logger.warning("This CPU multiplies BF16 far slower than FP32: Qwen3.5-9B is encoded in float32 on the CPU (about 36 GB of RAM)")
+    return device, torch.float32, False
 
 
 def stream_text_encoder(model, device: Union[str, torch.device]) -> None:

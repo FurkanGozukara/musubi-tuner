@@ -879,3 +879,22 @@ def keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.devic
 
     module.register_forward_pre_hook(load)
     module.register_forward_hook(release)
+
+
+@lru_cache(maxsize=1)
+def cpu_bf16_is_slow() -> bool:
+    """True when this CPU multiplies BF16 matrices far slower than FP32 (no native BF16: AVX2-only CPUs). A Broadwell
+    Xeon took 98.6 s for ten 64x4096x4096 BF16 matmuls against 0.115 s in FP32 (a 9B text encoder: 1035 s vs 21.5 s per
+    caption); a Ryzen 9 9950X runs BF16 faster than FP32. Measured once per process on small matrices."""
+    import time
+
+    a32, b32 = torch.randn(32, 1024), torch.randn(1024, 1024)
+    timings = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        a, b = a32.to(dtype), b32.to(dtype)
+        a @ b  # warm-up
+        start = time.perf_counter()
+        for _ in range(3):
+            a @ b
+        timings[dtype] = time.perf_counter() - start
+    return timings[torch.bfloat16] > 4 * timings[torch.float32]

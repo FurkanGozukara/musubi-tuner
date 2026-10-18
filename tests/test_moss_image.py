@@ -174,6 +174,32 @@ def test_low_vram_text_encoding_on_the_gpu_matches_the_resident_text_encoder():
     _streamed_matches_resident("cuda")
 
 
+@pytest.mark.parametrize(
+    ("slow_cpu", "cuda", "asked", "expected"),
+    [
+        # BF16 on a CPU without fast BF16 (a Broadwell Xeon: 16 minutes per caption): stream on the GPU, else FP32
+        (True, True, ("cpu", torch.bfloat16, False), ("cuda", torch.bfloat16, True)),
+        (True, False, ("cpu", torch.bfloat16, False), ("cpu", torch.float32, False)),
+        # a CPU with fast BF16, an explicit choice, or the GPU: unchanged
+        (False, True, ("cpu", torch.bfloat16, False), ("cpu", torch.bfloat16, False)),
+        (True, True, ("cpu", torch.float32, False), ("cpu", torch.float32, False)),
+        (True, True, ("cuda", torch.bfloat16, False), ("cuda", torch.bfloat16, False)),
+        (True, True, ("cuda", torch.bfloat16, True), ("cuda", torch.bfloat16, True)),
+    ],
+)
+def test_text_encoder_plan_avoids_slow_cpu_bf16(monkeypatch, slow_cpu, cuda, asked, expected):
+    monkeypatch.setattr(moss_utils, "cpu_bf16_is_slow", lambda: slow_cpu)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    device, dtype, stream = moss_utils.text_encoder_plan(*asked)
+    assert (device.type, dtype, stream) == (torch.device(expected[0]).type, expected[1], expected[2])
+
+
+def test_cpu_bf16_check_returns_a_verdict():
+    from musubi_tuner.utils.model_utils import cpu_bf16_is_slow
+
+    assert isinstance(cpu_bf16_is_slow(), bool)
+
+
 def test_lora_targets_the_block_linears_under_comfyui_names():
     from musubi_tuner.networks import lora_moss_image
 
