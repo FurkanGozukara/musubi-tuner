@@ -259,3 +259,21 @@ def test_moss_image_is_registered_with_the_shared_code():
     assert bucket.BucketSelector.RESOLUTION_STEPS_MOSS_IMAGE == 16
     metadata = sai_model_spec.build_metadata(None, ARCHITECTURE_MOSS_IMAGE, 0.0, title="moss")
     assert metadata["modelspec.architecture"].startswith(sai_model_spec.ARCH_MOSS_IMAGE)
+
+
+@pytest.mark.parametrize("convrot", [True, False])
+@pytest.mark.parametrize("per_row", [True, False])
+def test_text_encoder_dequantizes_in_row_chunks_like_the_whole_tensor(convrot, per_row):
+    """The 248320 x 4096 token table dequantized whole held 10.4 GiB on the GPU; row chunks give the same weights."""
+    from musubi_tuner.modules.int8_convrot_utils import dequantize_int8_convrot_weight
+
+    torch.manual_seed(0)
+    q = torch.randint(-127, 128, (37, 256), dtype=torch.int8)
+    scale = torch.rand(37, 1) * 0.01 if per_row else torch.tensor(0.004)
+    quant = {"format": "int8_tensorwise", "convrot": convrot, "convrot_groupsize": 64}  # a power of 4
+    if convrot:
+        whole = dequantize_int8_convrot_weight(q, scale, 64, dtype=torch.bfloat16)
+    else:
+        whole = (q.float() * scale.float()).to(torch.bfloat16)
+    chunked = moss_utils._dequantize_rows(q, scale, quant, torch.bfloat16, torch.device("cpu"), chunk_elements=256 * 5)
+    assert chunked.device.type == "cpu" and torch.equal(chunked, whole)

@@ -147,6 +147,31 @@ def load_dit(
 # ------------------------------------------------------------------------------------------------------- text encoder
 _TE_PREFIXES = ("model.language_model.", "language_model.", "model.")
 _TE_DROPPED = ("lm_head.", "mtp.", "model.visual.", "visual.")
+# elements per dequantized chunk: about 1 GiB of FP32 temporaries; the 248320 x 4096 token table dequantized whole held
+# 10.4 GiB on the GPU, so text caching for the 6 GB preset (GPU streaming on a CPU slow in BF16) peaked at 10.8 GiB
+_DEQUANT_CHUNK_ELEMENTS = 64 * 2**20
+
+
+def _dequantize_rows(q: Tensor, scale: Tensor, quant: dict, dtype: torch.dtype, device, chunk_elements: int = _DEQUANT_CHUNK_ELEMENTS) -> Tensor:
+    """An INT8 (ConvRot) weight dequantized on ``device`` in row chunks into a CPU tensor of ``dtype``. Rows are
+    independent: the scale is per row (or one for the tensor) and the ConvRot rotation groups each row's inputs."""
+    if q.dim() != 2:
+        raise ValueError(f"INT8 weight of shape {tuple(q.shape)}: expected 2-D")
+    per_row = scale.numel() > 1
+    if per_row and scale.shape[0] != q.shape[0]:
+        raise ValueError(f"INT8 weight {tuple(q.shape)} with scale {tuple(scale.shape)}: expected one scale per row")
+    out = torch.empty(q.shape, dtype=dtype)
+    step = max(1, chunk_elements // q.shape[1])
+    for start in range(0, q.shape[0], step):
+        rows = slice(start, start + step)
+        chunk_q = q[rows].to(device)
+        chunk_scale = (scale[rows] if per_row else scale).to(device)
+        if quant.get("convrot"):
+            chunk = dequantize_int8_convrot_weight(chunk_q, chunk_scale, int(quant["convrot_groupsize"]), dtype=dtype)
+        else:
+            chunk = (chunk_q.float() * chunk_scale.float()).to(dtype)
+        out[rows] = chunk.cpu()
+    return out
 
 
 def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str, Tensor]:
@@ -164,13 +189,7 @@ def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str,
                 quant = parse_comfy_quant_tensor(handle.get_tensor(f"{base}.comfy_quant"))
                 if quant.get("format") != "int8_tensorwise":
                     raise ValueError(f"{path}: unsupported quantization {quant} at {base} (use the BF16 or INT8 ConvRot file)")
-                q = handle.get_tensor(key).to(device)
-                scale = handle.get_tensor(f"{base}.weight_scale").to(device)
-                if quant.get("convrot"):
-                    tensor = dequantize_int8_convrot_weight(q, scale, int(quant["convrot_groupsize"]), dtype=dtype)
-                else:
-                    tensor = (q.float() * scale.float()).to(dtype)
-                tensor = tensor.cpu()
+                tensor = _dequantize_rows(handle.get_tensor(key), handle.get_tensor(f"{base}.weight_scale"), quant, dtype, device)
             else:
                 tensor = handle.get_tensor(key)
                 if tensor.is_floating_point():
