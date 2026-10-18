@@ -27,6 +27,12 @@ def encode_and_save_batch(text_encoder, tokenizer, batch: list[ItemInfo]):
 def moss_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder", type=str, required=True, help="Qwen3.5-9B ComfyUI file (BF16 or INT8 ConvRot)")
     parser.add_argument("--text_encoder_dtype", type=str, default=None, help="dtype of the text encoder (default bfloat16)")
+    parser.add_argument(
+        "--low_vram_text_encoding",
+        action="store_true",
+        help="Keep Qwen3.5-9B in CPU RAM and run it on the GPU one decoder layer at a time: under 1 GB of VRAM instead "
+             "of about 18 GB, fast on any CPU (17 GB of host-to-device copies per prompt)",
+    )
     return parser
 
 
@@ -52,7 +58,9 @@ def main():
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
-    text_encoder, tokenizer = moss_utils.load_text_encoder(args.text_encoder, dtype=te_dtype, device=device)
+    text_encoder, tokenizer = moss_utils.load_text_encoder(
+        args.text_encoder, dtype=te_dtype, device=device, stream=bool(args.low_vram_text_encoding)
+    )
     logger.info("Encoding with Qwen3.5-9B")
 
     def encode_for_text_encoder(batch: list[ItemInfo]):

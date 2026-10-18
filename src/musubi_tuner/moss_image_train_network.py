@@ -68,7 +68,9 @@ class MossImageNetworkTrainer(NetworkTrainer):
                 if text not in texts:
                     texts.append(text)
 
-        text_encoder, tokenizer = moss_utils.load_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
+        text_encoder, tokenizer = moss_utils.load_text_encoder(
+            args.text_encoder, dtype=torch.bfloat16, device=device, stream=bool(getattr(args, "low_vram_text_encoding", False))
+        )
         logger.info("Encoding with Qwen3.5-9B")
         contexts = moss_utils.encode_prompts(text_encoder, tokenizer, texts)
         encoded = {text: ctx.cpu() for text, ctx in zip(texts, contexts)}
@@ -200,6 +202,14 @@ def moss_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     """MOSS-Image specific options."""
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument("--text_encoder", type=str, default=None, help="Qwen3.5-9B ComfyUI file, needed for sampling")
+    parser.add_argument(
+        "--low_vram_text_encoding",
+        action="store_true",
+        help=(
+            "encode the sample prompts with Qwen3.5-9B kept in CPU RAM and run on the GPU one decoder layer at a time: "
+            "under 1 GB of VRAM instead of about 18 GB, fast on any CPU"
+        ),
+    )
     return parser
 
 

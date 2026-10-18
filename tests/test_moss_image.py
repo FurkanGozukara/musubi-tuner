@@ -128,6 +128,52 @@ def test_conditioning_text_is_comfyuis():
     assert moss_utils.chat_text(_Template(), " a cat ") == "<|im_start|>user\na cat<|im_end|>\n<|im_start|>assistant\n<think>\n"
 
 
+class _CharTokenizer(_Template):
+    def __call__(self, text, return_tensors, truncation, max_length):
+        return {"input_ids": torch.tensor([[ord(c) % 97 for c in text][:max_length]])}
+
+
+def _tiny_text_encoder():
+    """Qwen3.5's layout (three linear-attention layers, then full attention) at toy sizes, random weights."""
+    from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
+
+    config = dict(moss_utils.QWEN35_9B_TEXT_CONFIG)
+    config.update(hidden_size=64, intermediate_size=96, num_hidden_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"],
+                  head_dim=32, num_attention_heads=2, num_key_value_heads=1, linear_key_head_dim=16, linear_value_head_dim=16,
+                  linear_num_key_heads=2, linear_num_value_heads=4, vocab_size=97, eos_token_id=1)
+    config["rope_parameters"] = dict(config["rope_parameters"], mrope_section=[2, 1, 1])
+    torch.manual_seed(3)
+    model = Qwen3_5TextModel(Qwen3_5TextConfig(**config)).eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0.0, 0.2)
+    return model
+
+
+def _streamed_matches_resident(device: str):
+    prompts = ["photo of ohwx man", "a red bicycle leaning on a wall at sunset"]
+    resident = _tiny_text_encoder().to(device)
+    expected = moss_utils.encode_prompts(resident, _CharTokenizer(), prompts)
+    streamed = _tiny_text_encoder()  # same seed, same weights
+    moss_utils.stream_text_encoder(streamed, device)
+    got = moss_utils.encode_prompts(streamed, _CharTokenizer(), prompts)
+    for a, b in zip(got, expected):
+        assert a.device.type == torch.device(device).type and torch.allclose(a, b, atol=1e-5)
+    # between forwards the layer weights live in CPU RAM; the embedding table never leaves it
+    assert all(p.device.type == "cpu" for p in streamed.layers.parameters()) and streamed.embed_tokens.weight.device.type == "cpu"
+
+
+def test_low_vram_text_encoding_matches_the_resident_text_encoder():
+    """--low_vram_text_encoding (stream_text_encoder) looks the tokens up on the CPU and passes the embeddings in; the
+    outputs must not change."""
+    _streamed_matches_resident("cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="streams the layers to the GPU")
+def test_low_vram_text_encoding_on_the_gpu_matches_the_resident_text_encoder():
+    _streamed_matches_resident("cuda")
+
+
 def test_lora_targets_the_block_linears_under_comfyui_names():
     from musubi_tuner.networks import lora_moss_image
 

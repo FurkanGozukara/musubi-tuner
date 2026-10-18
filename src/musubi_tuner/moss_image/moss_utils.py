@@ -31,6 +31,7 @@ from musubi_tuner.flux_2.flux2_utils import load_ae  # noqa: F401  (the FLUX.2 V
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 from musubi_tuner.modules.int8_convrot_utils import dequantize_int8_convrot_weight, parse_comfy_quant_tensor
 from musubi_tuner.moss_image import moss_model
+from musubi_tuner.utils.model_utils import keep_weights_in_cpu_ram
 from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 logger = logging.getLogger(__name__)
@@ -182,8 +183,9 @@ def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str,
     return out
 
 
-def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Union[str, torch.device] = "cpu"):
-    """Qwen3.5-9B's language tower from a ComfyUI file and the pinned vendor tokenizer: (model, tokenizer)."""
+def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Union[str, torch.device] = "cpu", stream: bool = False):
+    """Qwen3.5-9B's language tower from a ComfyUI file and the pinned vendor tokenizer: (model, tokenizer). ``stream``
+    (CUDA only) keeps the tower in CPU RAM and runs it on ``device`` one decoder layer at a time (stream_text_encoder)."""
     from transformers import AutoTokenizer, Qwen3_5TextConfig, Qwen3_5TextModel
 
     config = Qwen3_5TextConfig(**QWEN35_9B_TEXT_CONFIG)
@@ -201,9 +203,30 @@ def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Un
     for name, buffer in list(model.named_buffers()):
         if buffer.device.type == "meta":
             raise RuntimeError(f"Qwen3.5 text encoder buffer {name} was not initialized")
-    model.to(device)
+    if stream and torch.device(device).type == "cuda":
+        stream_text_encoder(model, device)
+    else:
+        model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(MOSS_TOKENIZER_REPO, subfolder="tokenizer", revision=MOSS_TOKENIZER_REVISION)
     return model.eval().requires_grad_(False), tokenizer
+
+
+def stream_text_encoder(model, device: Union[str, torch.device]) -> None:
+    """Low-VRAM text encoding: the Qwen3.5 tower stays in (pinned) CPU RAM and each decoder layer gets a GPU copy only
+    while it runs; the embedding table stays on the CPU, where encode_prompts looks the tokens up. Under 1 GB of VRAM
+    instead of about 18 GB, and fast on any CPU (the CPU path in BF16 took 16 minutes per caption on a Broadwell Xeon
+    without BF16 support); each prompt copies the 17 GB of layer weights to the GPU once."""
+    device = torch.device(device)
+    for layer in model.layers:
+        for buffer in layer.buffers():
+            buffer.data = buffer.data.to(device)
+        keep_weights_in_cpu_ram(layer, list(layer.parameters()), device)
+    model.norm.to(device)
+    model.rotary_emb.to(device)
+    model.embed_tokens.to("cpu")
+    model._moss_stream_device = device
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def chat_text(tokenizer, prompt: str) -> str:
@@ -221,11 +244,16 @@ def tokenize_prompt(tokenizer, prompt: str, max_tokens: int = MAX_TEXT_TOKENS) -
 @torch.no_grad()
 def encode_prompts(model, tokenizer, prompts: list[str], max_tokens: int = MAX_TEXT_TOKENS) -> list[Tensor]:
     """One (L_i, 4096) final hidden state per prompt, from one unpadded forward each, on the model's device and dtype."""
-    device = next(model.parameters()).device
+    stream_device = getattr(model, "_moss_stream_device", None)
+    device = stream_device or next(model.parameters()).device
     out = []
     for prompt in prompts:
-        input_ids = tokenize_prompt(tokenizer, prompt, max_tokens)[None].to(device)
-        out.append(model(input_ids=input_ids, use_cache=False).last_hidden_state[0])
+        input_ids = tokenize_prompt(tokenizer, prompt, max_tokens)[None]
+        if stream_device is not None:  # the embedding table stays on the CPU (stream_text_encoder)
+            embeds = model.embed_tokens(input_ids).to(stream_device)
+            out.append(model(inputs_embeds=embeds, use_cache=False).last_hidden_state[0])
+        else:
+            out.append(model(input_ids=input_ids.to(device), use_cache=False).last_hidden_state[0])
     return out
 
 

@@ -10,6 +10,7 @@ import torch
 from einops import rearrange
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
+from musubi_tuner.utils.model_utils import keep_weights_in_cpu_ram as _keep_weights_in_cpu_ram
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
@@ -309,33 +310,6 @@ def _forward_parameters(model_class: type) -> frozenset[str]:
 
 def _forward_accepts(model, name: str) -> bool:
     return name in _forward_parameters(type(model))
-
-
-def _keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.device) -> None:
-    """Keep ``params`` in pinned CPU RAM and give them a GPU copy only while ``module`` runs (forward hooks).
-
-    Assigning ``.data`` keeps every Parameter object, so tied weights (the Gemma LM head shares the embedding table)
-    follow, and dropping the GPU copy after the forward frees it for the next phase."""
-    params = list({id(param): param for param in params}.values())
-    cpu_copies = []
-    for param in params:
-        cpu = param.data.to("cpu")
-        if device.type == "cuda":
-            cpu = cpu.pin_memory()
-        param.data = cpu
-        cpu_copies.append(cpu)
-
-    def load(_module, _args):
-        with torch.inference_mode(False):
-            for param, cpu in zip(params, cpu_copies):
-                param.data = cpu.to(device, non_blocking=True)
-
-    def release(_module, _args, _output):
-        for param, cpu in zip(params, cpu_copies):
-            param.data = cpu
-
-    module.register_forward_pre_hook(load)
-    module.register_forward_hook(release)
 
 
 def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", device) -> list[str]:
