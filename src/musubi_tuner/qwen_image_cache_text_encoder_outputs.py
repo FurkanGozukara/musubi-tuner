@@ -2,6 +2,7 @@ import argparse
 from typing import Optional
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 import accelerate
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
@@ -98,7 +99,7 @@ def encode_and_save_batch(
     for item, (embed_i, mask_i) in zip(batch, zip(embed, mask)):
         txt_len = mask_i.to(dtype=torch.bool).sum().item()  # length of the text in the batch
         embed_i = embed_i[:txt_len]
-        save_text_encoder_output_cache_qwen_image(item, embed_i)
+        save_text_encoder_output_cache_qwen_image(item, cast_for_cache(text_encoder, embed_i))
 
 
 def main():
@@ -137,9 +138,12 @@ def main():
 
     # Load Qwen2.5-VL
     logger.info(f"Loading Qwen2.5-VL: {args.text_encoder}")
+    requested_dtype = vl_dtype
+    vl_dtype = cpu_text_encoder_dtype(device, vl_dtype, args.text_encoder, "Qwen2.5-VL text encoder")
     tokenizer, text_encoder = qwen_image_utils.load_qwen2_5_vl(
         ckpt_path=args.text_encoder, dtype=vl_dtype, device=device, disable_mmap=True
     )
+    mark_cpu_fp32_fallback(text_encoder, requested_dtype, vl_dtype)
 
     # Load Qwen2VLProcessor
     if args.is_edit:

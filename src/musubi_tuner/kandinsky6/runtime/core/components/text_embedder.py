@@ -114,6 +114,7 @@ class Kandinsky6TextEmbedder:
         device: str | torch.device = "cuda",
         quantized_qwen: bool = False,
         text_token_padding: bool = False,
+        qwen_dtype: torch.dtype = torch.bfloat16,
     ):
         self.max_length = max_length
         self.device = torch.device(device)
@@ -122,6 +123,8 @@ class Kandinsky6TextEmbedder:
         self.text_token_padding = text_token_padding
 
         qwen_kwargs = qwen_load_kwargs(self.device, quantized=quantized_qwen)
+        if not quantized_qwen:  # FP32 where text caching runs on a CPU that is slow in BF16
+            qwen_kwargs["torch_dtype"] = qwen_dtype
         self.qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(qwen_path, **qwen_kwargs).eval()
         self.processor = AutoProcessor.from_pretrained(qwen_processor_dir(qwen_path))
 

@@ -8,6 +8,7 @@ from typing import Optional
 
 from PIL import Image
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 from accelerate import Accelerator
 
@@ -134,11 +135,13 @@ class MageFlowNetworkTrainer(NetworkTrainer):
                 raise ValueError(f"T2I sample prompt {index} must not contain control_image_path")
             reference_lists.append([Image.open(path).convert("RGB") for path in paths])
 
+        te_dtype = cpu_text_encoder_dtype(accelerator.device, torch.bfloat16, args.text_encoder, "Mage-Flow text encoder")
         encoder = load_mage_flow_text_encoder(
             args.text_encoder,
             device=accelerator.device,
-            dtype=torch.bfloat16,
+            dtype=te_dtype,
         )
+        mark_cpu_fp32_fallback(encoder, torch.bfloat16, te_dtype)
         sample_parameters = []
         for prompt_dict, references in zip(prompts, reference_lists):
             item = prompt_dict.copy()
@@ -151,8 +154,8 @@ class MageFlowNetworkTrainer(NetworkTrainer):
                 references=[references, references] if self.is_edit else None,
                 is_edit=self.is_edit,
             )
-            item["mage_flow_embed"] = encoded[0].cpu()
-            item["negative_mage_flow_embed"] = encoded[1].cpu()
+            item["mage_flow_embed"] = cast_for_cache(encoder, encoded[0].cpu())
+            item["negative_mage_flow_embed"] = cast_for_cache(encoder, encoded[1].cpu())
             if self.is_edit:
                 width, height = resolve_output_size(
                     references[0].size,

@@ -5,6 +5,7 @@ import gc
 import logging
 
 import torch
+from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from safetensors.torch import load_file
 from torch.nn import functional as F
 
@@ -145,7 +146,13 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
 
     def process_sample_prompts(self, args, accelerator, sample_prompts):
         logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
-        processor, encoder = qwen_image_21_utils.load_text_encoder(args.text_encoder, device=accelerator.device, fp8_vl=args.fp8_vl)
+        te_dtype = torch.bfloat16
+        if not args.fp8_vl:
+            te_dtype = cpu_text_encoder_dtype(accelerator.device, te_dtype, args.text_encoder, "Qwen3-VL text encoder")
+        processor, encoder = qwen_image_21_utils.load_text_encoder(
+            args.text_encoder, device=accelerator.device, dtype=te_dtype, fp8_vl=args.fp8_vl
+        )
+        mark_cpu_fp32_fallback(encoder, torch.bfloat16, te_dtype)
         prompts = load_prompts(sample_prompts)
         logger.info("Encoding with VLM")
         prompts = qwen_image_21_sampling.encode_sample_prompts(processor, encoder, prompts)

@@ -3,6 +3,7 @@ from typing import Optional
 import math
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -59,9 +60,12 @@ class ZImageNetworkTrainer(NetworkTrainer):
 
         # Load Qwen3 text encoder
         llm_dtype = torch.bfloat16 if not args.fp8_llm else torch.float8_e4m3fn
+        requested_dtype = llm_dtype
+        llm_dtype = cpu_text_encoder_dtype(device, llm_dtype, args.text_encoder, "Qwen3 text encoder")
         # Use load_qwen3 from zimage_utils (wrapper for Qwen3ForCausalLM)
         tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=llm_dtype, device=device, disable_mmap=True)
         text_encoder.eval()
+        mark_cpu_fp32_fallback(text_encoder, requested_dtype, llm_dtype)
 
         # Encode prompts
         logger.info("Encoding with Qwen3 text encoder")
@@ -86,7 +90,7 @@ class ZImageNetworkTrainer(NetworkTrainer):
                 embed, mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, prompt)
 
                 # Move to CPU to save memory
-                embed = embed.cpu()
+                embed = cast_for_cache(text_encoder, embed.cpu())
                 mask = mask.cpu()
 
                 sample_prompts_te_outputs[prompt] = (embed, mask)

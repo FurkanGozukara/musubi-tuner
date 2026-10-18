@@ -3,6 +3,7 @@ import logging
 from typing import List
 
 import torch
+from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype
 
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
@@ -76,7 +77,7 @@ def main():
 
     device = args.device if hasattr(args, "device") and args.device else "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
-    text_encoder_dtype = torch.bfloat16
+    text_encoder_dtype = cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "Ideogram 4 text encoder")  # saved in --text_cache_dtype
 
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info(f"Load dataset config from {args.dataset_config}")

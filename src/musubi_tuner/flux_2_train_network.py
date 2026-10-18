@@ -1,6 +1,7 @@
 import argparse
 from typing import Optional
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 
 
@@ -88,9 +89,12 @@ class Flux2NetworkTrainer(NetworkTrainer):
     def _encode_sample_prompt_texts(self, args: argparse.Namespace, device: torch.device, prompts: list[dict]) -> dict:
         # Load Text Encoder (Mistral 3 or Qwen-3)
         te_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
+        requested_dtype = te_dtype
+        te_dtype = cpu_text_encoder_dtype(device, te_dtype, args.text_encoder, "FLUX.2 text encoder")
         text_embedder = flux2_utils.load_text_embedder(
             self.model_version_info, args.text_encoder, dtype=te_dtype, device=device, disable_mmap=True
         )
+        mark_cpu_fp32_fallback(text_embedder, requested_dtype, te_dtype)
 
         # Encode with Text Encoder (Mistral 3 or Qwen-3)
         logger.info("Encoding with Text Encoder (Mistral 3 or Qwen-3)...")
@@ -109,7 +113,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
                             ctx_vec = text_embedder([p])  # [1, 512, 15360]
                     else:
                         ctx_vec = text_embedder([p])  # [1, 512, 15360]
-                ctx_vec = ctx_vec.cpu()
+                ctx_vec = cast_for_cache(text_embedder, ctx_vec.cpu())
 
                 # save prompt cache
                 sample_prompts_te_outputs[p] = ctx_vec

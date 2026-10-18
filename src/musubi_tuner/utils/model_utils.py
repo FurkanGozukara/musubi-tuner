@@ -881,20 +881,113 @@ def keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.devic
     module.register_forward_hook(release)
 
 
-@lru_cache(maxsize=1)
-def cpu_bf16_is_slow() -> bool:
-    """True when this CPU multiplies BF16 matrices far slower than FP32 (no native BF16: AVX2-only CPUs). A Broadwell
-    Xeon took 98.6 s for ten 64x4096x4096 BF16 matmuls against 0.115 s in FP32 (a 9B text encoder: 1035 s vs 21.5 s per
-    caption); a Ryzen 9 9950X runs BF16 faster than FP32. Measured once per process on small matrices."""
+@lru_cache(maxsize=None)
+def cpu_dtype_is_slow(dtype: torch.dtype) -> bool:
+    """True when this CPU multiplies ``dtype`` (BF16 / FP16) matrices far slower than FP32: no native support, as on
+    AVX2-only CPUs. A Broadwell Xeon took 98.6 s for ten 64x4096x4096 BF16 matmuls against 0.115 s in FP32 (a 9B text
+    encoder: 1035 s vs 21.5 s per caption); a Ryzen 9 9950X runs BF16 faster than FP32. Measured once per process and
+    dtype on small matrices; MUSUBI_CPU_HALF_SLOW=1 / 0 forces the answer."""
+    forced = os.environ.get("MUSUBI_CPU_HALF_SLOW", "").strip().lower()
+    if forced:
+        return forced not in ("0", "false", "no", "off")
     import time
 
     a32, b32 = torch.randn(32, 1024), torch.randn(1024, 1024)
     timings = {}
-    for dtype in (torch.float32, torch.bfloat16):
-        a, b = a32.to(dtype), b32.to(dtype)
+    for candidate in (torch.float32, dtype):
+        a, b = a32.to(candidate), b32.to(candidate)
         a @ b  # warm-up
         start = time.perf_counter()
         for _ in range(3):
             a @ b
-        timings[dtype] = time.perf_counter() - start
-    return timings[torch.bfloat16] > 4 * timings[torch.float32]
+        timings[candidate] = time.perf_counter() - start
+    return timings[dtype] > 4 * timings[torch.float32]
+
+
+def cpu_bf16_is_slow() -> bool:
+    return cpu_dtype_is_slow(torch.bfloat16)
+
+
+def checkpoint_parameter_count(checkpoints) -> Optional[int]:
+    """Parameters stored in a checkpoint file, a list of files or a folder of .safetensors files (read from the
+    safetensors headers; other files count as half precision, size / 2). None when unknown (a repo id, no file)."""
+    if not checkpoints:
+        return None
+    paths = [checkpoints] if isinstance(checkpoints, (str, os.PathLike)) else list(checkpoints)
+    files = []
+    for path in map(str, paths):
+        if os.path.isdir(path):
+            files += sorted(str(p) for p in Path(path).rglob("*.safetensors"))
+        elif os.path.isfile(path):
+            files.append(path)
+        else:
+            return None
+    if not files:
+        return None
+    total = 0
+    for file in files:
+        if file.lower().endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(file, framework="pt") as handle:
+                for key in handle.keys():
+                    shape = handle.get_slice(key).get_shape()
+                    count = 1
+                    for size in shape:
+                        count *= size
+                    total += count
+        else:
+            total += os.path.getsize(file) // 2
+    return total
+
+
+def cpu_text_encoder_dtype(device, dtype: torch.dtype, checkpoints=None, name: str = "text encoder") -> torch.dtype:
+    """The dtype to run a text encoder in on ``device``: ``dtype``, except BF16 / FP16 on a CPU that is slow at it
+    (cpu_dtype_is_slow), which becomes FP32 when free RAM holds the FP32 weights (counted from ``checkpoints``, with a
+    10% margin). Without the room, or when the size is unknown, ``dtype`` stays and a warning says encoding is slow."""
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    if device.type != "cpu" or dtype not in (torch.bfloat16, torch.float16) or not cpu_dtype_is_slow(dtype):
+        return dtype
+    import psutil
+
+    params = checkpoint_parameter_count(checkpoints)
+    available = psutil.virtual_memory().available
+    needed = params * 4 * 1.1 if params else None
+    if needed is not None and needed <= available:
+        logger.warning(
+            f"This CPU multiplies {dtype} far slower than float32: the {name} runs in float32 on the CPU "
+            f"({needed / 2**30:.1f} GB of RAM, {available / 2**30:.0f} GB free)"
+        )
+        return torch.float32
+    logger.warning(
+        f"This CPU multiplies {dtype} far slower than float32, but float32 needs "
+        f"{f'{needed / 2**30:.0f} GB' if needed else 'an unknown amount'} of RAM ({available / 2**30:.0f} GB free): the "
+        f"{name} stays in {dtype} and encoding on the CPU will be slow (cache the text encoder outputs on the GPU if it fits)"
+    )
+    return dtype
+
+
+def mark_cpu_fp32_fallback(owner, requested: torch.dtype, actual: torch.dtype) -> None:
+    """Remember on a loaded text encoder (any object) that it runs in ``actual`` (FP32) only because the CPU is slow in
+    ``requested`` (cpu_text_encoder_dtype): cast_for_cache then saves its outputs in ``requested``."""
+    if actual != requested:
+        owner._musubi_save_dtype = requested
+
+
+def cast_for_cache(owner, value):
+    """``value`` (a tensor or a list / tuple / dict of them) in the dtype the caller asked the text encoder for, when
+    mark_cpu_fp32_fallback recorded one on ``owner``: caches then match those made on the GPU."""
+    dtype = getattr(owner, "_musubi_save_dtype", None)
+    if not isinstance(dtype, torch.dtype):  # nothing recorded (a stand-in object may answer any attribute)
+        return value
+
+    def cast(item):
+        if isinstance(item, torch.Tensor):
+            return item.to(dtype) if item.is_floating_point() else item
+        if isinstance(item, (list, tuple)):
+            return type(item)(cast(x) for x in item)
+        if isinstance(item, dict):
+            return {k: cast(v) for k, v in item.items()}
+        return item
+
+    return cast(value)

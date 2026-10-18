@@ -2,6 +2,7 @@ import argparse
 from typing import Optional
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -58,10 +59,12 @@ class ErnieImageNetworkTrainer(NetworkTrainer):
         logger.info(f"Cache text encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
 
+        te_dtype = cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "ERNIE-Image text encoder")
         tokenizer, text_encoder = ernie_image_utils.load_text_encoder(
-            args.text_encoder, dtype=torch.bfloat16, device=device, disable_mmap=True, tokenizer_id=args.tokenizer
+            args.text_encoder, dtype=te_dtype, device=device, disable_mmap=True, tokenizer_id=args.tokenizer
         )
         text_encoder.eval()
+        mark_cpu_fp32_fallback(text_encoder, torch.bfloat16, te_dtype)
 
         sample_prompts_te_outputs = {}
 
@@ -75,7 +78,7 @@ class ErnieImageNetworkTrainer(NetworkTrainer):
 
                 logger.info(f"Encoding prompt: {prompt}")
                 text_hiddens = ernie_image_utils.encode_text(tokenizer, text_encoder, prompt)
-                embed = text_hiddens[0].cpu()  # [T, D]
+                embed = cast_for_cache(text_encoder, text_hiddens[0].cpu())  # [T, D]
                 sample_prompts_te_outputs[prompt] = embed
 
         del tokenizer, text_encoder

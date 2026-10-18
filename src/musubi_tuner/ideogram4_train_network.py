@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype
 from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_IDEOGRAM4, ARCHITECTURE_IDEOGRAM4_FULL
@@ -82,7 +83,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         text_encoder = ideogram4_utils.load_ideogram4_text_encoder(
             args.text_encoder,
             device=device,
-            dtype=torch.bfloat16,
+            # FP32 for a CPU that is slow in BF16; the features are FP32 either way
+            dtype=cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "Ideogram 4 text encoder"),
             disable_mmap=args.disable_numpy_memmap,
         )
 

@@ -12,6 +12,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.mage_flow.text_encoder import encode_conditioning, load_mage_flow_text_encoder
 from musubi_tuner.utils.model_utils import str_to_dtype
+from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def main() -> None:
     args = parser.parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dtype = str_to_dtype(args.text_encoder_dtype, torch.bfloat16)
+    dtype = cpu_text_encoder_dtype(device, dtype, args.text_encoder, "Mage-Flow text encoder")  # saved as bf16
     architecture = ARCHITECTURE_MAGE_FLOW_EDIT if args.is_edit else ARCHITECTURE_MAGE_FLOW
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     user_config = config_utils.load_user_config(args.dataset_config)

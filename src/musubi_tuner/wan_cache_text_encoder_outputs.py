@@ -2,6 +2,7 @@ import argparse
 from typing import Optional
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -37,7 +38,7 @@ def encode_and_save_batch(
 
     # save prompt cache
     for item, ctx in zip(batch, context):
-        save_text_encoder_output_cache_wan(item, ctx)
+        save_text_encoder_output_cache_wan(item, cast_for_cache(text_encoder, ctx))
 
 
 def main():
@@ -69,9 +70,11 @@ def main():
 
     # Load T5
     logger.info(f"Loading T5: {args.t5}")
+    t5_dtype = config.t5_dtype if args.fp8_t5 else cpu_text_encoder_dtype(device, config.t5_dtype, args.t5, "T5 text encoder")
     text_encoder = T5EncoderModel(
-        text_len=config.text_len, dtype=config.t5_dtype, device=device, weight_path=args.t5, fp8=args.fp8_t5
+        text_len=config.text_len, dtype=t5_dtype, device=device, weight_path=args.t5, fp8=args.fp8_t5
     )
+    mark_cpu_fp32_fallback(text_encoder, config.t5_dtype, t5_dtype)
 
     # Encode with T5
     logger.info("Encoding with T5")

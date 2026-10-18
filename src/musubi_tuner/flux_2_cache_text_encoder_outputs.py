@@ -1,6 +1,7 @@
 import argparse
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -19,13 +20,14 @@ logging.basicConfig(level=logging.INFO)
 def encode_and_save_batch(text_embedder: torch.nn.Module, batch: list[ItemInfo], device: torch.device, arch_full: str):
     prompts = [item.caption for item in batch]
     autocast_dtype = torch.bfloat16 if text_embedder.dtype.itemsize == 1 else text_embedder.dtype  # use bfloat16 for fp8 models
-    with torch.autocast(device_type=device.type, dtype=autocast_dtype), torch.no_grad():
+    # an FP32 text encoder (cpu_text_encoder_dtype on a CPU slow in BF16) runs without autocast
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype != torch.float32), torch.no_grad():
         ctx_vec = text_embedder(prompts)
         ctx_vec = ctx_vec.cpu()  # [1, 512, 15360]
 
     # save prompt cache
     for item, _ctx_vec in zip(batch, ctx_vec):
-        save_text_encoder_output_cache_flux_2(item, _ctx_vec, arch_full=arch_full)
+        save_text_encoder_output_cache_flux_2(item, cast_for_cache(text_embedder, _ctx_vec), arch_full=arch_full)
 
 
 def precache_sample_prompts(text_embedder: torch.nn.Module, args: argparse.Namespace, device: torch.device) -> None:
@@ -40,8 +42,8 @@ def precache_sample_prompts(text_embedder: torch.nn.Module, args: argparse.Names
     logger.info(f"Sample prompts: {len(texts)} texts, {len(missing)} to encode into {args.sample_prompts_cache}")
     autocast_dtype = torch.bfloat16 if text_embedder.dtype.itemsize == 1 else text_embedder.dtype
     for text in missing:
-        with torch.autocast(device_type=device.type, dtype=autocast_dtype), torch.no_grad():
-            cached[text] = text_embedder([text]).cpu()  # [1, 512, D], as training encodes them
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype != torch.float32), torch.no_grad():
+            cached[text] = cast_for_cache(text_embedder, text_embedder([text]).cpu())  # [1, 512, D], as training encodes them
     flux2_utils.save_sample_prompts_cache(args.sample_prompts_cache, key, {text: cached[text] for text in texts})
 
 
@@ -69,9 +71,12 @@ def main():
 
     # Load Mistral 3 or Qwen-3 text encoder
     m3_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
+    requested_dtype = m3_dtype
+    m3_dtype = cpu_text_encoder_dtype(device, m3_dtype, args.text_encoder, "FLUX.2 text encoder")
     text_embedder = flux2_utils.load_text_embedder(
         model_version_info, args.text_encoder, dtype=m3_dtype, device=device, disable_mmap=True
     )
+    mark_cpu_fp32_fallback(text_embedder, requested_dtype, m3_dtype)
 
     # Encode with Mistral 3 or Qwen-3 text encoder
     logger.info("Encoding with text encoder")

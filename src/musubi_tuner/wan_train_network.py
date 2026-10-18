@@ -5,6 +5,7 @@ from PIL import Image
 
 import numpy as np
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
@@ -130,8 +131,8 @@ class WanNetworkTrainer(NetworkTrainer):
         def encode_for_text_encoder(text_encoder):
             sample_prompts_te_outputs = {}  # (prompt) -> (embeds, mask)
             # with accelerator.autocast(), torch.no_grad(): # this causes NaN if dit_dtype is fp16
-            t5_dtype = config.t5_dtype
-            with torch.amp.autocast(device_type=device.type, dtype=t5_dtype), torch.no_grad():
+            # t5_dtype: FP32 for a CPU that is slow in BF16 / FP16 (set below, before this runs), then without autocast
+            with torch.amp.autocast(device_type=device.type, dtype=t5_dtype, enabled=t5_dtype != torch.float32), torch.no_grad():
                 for prompt_dict in prompts:
                     if "negative_prompt" not in prompt_dict:
                         prompt_dict["negative_prompt"] = self.config["sample_neg_prompt"]
@@ -142,13 +143,15 @@ class WanNetworkTrainer(NetworkTrainer):
                             logger.info(f"cache Text Encoder outputs for prompt: {p}")
 
                             prompt_outputs = text_encoder([p], device)
-                            sample_prompts_te_outputs[p] = prompt_outputs
+                            sample_prompts_te_outputs[p] = cast_for_cache(text_encoder, prompt_outputs)
 
             return sample_prompts_te_outputs
 
         # Load Text Encoder 1 and encode
         logger.info(f"loading T5: {t5_path}")
-        t5 = T5EncoderModel(text_len=config.text_len, dtype=config.t5_dtype, device=device, weight_path=t5_path, fp8=fp8_t5)
+        t5_dtype = config.t5_dtype if fp8_t5 else cpu_text_encoder_dtype(device, config.t5_dtype, t5_path, "T5 text encoder")
+        t5 = T5EncoderModel(text_len=config.text_len, dtype=t5_dtype, device=device, weight_path=t5_path, fp8=fp8_t5)
+        mark_cpu_fp32_fallback(t5, config.t5_dtype, t5_dtype)
 
         logger.info("encoding with Text Encoder 1")
         te_outputs_1 = encode_for_text_encoder(t5)

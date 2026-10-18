@@ -5,6 +5,7 @@ import argparse
 import logging
 
 import torch
+from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype
 
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
@@ -52,6 +53,7 @@ def main():
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
+    te_dtype = cpu_text_encoder_dtype(device, te_dtype, args.text_encoder, "Qwen3-VL text encoder")  # saved as bf16 below
     text_encoder, tokenizer = flux3_utils.load_text_encoder(args.text_encoder, dtype=te_dtype, device=device)
     logger.info("Encoding with Qwen3-VL")
 

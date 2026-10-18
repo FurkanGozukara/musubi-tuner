@@ -6,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -90,7 +91,10 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         # Load Qwen2.5-VL
         vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
+        requested_dtype = vl_dtype
+        vl_dtype = cpu_text_encoder_dtype(device, vl_dtype, args.text_encoder, "Qwen2.5-VL text encoder")
         tokenizer, text_encoder = qwen_image_utils.load_qwen2_5_vl(args.text_encoder, vl_dtype, device, disable_mmap=True)
+        mark_cpu_fp32_fallback(text_encoder, requested_dtype, vl_dtype)
         is_edit = self.is_edit
         vl_processor = qwen_image_utils.load_vl_processor() if is_edit else None
 
@@ -104,7 +108,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             nonlocal is_edit
             return p if not is_edit else (p, tuple(ctrl_img_paths) if ctrl_img_paths is not None else None)
 
-        with torch.amp.autocast(device_type=device.type, dtype=vl_dtype), torch.no_grad():
+        with torch.amp.autocast(device_type=device.type, dtype=vl_dtype, enabled=vl_dtype != torch.float32), torch.no_grad():
             for prompt_dict in prompts:
                 width, height = prompt_dict.get("width", 256), prompt_dict.get("height", 256)
                 width = (width // 8) * 8
@@ -169,7 +173,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
                         )
                     txt_len = mask.to(dtype=torch.bool).sum().item()  # length of the text in the batch
                     embed = embed[:, :txt_len]
-                    sample_prompts_te_outputs[embed_key] = embed
+                    sample_prompts_te_outputs[embed_key] = cast_for_cache(text_encoder, embed)
 
         del tokenizer, text_encoder
         gc.collect()

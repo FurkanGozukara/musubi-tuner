@@ -12,6 +12,7 @@ import argparse
 import logging
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -36,7 +37,7 @@ def encode_and_save_batch(encoder, batch: list[ItemInfo]):
     for item, hidden_i, mask_i in zip(batch, hiddens, mask):
         valid = mask_i.bool()
         embed_i = hidden_i[valid]  # (valid_len, L, D)
-        save_text_encoder_output_cache_krea2(item, embed_i)
+        save_text_encoder_output_cache_krea2(item, cast_for_cache(encoder, embed_i))
 
 
 def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -76,7 +77,10 @@ def main():
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
+    requested_dtype = te_dtype
+    te_dtype = cpu_text_encoder_dtype(device, te_dtype, args.text_encoder, "Krea 2 text encoder")
     encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=te_dtype, device=device)
+    mark_cpu_fp32_fallback(encoder, requested_dtype, te_dtype)
 
     logger.info("Encoding with Qwen3-VL")
 

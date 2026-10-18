@@ -9,6 +9,7 @@ import argparse
 import logging
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -28,7 +29,7 @@ def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device
     for item, prompt in zip(batch, prompts):
         text_hiddens = ernie_image_utils.encode_text(tokenizer, text_encoder, prompt)
         embed = text_hiddens[0].cpu()  # [T, D]
-        save_text_encoder_output_cache_ernie_image(item, embed)
+        save_text_encoder_output_cache_ernie_image(item, cast_for_cache(text_encoder, embed))
 
 
 def main():
@@ -50,12 +51,13 @@ def main():
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
-    te_dtype = torch.bfloat16
+    te_dtype = cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "ERNIE-Image text encoder")
     logger.info(f"Loading text encoder from {args.text_encoder}")
     tokenizer, text_encoder = ernie_image_utils.load_text_encoder(
         args.text_encoder, dtype=te_dtype, device=device, disable_mmap=True, tokenizer_id=args.tokenizer
     )
     text_encoder.eval()
+    mark_cpu_fp32_fallback(text_encoder, torch.bfloat16, te_dtype)
 
     logger.info("Encoding prompts with Mistral3 text encoder")
 

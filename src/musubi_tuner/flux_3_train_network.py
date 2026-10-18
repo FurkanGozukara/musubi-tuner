@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from accelerate import Accelerator
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -92,10 +93,12 @@ class Flux3NetworkTrainer(NetworkTrainer):
                 if text not in texts:
                     texts.append(text)
 
-        text_encoder, tokenizer = flux3_utils.load_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
+        te_dtype = cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "Qwen3-VL text encoder")
+        text_encoder, tokenizer = flux3_utils.load_text_encoder(args.text_encoder, dtype=te_dtype, device=device)
+        mark_cpu_fp32_fallback(text_encoder, torch.bfloat16, te_dtype)
         logger.info("Encoding with Qwen3-VL")
         contexts = flux3_utils.encode_prompts(text_encoder, tokenizer, texts)
-        encoded = {text: ctx.cpu() for text, ctx in zip(texts, contexts)}
+        encoded = {text: cast_for_cache(text_encoder, ctx.cpu()) for text, ctx in zip(texts, contexts)}
         del text_encoder, contexts
         clean_memory_on_device(device)
 

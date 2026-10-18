@@ -10,6 +10,7 @@ from musubi_tuner.dataset.cache_io import save_text_encoder_output_cache_qwen_im
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.qwen_image_21 import qwen_image_21_utils
 from musubi_tuner.utils.model_utils import str_to_dtype
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -31,7 +32,11 @@ def encode_and_save_batch(processor, encoder, batch: list[ItemInfo]) -> None:
     )
     for item, (prompt_embeds, image_slots, image_grids) in zip(batch, outputs):
         save_text_encoder_output_cache_qwen_image_21(
-            item, prompt_embeds, image_slots, image_grids, qwen_image_21_utils.reference_fingerprints(item.control_content)
+            item,
+            cast_for_cache(encoder, prompt_embeds),
+            image_slots,
+            image_grids,
+            qwen_image_21_utils.reference_fingerprints(item.control_content),
         )
 
 
@@ -53,9 +58,12 @@ def main():
     datasets = qwen_image_21_utils.load_datasets(args)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Loading Qwen3-VL text encoder: %s", args.text_encoder)
+    requested_dtype = str_to_dtype(args.text_encoder_dtype)
+    te_dtype = requested_dtype if args.fp8_vl else cpu_text_encoder_dtype(device, requested_dtype, args.text_encoder, "Qwen3-VL text encoder")
     processor, encoder = qwen_image_21_utils.load_text_encoder(
-        args.text_encoder, device=device, dtype=str_to_dtype(args.text_encoder_dtype), fp8_vl=args.fp8_vl
+        args.text_encoder, device=device, dtype=te_dtype, fp8_vl=args.fp8_vl
     )
+    mark_cpu_fp32_fallback(encoder, requested_dtype, te_dtype)
     logger.info("Encoding with Qwen3-VL on %s", device)
     existing, expected = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 

@@ -8,6 +8,7 @@ import musubi_tuner.cache_text_encoder_outputs as cache_text
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +53,7 @@ def encode_and_save_batch(text_embedder, batch: list[ItemInfo]) -> None:
     for item, (text_embed, pooled_embed, mask) in zip(batch, rows):
         save_text_encoder_output_cache_kandinsky6(
             item,
-            text_embeds=text_embed.cpu(),
+            text_embeds=cast_for_cache(text_embedder, text_embed.cpu()),  # pooled_embed is CLIP's, FP32 either way
             pooled_embed=pooled_embed.cpu(),
             attention_mask=mask.cpu(),
         )
@@ -82,6 +83,9 @@ def main() -> None:
     )
     datasets = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group).datasets
     existing, expected = cache_text.prepare_cache_files_and_paths(datasets)
+    qwen_dtype = torch.bfloat16 if args.quantized_qwen else cpu_text_encoder_dtype(
+        device, torch.bfloat16, args.text_encoder_qwen, "Qwen2.5-VL text encoder"
+    )
     embedder = Kandinsky6TextEmbedder(
         args.text_encoder_qwen,
         args.text_encoder_clip,
@@ -89,7 +93,9 @@ def main() -> None:
         device=device,
         quantized_qwen=args.quantized_qwen,
         text_token_padding=False,
+        qwen_dtype=qwen_dtype,
     )
+    mark_cpu_fp32_fallback(embedder, torch.bfloat16, qwen_dtype)
     cache_text.process_text_encoder_batches(
         args.num_workers,
         args.skip_existing,

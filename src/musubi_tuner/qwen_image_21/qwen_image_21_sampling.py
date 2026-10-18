@@ -2,6 +2,7 @@ import logging
 
 import numpy as np
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache
 from musubi_tuner.training.sample_decode import decode_sample
 from PIL import Image
 from torch.nn import functional as F
@@ -39,7 +40,8 @@ def encode_sample_prompts(processor, encoder, prompts: list[dict], control_image
             key = (caption, paths)
             if key not in text_cache:
                 logger.info(f"cache Text Encoder outputs for prompt: {caption} with image: {paths}")
-                text_cache[key] = tuple(t.cpu() for t in qwen_image_21_utils.encode_prompt(processor, encoder, caption, images))
+                encoded = tuple(t.cpu() for t in qwen_image_21_utils.encode_prompt(processor, encoder, caption, images))
+                text_cache[key] = cast_for_cache(encoder, encoded)
             prompt[name] = text_cache[key]
     return prompts
 

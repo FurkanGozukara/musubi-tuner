@@ -10,6 +10,7 @@ import argparse
 import logging
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -49,7 +50,7 @@ def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device
         actual_length = int(mask.sum().item())
         embed_trimmed = embed[:actual_length]  # (actual_length, hidden_size)
 
-        save_text_encoder_output_cache_z_image(item, embed_trimmed)
+        save_text_encoder_output_cache_z_image(item, cast_for_cache(text_encoder, embed_trimmed))
 
 
 def main():
@@ -83,8 +84,11 @@ def main():
 
     # Load Qwen3 tokenizer and text encoder
     logger.info(f"Loading Qwen3 text encoder from {args.text_encoder}")
+    requested_dtype = te_dtype
+    te_dtype = cpu_text_encoder_dtype(device, te_dtype, args.text_encoder, "Qwen3 text encoder")
     tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=te_dtype, device=device, disable_mmap=True)
     text_encoder.eval()
+    mark_cpu_fp32_fallback(text_encoder, requested_dtype, te_dtype)
 
     # Encode with Qwen3 text encoder
     logger.info("Encoding prompts with Qwen3 text encoder")

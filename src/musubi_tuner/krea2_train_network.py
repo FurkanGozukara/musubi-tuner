@@ -16,6 +16,7 @@ import itertools
 from typing import Optional
 
 import torch
+from musubi_tuner.utils.model_utils import cast_for_cache, cpu_text_encoder_dtype, mark_cpu_fp32_fallback
 from musubi_tuner.training.sample_decode import decode_sample
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -142,7 +143,9 @@ class Krea2NetworkTrainer(NetworkTrainer):
             if prompt_dict.get("negative_prompt") is None and (5.5 if cfg_scale is None else cfg_scale) > 1.0:
                 prompt_dict["negative_prompt"] = ""
 
-        encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
+        te_dtype = cpu_text_encoder_dtype(device, torch.bfloat16, args.text_encoder, "Krea 2 text encoder")
+        encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=te_dtype, device=device)
+        mark_cpu_fp32_fallback(encoder, torch.bfloat16, te_dtype)
 
         logger.info("Encoding sample prompts with Qwen3-VL")
         te_outputs = {}  # prompt str -> (valid_len, num_layers, hidden) on cpu
@@ -153,7 +156,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
                         continue
                     hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [p])  # (1, seq, L, D), (1, seq)
                     embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
-                    te_outputs[p] = embed.to("cpu")
+                    te_outputs[p] = cast_for_cache(encoder, embed.to("cpu"))
 
         del encoder
         gc.collect()
