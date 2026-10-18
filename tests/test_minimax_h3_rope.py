@@ -34,8 +34,10 @@ def test_elementwise_rope_matches_the_matmul_formulation(dtype, head_dim, pairs)
     table = _rotation_table(2, 37, pairs, dtype)
     hidden = torch.randn(2, 37, 5, head_dim, dtype=dtype, requires_grad=True)
 
+    before = hidden.detach().clone()
     expected = _rope_matmul_reference(hidden, table)
     actual = _apply_rope_split_half(hidden, table)
+    assert torch.equal(hidden.detach(), before)  # the in-place rotation works on copies, also of an FP32 input
 
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype

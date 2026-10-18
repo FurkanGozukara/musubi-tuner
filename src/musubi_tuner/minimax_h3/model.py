@@ -391,12 +391,17 @@ def _apply_rope_split_half(hidden_states: torch.Tensor, rotation_table: torch.Te
     # products, which cuBLAS runs as GEMV launches: memory-bound, not fusable by torch.compile, and the bulk of a
     # training step's GPU time. The same rotation is two multiply-adds per element; computed in FP32 it matches the
     # matmul result (bit-identical in BF16), and torch.compile fuses it into the surrounding elementwise kernels.
+    # In place where autograd allows (the table needs no gradient, so no product saves its FP32 input): at most four
+    # FP32 copies of the rotated half live at once instead of six, the same roundings (+0.34 GiB on the 10 GB preset's
+    # training peak otherwise). copy=True: .float() of an FP32 input is the input itself, which mul_ would overwrite.
     pairs = rotation_table.shape[-3]
-    first = hidden_states[..., :pairs].float()
-    second = hidden_states[..., pairs : 2 * pairs].float()
+    first = hidden_states[..., :pairs].to(torch.float32, copy=True)
+    second = hidden_states[..., pairs : 2 * pairs].to(torch.float32, copy=True)
     table = rotation_table.float()
-    rotated_first = table[..., 0, 0] * first + table[..., 0, 1] * second
-    rotated_second = table[..., 1, 0] * first + table[..., 1, 1] * second
+    rotated_first = first * table[..., 0, 0]
+    rotated_first += second * table[..., 0, 1]
+    rotated_second = first.mul_(table[..., 1, 0])
+    rotated_second += second.mul_(table[..., 1, 1])
     dtype = torch.result_type(rotation_table, hidden_states)
     return torch.cat((rotated_first.to(dtype), rotated_second.to(dtype), hidden_states[..., 2 * pairs :].to(dtype)), dim=-1)
 
