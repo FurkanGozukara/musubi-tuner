@@ -134,9 +134,12 @@ class _CharTokenizer(_Template):
 
 
 def _tiny_text_encoder():
-    """Qwen3.5's layout (three linear-attention layers, then full attention) at toy sizes, random weights."""
+    """Qwen3.5's layout (three linear-attention layers, then full attention) at toy sizes, random weights. Routed by
+    device as load_text_encoder routes the real one: with flash-linear-attention installed, transformers otherwise hands
+    CPU tensors to its Triton kernels."""
     from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
+    moss_utils.install_qwen35_kernel_dispatch()
     config = dict(moss_utils.QWEN35_9B_TEXT_CONFIG)
     config.update(hidden_size=64, intermediate_size=96, num_hidden_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"],
                   head_dim=32, num_attention_heads=2, num_key_value_heads=1, linear_key_head_dim=16, linear_value_head_dim=16,
@@ -308,3 +311,49 @@ def test_text_encoder_dequantizes_in_row_chunks_like_the_whole_tensor(convrot, p
         torch.testing.assert_close(chunked.float(), whole.float(), atol=1e-6, rtol=2**-7)
     else:
         assert torch.equal(chunked, whole)
+
+
+def _kernel_module(fast_impl):
+    """A stand-in for transformers' modeling_qwen3_5: a reference function wrapped (functools.wraps) by a kernel path."""
+    import functools
+
+    def torch_chunk_gated_delta_rule(query, key, value, g=None, beta=None):
+        return ("reference", query)
+
+    @functools.wraps(torch_chunk_gated_delta_rule)
+    def wrapped(*args, **kwargs):
+        return fast_impl(*args, **kwargs)
+
+    return types.SimpleNamespace(torch_chunk_gated_delta_rule=wrapped)
+
+
+def test_qwen35_kernels_run_on_the_gpu_only_and_fall_back_when_they_fail(monkeypatch, caplog):
+    """fla's Triton kernels cannot take CPU tensors (CPU text caching); a failing kernel hands over to the reference."""
+    monkeypatch.setattr(moss_utils.importlib.util, "find_spec", lambda name: object())
+    calls = []
+
+    def fast(query, key, value, g=None, beta=None):
+        calls.append("fast")
+        return ("fast", query)
+
+    module = _kernel_module(fast)
+    assert moss_utils.install_qwen35_kernel_dispatch(module) == ["torch_chunk_gated_delta_rule"]
+    assert moss_utils.install_qwen35_kernel_dispatch(module) == []  # installed once
+    x = torch.zeros(2)
+    assert module.torch_chunk_gated_delta_rule(x, x, x, g=x)[0] == "reference" and not calls  # CPU tensors
+    monkeypatch.setattr(moss_utils, "_on_gpu", lambda tensor: True)
+    assert module.torch_chunk_gated_delta_rule(x, x, x, g=x)[0] == "fast" and calls == ["fast"]
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("triton build failed")
+
+    module = _kernel_module(broken)
+    moss_utils.install_qwen35_kernel_dispatch(module)
+    assert module.torch_chunk_gated_delta_rule(x, x, x)[0] == "reference" and "triton build failed" in caplog.text
+    assert module.torch_chunk_gated_delta_rule(x, x, x)[0] == "reference"  # the reference from then on
+
+
+def test_qwen35_kernels_are_left_alone_without_the_packages(monkeypatch):
+    monkeypatch.setattr(moss_utils.importlib.util, "find_spec", lambda name: None)
+    module = _kernel_module(lambda *a, **k: ("fast", None))
+    assert moss_utils.install_qwen35_kernel_dispatch(module) == []

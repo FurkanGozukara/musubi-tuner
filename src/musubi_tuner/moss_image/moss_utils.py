@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
+import itertools
 import logging
 from typing import Optional, Sequence, Union
 
@@ -203,11 +206,72 @@ def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str,
     return out
 
 
+# Qwen3.5's gated-delta layers call these module functions; transformers binds them at import to the
+# flash-linear-attention (fla) / causal-conv1d kernels when those packages are installed (package per function)
+_QWEN35_KERNELS = {
+    "torch_chunk_gated_delta_rule": "fla",
+    "torch_recurrent_gated_delta_rule": "fla",
+    "causal_conv1d_fn": "causal_conv1d",
+    "causal_conv1d_update": "causal_conv1d",
+}
+
+
+def _first_tensor(args, kwargs) -> Optional[Tensor]:
+    return next((value for value in itertools.chain(args, kwargs.values()) if isinstance(value, Tensor)), None)
+
+
+def _on_gpu(tensor: Optional[Tensor]) -> bool:
+    return tensor is not None and tensor.device.type == "cuda"
+
+
+def install_qwen35_kernel_dispatch(module=None) -> list[str]:
+    """Route Qwen3.5's gated-delta kernels by device; returns the functions routed.
+
+    With flash-linear-attention / causal-conv1d installed, transformers binds these functions to their Triton / CUDA
+    kernels for every call. The kernels cannot run on CPU tensors, and MOSS text encoding also runs on the CPU (FP32
+    where the CPU is slow in BF16, the low-VRAM presets' CPU caching): there they stopped with "Pointer argument cannot
+    be accessed from Triton". Each call now goes to the kernel for CUDA tensors and to the reference otherwise; a
+    kernel that raises (a Triton build problem, say) is reported once and the reference serves from then on. fla is
+    not a requirement: on 64 captions (A6000, vram_lab/moss_te_fla_bench.py) it took 0.21 s instead of 0.27 s per
+    batch of 8 with the encoder resident, after about 1.6 s of Triton compiling per process, and the same 7.3 s
+    layer-streamed (bound by the weight copies); outputs within BF16 noise of the reference (2.8%).
+    """
+    if module is None:
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as module
+    routed = []
+    for name, package in _QWEN35_KERNELS.items():
+        fast = getattr(module, name, None)
+        if fast is None or getattr(fast, "_moss_kernel_dispatch", False) or importlib.util.find_spec(package) is None:
+            continue
+        reference = inspect.unwrap(fast)
+        if reference is fast:
+            continue
+        state = {"failed": False}
+
+        def dispatch(*args, _fast=fast, _reference=reference, _name=name, _state=state, **kwargs):
+            if _state["failed"] or not _on_gpu(_first_tensor(args, kwargs)):
+                return _reference(*args, **kwargs)
+            try:
+                return _fast(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - the reference computes the same values
+                _state["failed"] = True
+                logger.warning(f"Qwen3.5 {_name}: the fast kernel failed ({type(exc).__name__}: {exc}); using the PyTorch reference")
+                return _reference(*args, **kwargs)
+
+        dispatch._moss_kernel_dispatch = True
+        setattr(module, name, dispatch)
+        routed.append(name)
+    if routed:
+        logger.info(f"Qwen3.5 text encoder: {', '.join(routed)} use their fast kernels on the GPU")
+    return routed
+
+
 def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Union[str, torch.device] = "cpu", stream: bool = False):
     """Qwen3.5-9B's language tower from a ComfyUI file and the pinned vendor tokenizer: (model, tokenizer). ``stream``
     (CUDA only) keeps the tower in CPU RAM and runs it on ``device`` one decoder layer at a time (stream_text_encoder)."""
     from transformers import AutoTokenizer, Qwen3_5TextConfig, Qwen3_5TextModel
 
+    install_qwen35_kernel_dispatch()
     device, dtype, stream = text_encoder_plan(device, dtype, stream)
     config = Qwen3_5TextConfig(**QWEN35_9B_TEXT_CONFIG)
     with init_empty_weights():
