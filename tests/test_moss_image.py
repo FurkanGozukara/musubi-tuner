@@ -171,11 +171,12 @@ def test_a_padded_batch_of_prompts_matches_one_forward_per_prompt():
     singles = moss_utils.encode_prompts(model, _CharTokenizer(), prompts, batch_size=1)
     batched = moss_utils.encode_prompts(model, _CharTokenizer(), prompts)
     assert [b.shape for b in batched] == [s.shape for s in singles] and len({s.shape[0] for s in singles}) == 4
+    # FP32 matrix products of another row count round differently (3e-5 on an AVX2 Xeon); a pad reaching a prompt would be O(1)
     for a, b in zip(batched, singles):
-        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
     pairs = moss_utils.encode_prompts(model, _CharTokenizer(), prompts, batch_size=3)  # a batch, then a single prompt
     for a, b in zip(pairs, singles):
-        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
 
 
 def test_low_vram_text_encoding_matches_the_resident_text_encoder():
@@ -302,4 +303,8 @@ def test_text_encoder_dequantizes_in_row_chunks_like_the_whole_tensor(convrot, p
     else:
         whole = (q.float() * scale.float()).to(torch.bfloat16)
     chunked = moss_utils._dequantize_rows(q, scale, quant, torch.bfloat16, torch.device("cpu"), chunk_elements=256 * 5)
-    assert chunked.device.type == "cpu" and torch.equal(chunked, whole)
+    assert chunked.device.type == "cpu"
+    if convrot:  # the inverse rotation is a matrix product: another row count may round differently (an AVX2 Xeon did, 1e-8)
+        torch.testing.assert_close(chunked.float(), whole.float(), atol=1e-6, rtol=2**-7)
+    else:
+        assert torch.equal(chunked, whole)
