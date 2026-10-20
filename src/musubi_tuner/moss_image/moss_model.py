@@ -378,3 +378,21 @@ def split_fused_qkv(state_dict: dict) -> dict:
             state_dict[f"{base}.{name}.weight"] = part.contiguous()
     state_dict.pop("rope.bands", None)  # a derived constant, recomputed in fp32
     return state_dict
+
+
+def fuse_qkv(state_dict: dict, params: Optional[MossImageParams] = None) -> dict:
+    """The inverse of ``split_fused_qkv``: ``layers.N.proj.{q,k,v}.weight`` -> ``layers.N.proj.qkv.weight`` (rows q, k, v)
+    and the ``rope.bands`` constant (FP32), i.e. the ComfyUI / vendor layout that ``load_dit``, ComfyUI and SwarmUI read.
+    Returns a new dict; the tensors are not copied."""
+    params = params or MossImageParams()
+    out = {}
+    for key, value in state_dict.items():
+        if key.startswith("layers.") and key.endswith((".proj.k.weight", ".proj.v.weight")):
+            continue
+        if key.startswith("layers.") and key.endswith(".proj.q.weight"):
+            base = key[: -len(".q.weight")]
+            out[f"{base}.qkv.weight"] = torch.cat([state_dict[f"{base}.{name}.weight"] for name in ("q", "k", "v")], dim=0)
+            continue
+        out[key] = value
+    out["rope.bands"] = rope_bands("cpu", params.dim // params.num_heads, params.rope_base)
+    return out
