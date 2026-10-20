@@ -208,6 +208,8 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         if args.task == "r2av":
             if not 0.0 <= args.ref_drop_prob < 1.0:
                 raise ValueError("--ref_drop_prob must be in [0, 1)")
+            if args.max_reference_slots == 0:
+                args.max_reference_slots = None  # the GUI's "0 = 8": the default, or the checkpoint's own count
             if args.max_reference_slots is not None and args.max_reference_slots < 1:
                 raise ValueError("--max_reference_slots must be positive")
             self._ref_drop_prob = float(args.ref_drop_prob)
@@ -866,7 +868,7 @@ def kandinsky6_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         type=int,
         default=None,
         help=f"R2AV: reference slots to add to a released checkpoint (default {DEFAULT_REFERENCE_SLOTS}); "
-        "omit for a checkpoint that already has them",
+        "omit (or 0) for a checkpoint that already has them",
     )
     parser.add_argument(
         "--ref_drop_prob",

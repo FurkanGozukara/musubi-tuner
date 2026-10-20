@@ -105,6 +105,21 @@ def test_prequantized_checkpoint_detected_by_parent_is_rejected(monkeypatch):
         trainer._validate_args_and_init(parse())
 
 
+@pytest.mark.parametrize("slots, expected", [("0", None), ("4", 4)])
+def test_r2av_reference_slots_zero_means_the_default(monkeypatch, slots, expected):
+    """The GUI's R2AV Reference Slots writes 0 for "8, or the checkpoint's own count": that is the unset value."""
+    from musubi_tuner import kandinsky6_train_network as network
+
+    monkeypatch.setattr(network, "has_comfy_quant_tensors", lambda *args, **kwargs: False)
+    args = parse("--task", "r2av", "--max_reference_slots", slots, "--mixed_precision", "bf16", "--timestep_sampling", "uniform", "--discrete_flow_shift", "1.0")
+    ft.Kandinsky6Trainer().handle_model_specific_args(args)
+    assert args.max_reference_slots == expected
+    with pytest.raises(ValueError, match="must be positive"):
+        ft.Kandinsky6Trainer().handle_model_specific_args(
+            parse("--task", "r2av", "--max_reference_slots", "-1", "--mixed_precision", "bf16", "--timestep_sampling", "uniform", "--discrete_flow_shift", "1.0")
+        )
+
+
 def test_freeze_uses_kandinsky6_visual_block_names():
     model = tiny_dit(num_visual_blocks=3)
     model.requires_grad_(True)
