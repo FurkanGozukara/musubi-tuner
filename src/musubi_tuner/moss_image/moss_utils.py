@@ -276,19 +276,37 @@ def tokenize_prompt(tokenizer, prompt: str, max_tokens: int = MAX_TEXT_TOKENS) -
     return tokenizer(chat_text(tokenizer, prompt), return_tensors="pt", truncation=True, max_length=max_tokens)["input_ids"][0]
 
 
+TEXT_BATCH_SIZE = 8  # prompts per padded forward
+
+
 @torch.no_grad()
-def encode_prompts(model, tokenizer, prompts: list[str], max_tokens: int = MAX_TEXT_TOKENS) -> list[Tensor]:
-    """One (L_i, 4096) final hidden state per prompt, from one unpadded forward each, on the model's device and dtype."""
+def encode_prompts(
+    model, tokenizer, prompts: list[str], max_tokens: int = MAX_TEXT_TOKENS, batch_size: int = TEXT_BATCH_SIZE
+) -> list[Tensor]:
+    """One (L_i, 4096) final hidden state per prompt, on the model's device and dtype.
+
+    Up to ``batch_size`` prompts run as one right-padded forward without an attention mask, as ai-toolkit (0473387)
+    does: every Qwen3.5 layer is causal (full attention under the causal mask, Gated DeltaNet and its short
+    convolution), so the pads after a prompt never reach its tokens, which keep their rotary positions. Each prompt's
+    states are cut back to its own length. With --low_vram_text_encoding a forward copies the 17 GB of layer weights to
+    the GPU once, so 8 captions took 8 s instead of 63 s on the real model (vram_lab/moss_te_batch_check.py).
+    """
     stream_device = getattr(model, "_moss_stream_device", None)
     device = stream_device or next(model.parameters()).device
+    pad = getattr(tokenizer, "pad_token_id", None) or 0
     out = []
-    for prompt in prompts:
-        input_ids = tokenize_prompt(tokenizer, prompt, max_tokens)[None]
+    for start in range(0, len(prompts), max(1, batch_size)):
+        ids = [tokenize_prompt(tokenizer, prompt, max_tokens) for prompt in prompts[start : start + max(1, batch_size)]]
+        input_ids = torch.full((len(ids), max(len(tokens) for tokens in ids)), pad, dtype=torch.long)
+        for row, tokens in enumerate(ids):
+            input_ids[row, : len(tokens)] = tokens
         if stream_device is not None:  # the embedding table stays on the CPU (stream_text_encoder)
             embeds = model.embed_tokens(input_ids).to(stream_device)
-            out.append(model(inputs_embeds=embeds, use_cache=False).last_hidden_state[0])
+            hidden = model(inputs_embeds=embeds, use_cache=False).last_hidden_state
         else:
-            out.append(model(input_ids=input_ids.to(device), use_cache=False).last_hidden_state[0])
+            hidden = model(input_ids=input_ids.to(device), use_cache=False).last_hidden_state
+        out.extend(hidden[row, : len(tokens)].clone() for row, tokens in enumerate(ids))
+        del hidden
     return out
 
 

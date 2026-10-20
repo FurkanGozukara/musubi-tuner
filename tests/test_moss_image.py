@@ -163,6 +163,21 @@ def _streamed_matches_resident(device: str):
     assert all(p.device.type == "cpu" for p in streamed.layers.parameters()) and streamed.embed_tokens.weight.device.type == "cpu"
 
 
+def test_a_padded_batch_of_prompts_matches_one_forward_per_prompt():
+    """encode_prompts runs up to TEXT_BATCH_SIZE prompts as one right-padded forward without a mask: every Qwen3.5 layer
+    is causal, so each prompt's states equal its own unpadded forward's (ai-toolkit 0473387)."""
+    model = _tiny_text_encoder()
+    prompts = ["ohwx man", "a red bicycle leaning on a wall at sunset, long shadows on the cobblestones", "", "photo of ohwx dog"]
+    singles = moss_utils.encode_prompts(model, _CharTokenizer(), prompts, batch_size=1)
+    batched = moss_utils.encode_prompts(model, _CharTokenizer(), prompts)
+    assert [b.shape for b in batched] == [s.shape for s in singles] and len({s.shape[0] for s in singles}) == 4
+    for a, b in zip(batched, singles):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+    pairs = moss_utils.encode_prompts(model, _CharTokenizer(), prompts, batch_size=3)  # a batch, then a single prompt
+    for a, b in zip(pairs, singles):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+
+
 def test_low_vram_text_encoding_matches_the_resident_text_encoder():
     """--low_vram_text_encoding (stream_text_encoder) looks the tokens up on the CPU and passes the embeddings in; the
     outputs must not change."""

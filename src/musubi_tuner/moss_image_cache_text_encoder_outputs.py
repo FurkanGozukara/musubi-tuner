@@ -1,5 +1,6 @@
 """Cache MOSS-Image text encoder outputs: per caption the (L, 4096) final hidden state of Qwen3.5-9B on the chat template,
-L the caption's own token count (unpadded, as the vendor encodes). See moss_image/moss_utils.py."""
+L the caption's own token count, as the vendor encodes. The captions of a batch (--batch_size) run as one right-padded
+forward whose causal layers keep each caption's states (moss_utils.encode_prompts). See moss_image/moss_utils.py."""
 
 import argparse
 import logging
