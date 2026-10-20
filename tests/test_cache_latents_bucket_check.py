@@ -44,3 +44,25 @@ def test_unknown_layout_keeps_the_exists_test(tmp_path):
     garbage.write_bytes(b"not a safetensors file")
     assert latent_cache_matches_bucket(_item(garbage, (512, 512)))
     assert latent_cache_matches_bucket(_item(path, None))
+
+
+def test_references_must_fit_their_current_size(tmp_path):
+    """Keeping each reference's own framing (control_resolution) leaves the target bucket unchanged: the cached
+    reference latents must be re-encoded all the same."""
+    import numpy as np
+
+    path = tmp_path / "e_1024x1024_f3.safetensors"
+    latents = {
+        "latents_64x64_bfloat16": torch.zeros(128, 64, 64, dtype=torch.bfloat16),
+        "latents_control_0_64x64_bfloat16": torch.zeros(128, 64, 64, dtype=torch.bfloat16),  # cropped to the target bucket
+    }
+    save_file(latents, str(path))
+    item = _item(path, (1024, 1024))
+    item.control_content = [np.zeros((1024, 1024, 3), dtype=np.uint8)]
+    assert latent_cache_matches_bucket(item)
+    item.control_content = [np.zeros((832, 1248, 3), dtype=np.uint8)]  # the reference now keeps its 3:2 framing
+    assert not latent_cache_matches_bucket(item)
+    item.control_content = [np.zeros((1024, 1024, 3), dtype=np.uint8)] * 2  # a second reference
+    assert not latent_cache_matches_bucket(item)
+    item.control_content = None  # no references: the target test alone
+    assert latent_cache_matches_bucket(item)

@@ -328,6 +328,42 @@ def resolve_distributed_cache_shard(args: argparse.Namespace, device):
 
 
 _LATENT_KEY = re.compile(r"^latents_(?:\d+x)?(\d+)x(\d+)_[0-9a-z]+$")
+_CONTROL_KEY = re.compile(r"^latents_control_(\d+)_(?:\d+x)?(\d+)x(\d+)_[0-9a-z]+$")
+_FACTORS = (1, 2, 4, 8, 16, 32, 64)
+
+
+def _grid_fits(grid_height: int, grid_width: int, height: int, width: int) -> bool:
+    """The latent grid is the pixel size divided by one compression factor."""
+    return any(abs(grid_width * factor - width) < factor and abs(grid_height * factor - height) < factor for factor in _FACTORS)
+
+
+def _references_match(item: ItemInfo, header: dict) -> bool:
+    """The cached reference latents (``latents_control_<i>``) fit the item's reference images as the dataset now resizes
+    them: after a change such as control_resolution (keep each reference's own framing) the target bucket stays the same
+    and the old latents would otherwise be reused. A layout without such keys, or no references, keeps the target test."""
+    controls = getattr(item, "control_content", None)
+    if controls is None:
+        return True
+    controls = [control for control in (controls if isinstance(controls, list) else [controls]) if control is not None]
+    grids = {}
+    for key in header:
+        match = _CONTROL_KEY.match(key)
+        if match:
+            grids[int(match.group(1))] = (int(match.group(2)), int(match.group(3)))
+    if not controls or not grids:
+        return True
+    if sorted(grids) != list(range(len(controls))):
+        logger.info(f"Re-encoding {os.path.basename(item.latent_cache_path)}: {len(grids)} cached references, {len(controls)} now")
+        return False
+    for index, control in enumerate(controls):
+        height, width = int(control.shape[-3]), int(control.shape[-2])  # HWC images, (F)HWC videos
+        if not _grid_fits(*grids[index], height, width):
+            logger.info(
+                f"Re-encoding {os.path.basename(item.latent_cache_path)}: reference {index} cached as latent grid "
+                f"{grids[index][1]}x{grids[index][0]}, the reference is now {width}x{height}"
+            )
+            return False
+    return True
 
 
 def read_cache_header(path: str) -> Optional[dict]:
@@ -358,7 +394,8 @@ def latent_cache_matches_bucket(item: ItemInfo) -> bool:
     Image cache names carry the source image size, not the training bucket, so after a resolution change the old
     file would otherwise be reused silently (training then runs at the old resolution). New caches record their
     bucket in the metadata and are compared exactly; older caches fall back to the latent grid, which must equal
-    the bucket divided by one compression factor. Unreadable caches keep the plain exists test.
+    the bucket divided by one compression factor. Unreadable caches keep the plain exists test. Reference images'
+    latents must fit their current sizes too (_references_match).
     """
     path = item.latent_cache_path
     if not os.path.exists(path):
@@ -380,14 +417,12 @@ def latent_cache_matches_bucket(item: ItemInfo) -> bool:
         if grid is None:
             return True
         grid_height, grid_width = grid
-        matches = any(
-            abs(grid_width * factor - width) < factor and abs(grid_height * factor - height) < factor
-            for factor in (1, 2, 4, 8, 16, 32, 64)
-        )
+        matches = _grid_fits(grid_height, grid_width, height, width)
         cached = f"latent grid {grid_width}x{grid_height}"
     if not matches:
         logger.info(f"Re-encoding {os.path.basename(path)}: cached for {cached}, current bucket is {width}x{height}")
-    return matches
+        return False
+    return _references_match(item, header)
 
 
 def encode_datasets(
