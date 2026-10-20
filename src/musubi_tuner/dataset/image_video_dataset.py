@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 from PIL import Image
+from musubi_tuner.utils.color_profile import open_rgb_image
 import cv2
 import av
 
@@ -917,7 +918,7 @@ def load_video(
                     break
 
                 image_file = image_files[i]
-                image = Image.open(image_file).convert("RGB")
+                image = open_rgb_image(image_file).convert("RGB")
 
                 if bucket_selector is not None and bucket_reso is None:
                     bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame
@@ -984,7 +985,7 @@ def load_video(
                     break
 
                 image_file = image_files[i]
-                image = Image.open(image_file).convert("RGB")
+                image = open_rgb_image(image_file).convert("RGB")
 
                 if bucket_selector is not None and bucket_reso is None:
                     bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame
@@ -1248,9 +1249,7 @@ class ImageDirectoryDatasource(ImageDatasource):
 
         images = []
         for p in image_paths:
-            img = Image.open(p)
-            if img.mode != "RGB" and img.mode != "RGBA":
-                img = img.convert("RGB")
+            img = open_rgb_image(p)  # sRGB (utils.color_profile)
             images.append(img)
 
         _, caption = self.get_caption(idx)
@@ -1268,9 +1267,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         if self.has_control:
             controls = []
             for control_path in self.control_paths[image_path]:
-                control = Image.open(control_path)
-                if control.mode != "RGB" and control.mode != "RGBA":
-                    control = control.convert("RGB")
+                control = open_rgb_image(control_path)
                 controls.append(control)
 
         return image_path, images, caption, controls, loss_mask
@@ -1407,9 +1404,7 @@ class ImageJsonlDatasource(ImageDatasource):
 
         images = []
         for path in image_paths:
-            img = Image.open(path)
-            if img.mode != "RGB" and img.mode != "RGBA":
-                img = img.convert("RGB")
+            img = open_rgb_image(path)  # sRGB (utils.color_profile)
             images.append(img)
 
         caption = select_caption_from_metadata(data, self.caption_field)
@@ -1433,9 +1428,7 @@ class ImageJsonlDatasource(ImageDatasource):
                 if f"control_path_{i}" not in data:
                     break
                 control_path = data[f"control_path_{i}"]
-                control = Image.open(control_path)
-                if control.mode != "RGB" and control.mode != "RGBA":
-                    control = control.convert("RGB")
+                control = open_rgb_image(control_path)
                 controls.append(control)
 
         return image_path, images, caption, controls, loss_mask

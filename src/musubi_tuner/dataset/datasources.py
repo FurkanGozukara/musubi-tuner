@@ -6,6 +6,7 @@ import os
 from typing import Any, Mapping, Optional, TYPE_CHECKING
 
 from PIL import Image
+from musubi_tuner.utils.color_profile import open_rgb_image
 
 from musubi_tuner.dataset.audio_utils import AudioSource, AudioSpec, DecodedAudio, decode_audio, resolve_audio_source
 from musubi_tuner.dataset.media_utils import glob_images, glob_videos, load_video, VIDEO_EXTENSIONS
@@ -274,9 +275,7 @@ class ImageDirectoryDatasource(ImageDatasource):
 
         images = []
         for p in image_paths:
-            img = Image.open(p)
-            if img.mode != "RGB" and img.mode != "RGBA":
-                img = img.convert("RGB")
+            img = open_rgb_image(p)  # sRGB (utils.color_profile)
             images.append(img)
 
         _, caption = self.get_caption(idx)
@@ -285,9 +284,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         if self.has_control:
             controls = []
             for control_path in self.control_paths[image_path]:
-                control = Image.open(control_path)
-                if control.mode != "RGB" and control.mode != "RGBA":
-                    control = control.convert("RGB")
+                control = open_rgb_image(control_path)
                 controls.append(control)
 
         return image_path, images, caption, controls
@@ -410,9 +407,7 @@ class ImageJsonlDatasource(ImageDatasource):
 
         images = []
         for path in image_paths:
-            img = Image.open(path)
-            if img.mode != "RGB" and img.mode != "RGBA":
-                img = img.convert("RGB")
+            img = open_rgb_image(path)  # sRGB (utils.color_profile)
             images.append(img)
 
         caption = data["caption"]
@@ -424,9 +419,7 @@ class ImageJsonlDatasource(ImageDatasource):
                 if f"control_path_{i}" not in data:
                     break
                 control_path = data[f"control_path_{i}"]
-                control = Image.open(control_path)
-                if control.mode != "RGB" and control.mode != "RGBA":
-                    control = control.convert("RGB")
+                control = open_rgb_image(control_path)
                 controls.append(control)
 
         return image_path, images, caption, controls

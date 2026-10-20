@@ -9,6 +9,7 @@ from typing import Optional, Union, TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
+from musubi_tuner.utils.color_profile import open_rgb_image
 from musubi_tuner.utils import cv2_compat  # noqa: F401 - must be imported before `import cv2`
 import cv2
 import av
@@ -336,7 +337,7 @@ def load_video(
                     break
 
                 image_file = image_files[i]
-                image = Image.open(image_file).convert("RGB")
+                image = open_rgb_image(image_file).convert("RGB")
 
                 if bucket_selector is not None and bucket_reso is None:
                     bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame
@@ -402,7 +403,7 @@ def load_video(
                     break
 
                 image_file = image_files[i]
-                image = Image.open(image_file).convert("RGB")
+                image = open_rgb_image(image_file).convert("RGB")
 
                 if bucket_selector is not None and bucket_reso is None:
                     bucket_reso = bucket_selector.get_bucket_resolution(image.size)  # calc resolution from first frame

@@ -42,6 +42,7 @@ from musubi_tuner.flux_2 import flux2_models
 from musubi_tuner.utils.safetensors_utils import load_split_weights
 
 import logging
+from musubi_tuner.utils.color_profile import open_rgb_image
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -327,7 +328,7 @@ def preprocess_control_image(
             - control_image_np (np.ndarray): The preprocessed control image as a NumPy array for conditioning. HWC format.
             - None: Placeholder for compatibility (no additional data returned).
     """
-    control_image = Image.open(control_image_path)
+    control_image = open_rgb_image(control_image_path)  # sRGB (utils.color_profile)
     width, height = control_image.size
 
     if limit_size is None or limit_size[0] * limit_size[1] >= width * height:  # No resizing needed
