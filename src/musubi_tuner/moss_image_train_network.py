@@ -46,6 +46,12 @@ class MossImageNetworkTrainer(NetworkTrainer):
 
     def handle_model_specific_args(self, args):
         self.dit_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
+        if args.mixed_precision == "fp16":
+            # KBlueLeaf/MOSS-Image-FP16-fixed measured the residual stream near 62,000 at block 26 (FP16 ends at 65,504)
+            logger.warning(
+                "MOSS-Image in FP16: its residual stream comes close to FP16's limit (about 62,000 of 65,504 measured at "
+                "block 26), so a LoRA or a larger image can overflow to inf / NaN. Train in BF16 where the GPU supports it."
+            )
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = moss_utils.DEFAULT_GUIDANCE

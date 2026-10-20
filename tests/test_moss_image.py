@@ -229,6 +229,17 @@ def test_call_dit_targets_noise_minus_latents_on_the_vendor_timestep_scale():
     assert torch.equal(out.target, noise - latents)
 
 
+@pytest.mark.parametrize("precision, warned", [("fp16", True), ("bf16", False)])
+def test_fp16_training_warns_about_the_residual_stream(caplog, precision, warned):
+    """KBlueLeaf/MOSS-Image-FP16-fixed measured the residual stream near 62,000 at block 26 (FP16 ends at 65,504)."""
+    from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer
+
+    trainer = MossImageNetworkTrainer()
+    trainer.handle_model_specific_args(argparse.Namespace(mixed_precision=precision, sample_prompts=None, text_encoder=None))
+    assert trainer.dit_dtype == (torch.float16 if precision == "fp16" else torch.bfloat16)
+    assert ("65,504" in caplog.text) == warned
+
+
 class _ConstantVelocity(torch.nn.Module):
     def __init__(self):
         super().__init__()
