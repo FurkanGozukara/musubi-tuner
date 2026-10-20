@@ -1,6 +1,7 @@
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 import gc
 import time
@@ -987,6 +988,26 @@ class _DirectCopier:
         self._xfer.clear()
 
 
+def _host_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy one host tensor into another of the same byte size with a single ``memmove`` on the calling thread
+    (kohya-ss/sd-scripts 3a082f5). torch's CPU ``copy_`` spreads a large copy over every intra-op thread and the
+    OpenMP workers keep spinning afterwards: the per-block staging copies kept 46 of 64 cores busy in a MOSS-Image
+    LoRA run there, against about one core for the classic block swap. One memmove (about 18 GB/s) still outruns the
+    PCIe DMA that consumes the buffer, releases the GIL and leaves the OpenMP pool alone. Anything other than two
+    contiguous CPU tensors of equal byte size goes through ``copy_``, which also raises for a size mismatch."""
+    nbytes = src.numel() * src.element_size()
+    if (
+        dst.device.type != "cpu"
+        or src.device.type != "cpu"
+        or not dst.is_contiguous()
+        or not src.is_contiguous()
+        or dst.numel() * dst.element_size() != nbytes
+    ):
+        dst.copy_(src)
+        return
+    ctypes.memmove(dst.data_ptr(), src.data_ptr(), nbytes)
+
+
 class _StagedCopier:
     """
     Transfer engine for ``LoRAStreamOffloader`` when the masters are kept in *pageable* host memory: each
@@ -1033,7 +1054,7 @@ class _StagedCopier:
         if free_ev is not None:
             free_ev.synchronize()  # CPU(worker) waits until the prior H2D released this buffer -- off main thread
 
-        staging.copy_(src_flat)  # pageable -> pinned, plain CPU memcpy
+        _host_memcpy(staging, src_flat)  # pageable -> pinned, one-thread host memcpy
 
         ev_a = ev_b = None
         with torch.cuda.stream(self.copy_stream):
