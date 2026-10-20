@@ -303,6 +303,8 @@ def train(self, args):
         if validation_dataset_group is not None:
             conditioning_datasets.extend(validation_dataset_group.datasets)
         self.configure_reference_target_ranges_from_datasets(conditioning_datasets)
+    if hasattr(self, "on_train_datasets"):  # MOSS-Image control adapters: maps present, the empty caption's context
+        self.on_train_datasets(args, list(train_dataset_group.datasets))
 
     if train_dataset_group.num_train_items == 0:
         raise ValueError(
@@ -2776,6 +2778,7 @@ def train(self, args):
                         params_to_clip.extend(self._self_flow.get_trainable_params())
                     if uncertainty_state is not None:
                         params_to_clip.extend(uncertainty_state.parameters())
+                    params_to_clip.extend(self.extra_grad_params())
 
                     if args.log_grad_metrics and len(accelerator.trackers) > 0:
                         grad_metrics = self.collect_grad_metrics(network.parameters())

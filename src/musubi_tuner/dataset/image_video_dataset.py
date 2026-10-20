@@ -49,6 +49,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_MAGE_FLOW_EDIT,
     ARCHITECTURE_MAGE_FLOW_EDIT_FULL,
     ARCHITECTURE_MAGE_FLOW_FULL,
+    ARCHITECTURE_MOSS_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_QWEN_IMAGE_21,
     ARCHITECTURE_WAN,
@@ -2708,6 +2709,8 @@ class ImageDataset(BaseDataset):
             control_count_per_image = None  # can be multiple control images
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
+        elif self.architecture == ARCHITECTURE_MOSS_IMAGE:
+            control_count_per_image = 2  # control adapter maps: <name>_0 colour regions, <name>_1 depth (both, in order)
 
         if self.cache_only:
             self.datasource = None

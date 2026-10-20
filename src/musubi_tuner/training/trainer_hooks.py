@@ -36,6 +36,12 @@ def pre_train_hook(self, args, accelerator, transformer=None, network=None):
     pass
 
 
+def extra_grad_params(self) -> list:
+    """Parameters outside the network that the optimizer trains as well (the MOSS-Image control embedder): gradient
+    clipping and the gradient-norm logs include them."""
+    return []
+
+
 def compute_prior_divergence_addition(self, args, accelerator, transformer, network, video_pred, network_dtype):
     return None
 

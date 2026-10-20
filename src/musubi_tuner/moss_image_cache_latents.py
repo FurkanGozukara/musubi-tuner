@@ -1,5 +1,6 @@
 """Cache MOSS-Image latents: the FLUX.2 VAE's packed 128-channel latents at 1/16 (MOSS-Image uses that VAE unchanged),
-written under the MOSS-Image architecture name."""
+written under the MOSS-Image architecture name. A dataset with control images (a control adapter's colour and depth maps,
+<name>_0 and <name>_1) caches their latents beside the target's, at the target's bucket (latents_control_0 / _1)."""
 
 import logging
 from typing import List
@@ -13,6 +14,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.flux_2.flux2_utils import load_ae
 from musubi_tuner.flux_2_cache_latents import encode_and_save_batch
+from musubi_tuner.moss_image import moss_control
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,10 @@ def main():
     def encode(batch: List[ItemInfo]):
         encode_and_save_batch(ae, batch, ARCHITECTURE_MOSS_IMAGE_FULL)
 
-    cache_latents.encode_datasets(datasets, encode, args)
+    def cache_is_current(item: ItemInfo) -> bool:
+        return moss_control.latent_cache_is_current(item, cache_latents.latent_cache_matches_bucket)
+
+    cache_latents.encode_datasets(datasets, encode, args, cache_is_current=cache_is_current)
 
 
 if __name__ == "__main__":

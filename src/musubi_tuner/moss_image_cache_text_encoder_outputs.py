@@ -9,10 +9,10 @@ import torch
 
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
-from musubi_tuner.dataset.architectures import ARCHITECTURE_MOSS_IMAGE
+from musubi_tuner.dataset.architectures import ARCHITECTURE_MOSS_IMAGE, ARCHITECTURE_MOSS_IMAGE_FULL
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, save_text_encoder_output_cache_moss_image
-from musubi_tuner.moss_image import moss_utils
+from musubi_tuner.moss_image import moss_control, moss_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +23,19 @@ def encode_and_save_batch(text_encoder, tokenizer, batch: list[ItemInfo]):
     contexts = moss_utils.encode_prompts(text_encoder, tokenizer, prompts)
     for item, ctx in zip(batch, contexts):
         save_text_encoder_output_cache_moss_image(item, ctx.to(torch.bfloat16))
+
+
+def save_empty_caption_for_control_datasets(text_encoder, tokenizer, datasets) -> None:
+    """A control adapter's caption dropout trains with the empty caption: its context goes beside the caches of every
+    dataset with control maps (moss_control.EMPTY_CAPTION_FILE), encoded by this run's text encoder."""
+    directories = sorted({dataset.cache_directory for dataset in datasets if getattr(dataset, "has_control", False) and dataset.cache_directory})
+    if not directories:
+        return
+    empty = moss_utils.encode_prompts(text_encoder, tokenizer, [""])[0].to(torch.bfloat16)
+    for directory in directories:
+        path = moss_control.empty_caption_path(directory)
+        moss_control.save_empty_caption(path, empty, ARCHITECTURE_MOSS_IMAGE_FULL)
+        logger.info(f"Saved the empty caption's context for the control adapter's caption dropout: {path}")
 
 
 def moss_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -76,6 +89,7 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
     )
+    save_empty_caption_for_control_datasets(text_encoder, tokenizer, datasets)
     del text_encoder
 
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache)
