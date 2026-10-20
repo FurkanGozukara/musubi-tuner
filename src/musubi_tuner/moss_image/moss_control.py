@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from typing import Optional, Sequence
 
 import numpy as np
@@ -348,5 +349,6 @@ def write_comfy_control_file(path: str, embedder: MossControlEmbedder, module_na
         metadata["alpha"] = str(float(rank))
     temporary = path + ".tmp"
     save_file(out, temporary, metadata={key: str(value) for key, value in metadata.items()})
+    shutil.copymode(path, temporary)  # safetensors creates the file owner-only (0600 on Linux); keep the checkpoint's
     os.replace(temporary, path)
     return len(out)

@@ -201,6 +201,16 @@ def test_the_exported_adapter_reproduces_the_trained_model_when_patched_as_comfy
     assert torch.allclose(patched, trained, rtol=1e-4, atol=1e-5), float((patched - trained).abs().max())
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_the_rewritten_checkpoint_keeps_its_file_mode(tmp_path):
+    """safetensors creates its file owner-only (0600): the rewritten checkpoint keeps the trainer's file mode."""
+    path = str(tmp_path / "adapter.safetensors")
+    save_file({"lora_unet_layers_0_proj_q.lora_down.weight": torch.zeros(2, 8), "lora_unet_layers_0_proj_q.lora_up.weight": torch.zeros(8, 2)}, path)
+    os.chmod(path, 0o664)
+    moss_control.write_comfy_control_file(path, moss_control.MossControlEmbedder(torch.nn.Linear(8, 16)), {"lora_unet_layers_0_proj_q": "layers.0.proj.q"})
+    assert os.stat(path).st_mode & 0o777 == 0o664
+
+
 def test_export_keeps_dora_scales_in_fp32_and_folds_alpha_into_lora_b():
     embedder = moss_control.MossControlEmbedder(torch.nn.Linear(8, 16))
     down = torch.randn(4, 16, dtype=torch.bfloat16)
