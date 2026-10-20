@@ -81,7 +81,8 @@ QWEN35_9B_TEXT_CONFIG = {
 }
 
 MAX_TEXT_TOKENS = 4096
-DEFAULT_SHIFT = 5.0  # sampler shift; also the training timestep shift (ai-toolkit, ComfyUI's model_sampling)
+DEFAULT_SHIFT = 5.0  # the vendor's sampler shift (ComfyUI's model_sampling); ai-toolkit also trains at it, the GUI presets
+# train at --discrete_flow_shift 3 (about the pre-training distribution, one save cleaner on two seeds)
 DEFAULT_GUIDANCE = 3.0
 DEFAULT_SAMPLE_STEPS = 50
 DEFAULT_UNCOND_SKIP_LAYERS = (22,)
