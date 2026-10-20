@@ -3,6 +3,7 @@
 import argparse
 import gc
 import logging
+import os
 
 import torch
 from musubi_tuner.utils.model_utils import cpu_text_encoder_dtype, mark_cpu_fp32_fallback
@@ -13,7 +14,7 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_QWEN_IMAGE_21, ARCHI
 from musubi_tuner.qwen_image_21 import qwen_image_21_model, qwen_image_21_sampling, qwen_image_21_utils
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import load_prompts
-from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
+from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer, comfy_lora_path
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
@@ -72,6 +73,29 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
     @property
     def architecture_full_name(self):
         return ARCHITECTURE_QWEN_IMAGE_21_FULL
+
+    def on_post_save(self, args, accelerator, network, transformer, ckpt_name, save_dtype, metadata, force_sync_upload):
+        """A ComfyUI / SwarmUI copy of each checkpoint, ``<name>.comfy.safetensors``, with diffusers keys
+        (``transformer.<module>.lora_A.weight``, DoRA's ``dora_scale`` beside them). Comfy-Org's Qwen-Image 2.1 checkpoints
+        fuse each block's MLP gate and up layers (``img_mlp.gate_up``) and ComfyUI maps LoRA weights onto the two halves
+        only for such keys: with the trainer's own ``lora_unet_`` keys it skipped ``img_mlp.proj`` and
+        ``img_mlp.gate_layer`` ("lora key not loaded"), two of the seven trained layers of every block
+        (kohya-ss/musubi-tuner #1163). The trainer's own file stays as it is (resume, musubi's tools)."""
+        if not accelerator.is_main_process:
+            return
+        from safetensors.torch import save_file
+
+        from musubi_tuner.convert_lora import convert_to_diffusers
+
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        comfy_file = comfy_lora_path(ckpt_file)
+        weights = convert_to_diffusers("lora_unet_", "transformer", load_file(ckpt_file))
+        save_file(weights, comfy_file, metadata={key: str(value) for key, value in (metadata or {}).items()})
+        accelerator.print(f"saved the ComfyUI / SwarmUI LoRA: {comfy_file}")
+        if args.huggingface_repo_id is not None:
+            from musubi_tuner.utils import huggingface_utils
+
+            huggingface_utils.upload(args, comfy_file, "/" + os.path.basename(comfy_file), force_sync_upload=force_sync_upload)
 
     def handle_model_specific_args(self, args):
         self.dit_dtype = torch.bfloat16

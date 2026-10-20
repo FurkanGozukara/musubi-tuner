@@ -147,6 +147,12 @@ class DiTOutput:
     extra: dict = field(default_factory=dict)
 
 
+def comfy_lora_path(ckpt_file: str) -> str:
+    """The ComfyUI / SwarmUI copy a trainer may write beside a LoRA checkpoint (``<name>.comfy.safetensors``)."""
+    root, extension = os.path.splitext(ckpt_file)
+    return f"{root}.comfy{extension or '.safetensors'}"
+
+
 class NetworkTrainer:
     # audio-capable architectures override this class attribute with their AudioSpec so that
     # dataset construction enables audio (class attribute because _build_dataset runs before
@@ -2140,9 +2146,11 @@ class NetworkTrainer:
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-            if os.path.exists(old_ckpt_file):
-                accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
-                os.remove(old_ckpt_file)
+            # with the ComfyUI copy a trainer writes beside it (on_post_save: Qwen-Image 2.1)
+            for path in (old_ckpt_file, comfy_lora_path(old_ckpt_file)):
+                if os.path.exists(path):
+                    accelerator.print(f"removing old checkpoint: {path}")
+                    os.remove(path)
 
         def _do_sample(epoch_arg, steps_arg):
             if not should_sample_images(args, steps_arg, epoch_arg):
