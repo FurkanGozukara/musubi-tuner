@@ -49,7 +49,7 @@ def modulate(x, shift=None, scale=None):
 
 
 def apply_gate(x, gate=None, tanh=False):
-    """AI is creating summary for apply_gate
+    """Apply an optional broadcast gate to the input tensor.
 
     Args:
         x (torch.Tensor): input tensor.

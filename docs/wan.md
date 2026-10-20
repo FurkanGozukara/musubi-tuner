@@ -180,7 +180,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 ```
 The above is an example. The appropriate values for `timestep_sampling` and `discrete_flow_shift` need to be determined by experimentation.
 
-For additional options, use `python src/musubi_tuner/wan_train_network.py --help` (note that many options are unverified).
+For additional options, use `python src/musubi_tuner/wan_train_network.py --help` (compatibility of additional options is not guaranteed).
 
 `--task` is one of `t2v-1.3B`, `t2v-14B`, `i2v-14B`, `t2i-14B` (for Wan2.1 official models), `t2v-1.3B-FC`, `t2v-14B-FC`, and `i2v-14B-FC` (for Wan2.1 Fun Control model), `t2v-A14B`, `i2v-A14B` (for Wan2.2 14B models). Specify the DiT weights for the task with `--dit`.
 
@@ -220,7 +220,7 @@ The trained LoRA weights are seemed to be compatible with ComfyUI (may depend on
 
 `timestep_sampling`や`discrete_flow_shift`は一例です。どのような値が適切かは実験が必要です。
 
-その他のオプションについては `python src/musubi_tuner/wan_train_network.py --help` を使用してください（多くのオプションは未検証です）。
+その他のオプションについては `python src/musubi_tuner/wan_train_network.py --help` を使用してください（追加オプションの互換性は保証されません）。
 
 `--task` には `t2v-1.3B`, `t2v-14B`, `i2v-14B`, `t2i-14B` （これらはWan2.1公式モデル）、`t2v-1.3B-FC`, `t2v-14B-FC`, `i2v-14B-FC`（Wan2.1-Fun Controlモデル）、`t2v-A14B`, `i2v-A14B`（Wan2.2 14Bモデル）を指定します。`--dit`に、taskに応じたDiTの重みを指定してください。
 
@@ -303,7 +303,7 @@ For Wan2.2 models, you can specify the low-noise model with `--dit` and the high
 
 When inferring Wan2 .2 high and low models, you can use `--offload_inactive_dit` to offload the inactive DiT model to the CPU, or `--lazy_loading` to enable lazy loading for DiT models, which can save VRAM. `--offload_inactive_dit` only works when `--blocks_to_swap` is not specified, so use `--lazy_loading` instead. Without these options, both models will remain on the GPU, which may use more VRAM.
 
-`--attn_mode` is `torch`, `sdpa` (same as `torch`), `xformers`, `sageattn`,`flash2`, `flash` (same as `flash2`) or `flash3`. `torch` is the default. Other options require the corresponding library to be installed. `flash3` (Flash attention 3) is not tested.
+`--attn_mode` is `torch`, `sdpa` (same as `torch`), `xformers`, `sageattn`,`flash2`, `flash` (same as `flash2`) or `flash3`. `torch` is the default. Other options require the corresponding library to be installed. Compatibility with `flash3` (Flash attention 3) is not guaranteed.
 
 Specifying `--fp8` runs DiT in fp8 mode. fp8 can significantly reduce memory consumption but may impact output quality.
 

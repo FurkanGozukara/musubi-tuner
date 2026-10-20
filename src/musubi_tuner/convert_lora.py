@@ -135,27 +135,27 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
                 module_name = lora_name[len(prefix) :]  # remove "lora_unet_"
                 module_name = module_name.replace("_", ".")  # replace "_" with "."
                 if ".cross.attn." in module_name or ".self.attn." in module_name:
-                    # Wan2.1 lora name to module name: ugly but works
+                    # Wan2.1 lora name to module name: normalize architecture-specific module names
                     module_name = module_name.replace("cross.attn", "cross_attn")  # fix cross attn
                     module_name = module_name.replace("self.attn", "self_attn")  # fix self attn
                     module_name = module_name.replace("k.img", "k_img")  # fix k img
                     module_name = module_name.replace("v.img", "v_img")  # fix v img
                 elif ".attention.to." in module_name or ".feed.forward." in module_name:
-                    # Z-Image lora name to module name: ugly but works
+                    # Z-Image lora name to module name: normalize architecture-specific module names
                     module_name = module_name.replace("to.q", "to_q")  # fix to q
                     module_name = module_name.replace("to.k", "to_k")  # fix to k
                     module_name = module_name.replace("to.v", "to_v")  # fix to v
                     module_name = module_name.replace("to.out", "to_out")  # fix to out
                     module_name = module_name.replace("feed.forward", "feed_forward")  # fix feed forward
                 elif "double.blocks." in module_name or "single.blocks." in module_name:
-                    # HunyuanVideo and FLUX lora name to module name: ugly but works
+                    # HunyuanVideo and FLUX lora name to module name: normalize architecture-specific module names
                     module_name = module_name.replace("double.blocks.", "double_blocks.")  # fix double blocks
                     module_name = module_name.replace("single.blocks.", "single_blocks.")  # fix single blocks
                     module_name = module_name.replace("img.", "img_")  # fix img
                     module_name = module_name.replace("txt.", "txt_")  # fix txt
                     module_name = module_name.replace("attn.", "attn_")  # fix attn
                 elif ".attn.qkv.proj" in module_name or ".attn.out.proj" in module_name or ".adaln.proj" in module_name:
-                    # MiniMax-H3 lora name to module name: ugly but works
+                    # MiniMax-H3 lora name to module name: normalize architecture-specific module names
                     module_name = module_name.replace("qkv.proj", "qkv_proj")  # fix qkv proj
                     module_name = module_name.replace("out.proj", "out_proj")  # fix out proj
                     module_name = module_name.replace("adaln.proj", "adaln_proj")  # fix adaln proj

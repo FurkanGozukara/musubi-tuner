@@ -1,8 +1,7 @@
 """Named prompt beautifiers. The pipeline picks one by ``beautifier.name``.
 
-Public names: ``none``, ``qwen25``.
-``qwen35_9b``, ``qwen38_27b``, and ``gigachat`` are registered by the
-``musubi_tuner.kandinsky6.runtime.beautifiers`` entry point from the internal package.
+Built-in names: ``none``, ``qwen25``. Additional beautifiers can be registered
+through the ``musubi_tuner.kandinsky6.runtime.beautifiers`` entry point.
 """
 
 from __future__ import annotations

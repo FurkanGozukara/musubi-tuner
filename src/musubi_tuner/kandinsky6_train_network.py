@@ -19,9 +19,25 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     should_sample_images,
 )
-from musubi_tuner.kandinsky6 import PiFlowDiffusionTransformer3D, load_dit, load_dit_convrot_int8, load_dit_fp8
+from musubi_tuner.kandinsky6 import (
+    PiFlowDiffusionTransformer3D,
+    inspect_reference_layout,
+    load_dit,
+    load_dit_convrot_int8,
+    load_dit_fp8,
+)
 from musubi_tuner.kandinsky6.defaults import DEFAULT_NEGATIVE_PROMPT
+from musubi_tuner.kandinsky6.attention import require_attention_engine
 from musubi_tuner.kandinsky6.model import _resolve_weight_file
+from musubi_tuner.kandinsky6.reference import (
+    DEFAULT_REF_PAD_VALUE,
+    DEFAULT_REFERENCE_SLOTS,
+    build_reference_video_input,
+    cached_references_to_batch,
+    encode_reference_paths,
+    reference_visual_rope,
+    sample_reference_latents,
+)
 from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
 # The upstream loop (like MiniMax H3): it routes every step through process_batch(), which this trainer
@@ -151,12 +167,17 @@ def build_ti2av_video_input(noisy_video: torch.Tensor, image_latent: torch.Tenso
 
 class Kandinsky6NetworkTrainer(NetworkTrainer):
     audio_spec = KANDINSKY6_AUDIO_SPEC
+    # True in the dense trainer: only full fine-tuning may train the new reference
+    # embeddings added when a released checkpoint is extended for R2AV.
+    trains_full_transformer = False
 
     def __init__(self):
         super().__init__()
         self._task = "t2av"
         self._scheduler_scale = 1.0
         self._visual_rope_scale = (1.0, 2.0, 2.0)
+        self._ref_drop_prob = 0.0
+        self._reference_slots = 0
 
     @property
     def architecture(self) -> str:
@@ -167,6 +188,13 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         return ARCHITECTURE_KANDINSKY6_FULL
 
     def handle_model_specific_args(self, args: argparse.Namespace):
+        if args.flash_attn and args.flash3:
+            raise ValueError("Kandinsky 6 accepts only one of --flash_attn and --flash3")
+        if args.flash_attn or args.flash3:
+            require_attention_engine("flash_attention_3" if args.flash3 else "flash_attention_2")
+            # K6 supplies SDPA as its default, while the common trainer gives an
+            # explicitly true SDPA flag precedence over the other backends.
+            args.sdpa = False
         if not args.convrot_int8 and getattr(args, "dit", None):
             checkpoint = _resolve_weight_file(args.dit)
             if has_comfy_quant_tensors([checkpoint], disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False)):
@@ -177,10 +205,16 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         self._visual_rope_scale = tuple(float(value) for value in args.visual_rope_scale)
         self.default_guidance_scale = float(args.guidance_scale)
         self.default_discrete_flow_shift = 1.0
+        if args.task == "r2av":
+            if not 0.0 <= args.ref_drop_prob < 1.0:
+                raise ValueError("--ref_drop_prob must be in [0, 1)")
+            if args.max_reference_slots is not None and args.max_reference_slots < 1:
+                raise ValueError("--max_reference_slots must be positive")
+            self._ref_drop_prob = float(args.ref_drop_prob)
         if args.mixed_precision != "bf16":
             raise ValueError("Kandinsky 6 training requires --mixed_precision bf16")
-        if args.flash_attn or args.sage_attn or args.xformers or args.flash3 or args.split_attn:
-            raise ValueError("Kandinsky 6 training currently supports SDPA attention only")
+        if args.sage_attn or args.xformers or args.split_attn:
+            raise ValueError("Kandinsky 6 training supports --sdpa, --flash_attn, or --flash3")
         if args.timestep_sampling != "uniform" or args.weighting_scheme != "none" or args.discrete_flow_shift != 1.0:
             raise ValueError(
                 "Kandinsky 6 uses its own shifted uniform flow schedule; timestep_sampling must be uniform, "
@@ -203,6 +237,14 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
     def control_training(self) -> bool:
         return False
 
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        metadata = super().extra_metadata(args)
+        metadata["ss_k6_task"] = str(args.task)
+        if args.task == "r2av":
+            metadata["ss_k6_reference_slots"] = str(self._reference_slots)
+            metadata["ss_k6_ref_drop_prob"] = str(self._ref_drop_prob)
+        return metadata
+
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         del args, vae_dtype, vae_path
         return None
@@ -217,8 +259,31 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
-        del attn_mode, split_attn
+        del split_attn
+        attention_engine = {
+            "flash": "flash_attention_2",
+            "flash3": "flash_attention_3",
+        }.get(attn_mode, "sdpa")
         dtype = dit_weight_dtype or torch.bfloat16
+        reference_slots = None
+        if args.task == "r2av":
+            _, file_slots = inspect_reference_layout(dit_path)
+            if file_slots:
+                reference_slots = args.max_reference_slots  # None accepts the checkpoint's count
+            else:
+                if args.convrot_int8 or args.fp8_base:
+                    raise ValueError(
+                        "R2AV from a released checkpoint adds untrained reference embeddings and needs a BF16 base "
+                        "with full fine-tuning (kandinsky6_train.py); FP8 / ConvRot INT8 bases can only load a "
+                        "checkpoint whose reference slots were already trained"
+                    )
+                if not self.trains_full_transformer:
+                    raise ValueError(
+                        "R2AV from a released checkpoint must be trained with full fine-tuning (kandinsky6_train.py): "
+                        "LoRA cannot train the new reference embeddings. LoRA R2AV needs a checkpoint whose "
+                        "reference slots were already trained"
+                    )
+                reference_slots = args.max_reference_slots or DEFAULT_REFERENCE_SLOTS
         if args.convrot_int8:
             transformer = load_dit_convrot_int8(
                 dit_path,
@@ -227,6 +292,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 quant_device=accelerator.device,
                 bwd_mode=args.convrot_int8_bwd,
                 disable_numpy_memmap=args.disable_numpy_memmap,
+                attention_engine=attention_engine,
             )
         elif args.fp8_base:
             transformer = load_dit_fp8(
@@ -235,13 +301,35 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 device=loading_device,
                 quant_device=accelerator.device,
                 disable_numpy_memmap=args.disable_numpy_memmap,
+                attention_engine=attention_engine,
             )
         else:
-            transformer = load_dit(dit_path, model_variant=args.model_variant, dtype=dtype, device=loading_device)
+            transformer = load_dit(
+                dit_path,
+                model_variant=args.model_variant,
+                dtype=dtype,
+                device=loading_device,
+                reference_slots=reference_slots,
+                attention_engine=attention_engine,
+            )
         if isinstance(transformer, PiFlowDiffusionTransformer3D):
             raise ValueError("PiFlow distilled Kandinsky 6 checkpoints use grid outputs and are not trainable yet")
         if not transformer.is_multimodal:
             raise ValueError("Kandinsky 6 joint training requires a multimodal Lite or Pro checkpoint")
+        if args.task == "r2av":
+            self._reference_slots = int(getattr(transformer, "reference_slots", 0) or 0)
+            if not self._reference_slots or not hasattr(transformer, "visual_token_type_embeddings"):
+                raise ValueError("--task r2av requires a Kandinsky 6 checkpoint with token-type and reference-slot tables")
+            if args.max_reference_slots is not None and args.max_reference_slots != self._reference_slots:
+                raise ValueError(
+                    f"--max_reference_slots {args.max_reference_slots} does not match the checkpoint's "
+                    f"{self._reference_slots} reference slots"
+                )
+            logger.info(
+                "Kandinsky 6 R2AV: %d reference slots (%s)",
+                self._reference_slots,
+                "freshly added, untrained" if getattr(transformer, "reference_extension_is_fresh", False) else "trained",
+            )
         return transformer
 
     def compile_transformer(self, args, transformer):
@@ -320,6 +408,61 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 module.eval()
         return self.process_sample_prompts(args, accelerator, args.sample_prompts), resources
 
+    def _sample_reference_result(
+        self,
+        args,
+        accelerator,
+        transformer,
+        resources,
+        sample: dict,
+        reference_paths: list[str],
+        text,
+        null,
+        attention_mask,
+        null_attention_mask,
+        *,
+        width: int,
+        height: int,
+        video_frames: int,
+        sample_steps: int,
+        guidance: float,
+        seed: int,
+        restore_dit,
+    ):
+        """Generate one R2AV sample; the DiT is parked on entry and restored here."""
+        if self._task != "r2av":
+            raise ValueError("sample prompts with --ref need --task r2av")
+        if sample.get("image_path"):
+            raise ValueError("a Kandinsky 6 sample prompt cannot combine --ref with a TI2AV image (--i)")
+        if len(reference_paths) > self._reference_slots:
+            raise ValueError(f"sample has {len(reference_paths)} references, but the model has {self._reference_slots} slots")
+        references = None
+        if reference_paths:
+            resources.video_vae.to(accelerator.device)
+            latents = encode_reference_paths(resources.video_vae, reference_paths, width, height, args.ref_pad_value)
+            resources.video_vae.to("cpu")
+            clean_memory_on_device(accelerator.device)
+            references = latents.permute(0, 2, 3, 1).unsqueeze(0)  # [1,N,h,w,C]
+        restore_dit()
+        return sample_reference_latents(
+            transformer,
+            references,
+            text,
+            null,
+            attention_mask=attention_mask,
+            null_attention_mask=null_attention_mask,
+            video_frames=video_frames,
+            latent_height=height // 8,
+            latent_width=width // 8,
+            seed=seed,
+            device=accelerator.device,
+            num_steps=sample_steps,
+            guidance_scale=guidance,
+            reference_guidance_scale=float(args.ref_guidance_scale) if references is not None else 0.0,
+            scheduler_scale=self._scheduler_scale,
+            visual_rope_scale=self._visual_rope_scale,
+        )
+
     @torch.no_grad()
     def sample_images(self, accelerator, args, epoch, steps, resources, transformer, sample_parameters, dit_dtype):
         del dit_dtype
@@ -382,90 +525,112 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
                 latent_h, latent_w = height // 8, width // 8
-                bundle = prepare_video_latents(
-                    1, video_frames, latent_h, latent_w, transformer.in_visual_dim, seed, accelerator.device
-                )
-                bundle = LatentBundle(
-                    video=bundle.video.reshape(1, video_frames, latent_h, latent_w, transformer.in_visual_dim),
-                    audio=None,
-                    video_cu_seqlens=bundle.video_cu_seqlens,
-                    audio_cu_seqlens=None,
-                )
-                first_frames = None
-                token_types = None
-                generated_mask = None
-                image_path = sample.get("image_path")
-                if image_path:
-                    resources.video_vae.to(accelerator.device)
-                    first_frames, _, _ = encode_i2va_first_frame(
-                        image_path, resources.video_vae, accelerator.device, height=height, width=width
+                reference_paths = list(sample.get("ref") or [])
+                if reference_paths or self._task == "r2av":
+                    result = self._sample_reference_result(
+                        args,
+                        accelerator,
+                        transformer,
+                        resources,
+                        sample,
+                        reference_paths,
+                        text,
+                        null,
+                        attention_mask,
+                        null_attention_mask,
+                        width=width,
+                        height=height,
+                        video_frames=video_frames,
+                        sample_steps=sample_steps,
+                        guidance=guidance,
+                        seed=seed,
+                        restore_dit=restore_dit,
                     )
-                    resources.video_vae.to("cpu")
-                    clean_memory_on_device(accelerator.device)
-                    video, token_types, generated_mask = append_i2va_tail_condition(
-                        bundle.video, first_frames, batch_size=1, video_duration=video_frames
+                else:
+                    bundle = prepare_video_latents(
+                        1, video_frames, latent_h, latent_w, transformer.in_visual_dim, seed, accelerator.device
                     )
                     bundle = LatentBundle(
-                        video=video,
+                        video=bundle.video.reshape(1, video_frames, latent_h, latent_w, transformer.in_visual_dim),
                         audio=None,
-                        video_cu_seqlens=torch.tensor([0, video_frames + 1], device=accelerator.device, dtype=torch.int32),
+                        video_cu_seqlens=bundle.video_cu_seqlens,
                         audio_cu_seqlens=None,
                     )
-                audio_frames = audio_latent_duration(video_frames, fps=24, audio_fps=44100, downsample_factor=1024)
-                bundle = prepare_audio_latents(bundle, audio_frames, transformer.in_audio_dim, seed, accelerator.device)
-                bundle = LatentBundle(
-                    video=bundle.video,
-                    audio=bundle.audio.reshape(1, audio_frames, transformer.in_audio_dim),
-                    video_cu_seqlens=bundle.video_cu_seqlens,
-                    audio_cu_seqlens=bundle.audio_cu_seqlens,
-                )
-                restore_dit()
-                visual_rope = compute_visual_rope(
-                    transformer.visual_rope,
-                    (
-                        video_frames // transformer.patch_size[0],
-                        latent_h // transformer.patch_size[1],
-                        latent_w // transformer.patch_size[2],
-                    ),
-                    self._visual_rope_scale,
-                )
-                if image_path:
-                    visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
-                audio_rope = compute_rope1d(transformer.audio_rope, audio_frames)
-                text_rope = [
-                    compute_rope1d(transformer.video_text_rope, text_length),
-                    compute_rope1d(transformer.audio_text_rope, text_length),
-                ]
-                null_rope = [
-                    compute_rope1d(transformer.video_text_rope, null_length),
-                    compute_rope1d(transformer.audio_text_rope, null_length),
-                ]
-                result = denoise_loop(
-                    bundle,
-                    transformer,
-                    text,
-                    null,
-                    visual_rope,
-                    audio_rope,
-                    text_rope,
-                    null_rope,
-                    sample_steps,
-                    guidance,
-                    self._scheduler_scale,
-                    first_frames=first_frames,
-                    visual_cond_scheme="tail_cond_first_frame" if image_path else "pretrain",
-                    attention_mask=attention_mask,
-                    null_attention_mask=null_attention_mask,
-                    visual_token_type_ids=token_types,
-                    scale_factor=self._visual_rope_scale,
-                )
-                if generated_mask is not None:
-                    result = LatentBundle(
-                        video=result.video[:, generated_mask[0]],
-                        audio=result.audio,
-                        video_cu_seqlens=torch.tensor([0, video_frames], device=accelerator.device, dtype=torch.int32),
-                        audio_cu_seqlens=result.audio_cu_seqlens,
+                    first_frames = None
+                    token_types = None
+                    generated_mask = None
+                    image_path = sample.get("image_path")
+                    if image_path:
+                        resources.video_vae.to(accelerator.device)
+                        first_frames, _, _ = encode_i2va_first_frame(
+                            image_path, resources.video_vae, accelerator.device, height=height, width=width
+                        )
+                        resources.video_vae.to("cpu")
+                        clean_memory_on_device(accelerator.device)
+                        video, token_types, generated_mask = append_i2va_tail_condition(
+                            bundle.video, first_frames, batch_size=1, video_duration=video_frames
+                        )
+                        bundle = LatentBundle(
+                            video=video,
+                            audio=None,
+                            video_cu_seqlens=torch.tensor([0, video_frames + 1], device=accelerator.device, dtype=torch.int32),
+                            audio_cu_seqlens=None,
+                        )
+                    audio_frames = audio_latent_duration(video_frames, fps=24, audio_fps=44100, downsample_factor=1024)
+                    bundle = prepare_audio_latents(bundle, audio_frames, transformer.in_audio_dim, seed, accelerator.device)
+                    bundle = LatentBundle(
+                        video=bundle.video,
+                        audio=bundle.audio.reshape(1, audio_frames, transformer.in_audio_dim),
+                        video_cu_seqlens=bundle.video_cu_seqlens,
+                        audio_cu_seqlens=bundle.audio_cu_seqlens,
                     )
+                    restore_dit()
+                    visual_rope = compute_visual_rope(
+                        transformer.visual_rope,
+                        (
+                            video_frames // transformer.patch_size[0],
+                            latent_h // transformer.patch_size[1],
+                            latent_w // transformer.patch_size[2],
+                        ),
+                        self._visual_rope_scale,
+                    )
+                    if image_path:
+                        visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
+                    audio_rope = compute_rope1d(transformer.audio_rope, audio_frames)
+                    text_rope = [
+                        compute_rope1d(transformer.video_text_rope, text_length),
+                        compute_rope1d(transformer.audio_text_rope, text_length),
+                    ]
+                    null_rope = [
+                        compute_rope1d(transformer.video_text_rope, null_length),
+                        compute_rope1d(transformer.audio_text_rope, null_length),
+                    ]
+                    result = denoise_loop(
+                        bundle,
+                        transformer,
+                        text,
+                        null,
+                        visual_rope,
+                        audio_rope,
+                        text_rope,
+                        null_rope,
+                        sample_steps,
+                        guidance,
+                        self._scheduler_scale,
+                        first_frames=first_frames,
+                        visual_cond_scheme="tail_cond_first_frame" if image_path else "pretrain",
+                        attention_mask=attention_mask,
+                        null_attention_mask=null_attention_mask,
+                        visual_token_type_ids=token_types,
+                        scale_factor=self._visual_rope_scale,
+                    )
+                    if generated_mask is not None:
+                        result = LatentBundle(
+                            video=result.video[:, generated_mask[0]],
+                            audio=result.audio,
+                            video_cu_seqlens=torch.tensor([0, video_frames], device=accelerator.device, dtype=torch.int32),
+                            audio_cu_seqlens=result.audio_cu_seqlens,
+                        )
                 # The decoders are large enough that co-residency with the DiT defeats
                 # training-time sampling on consumer GPUs. Offload the unwrapped DiT,
                 # decode one modality at a time, then restore its block-swap placement.
@@ -510,10 +675,14 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         visual_shape = (frames // patch_t, height // patch_h, width // patch_w)
         visual_pos = [torch.arange(size, device=video.device) for size in visual_shape]
         visual_rope = transformer.visual_rope(visual_shape, visual_pos, self._visual_rope_scale)
-        audio_rope = transformer.audio_rope(torch.arange(audio.shape[1], device=audio.device))
-        text_positions = torch.arange(text_length, device=video.device)
-        text_rope = [transformer.video_text_rope(text_positions), transformer.audio_text_rope(text_positions)]
+        audio_rope, text_rope = self._audio_text_ropes(transformer, audio, text_length)
         return visual_rope, audio_rope, text_rope
+
+    def _audio_text_ropes(self, transformer, audio, text_length):
+        audio_rope = transformer.audio_rope(torch.arange(audio.shape[1], device=audio.device))
+        text_positions = torch.arange(text_length, device=audio.device)
+        text_rope = [transformer.video_text_rope(text_positions), transformer.audio_text_rope(text_positions)]
+        return audio_rope, text_rope
 
     def call_dit(
         self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
@@ -526,17 +695,34 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         pooled_embed = kwargs.pop("pooled_embed")
         attention_mask = kwargs.pop("attention_mask")
         image_latent = kwargs.pop("image_latent")
+        reference_latents = kwargs.pop("reference_latents", None)
         audio_loss_weights = kwargs.pop("audio_loss_weights")
         if kwargs:
             raise TypeError(f"Unexpected Kandinsky 6 call_dit arguments: {sorted(kwargs)}")
 
         generated_video = noisy_model_input.to(accelerator.device)
-        model_video, token_types = build_ti2av_video_input(generated_video, image_latent, transformer.visual_cond)
-        visual_rope, audio_rope, text_rope = self._ropes(transformer, generated_video, noisy_audio, text_embeds.shape[1])
-        if image_latent is not None:
-            # The upstream tail reference reuses generated frame zero's temporal
-            # position; its token type distinguishes it from the generated frame.
-            visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
+        slot_ids = None
+        if self._task == "r2av":
+            if image_latent is not None:
+                raise ValueError("R2AV batches cannot also carry a TI2AV image latent")
+            model_video, token_types, slot_ids = build_reference_video_input(
+                generated_video, reference_latents, transformer.visual_cond
+            )
+            _, frames, height, width, _ = generated_video.shape
+            num_references = 0 if reference_latents is None else reference_latents.shape[1]
+            visual_rope = reference_visual_rope(
+                transformer, frames, height, width, num_references, self._visual_rope_scale, device=generated_video.device
+            )
+            audio_rope, text_rope = self._audio_text_ropes(transformer, noisy_audio, text_embeds.shape[1])
+        else:
+            if reference_latents is not None:
+                raise ValueError("reference latents need --task r2av")
+            model_video, token_types = build_ti2av_video_input(generated_video, image_latent, transformer.visual_cond)
+            visual_rope, audio_rope, text_rope = self._ropes(transformer, generated_video, noisy_audio, text_embeds.shape[1])
+            if image_latent is not None:
+                # The upstream tail reference reuses generated frame zero's temporal
+                # position; its token type distinguishes it from the generated frame.
+                visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
         if args.gradient_checkpointing:
             model_video.requires_grad_(True)
             noisy_audio.requires_grad_(True)
@@ -553,6 +739,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 text_rope=text_rope,
                 attention_mask=attention_mask,
                 visual_token_type_ids=token_types,
+                visual_ref_slot_ids=slot_ids,
             )
         video_pred = video_pred[:, : latents.shape[1]]
         return DiTOutput(
@@ -603,6 +790,26 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             image = image.to(video.device).permute(0, 2, 3, 4, 1).contiguous()
         elif image is not None:
             raise ValueError("T2AV cache unexpectedly contains TI2AV image conditioning")
+        references = batch.get("latents_refs")
+        if self._task == "r2av":
+            if references is not None:
+                if len(references) != video.shape[0]:
+                    raise ValueError(
+                        "an R2AV batch mixes items with and without references; use batch_size = 1 or a dataset "
+                        "where every item has references"
+                    )
+                references = cached_references_to_batch(references, video.device, video.dtype)
+                if references.shape[1] > self._reference_slots:
+                    raise ValueError(
+                        f"cache item has {references.shape[1]} references, but the model has {self._reference_slots} slots"
+                    )
+                # Drop the whole reference set (never single references) so the model also
+                # learns the reference-free branch used by --ref_guidance_scale. Grad mode marks
+                # training steps (validation runs under no_grad; the LoRA base may stay in eval mode).
+                if torch.is_grad_enabled() and self._ref_drop_prob > 0 and float(torch.rand(())) < self._ref_drop_prob:
+                    references = None
+        elif references is not None:
+            raise ValueError("the latent cache contains R2AV reference latents; train it with --task r2av")
         audio_weights = effective_audio_loss_weights(batch["audio_present"], args).to(video.device)
         output = self.call_dit(
             args,
@@ -621,6 +828,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             pooled_embed=pooled,
             attention_mask=text_mask,
             image_latent=image,
+            reference_latents=references,
             audio_loss_weights=audio_weights,
         )
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
@@ -647,7 +855,37 @@ def kandinsky6_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         mixed_precision="bf16",
         guidance_scale=4.0,
     )
-    parser.add_argument("--task", choices=("t2av", "ti2av"), default="t2av")
+    parser.add_argument(
+        "--task",
+        choices=("t2av", "ti2av", "r2av"),
+        default="t2av",
+        help="t2av: text only; ti2av: first-frame image; r2av: multiple reference images bound to '@Image N' prompt tags",
+    )
+    parser.add_argument(
+        "--max_reference_slots",
+        type=int,
+        default=None,
+        help=f"R2AV: reference slots to add to a released checkpoint (default {DEFAULT_REFERENCE_SLOTS}); "
+        "omit for a checkpoint that already has them",
+    )
+    parser.add_argument(
+        "--ref_drop_prob",
+        type=float,
+        default=0.1,
+        help="R2AV: probability of dropping all references of a training step (enables --ref_guidance_scale)",
+    )
+    parser.add_argument(
+        "--ref_guidance_scale",
+        type=float,
+        default=0.0,
+        help="R2AV sampling: extra guidance toward the references (one more forward per step; 0 disables)",
+    )
+    parser.add_argument(
+        "--ref_pad_value",
+        type=int,
+        default=DEFAULT_REF_PAD_VALUE,
+        help="R2AV sampling: letterbox grey level for reference images; match the caching value",
+    )
     parser.add_argument("--model_variant", choices=("auto", "lite", "pro"), default="auto")
     parser.add_argument("--scheduler_scale", type=float, default=1.0)
     parser.add_argument(

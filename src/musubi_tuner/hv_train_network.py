@@ -88,7 +88,7 @@ class HunyuanVideoNetworkTrainer(BaseNetworkTrainer):
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.pos_embed_cache = {}
 
-        self._i2v_training = args.dit_in_channels == 32  # may be changed in the future
+        self._i2v_training = args.dit_in_channels == 32  # Detect image-conditioned training from the DiT input channels
         if self._i2v_training:
             logger.info("I2V training mode")
 

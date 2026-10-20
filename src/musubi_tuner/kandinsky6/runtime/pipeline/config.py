@@ -67,9 +67,8 @@ BeautifierName = Literal["none", "qwen25", "qwen35_9b", "qwen38_27b", "gigachat"
 class BeautifierConfig(_Cfg):
     """Prompt beautifier selected by name.
 
-    ``qwen25`` reuses the text encoder. ``qwen35_9b``, ``qwen38_27b``, and
-    ``gigachat`` are registered by the internal package. ``model_path`` is a
-    local snapshot for the Qwen variants.
+    ``qwen25`` reuses the text encoder. Additional builders can be registered
+    through the beautifier entry point. ``model_path`` supplies a local snapshot.
     """
 
     name: BeautifierName = "qwen25"
@@ -146,7 +145,7 @@ class GenerationConfig(_Cfg):
 
 class TextEmbedderConfig(_Cfg):
     max_length: int = 1024
-    # NF4 Qwen via bitsandbytes (``musubi_tuner.kandinsky6.runtime.runtime.quantize.nf4``). Saves ~10–12 GiB VRAM.
+    # NF4 Qwen via bitsandbytes (``musubi_tuner.kandinsky6.runtime.runtime.quantize.nf4``) reduces weight residency.
     quantized_qwen: bool = False
 
 

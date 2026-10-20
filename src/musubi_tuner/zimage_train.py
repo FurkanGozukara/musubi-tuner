@@ -216,7 +216,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
         accelerator.print("prepare optimizer, data loader etc.")
 
         name_and_params = list(transformer.named_parameters())
-        # single param group for now
+        # Use a single parameter group
         params_to_optimize = []
         params_to_optimize.append({"params": [p for _, p in name_and_params], "lr": args.learning_rate})
         param_names = [[n for n, _ in name_and_params]]
@@ -300,7 +300,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
 
         # patch for fused backward pass, adafactor only
         if args.fused_backward_pass:
-            # use fused optimizer for backward pass: other optimizers will be supported in the future
+            # Use the fused optimizer for the backward pass
             import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
             adafactor_fused.patch_adafactor_fused(optimizer)

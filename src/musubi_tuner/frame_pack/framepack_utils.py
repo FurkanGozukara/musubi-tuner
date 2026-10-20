@@ -230,7 +230,7 @@ FEATURE_EXTRACTOR_CONFIG = {
     "size": {"height": 384, "width": 384},
 }
 IMAGE_ENCODER_CONFIG = {
-    "_name_or_path": "/home/lvmin/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-Redux-dev/snapshots/1282f955f706b5240161278f2ef261d2a29ad649/image_encoder",
+    "_name_or_path": "black-forest-labs/FLUX.1-Redux-dev",
     "architectures": ["SiglipVisionModel"],
     "attention_dropout": 0.0,
     "hidden_act": "gelu_pytorch_tanh",

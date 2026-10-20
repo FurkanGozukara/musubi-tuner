@@ -85,7 +85,6 @@ def encode_and_save_batch(vae: AutoencoderKL, batch: List[ItemInfo]):
 def main():
     parser = cache_latents.setup_parser_common()
     # Z-Image VAE doesn't need special tiling options like HunyuanVideo
-    # but we can add them if needed in the future
 
     args = parser.parse_args()
 

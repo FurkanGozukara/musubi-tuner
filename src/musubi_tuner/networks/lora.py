@@ -1554,7 +1554,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
 
             for name, module in root_module.named_modules():
                 if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
-                    if target_replace_mods is None:  # dirty hack for all modules
+                    if target_replace_mods is None:  # Apply shared configuration to all modules
                         module = root_module  # search all modules
 
                     for child_name, child_module in module.named_modules():

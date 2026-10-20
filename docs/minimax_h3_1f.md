@@ -8,7 +8,7 @@
 `--video_length 1` switches `minimax_h3_generate_video.py` into one-frame mode:
 
 - The target is one video latent token plus the two audio latent frames the joint layout requires. The audio is a byproduct and is never decoded; the output is a PNG (`--save_path` must use `.png`).
-- The single-token VAE decode duplicates the latent to a pseudo two-token clip and keeps pixel frame 0 (a solo token decode breaks down; the duplication decodes within ~1-2 dB of a true two-token decode). This happens inside the VAE automatically.
+- The single-token VAE decode duplicates the latent to a pseudo two-token clip and keeps pixel frame 0. This happens inside the VAE automatically.
 - All tasks are available: `t2va` (plain image), `fl2va` with one or more condition images (editing/inbetween-style probes; one or two is the released API, three or more is experimental), and `ref2va` (reference-driven images, including single-image novel-view generation).
 - `--trajectory_dir` writes per-step PNGs instead of per-step videos.
 - Standalone `audio` references are rejected in one-frame mode (their window is defined by the target duration, which a single frame does not have); video references keep their embedded audio.
@@ -84,7 +84,7 @@ Ref2VA one-frame combines with inline `--ref` references (see `docs/minimax_h3.m
 
 With a full-reference-style caption, a single image reference yields novel views of the referenced subject (front/side/back selectable by text) with the environment plausibly extended — useful for synthesizing character-LoRA training data. Note that for dense 2D illustrations the reference is re-drawn rather than preserved pixel-exactly, and unseen-angle environments are plausible inventions, not geometry.
 
-Audio-bearing video references are accepted and keep their own duration; combining them with a one-frame target is untested territory.
+Audio-bearing video references are accepted and keep their own duration; compatibility with a one-frame target is not guaranteed.
 
 ## One-frame training (T2VA image LoRA)
 
@@ -145,10 +145,10 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
   ... # remaining flags as in docs/minimax_h3.md
 ```
 
-- **One of the three loss methods of `docs/minimax_h3.md` is mandatory for one-frame training.** With the plain flow target alone, de-distillation drift surfaces within ~50 steps as structural degradation — wobbly lines and broken proportions, like low-CFG output of an undistilled model — rather than the washout seen in video training (image steps average over far fewer target rows and repeat a small dataset quickly). A training adapter (`--base_weights`) or the guidance loss (`--h3_guidance_loss_scale 4.0 --h3_guidance_loss_sigma_min 0.15` with an uncond cache) restores clean structure; a short LR warmup (e.g. 50 steps) also helps the early phase. For character identity LoRAs with per-item references there is a third option, the subject-reference teacher (see [One-frame reference training](#one-frame-reference-training-ref2va-image-references)). Editing and reference training below take the adapter or the guidance loss.
+- **One of the three loss methods of `docs/minimax_h3.md` is mandatory for one-frame training.** With the plain flow target alone, de-distillation drift surfaces as structural degradation — wobbly lines and broken proportions, like low-CFG output of an undistilled model — rather than the washout seen in video training (image steps average over far fewer target rows and repeat a small dataset quickly). A training adapter (`--base_weights`) or the guidance loss (`--h3_guidance_loss_scale 4.0 --h3_guidance_loss_sigma_min 0.15` with an uncond cache) restores clean structure; a short LR warmup (e.g. 50 steps) also helps the early phase. For character identity LoRAs with per-item references there is a third option, the subject-reference teacher (see [One-frame reference training](#one-frame-reference-training-ref2va-image-references)). Editing and reference training below take the adapter or the guidance loss.
 - `--video_only` is recommended for image-only runs: the silence placeholders are excluded from audio supervision by presence gating either way, so the audio loss would always be 0.
 - Steps are much cheaper than video steps (a 1 MP image is a few hundred target rows); with block swap active, per-step time is dominated by weight streaming rather than compute.
-- Mixed image+video training in one run is expected to work (`--one_frame` only adds acceptance of one-frame batches; video batches are unaffected) but is untested — treat it as experimental.
+- `--one_frame` adds acceptance of one-frame batches and leaves video batches unchanged. Compatibility of mixed image+video training in one run is not guaranteed.
 - Training-time samples under a merged `--base_weights` adapter show the de-distilled model and are not representative; evaluate with the generation CLI on the plain base + LoRA.
 
 Training-time samples support one-frame outputs: `--f 1` in a sample prompt line switches that sample to a PNG (audio is never decoded), and `--of target_index=N` optionally places it on the time axis:
@@ -225,7 +225,7 @@ Official-format caption... --w 1024 --h 1024 --f 1 --s 30 --ci a.png --ci b.png 
 
 With `--task ref2va`, an image dataset pairs each target image with **untimed references** (the same reference schema as video Ref2VA: images, videos with or without audio). Typical uses are identity/character LoRAs trained on (reference image → target image) pairs of the same subject, where the reference is a *different* picture than the target, view-synthesis or restyling pairs, and composition tasks that assemble a target from several pictures (a character, a pose, a background).
 
-Both released transformer families respond to the reference presentation with a one-frame target: the Ref2VA checkpoint by design, and the FL2VA checkpoint extracts a referenced subject's identity about as well (measured with the generation CLI). Training `--task ref2va` on the FL2VA base is therefore a legitimate choice when the LoRA should be deployed with the FL2VA/T2VA weights; note that the LoRA metadata records `ss_minimax_h3_base_family=ref2va` from the task in that case.
+Both released transformer families accept the reference presentation with a one-frame target: Ref2VA and FL2VA. Training `--task ref2va` on the FL2VA base is therefore a legitimate choice when the LoRA should be deployed with the FL2VA/T2VA weights; note that the LoRA metadata records `ss_minimax_h3_base_family=ref2va` from the task in that case.
 
 ### Dataset configuration
 

@@ -1,15 +1,22 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 
+from musubi_tuner.dataset.datasources import ItemExtras
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.kandinsky6_cache_latents import (
+    K6_REFERENCE_CACHE_FINGERPRINT,
     audio_latent_frames_for_video,
     audio_samples_for_frames,
     encode_batch,
     first_control_frame,
     prepare_video_pixels,
+    reference_cache_fingerprint,
+    reference_cache_is_current,
 )
 from musubi_tuner.kandinsky6_cache_text_encoder_outputs import split_text_batch
 from musubi_tuner.kandinsky6_generate_video import resolve_config
@@ -224,3 +231,79 @@ def test_encode_batch_video_still_requires_dataset_audio(monkeypatch, tmp_path) 
     item.latent_cache_path = str(tmp_path / "video.safetensors")
     with pytest.raises(ValueError, match="audio-enabled video item"):
         encode_batch(VideoVAE(), AudioVAE(), [item])
+
+
+def _cache_subject(tmp_path, references):
+    fields = {"references": references} if references is not None else {}
+    datasource = SimpleNamespace(get_item_extras=lambda _index: ItemExtras(fields, str(tmp_path), "record"))
+    item = ItemInfo("item", "caption", (16, 8), (16, 8), content=np.zeros((1, 8, 16, 3), dtype=np.uint8))
+    item.datasource_index = 0
+    item.latent_cache_path = str(tmp_path / "cache.safetensors")
+    return SimpleNamespace(datasource=datasource), item, fields
+
+
+def _write_cache(item, reference_paths, *, pad=127, fingerprint=True, reference_count=None):
+    tensors = {"latents_1x1x2_float32": torch.zeros(1, 1, 1, 2)}
+    if reference_count is None:
+        reference_count = len(reference_paths)
+    if reference_count:
+        tensors[f"varlen_latents_refs_{reference_count}x1x2_float32"] = torch.zeros(reference_count, 1, 1, 2)
+    metadata = {}
+    if fingerprint:
+        metadata[K6_REFERENCE_CACHE_FINGERPRINT] = reference_cache_fingerprint(reference_paths, 16, 8, pad)
+    save_file(tensors, item.latent_cache_path, metadata=metadata)
+
+
+def test_reference_cache_fingerprint_tracks_order_source_content_canvas_and_pad(tmp_path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    dataset, item, fields = _cache_subject(tmp_path, ["first.png", "second.png"])
+    paths = [str(first), str(second)]
+    _write_cache(item, paths)
+
+    assert reference_cache_is_current(dataset, item, 127)
+
+    fields["references"] = ["second.png", "first.png"]
+    assert not reference_cache_is_current(dataset, item, 127)
+    fields["references"] = ["first.png", "second.png"]
+    second.write_bytes(b"changed")
+    assert not reference_cache_is_current(dataset, item, 127)
+    second.write_bytes(b"second")
+    item.content = np.zeros((1, 16, 16, 3), dtype=np.uint8)
+    assert not reference_cache_is_current(dataset, item, 127)
+    item.content = np.zeros((1, 8, 16, 3), dtype=np.uint8)
+    assert not reference_cache_is_current(dataset, item, 128)
+
+
+def test_removed_references_rebuild_a_reference_cache(tmp_path):
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"reference")
+    dataset, item, fields = _cache_subject(tmp_path, ["reference.png"])
+    _write_cache(item, [str(reference)])
+    fields.pop("references")
+
+    assert not reference_cache_is_current(dataset, item)
+
+
+def test_legacy_cache_policy_distinguishes_reference_free_items(tmp_path):
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"reference")
+    dataset, item, fields = _cache_subject(tmp_path, None)
+    _write_cache(item, [], fingerprint=False)
+    assert reference_cache_is_current(dataset, item)
+
+    fields["references"] = ["reference.png"]
+    assert not reference_cache_is_current(dataset, item)
+
+    fields.pop("references")
+    _write_cache(item, [], fingerprint=False, reference_count=1)
+    assert not reference_cache_is_current(dataset, item)
+
+
+def test_legacy_reference_free_cache_without_metadata_is_current(tmp_path):
+    dataset, item, _fields = _cache_subject(tmp_path, None)
+    save_file({"latents_1x1x2_float32": torch.zeros(1, 1, 1, 2)}, item.latent_cache_path)
+
+    assert reference_cache_is_current(dataset, item)

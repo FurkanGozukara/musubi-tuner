@@ -154,7 +154,7 @@ When using `--sigma_rel`, the beta decay schedule is determined by the Power Fun
 - **Target Epochs:** From the first epoch, omitting the last few potentially overfitted epochs.
 - **sigma_rel:** `0.15` (gives more weight to later (but not the very last) checkpoints, helping to mitigate overfitting from the final stages).
 
-**Note:** The optimal `sigma_rel` value can depend on the dataset, model, and training duration. Experimentation is encouraged. Values typically range from 0.1 to 0.5. A graph showing the relationship between `sigma_rel` and the calculated `beta` values over epochs will be provided later to help understand its behavior.
+**Note:** The optimal `sigma_rel` value can depend on the dataset, model, and training duration. Experimentation is encouraged. Values typically range from 0.1 to 0.5.
 
 ### Notes:
 
@@ -308,7 +308,7 @@ python src/musubi_tuner/lora_post_hoc_ema.py \
 - **対象エポック:** 最初のエポックから、過学習の可能性がある最後の数エポックを除外
 - **sigma_rel:** `0.15` （終盤（ただし最後の最後ではない）のチェックポイントに重きを置き、最終段階での過学習を軽減するのに役立ちます）
 
-**ヒント:** 最適な `sigma_rel` の値は、データセット、モデル、学習期間によって異なる場合があります。実験を推奨します。値は通常0.1から0.5の範囲です。`sigma_rel` とエポックごとの計算された `beta` 値の関係を示すグラフは、その挙動を理解するのに役立つよう後ほど提供する予定です。
+**ヒント:** 最適な `sigma_rel` の値は、データセット、モデル、学習期間によって異なる場合があります。実験を推奨します。値は通常0.1から0.5の範囲です。
 
 ### 注意点：
 
@@ -327,14 +327,14 @@ python src/musubi_tuner/lora_post_hoc_ema.py \
 
 The `caption_images_by_qwen_vl.py` script automatically generates captions for a directory of images using a fine-tuned Qwen2.5-VL model. It's designed to help prepare datasets for training by creating captions from the images themselves.
 
-The Qwen2.5-VL model used in Qwen-Image is not confirmed to be the same as the original Qwen2.5-VL-Instruct model, but it appears to work for caption generation based on the tests conducted.
+The captioning script accepts the Qwen2.5-VL weights used by Qwen-Image; compatibility with other Qwen2.5-VL variants is not guaranteed.
 
 <details>
 <summary>日本語</summary>
 
 `caption_images_by_qwen_vl.py`スクリプトは、Qwen2.5-VLモデルを使用して、指定されたディレクトリ内の画像に対するキャプションを自動生成します。画像自体からキャプションを作成することで、学習用データセットの準備を支援することを目的としています。
 
-Qwen-Imageで使用されているQwen2.5-VLモデルは、元のQwen2.5-VL-Instructモデルと同じかどうか不明ですが、試した範囲ではキャプション生成も動作するようです。
+キャプション生成スクリプトはQwen-Imageで使用されるQwen2.5-VL重みに対応します。他のQwen2.5-VLモデルとの互換性は保証されません。
 
 </details>
 

@@ -101,8 +101,8 @@ def create_bare_dit(
 ) -> DiffusionTransformer3D:
     """Construct DiT and load its checkpoint — no CacheDiT / compile / AOTI.
 
-    Builds on the ``meta`` device so we never allocate the full bf16 skeleton
-    (~120 GB / ~2 min for Pro T2VA) before overwriting it from the checkpoint.
+    Builds on the ``meta`` device to avoid allocating placeholder weights
+    before assigning tensors from the checkpoint.
     """
     device = torch.device(device)
     dit_cfg = cfg.dit

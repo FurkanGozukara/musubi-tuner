@@ -374,11 +374,11 @@ accelerate launch --num_cpu_threads_per_process 1 src/musubi_tuner/qwen_image_tr
 
 When using `--mem_eff_save`, please note that traditional saving methods are still used when saving the optimizer state in `--save_state`, requiring about 40GB of main memory.
 
-`--model_version` option allows for finetuning of Qwen-Image-Edit/Edit-2509/Edit-2511 (unverified).
+`--model_version` option allows for finetuning of Qwen-Image-Edit/Edit-2509/Edit-2511; compatibility is not guaranteed.
 
 ### Recommended Settings
 
-We are still exploring the optimal settings. The configurations above are just examples, so please adjust them as needed. We welcome your feedback.
+The configurations above are examples; adjust them for your model, dataset, and available memory.
 
 If you have ample VRAM, you can use any optimizer of your choice. `--full_bf16` is not recommended.
 
@@ -408,11 +408,11 @@ Finetuningは専用のスクリプト`qwen_image_train.py`を使用します。�
 
 `--mem_eff_save`を使用する場合でも、`--save_state`においてはオプティマイザの状態を保存する際に従来の保存方法が依然として使用されるため、約40GBのメインメモリが必要であることに注意してください。
 
-`--model_version`オプションにより、Qwen-Image-Edit/Edit-2509/Edit-2511のfinetuningが可能です（未検証）。
+`--model_version`オプションにより、Qwen-Image-Edit/Edit-2509/Edit-2511のfinetuningを選択できますが、互換性は保証されません。
 
 ### 推奨設定
 
-最適な設定はまだ調査中です。上記の構成はあくまで一例ですので、必要に応じて調整してください。フィードバックをお待ちしております。
+上記の構成は一例です。モデル、データセット、使用可能なメモリに応じて調整してください。
 
 十分なVRAMがある場合は、お好みのオプティマイザを使用できます。`--full_bf16`は推奨されません。
 

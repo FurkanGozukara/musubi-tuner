@@ -10,6 +10,7 @@ Architecture decisions:
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +26,6 @@ from .tensors import (
 from .attention import SelfAttentionEngine, _sdpa
 from .rope import RoPE1D, RoPE3D
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
-from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +615,9 @@ class DiffusionTransformer3D(nn.Module):
         fix_modulation: bool = False,
         # I2VA: 0 = off; 2 = generated vs reference frame (tail_cond_first_frame)
         visual_token_type_num_embeddings: int = 0,
+        # Multi-reference (R2AV) extension: number of reference slots (``@Image 1..N``).
+        # 0 keeps the released architecture; >0 requires a type row for references.
+        reference_slots: int = 0,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -624,8 +627,12 @@ class DiffusionTransformer3D(nn.Module):
         self.in_audio_dim = in_audio_dim
         self.text_token_padding = text_token_padding
         self.visual_token_type_num_embeddings = int(visual_token_type_num_embeddings or 0)
+        self.reference_slots = int(reference_slots or 0)
+        if self.reference_slots > 0 and self.visual_token_type_num_embeddings < 3:
+            raise ValueError("reference_slots requires visual_token_type_num_embeddings >= 3 (generated, first frame, reference)")
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
+        self._activation_offload_streams = {}
         self.blocks_to_swap = 0
         self.offloader = None
         self._execution_device = None
@@ -646,6 +653,8 @@ class DiffusionTransformer3D(nn.Module):
         self.visual_embeddings = VisualEmbeddings(vis_in_dim, model_dim, patch_size)
         if self.visual_token_type_num_embeddings > 0:
             self.visual_token_type_embeddings = nn.Embedding(self.visual_token_type_num_embeddings, model_dim)
+        if self.reference_slots > 0:
+            self.visual_ref_slot_embeddings = nn.Embedding(self.reference_slots, model_dim)
         self.visual_rope = RoPE3D(axes_dims)
         self.out_layer = OutLayer(model_dim, time_dim, out_visual_dim, patch_size)
 
@@ -796,13 +805,53 @@ class DiffusionTransformer3D(nn.Module):
         blocks = self.text_blocks if prefix is None else getattr(self, f"{prefix}_text_transformer_blocks")
         for blk in blocks:
             if self.gradient_checkpointing and self.training:
-                forward_fn = blk
-                if self.activation_cpu_offloading:
-                    forward_fn = create_cpu_offloading_wrapper(forward_fn, next(blk.parameters()).device)
-                te = checkpoint(forward_fn, te, tm, text_rope, attn_mask, use_reentrant=False)
+                te = self._checkpoint_block(blk, te, tm, text_rope, attn_mask, activation_arg_count=1)
             else:
                 te = blk(te, tm, text_rope, attn_mask)
         return te
+
+    def _checkpoint_block(self, forward_fn, *args, recompute_wait=None, activation_arg_count=1):
+        checkpoint_kwargs = {"use_reentrant": False}
+        if recompute_wait is not None:
+
+            @contextmanager
+            def wait_context():
+                recompute_wait()
+                yield
+
+            checkpoint_kwargs["context_fn"] = lambda: (nullcontext(), wait_context())
+        if not self.activation_cpu_offloading:
+            return checkpoint(forward_fn, *args, **checkpoint_kwargs)
+
+        activation_ids = {id(tensor) for tensor in args[:activation_arg_count] if isinstance(tensor, Tensor)}
+
+        def pack_to_cpu(tensor: Tensor):
+            if tensor.device.type != "cuda" or id(tensor) not in activation_ids:
+                return tensor.device, tensor, None
+            device = tensor.device
+            stream = self._activation_offload_streams.get(device)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self._activation_offload_streams[device] = stream
+            packed = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            ready = torch.cuda.Event()
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                packed.copy_(tensor, non_blocking=True)
+                ready.record(stream)
+            tensor.record_stream(stream)
+            return device, packed, ready
+
+        def unpack_from_cpu(packed):
+            device, tensor, ready = packed
+            if ready is None:
+                return tensor
+            current_stream = torch.cuda.current_stream(device)
+            current_stream.wait_event(ready)
+            return tensor.to(device, non_blocking=True)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu):
+            return checkpoint(forward_fn, *args, **checkpoint_kwargs)
 
     def _encode_text(
         self,
@@ -842,6 +891,7 @@ class DiffusionTransformer3D(nn.Module):
         visual_rope: Tensor,
         *,
         visual_token_type_ids: Tensor | None = None,
+        visual_ref_slot_ids: Tensor | None = None,
     ) -> tuple[Tensor, tuple, Tensor]:
         if x_video.ndim == 4:
             x_video = x_video.unsqueeze(0)
@@ -859,6 +909,22 @@ class DiffusionTransformer3D(nn.Module):
                 vis_embed
                 + self.visual_token_type_embeddings(visual_token_type_ids.to(device=vis_embed.device))[:, :, None, None, :]
             )
+        if visual_ref_slot_ids is not None:
+            if not hasattr(self, "visual_ref_slot_embeddings"):
+                raise ValueError("visual_ref_slot_ids were given, but this Kandinsky 6 model has no reference slots")
+            if visual_ref_slot_ids.ndim == 1:
+                visual_ref_slot_ids = visual_ref_slot_ids.unsqueeze(0)
+            if visual_ref_slot_ids.shape[:2] != vis_embed.shape[:2]:
+                raise ValueError(
+                    "visual_ref_slot_ids shape must match visual latent batch and frames: "
+                    f"slot_ids={tuple(visual_ref_slot_ids.shape)}, visual={tuple(vis_embed.shape)}"
+                )
+            slot_ids = visual_ref_slot_ids.to(device=vis_embed.device, dtype=torch.long)
+            if int(slot_ids.max()) >= self.reference_slots:
+                raise ValueError(f"reference slot id {int(slot_ids.max())} exceeds the model's {self.reference_slots} slots")
+            is_reference = (slot_ids >= 0).to(vis_embed.dtype)[:, :, None, None, None]
+            slot_embed = self.visual_ref_slot_embeddings(slot_ids.clamp_min(0))[:, :, None, None, :]
+            vis_embed = vis_embed + slot_embed.to(vis_embed.dtype) * is_reference
         vis_shape = vis_embed.shape[-4:-1]
         vis_rope = visual_rope.flatten(0, 2)
         vis_embed = vis_embed.flatten(1, 3)
@@ -886,17 +952,17 @@ class DiffusionTransformer3D(nn.Module):
             if self.is_multimodal:
                 if vis_embed is not None and aud_embed is None:
                     args = (vis_embed, None, te, te, (tm, tm), vis_rope, None, attn_mask)
-                    vis_embed, _ = self._run_visual_block(blk, *args)
+                    vis_embed, _ = self._run_visual_block(blk, *args, block_index=index)
                 elif aud_embed is not None and vis_embed is None:
                     args = (None, aud_embed, te, te, (tm, tm), None, aud_rope, attn_mask)
-                    _, aud_embed = self._run_visual_block(blk, *args)
+                    _, aud_embed = self._run_visual_block(blk, *args, block_index=index)
                 else:
                     raise RuntimeError("single-modality fused path expects exactly one of video/audio")
             else:
                 if vis_embed is not None:
-                    vis_embed = self._run_visual_block(blk, vis_embed, te, tm, vis_rope, attn_mask)
+                    vis_embed = self._run_visual_block(blk, vis_embed, te, tm, vis_rope, attn_mask, block_index=index)
                 else:
-                    aud_embed = self._run_visual_block(blk, aud_embed, te, tm, aud_rope, attn_mask)
+                    aud_embed = self._run_visual_block(blk, aud_embed, te, tm, aud_rope, attn_mask, block_index=index)
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.visual_transformer_blocks, index)
         return vis_embed, aud_embed
@@ -926,18 +992,24 @@ class DiffusionTransformer3D(nn.Module):
                 vis_rope,
                 aud_rope,
                 attn_mask,
+                block_index=index,
             )
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.visual_transformer_blocks, index)
         return vis_embed, aud_embed
 
-    def _run_visual_block(self, block, *args):
+    def _run_visual_block(self, block, *args, block_index: int):
         if not (self.gradient_checkpointing and self.training):
             return block(*args)
-        forward_fn = block
-        if self.activation_cpu_offloading:
-            forward_fn = create_cpu_offloading_wrapper(forward_fn, next(block.parameters()).device)
-        return checkpoint(forward_fn, *args, use_reentrant=False)
+        recompute_wait = None
+        if self.blocks_to_swap and getattr(self.offloader, "recompute_requires_wait", False):
+
+            def recompute_wait():
+                self.offloader.wait_for_block(block_index)
+
+        return self._checkpoint_block(
+            block, *args, recompute_wait=recompute_wait, activation_arg_count=2 if self.is_multimodal else 1
+        )
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
         self.gradient_checkpointing = True
@@ -1048,6 +1120,7 @@ class DiffusionTransformer3D(nn.Module):
         text_rope: Tensor | list[Tensor],
         attention_mask: Tensor | None = None,
         visual_token_type_ids: Tensor | None = None,
+        visual_ref_slot_ids: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """RoPE tensors are precomputed outside (pipeline / export); not from positions."""
         both = x_video is not None and x_audio is not None and self.is_multimodal
@@ -1073,6 +1146,7 @@ class DiffusionTransformer3D(nn.Module):
                     x_video,
                     visual_rope,
                     visual_token_type_ids=visual_token_type_ids,
+                    visual_ref_slot_ids=visual_ref_slot_ids,
                 )
                 vis_embed, _ = self._run_visual_blocks_single(
                     vis_embed,
@@ -1112,6 +1186,7 @@ class DiffusionTransformer3D(nn.Module):
             x_video,
             visual_rope,
             visual_token_type_ids=visual_token_type_ids,
+            visual_ref_slot_ids=visual_ref_slot_ids,
         )
         aud_embed, aud_rope = self._embed_audio(x_audio, audio_rope)
 
@@ -1140,3 +1215,5 @@ class DiffusionTransformer3D(nn.Module):
                 m.reset_parameters()
         if hasattr(self, "visual_token_type_embeddings"):
             nn.init.zeros_(self.visual_token_type_embeddings.weight)
+        if hasattr(self, "visual_ref_slot_embeddings"):
+            nn.init.zeros_(self.visual_ref_slot_embeddings.weight)

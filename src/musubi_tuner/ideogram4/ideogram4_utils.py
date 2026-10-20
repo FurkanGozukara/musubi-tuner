@@ -217,7 +217,7 @@ def load_ideogram4_transformer(
     is_prequant_fp8 = any(k.endswith(FP8_SCALE_SUFFIX) for k in keys)
 
     if is_bnb4bit:
-        # bnb 4-bit checkpoints stay on the dedicated quantized loader for now.
+        # Load bnb 4-bit checkpoints with the dedicated quantized loader.
         if device.type != "cuda":
             raise ValueError(f"bnb 4-bit weights require a CUDA device, got device={device}")
         state_dict = _load_state_dict(path, device="cpu", disable_mmap=disable_mmap)

@@ -147,7 +147,7 @@ class MultiScaleUpsampler(nn.Module):
             msg = "motion_attention requires dims=3"
             raise ValueError(msg)
         if motion_attention is not None and enable_x2_entry:
-            msg = "motion_attention Round 23 is x4-only and cannot enable the x2 entry"
+            msg = "motion_attention is x4-only and cannot enable the x2 entry"
             raise ValueError(msg)
         if motion_attention is not None and not motion_attention.after_mid_blocks:
             msg = "motion_attention requires at least one mid-stage placement"
@@ -250,7 +250,7 @@ class MultiScaleUpsampler(nn.Module):
         return self.output_proj.conv.weight
 
     def shared_second_stage(self) -> SharedSecondStage:
-        """Return a non-registering view of the e115-compatible second stage."""
+        """Return a non-registering view of the shared second stage."""
         return SharedSecondStage(
             upsample=self.upsample_2,
             blocks=self.post_blocks,
@@ -277,7 +277,7 @@ class MultiScaleUpsampler(nn.Module):
             self.x2_branch.finisher.copy_from(self.upsample_1)
 
     def configure_x2_finetuning(self) -> None:
-        """Freeze the e115 path and expose only x2-exclusive parameters."""
+        """Freeze the shared base path and expose only x2-exclusive parameters."""
         if self.mid_input_proj is None or self.x2_branch is None:
             msg = "x2 fine-tuning requires enable_x2_entry=True"
             raise ValueError(msg)

@@ -253,7 +253,7 @@ def test_wrap_ref_teacher_caption_prepends_the_copy_declaration_boilerplate():
 
     assert wrapped == REF_TEACHER_CAPTION_HEADER + caption
     assert wrapped.startswith("subject_definitions:")
-    # the audio fully_copy declaration is what opens audio education (probe round 2)
+    # The audio fully_copy declaration enables audio conditioning.
     assert "<Audio 1>: fully_copy" in wrapped
     assert "<Video 1> (all shots): fully_preserved" in wrapped
     assert wrapped.endswith(f"detailed_description:\n{caption}")

@@ -13,7 +13,7 @@ This document describes the application of "One Frame Inference" found in the Fr
 2. **Intermediate Frame One Frame Inference**:
     *   Similar to the kisekaeichi method, use the FLF2V (First and Last Frame to Video) method to generate intermediate frames. Use the FLF2V model.
     *   Set the RoPE timestamp of the generated image to an intermediate value between the timestamps of the starting image and the ending image.
-    *   (This is a theoretical proposal, implemented but not yet tested.)
+    *   (Output quality is not guaranteed for this inference mode.)
 
 <details>
 <summary>日本語</summary>
@@ -115,9 +115,9 @@ When performing one-frame training, please create the cache by specifying `--one
 
 In one-frame training, the I2V 14B model is used. Specify `--task i2v-14B` and the corresponding weights. For intermediate frame one-frame training, the FLF2V model is used. Specify `--task flf2v-14B` and the corresponding weights.
 
-In simple experiments for intermediate frame one-frame training, using `control_index=0;2`, `target_index=1` (in dataset settings, `fp_1f_clean_indices = [0, 2]`, `fp_1f_target_index = 1`), yielded better results than `0;10` and `5`.
+For intermediate frame one-frame training, an example is `control_index=0;2`, `target_index=1` (in dataset settings, `fp_1f_clean_indices = [0, 2]`, `fp_1f_target_index = 1`).
 
-The optimal training settings are currently unknown. Feedback is welcome.
+Adjust training settings for your dataset and target output.
 
 ### Example of prompt file description for sample generation
 
@@ -151,9 +151,9 @@ The girl wears a school uniform. --i path/to/start.png --ei path/to/end.png --ci
 
 1フレーム学習ではI2Vの14Bモデルを使用します。`--task i2v-14B`を指定し、該当する重みを指定してください。中間フレームの1フレーム学習では、FLF2Vモデルを使用します。`--task flf2v-14B`を指定し、該当する重みを指定してください。
 
-中間フレーム学習の簡単な実験では、`control_index=0;2`、`target_index=1`が（データセット設定では `fp_1f_clean_indices = [0, 2]`、`fp_1f_target_index = 1`）、`0;10`および`5`よりも良い結果を得られました。
+中間フレーム学習の設定例は、`control_index=0;2`、`target_index=1`です（データセット設定では `fp_1f_clean_indices = [0, 2]`、`fp_1f_target_index = 1`）。
 
-最適な学習設定は今のところ不明です。フィードバックを歓迎します。
+データセットと目標の出力に応じて学習設定を調整してください。
 
 **サンプル生成のプロンプトファイル記述例**
 

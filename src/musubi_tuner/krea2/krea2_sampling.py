@@ -85,9 +85,8 @@ def encode_prompts(encoder, prompts, negative_prompts=None, *, cfg=True):
     """Encode prompts (and optional negatives) into gathered varlen text embeddings.
 
     Returns ``(txt, txtmask, untxt, untxtmask)``; the unconditional pair is ``None`` when
-    ``cfg`` is False. Run this BEFORE loading the DiT so the (~8GB Qwen3-VL) encoder can be
-    freed and not compete with the DiT for VRAM — on a 24GB card the encoder and the DiT do
-    not fit at the same time. ``gather_valid_text`` drops the interior padding the encoder
+    ``cfg`` is False. Encode before loading the DiT so the text encoder can be freed
+    to keep peak VRAM use low. ``gather_valid_text`` drops the interior padding the encoder
     inserts between prompt and suffix so the valid tokens form a contiguous prefix.
     """
     txt, txtmask = encoder(prompts)
@@ -134,9 +133,8 @@ def sample(
     The DiT (``model``) stays resident on its device for the whole call — it is never moved
     to CPU. The VAE is kept on CPU and moved to the latent's device only for the final decode,
     then moved back to CPU before returning. So the only VRAM the decode adds on top of the
-    resident DiT is the VAE plus its transient activations; that headroom is expected to come
-    from running the DiT under fp8 and/or block swap (moving the ~24GB DiT to CPU instead would
-    only shift the pressure onto host RAM). Keeping the DiT in place lets the caller reuse it
+    resident DiT is the VAE plus its transient activations. FP8 and/or block swap provide
+    headroom for decoding. Keeping the DiT in place lets the caller reuse it
     for the next prompt without reloading.
     """
     patch = model.config.patch

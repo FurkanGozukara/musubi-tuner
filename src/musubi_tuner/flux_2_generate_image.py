@@ -616,7 +616,7 @@ def generate(
         if shared_models and "ae" in shared_models:  # Should not happen with new load_shared_models
             vae_instance_for_return = shared_models["ae"]
         else:
-            # the dtype of VAE weights is float32, but we can load it as bfloat16 for better performance in future
+            # Load the VAE weights in float32
             vae_instance_for_return = flux2_utils.load_ae(args.vae, dtype=torch.float32, device=device, disable_mmap=True)
 
         height, width, ctx_nctx, control_latent = prepare_i2v_inputs(args, device, vae_instance_for_return, shared_models)

@@ -355,11 +355,11 @@ The current scripts in this repository use FP8 E4M3 format and block-wise quanti
 - Quantizes weights to FP8 format with appropriate scaling instead of simple cast to FP8
 - Applies monkey patching to Linear layers for transparent dequantization during computation
 - Maintains computational precision by dequantizing to original precision (FP16/BF16) during forward pass
-- Preserves important weights for example norm, embedding, modulation in FP16/BF16 format (fewer exclusions than previous versions)
+- Preserves important weights for example norm, embedding, modulation in FP16/BF16 format
 
 For quantization and precision discussion, see also [Discussion #564](https://github.com/kohya-ss/musubi-tuner/discussions/564).
 
-Note: Testing for quantization other than E4M3/block-wise is limited, so please be cautious if you plan to use the code in other projects.
+Note: Compatibility of quantization formats other than E4M3/block-wise is not guaranteed.
 
 <details>
 <summary>日本語</summary>
@@ -375,11 +375,11 @@ Note: Testing for quantization other than E4M3/block-wise is limited, so please 
 - 単純なFP8へのcastではなく、適切な値でスケールして重みをFP8形式に量子化
 - Linear層にmonkey patchingを適用し、計算時に透過的に逆量子化
 - forward時に元の精度（FP16/BF16）に逆量子化して計算精度を維持
-- 精度が重要な重み、たとえばnormやembedding、modulationは、FP16/BF16のまま保持（従来バージョンより除外対象を削減）
+- 精度が重要な重み、たとえばnormやembedding、modulationは、FP16/BF16のまま保持
 
 量子化と精度については[Discussion #564](https://github.com/kohya-ss/musubi-tuner/discussions/564)も参照してください。
 
-※E4M3/ブロック単位以外の量子化のテストは不十分ですので、コードを他のプロジェクトで利用する場合等には注意してください。
+※E4M3/ブロック単位以外の量子化形式との互換性は保証されません。
 
 </details>
 
@@ -419,7 +419,7 @@ Additional options allow for fine-tuning the Dynamo behavior:
 - `--dynamo_fullgraph`: Enables fullgraph mode for potentially better optimization
 - `--dynamo_dynamic`: Enables dynamic shape handling
 
-The `--dynamo_dynamic` option has been reported to have many problems based on the validation in PR #215.
+The `--dynamo_dynamic` option can cause compilation problems; leave it disabled unless dynamic shapes are needed.
 
 ### Available options:
 
@@ -466,7 +466,7 @@ PyTorch Dynamoオプションが学習プロセスを最適化するために追
 - `--dynamo_fullgraph`：より良い最適化の可能性のためにフルグラフモードを有効にします
 - `--dynamo_dynamic`：動的形状処理を有効にします
 
-PR #215での検証によると、`--dynamo_dynamic`には問題が多いことが報告されています。
+`--dynamo_dynamic`はコンパイルの問題を引き起こす場合があります。動的な形状が必要な場合にのみ有効にしてください。
 
 __利用可能なオプション：__
 
@@ -819,14 +819,14 @@ This feature is enabled by specifying `--num_timestep_buckets`.
 
 Specify the number of buckets with the `--num_timestep_buckets` option. A value of 2 or more enables this feature. If not specified, it is disabled.
 
-The community research is required to determine the optimal value, but starting with a value between `4` and `10` may be a good idea.
+Start with a value between `4` and `10`, then adjust for your training configuration.
 
 <details>
 <summary>日本語</summary>
 
 `--num_timestep_buckets` オプションでバケット数を指定します。2以上の値を指定するとこの機能が有効になります。指定しない場合は無効です。
 
-最適な値に関してはコミュニティの検証が必要ですが、`4` から `10` 程度の値から始めると良いと思われます。
+`4` から `10` 程度の値から始め、学習設定に応じて調整してください。
 
 </details>
 

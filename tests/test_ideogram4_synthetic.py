@@ -686,9 +686,9 @@ class Ideogram4InputAndCacheTests(unittest.TestCase):
         self.assertEqual(args.lora_multiplier, [0.8, 1.0])
 
     def test_scale_shift_latents_normalizes_and_compute_loss_reports_metrics(self):
-        # process_batch is now the shared base trainer's; Ideogram 4 only overrides the
+        # process_batch belongs to the shared base trainer; Ideogram 4 overrides the
         # scale_shift_latents (latent normalization) and compute_loss (mean MSE + diagnostics)
-        # hooks, so verify those directly instead of the old monolithic process_batch.
+        # hooks, which are verified directly.
         original_image_video = sys.modules.get("musubi_tuner.dataset.image_video_dataset")
         original_sampling = sys.modules.get("musubi_tuner.training.sampling_prompts")
         original_trainer = sys.modules.get("musubi_tuner.training.trainer_base")

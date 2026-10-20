@@ -1,5 +1,5 @@
 # Low-level NVFP4 routines (E2M1 encode/decode, cuBLAS swizzle, scaled_mm call) are
-# adapted from the exp-nvfp4-support-for-torch-2-10 branch, which was inspired by
+# adapted for PyTorch NVFP4 support, with implementation references from
 # comfy-kitchen (https://github.com/Comfy-Org/comfy-kitchen, Apache License 2.0).
 
 """Loading ComfyUI pre-quantized NVFP4 (+AWQ) checkpoints for frozen text encoders.

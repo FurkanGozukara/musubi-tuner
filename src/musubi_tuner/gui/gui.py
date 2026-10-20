@@ -565,7 +565,7 @@ num_repeats = 1
                     yield f"Error: Text Encoder 1 model not found at / 指定されたパスにText Encoder 1モデルが見つかりません: {te1_path_val}"
                     return
 
-                # Z-Image only uses te1 for now, but keeping te2 in signature if needed later or for other models
+                # Z-Image uses te1; te2 is part of the shared model interface
 
                 config_path = os.path.join(project_path, "dataset_config.toml")
                 if not os.path.exists(config_path):

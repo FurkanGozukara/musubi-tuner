@@ -44,7 +44,7 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
         latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
     latent = torch.stack(latent, dim=0)  # B, C, F, H, W
-    latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
+    latent = latent.to(vae.dtype)  # convert encoded latents to bfloat16
 
     if i2v:
         # extract first frame of contents
@@ -153,7 +153,7 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
             latent.append(torch.cat(l, dim=2))  # B, C, F, H, W
         latent = torch.cat(latent, dim=0)  # B, C, F, H, W
 
-    latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
+    latent = latent.to(vae.dtype)  # convert encoded latents to bfloat16
     control_latent = latent[:, :, :-1, :, :]
     target_latent = latent[:, :, -1:, :, :]
 

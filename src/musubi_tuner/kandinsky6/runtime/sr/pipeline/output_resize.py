@@ -10,9 +10,8 @@ Resize only — no cropping. Where the SR aspect differs slightly from the tier
 (a 1.8 source against 16:9, ~1%), the scale is very mildly anisotropic instead
 of throwing pixels away; the mismatch is logged so it stays visible.
 
-Downscaling is antialiased and runs in frame chunks — a 2K result is a couple
-of GB as uint8 and four times that as float, so a single ``interpolate`` over
-the whole clip would spike memory for no reason.
+Downscaling is antialiased and runs in frame chunks to limit peak memory
+during interpolation.
 """
 
 from __future__ import annotations

@@ -347,7 +347,7 @@ def load_video(
 
                 video.append(image)
     else:
-        # drop frames to match the target fps TODO commonize this code with the above if this works
+        # Drop frames to match the target fps
         frame_index_delta = target_fps / source_fps  # example: 16 / 30 = 0.5333
         if os.path.isfile(video_path):
             container = av.open(video_path)

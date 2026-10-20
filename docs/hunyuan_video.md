@@ -42,7 +42,7 @@ For DiT and VAE, use the HunyuanVideo models.
 
 From https://huggingface.co/tencent/HunyuanVideo/tree/main/hunyuan-video-t2v-720p/transformers, download [mp_rank_00_model_states.pt](https://huggingface.co/tencent/HunyuanVideo/resolve/main/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt) and place it in your chosen directory.
 
-(Note: The fp8 model on the same page is unverified.)
+(Compatibility with the fp8 model on the same page is not guaranteed.)
 
 If you are training with `--fp8_base`, you can use `mp_rank_00_model_states_fp8.safetensors` from [here](https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial) instead of `mp_rank_00_model_states.pt`. (This file is unofficial and simply converts the weights to float8_e4m3fn.)
 
@@ -50,7 +50,7 @@ From https://huggingface.co/tencent/HunyuanVideo/tree/main/hunyuan-video-t2v-720
 
 For the Text Encoder, use the models provided by ComfyUI. Refer to [ComfyUI's page](https://comfyanonymous.github.io/ComfyUI_examples/hunyuan_video/), from https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/tree/main/split_files/text_encoders, download `llava_llama3_fp16.safetensors` (Text Encoder 1, LLM) and `clip_l.safetensors` (Text Encoder 2, CLIP) and place them in your chosen directory.
 
-(Note: The fp8 LLM model on the same page is unverified.)
+(Compatibility with the fp8 LLM model on the same page is not guaranteed.)
 
 <details>
 <summary>日本語</summary>
@@ -77,7 +77,7 @@ For the Text Encoder, use the models provided by ComfyUI. Refer to [ComfyUI's pa
 
 https://huggingface.co/tencent/HunyuanVideo/tree/main/hunyuan-video-t2v-720p/transformers から、[mp_rank_00_model_states.pt](https://huggingface.co/tencent/HunyuanVideo/resolve/main/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt) をダウンロードし、任意のディレクトリに配置します。
 
-（同じページにfp8のモデルもありますが、未検証です。）
+（同じページのfp8モデルとの互換性は保証されません。）
 
 `--fp8_base`を指定して学習する場合は、`mp_rank_00_model_states.pt`の代わりに、[こちら](https://huggingface.co/kohya-ss/HunyuanVideo-fp8_e4m3fn-unofficial)の`mp_rank_00_model_states_fp8.safetensors`を使用可能です。（このファイルは非公式のもので、重みを単純にfloat8_e4m3fnに変換したものです。）
 
@@ -85,7 +85,7 @@ https://huggingface.co/tencent/HunyuanVideo/tree/main/hunyuan-video-t2v-720p/tra
 
 Text EncoderにはComfyUI提供のモデルを使用させていただきます。[ComyUIのページ](https://comfyanonymous.github.io/ComfyUI_examples/hunyuan_video/)を参考に、https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/tree/main/split_files/text_encoders から、llava_llama3_fp16.safetensors （Text Encoder 1、LLM）と、clip_l.safetensors （Text Encoder 2、CLIP）をダウンロードし、任意のディレクトリに配置します。
 
-（同じページにfp8のLLMモデルもありますが、動作未検証です。）
+（同じページのfp8 LLMモデルとの互換性は保証されません。）
 
 </details>
 
@@ -223,9 +223,9 @@ uv run --extra cu124 accelerate launch --num_cpu_threads_per_process 1 --mixed_p
 
 If the details of the image are not learned well, try lowering the discrete flow shift to around 3.0.
 
-The training settings are still experimental. Appropriate learning rates, training steps, timestep distribution, loss weighting, etc. are not yet known. Feedback is welcome.
+Adjust the learning rate, training steps, timestep distribution, and loss weighting for your dataset and target output.
 
-For additional options, use `python src/musubi_tuner/hv_train_network.py --help` (note that many options are unverified).
+For additional options, use `python src/musubi_tuner/hv_train_network.py --help` (compatibility of additional options is not guaranteed).
 
 ### Save Precision
 
@@ -286,7 +286,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 ディテールが甘くなる場合は、discrete flow shiftを3.0程度に下げてみてください。
 
-ただ、適切な学習率、学習ステップ数、timestepsの分布、loss weightingなどのパラメータは、以前として不明な点が数多くあります。情報提供をお待ちしています。
+データセットと目標の出力に応じて、学習率、学習ステップ数、timestepsの分布、loss weightingなどのパラメータを調整してください。
 
 その他のオプションは`python src/musubi_tuner/hv_train_network.py --help`で確認できます（ただし多くのオプションは動作未確認です）。
 
@@ -513,7 +513,7 @@ You can also perform image2video inference with SkyReels V1 I2V model. Specify t
 
 SkyReels V1のT2VとI2Vモデルがサポートされています（推論のみ）。
 
-モデルは[こちら](https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy)からダウンロードできます。モデルを提供してくださったKijai氏に感謝します。`skyreels_hunyuan_i2v_bf16.safetensors`がI2Vモデル、`skyreels_hunyuan_t2v_bf16.safetensors`がT2Vモデルです。`bf16`以外の形式は未検証です（`fp8_e4m3fn`は動作するかもしれません）。
+モデルは[こちら](https://huggingface.co/Kijai/SkyReels-V1-Hunyuan_comfy)からダウンロードできます。モデルを提供してくださったKijai氏に感謝します。`skyreels_hunyuan_i2v_bf16.safetensors`がI2Vモデル、`skyreels_hunyuan_t2v_bf16.safetensors`がT2Vモデルです。`bf16`以外の形式との互換性は保証されません。
 
 T2V推論を行う場合、以下のオプションを推論コマンドに追加してください：
 

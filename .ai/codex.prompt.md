@@ -8,10 +8,9 @@ This file provides guidance to Codex CLI when working with code in this reposito
 - Style: PEP 8, 4‑space indentation, limit lines to ~120 chars.
 - Naming: snake_case for files/functions (`*_train_network.py`, `*_generate_*`), PascalCase for classes.
 - Types/Docs: Prefer type hints for public APIs and short docstrings describing args/returns.
-- Formatting: No formatter configured; keep diffs small and consistent with surrounding code.
+- Formatting: Ruff is configured in `pyproject.toml`; keep diffs small and consistent with surrounding code.
 
 ### Testing Guidelines
-- Current state: No formal test suite.
 - If adding tests, use `pytest`, place under `tests/` mirroring `src/musubi_tuner/` and name files `test_*.py`.
 - Run (uv): `uv run pytest -q`. Run (pip): `pytest -q`.
 - Prefer small, deterministic unit tests around data utilities and argument parsing.

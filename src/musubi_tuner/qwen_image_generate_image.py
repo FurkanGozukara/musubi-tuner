@@ -695,7 +695,7 @@ def generate(
         if shared_models and "vae" in shared_models:  # Should not happen with new load_shared_models
             vae_instance_for_return = shared_models["vae"]
         else:
-            # the dtype of VAE weights is float32, but we can load it as bfloat16 for better performance in future
+            # Load the VAE weights in float32
             vae_instance_for_return = load_vae(args, device)
             vae_instance_for_return.eval()
 

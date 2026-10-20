@@ -1,14 +1,12 @@
-"""DX π-Flow DiT wrapper (LAY-396).
+"""DX π-Flow DiT wrapper.
 
 Wraps the SR ``DiffusionTransformer3D`` so its output head emits ``n_grid``
 velocity grids instead of one: the final projection width becomes
 ``out_visual_dim * n_grid`` and the forward reshapes the trailing channel axis
 into ``(n_grid, out_visual_dim)``.
 
-Warm-start replicates the teacher's single output head ``n_grid`` times (see
-``musubi_tuner.kandinsky6.runtime.sr/train/checkpoint.py:load_and_replicate_fsdp_model``), so at step 0
-every grid slot equals the teacher's velocity — which shows up as a low starting
-training loss rather than a dedicated identity test.
+Warm-start replicates the teacher's single output head ``n_grid`` times, so
+each grid slot initially emits the teacher's velocity.
 """
 
 from __future__ import annotations

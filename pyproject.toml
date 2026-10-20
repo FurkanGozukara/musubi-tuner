@@ -90,8 +90,7 @@ dev = [
   "tensorboard; platform_machine != 'ARM64'",
   "tensorboardX; platform_machine == 'ARM64'",
   "prompt-toolkit==3.0.51",
-  # ruff 0.16.0 enabled many new lint rules by default, producing ~2000 new findings;
-  # pinned below 0.16 until those are triaged and resolved
+  # Keep the established lint-rule set stable across development environments.
   "ruff>=0.12.10,<0.16",
   "pre-commit>=4.6.0",
 ]

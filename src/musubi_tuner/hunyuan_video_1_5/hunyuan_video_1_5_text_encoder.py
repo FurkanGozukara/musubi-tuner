@@ -187,7 +187,7 @@ def load_byt5(
 ) -> Tuple[T5Tokenizer, T5Stack]:
     BYT5_CONFIG_JSON = """
 {
-    "_name_or_path": "/home/patrick/t5/byt5-small",
+    "_name_or_path": "google/byt5-small",
     "architectures": [
         "T5ForConditionalGeneration"
     ],
