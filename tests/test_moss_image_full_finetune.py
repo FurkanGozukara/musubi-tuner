@@ -58,6 +58,26 @@ def test_non_fused_optimizer_is_allowed_without_block_swap():
     ft.MossImageTrainer()._validate_full_finetune_args(parse("--no-fused_backward_pass", "--optimizer_type", "AdamW8bit", "--max_grad_norm", "1.0"))
 
 
+def test_triton_adafactor_falls_back_where_its_kernels_cannot_run():
+    """--adafactor_triton (the presets' setting) where Triton cannot build or launch its kernels, here the CPU: the run
+    trains with the standard fused update instead of stopping at the first backward pass."""
+    from types import SimpleNamespace
+
+    from musubi_tuner.modules.adafactor_fused import adafactor_step_param
+
+    trainer = ft.MossImageTrainer()
+    args = parse("--adafactor_triton")
+    parameter = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.bfloat16))
+    _, _, optimizer, _, _ = trainer.get_optimizer(args, [{"params": [parameter], "lr": 1e-2}])
+    accelerator = SimpleNamespace(sync_gradients=True, num_processes=1, device=torch.device("cpu"))
+    trainer._install_fused_optimizer(args, accelerator, optimizer)
+    assert optimizer.step_param.__func__ is adafactor_step_param
+
+    before = parameter.detach().clone()
+    (parameter.float() ** 2).sum().backward()
+    assert parameter.grad is None and not torch.equal(parameter, before)
+
+
 def test_the_checkpoint_has_the_vendor_layout_and_loads_back(tmp_path):
     torch.manual_seed(0)
     params = MossImageParams(**PARAMS)

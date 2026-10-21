@@ -55,6 +55,22 @@ def drain_block_swap(transformer: torch.nn.Module) -> None:
         torch.cuda.synchronize()
 
 
+def triton_adafactor_usable(device: torch.device) -> bool:
+    """--adafactor_triton: whether Triton builds and runs its Adafactor kernels here, checked once before training, so a
+    machine without a working Triton trains with the standard fused update instead of stopping at the first backward."""
+    try:
+        from musubi_tuner.modules.adafactor_triton import check_triton_adafactor
+
+        check_triton_adafactor(device)
+        return True
+    except Exception as error:  # no Triton here, or its compiler cannot build the kernels for this GPU
+        logger.warning(
+            f"Triton Adafactor is not available ({type(error).__name__}: {error}); using the standard fused Adafactor "
+            "update, which needs more VRAM for its temporaries"
+        )
+        return False
+
+
 def load_ring_checkpoint_state(model: torch.nn.Module, checkpoint: Path) -> None:
     """Stream a packed-ring checkpoint with strict keys and tensor shapes."""
     current = model.state_dict()
@@ -390,7 +406,7 @@ class DenseTrainerMixin:
             raise ValueError("--fused_backward_pass requires a single process; hooks step before distributed gradient reduction")
         # patch only the underlying optimizer: the Accelerate wrapper keeps its gradient-accumulation guard, and after
         # the hooks stepped and freed every gradient its step() sees grad=None everywhere and does nothing
-        if args.adafactor_triton:
+        if args.adafactor_triton and triton_adafactor_usable(accelerator.device):
             from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
 
             patch_adafactor_triton(raw_optimizer)

@@ -505,7 +505,9 @@ class Kandinsky6Trainer(Kandinsky6NetworkTrainer):
         # the wrapper retains its step/zero_grad semantics. After the hooks have
         # stepped and freed every gradient, the wrapper's step() sees grad=None
         # everywhere and is a no-op.
-        if args.adafactor_triton:
+        from musubi_tuner.training.dense_trainer import triton_adafactor_usable
+
+        if args.adafactor_triton and triton_adafactor_usable(accelerator.device):
             from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
 
             patch_adafactor_triton(raw_optimizer)

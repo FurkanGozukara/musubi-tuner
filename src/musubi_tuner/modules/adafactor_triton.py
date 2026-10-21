@@ -235,6 +235,19 @@ def adafactor_step_triton(self: Adafactor, closure=None):
     return loss
 
 
+def check_triton_adafactor(device: torch.device) -> None:
+    """Build and run the kernels once on a small BF16 matrix: raises where Triton cannot compile or launch them (no
+    working compiler for this platform or GPU), before training starts."""
+    param = torch.zeros((32, 128), device=device, dtype=torch.bfloat16)
+    grad = torch.full_like(param, 1e-3)
+    row_state = torch.zeros(32, device=device, dtype=torch.float32)
+    col_state = torch.zeros(128, device=device, dtype=torch.float32)
+    _triton_matrix_step(param, grad, row_state, col_state, beta2=0.0, eps=1e-30, clip_threshold=1.0, learning_rate=1e-3, weight_decay=0.0, seed=1)
+    torch.cuda.synchronize(device)
+    if not torch.isfinite(param.float()).all() or not bool((param != 0).any()):
+        raise RuntimeError("the Triton Adafactor kernels returned no update")
+
+
 def patch_adafactor_triton(optimizer: Adafactor) -> None:
     parameter_indices = {}
     for group in optimizer.param_groups:

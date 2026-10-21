@@ -330,6 +330,25 @@ def test_adafactor_resume_preserves_fp32_moments_exactly(fused):
     assert torch.equal(state["exp_avg_sq_col"], col)
 
 
+def test_triton_adafactor_falls_back_where_its_kernels_cannot_run():
+    """--adafactor_triton where Triton cannot build or launch its kernels (here the CPU) trains with the standard fused
+    update instead of stopping at the first step's backward pass."""
+    from musubi_tuner.modules.adafactor_fused import adafactor_step_param
+
+    trainer = ft.Kandinsky6Trainer()
+    args = parse()
+    args.adafactor_triton = True
+    parameter = torch.nn.Parameter(torch.randn(5, 7, dtype=torch.bfloat16))
+    _, _, optimizer, _, _ = trainer.get_optimizer(args, [{"params": [parameter], "lr": 1e-2}])
+    accelerator = SimpleNamespace(sync_gradients=True, num_processes=1, device=torch.device("cpu"))
+    trainer._install_fused_optimizer(args, accelerator, optimizer)
+    assert optimizer.step_param.__func__ is adafactor_step_param
+
+    before = parameter.detach().clone()
+    (parameter.float() ** 2).sum().backward()
+    assert parameter.grad is None and not torch.equal(parameter, before)
+
+
 def test_trainable_ring_configuration_requires_training_prerequisites():
     from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 
