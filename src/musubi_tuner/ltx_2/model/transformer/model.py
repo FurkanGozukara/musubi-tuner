@@ -611,7 +611,7 @@ class LTXModel(torch.nn.Module):
                 enabled = idx in managed_indices
                 setattr(block, "_h2d_stream_offloader_ref", offloader_ref if enabled else None)
                 setattr(block, "swap_weight_offload", enabled)
-                managed_module_ids = {id(module) for module in self.offloader._modules(idx)} if enabled else set()
+                managed_module_ids = {id(module) for module, _name, _is_param in self.offloader._jobs(idx)} if enabled else set()
                 for module in block.modules():
                     if module.__class__.__name__.endswith("Linear"):
                         setattr(module, "_h2d_stream_managed", id(module) in managed_module_ids)

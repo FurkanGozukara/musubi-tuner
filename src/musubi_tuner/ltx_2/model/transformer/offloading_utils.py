@@ -382,7 +382,12 @@ class LTX2H2DModelOffloader(LoRAStreamOffloader):
     def __init__(self, *args, swap_norms: bool = False, **kwargs):
         self.swap_norms = swap_norms
         self._swap_mask = _swap_mask_tokens()
+        # the shared offloader streams what its selector names: here the weights of _swap_modules
+        kwargs.setdefault("swap_tensor_selector", self._swap_weights)
         super().__init__(*args, **kwargs)
+
+    def _swap_weights(self, block: nn.Module) -> list[tuple[nn.Module, str]]:
+        return [(module, "weight") for module in self._swap_modules(block)]
 
     def _swap_modules(self, block: nn.Module) -> list[nn.Module]:
         mods = []
