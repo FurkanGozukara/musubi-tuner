@@ -220,6 +220,19 @@ def test_offloaded_sampling_prepares_the_block_ring_after_each_move_to_the_gpu(t
     _assert_ring_prepared_after_every_move(log)
 
 
+def test_h2d_block_swap_allows_sample_offloading_but_not_the_block_cpu_offloads():
+    # the offloaded sampler's moves rebuild the ring (above), so only the two block CPU offloads stay refused
+    base = {"block_swap_h2d_only": True, "gradient_checkpointing": True}
+    device = torch.device("cuda")
+
+    config = BlockSwapConfig.from_args(SimpleNamespace(**base, sample_with_offloading=True), device, supports_backward=True)
+
+    assert config.h2d_only
+    for flag in ("blockwise_checkpointing", "gradient_checkpointing_cpu_offload"):
+        with pytest.raises(ValueError, match=flag):
+            BlockSwapConfig.from_args(SimpleNamespace(**base, **{flag: True}), device, supports_backward=True)
+
+
 # ---------------------------------------------------------------- the ring after a device move
 
 
@@ -336,7 +349,8 @@ def _run_blocks(blocks: list[nn.Module], offloader, x: torch.Tensor) -> torch.Te
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for LoRAStreamOffloader")
 @pytest.mark.parametrize("use_pinned_memory", [False, True])
-def test_cuda_ring_survives_a_device_move_of_the_streamed_blocks(use_pinned_memory):
+@pytest.mark.parametrize("whole_move_first", [False, True])
+def test_cuda_ring_survives_a_device_move_of_the_streamed_blocks(use_pinned_memory, whole_move_first):
     device = torch.device("cuda")
     blocks = [_Block(seed) for seed in range(6)]
     x = torch.randn(3, 8, generator=torch.Generator().manual_seed(7)).to(device)
@@ -349,6 +363,9 @@ def test_cuda_ring_survives_a_device_move_of_the_streamed_blocks(use_pinned_memo
     with torch.no_grad():
         offloader.prepare_block_devices_before_forward(blocks)
         first = _run_blocks(blocks, offloader, x)
+        if whole_move_first:  # --sample_with_offloading moves the whole transformer to the CPU before that
+            for block in blocks:
+                block.to("cpu")
         # what LTX-2's placement helper does after sampling: streamed blocks to the CPU, the others to the GPU
         for idx, block in enumerate(blocks):
             block.to("cpu" if offloader.is_stream[idx] else device)
@@ -383,6 +400,33 @@ def test_cuda_ltx_sampling_end_keeps_the_h2d_layout():
     model.prepare_block_swap_before_forward()
     torch.cuda.synchronize()
 
+    _assert_h2d_layout(model)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for LoRAStreamOffloader")
+def test_cuda_ltx_offloaded_sampling_keeps_the_h2d_layout():
+    device = torch.device("cuda")
+    model = _tiny_ltx(num_layers=6)
+    model.enable_block_swap(4, _h2d_config(device))
+    model.move_to_device_except_swap_blocks(device)
+    model.prepare_block_swap_before_forward()
+
+    # LTX2SamplingMixin.sample_images with --sample_with_offloading, one prompt
+    model.to("cpu")  # before the prompt loop
+    model.move_to_device_except_swap_blocks(device)  # for the denoise
+    model.switch_block_swap_for_inference()
+    model.move_to_device_except_swap_blocks(torch.device("cpu"))  # for the VAE decode
+    model.to("cpu")  # after the prompt
+    model.move_to_device_except_swap_blocks(device)  # back on the training device
+    model.switch_block_swap_for_training()
+    model.move_to_device_except_swap_blocks(device)
+    model.prepare_block_swap_before_forward()
+    torch.cuda.synchronize()
+
+    _assert_h2d_layout(model)
+
+
+def _assert_h2d_layout(model: LTXModel) -> None:
     offloader = model.offloader
     assert offloader.stream_idx == [0, 2, 3, 5]
     assert offloader.in_slot == [0, 2]  # blocks 3 and 5 stay on their CPU masters

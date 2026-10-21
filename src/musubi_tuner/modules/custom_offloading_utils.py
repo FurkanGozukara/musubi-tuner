@@ -178,11 +178,13 @@ class BlockSwapConfig:
         # detaches them from the ring (a raw ``weight.data = weight.data.to("cpu")`` on a ring view), which
         # corrupts the ring and crashes with an opaque device/version mismatch. These offload paths route
         # around the ring entirely, so they are mutually exclusive with H2D-only swap during training.
+        # LTX-2's --sample_with_offloading moves the whole transformer to the CPU as well, but the sampler follows
+        # every such move with LTXModel.move_to_device_except_swap_blocks, which rebuilds the ring before the next
+        # forward (invalidate_ring_bindings_after_device_move), so it is allowed.
         if h2d_only and supports_backward:
             for flag_attr, flag_name in (
                 ("blockwise_checkpointing", "--blockwise_checkpointing"),
                 ("gradient_checkpointing_cpu_offload", "--gradient_checkpointing_cpu_offload"),
-                ("sample_with_offloading", "--sample_with_offloading"),
             ):
                 if getattr(args, flag_attr, False):
                     message = (

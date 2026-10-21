@@ -1319,6 +1319,9 @@ class LTX2Inferencer:
                     self.transformer.move_to_device_except_swap_blocks(self.device)
                 else:
                     self.transformer.to(self.device)
+                # the move rebinds the weights a block ring has bound, so the ring is prepared again after it
+                if hasattr(self.transformer, "prepare_block_swap_before_forward"):
+                    self.transformer.prepare_block_swap_before_forward()
 
             # Apply distilled LoRA for stage 2
             if config.distilled_lora_path:
