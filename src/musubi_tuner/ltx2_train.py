@@ -69,7 +69,12 @@ from musubi_tuner.training.step_control import (
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.async_checkpoint import AsyncCheckpointSaver, validate_async_checkpoint_save_options
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
-from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser, warn_if_h2d_only_ignored
+from musubi_tuner.ltx2_train_network import (
+    LTX2NetworkTrainer,
+    ltx2_setup_parser,
+    validate_ltx2_low_ram_load,
+    warn_if_h2d_only_ignored,
+)
 from musubi_tuner.ltx2_model_parallel import (
     add_ltx2_model_parallel_args,
     clip_grad_norm_model_parallel,
@@ -3250,6 +3255,26 @@ def _run_noise_scale_probe_ft(trainer, args, accelerator, transformer, noise_sch
         accelerator.print("[noise-scale/FT] RESULT: no finite estimate (raise K / check setup).")
 
 
+def _transformer_loading_device(
+    args: argparse.Namespace, blocks_to_swap: int, force_cpu_load: bool, device: torch.device
+) -> str | torch.device:
+    """The CPU with block swap or a feature that stages the transformer there, else the training device.
+
+    --ltx2_low_ram_load streams each weight to the device it is used from (the swapped blocks to main RAM, the
+    others to the GPU), so the model never exists whole on either; the loader places weights that way only when
+    it loads on the GPU (AkaneTendo25 850015b2).
+    """
+    low_ram_load = bool(getattr(args, "ltx2_low_ram_load", False))
+    if low_ram_load:
+        validate_ltx2_low_ram_load(args)
+        if force_cpu_load:
+            raise ValueError(
+                "--ltx2_low_ram_load is incompatible with model parallel, remote-stage block pruning, "
+                "--qgalore_load_device cpu, and --int8_weights, which stage the transformer on CPU."
+            )
+    return "cpu" if (blocks_to_swap > 0 and not low_ram_load) or force_cpu_load else device
+
+
 def main() -> None:
     parser = setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -3821,11 +3846,8 @@ def main() -> None:
     # int8 model to the GPU. This lets int8-weight FFT fit without --blocks_to_swap (which is slow).
     # The resulting Int8QTWeight is identical to converting on the GPU (from_float is deterministic).
     int8_weights_cpu_load = bool(getattr(args, "int8_weights", False))
-    loading_device = (
-        "cpu"
-        if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
-        else accelerator.device
-    )
+    force_cpu_load = ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
+    loading_device = _transformer_loading_device(args, blocks_to_swap, force_cpu_load, accelerator.device)
     if qgalore_cpu_load:
         logger.info("Q-GaLore CPU load enabled: load/replace/quantize transformer on CPU before moving to %s", accelerator.device)
 

@@ -1849,6 +1849,7 @@ Notes:
 - Rejected together with `--loftq_init`, AWQ calibration, `--blockwise_checkpointing` and `--gradient_checkpointing_cpu_offload`, which all move state back through main RAM.
 - Works with `--block_swap_h2d_only`, whose offloaded blocks are chosen differently from classic block swap.
 - The option changes only where weights are written during loading, not what is computed.
+- Available in `ltx2_train.py` as well as `ltx2_train_network.py`. In full fine-tuning it is rejected together with model parallel, remote-stage block pruning, `--qgalore_load_device cpu` and `--int8_weights`, which all stage the transformer on CPU.
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>
