@@ -1081,7 +1081,6 @@ class LTX2SamplingMixin:
         distributed_state = PartialState()  # for multi gpu distributed inference
 
         transformer = accelerator.unwrap_model(transformer)
-        transformer.switch_block_swap_for_inference()
         original_device = next(transformer.parameters()).device
         offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
@@ -1096,6 +1095,11 @@ class LTX2SamplingMixin:
                 transformer.to(accelerator.device)
             clean_memory_on_device(accelerator.device)
             original_device = accelerator.device
+
+        # A device move rebinds the weights a block ring has bound (Module.to moves Parameters in place), so the
+        # ring is prepared after the last placement move: here, or after each move to the GPU when offloading.
+        if not transformer_offloaded:
+            transformer.switch_block_swap_for_inference()
 
         save_dir = os.path.join(args.output_dir, "sample")
         os.makedirs(save_dir, exist_ok=True)
@@ -1115,6 +1119,7 @@ class LTX2SamplingMixin:
                 else:
                     transformer.to(accelerator.device)
                 clean_memory_on_device(accelerator.device)
+                transformer.switch_block_swap_for_inference()
 
         def offload_transformer_if_needed() -> None:
             if transformer_offloaded:
@@ -1372,10 +1377,13 @@ class LTX2SamplingMixin:
             logger.info("Sampling offload: restored transformer to training device")
             clean_memory_on_device(accelerator.device)
 
+        # Leaving inference mode first also finishes the block transfers still in flight before any block moves.
         transformer.switch_block_swap_for_training()
-        # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
+        # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep. The move rebinds the weights a
+        # block ring has bound, so the ring is prepared again after it.
         if hasattr(transformer, "move_to_device_except_swap_blocks"):
             transformer.move_to_device_except_swap_blocks(accelerator.device)
+            transformer.prepare_block_swap_before_forward()
         self._cleanup_cuda(accelerator.device)
 
     @staticmethod

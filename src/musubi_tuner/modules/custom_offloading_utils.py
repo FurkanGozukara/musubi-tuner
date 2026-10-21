@@ -1214,6 +1214,7 @@ class LoRAStreamOffloader:
         self._layout = None  # ([byte offset per swap tensor], total bytes) shared by all streaming blocks
         self.in_slot = [None] * self.B  # slot -> block_idx currently bound to this slot (or None)
         self.free_event = [None] * self.B  # slot -> cuda.Event recording when compute finished using the slot
+        self._blocks_moved = False  # the next prepare must place the blocks again (a device move took them along)
 
         self._wait_ctx = "fwd"  # context tag for wait/load timing ("fwd" while in the forward loop, "bwd" in hooks)
         if self.debug:
@@ -1259,6 +1260,11 @@ class LoRAStreamOffloader:
         # module's _parameters / _buffers dicts respectively (buffer names are already registered)
         for (m, name, _is_param), t in zip(self._jobs(block_idx), tensors):
             setattr(m, name, t)
+
+    def _unbind(self, block_idx: int):
+        # leave the swap tensors out of the block, so that moving the block does not move its masters
+        for m, name, is_param in self._jobs(block_idx):
+            (m._parameters if is_param else m._buffers)[name] = None
 
     @staticmethod
     def _compute_layout(weights: list[torch.Tensor]) -> tuple[list[int], int]:
@@ -1316,6 +1322,33 @@ class LoRAStreamOffloader:
         self.copier.sync()
         self.forward_only = forward_only
 
+    def invalidate_ring_bindings_after_device_move(self):
+        """Rebuild the ring after the blocks were moved with ``Module.to`` (e.g. LTX-2's placement helper).
+
+        ``Module.to`` moves registered Parameters in place, so moving a block bound to the ring also moved the
+        ring's own Parameter objects off the device while ``ring_flat`` stayed there; the move also took the
+        streamed blocks' non-swap tensors along. Recreate the ring views, bind the slot owners back to their
+        masters, and have the next prepare refill every slot and put the blocks back on the device
+        (AkaneTendo25 12eedd9f).
+        """
+        if self.ring_param is None:
+            return  # not prepared yet: the first prepare places everything
+        self.copier.sync()
+        for block_idx in self.in_slot:
+            if block_idx is not None:
+                self._bind(block_idx, self.cpu_master[block_idx])
+        template = self.stream_idx[0]
+        template_weights = [t.data for t in self.cpu_master[template]]
+        self.ring_param = [
+            [
+                nn.Parameter(view, requires_grad=False) if is_param else view
+                for (_m, _name, is_param), view in zip(self._jobs(template), self._flat_views(flat, template_weights, self._layout))
+            ]
+            for flat in self.ring_flat
+        ]
+        self.in_slot = [None] * self.B
+        self._blocks_moved = True
+
     def compile_safe_block_indices(self) -> list[int]:
         """Return the permanently GPU-resident complement of streamed blocks."""
         return [index for index, is_stream in enumerate(self.is_stream) if not is_stream]
@@ -1333,10 +1366,12 @@ class LoRAStreamOffloader:
             print(f"[{self.block_type}] Prepare block devices before forward (H2D-only)")
 
         first_time = not self.cpu_master  # device placement is only needed on the very first call
+        blocks_moved = self._blocks_moved  # ...or after a device move took the blocks along
+        self._blocks_moved = False
         cpu_device = torch.device("cpu")
         for i, b in enumerate(blocks):
             if not self.is_stream[i]:
-                if first_time:
+                if first_time or blocks_moved:
                     b.to(self.device)  # resident block: buffers + Linear weights on GPU permanently
                     weighs_to_device(b, self.device)
                 continue
@@ -1344,8 +1379,11 @@ class LoRAStreamOffloader:
             if not first_time:
                 # re-prepare (e.g. around in-training sampling): the non-swap parts are already on the device
                 # and the CPU masters have stayed on the CPU throughout, so just repoint weights to the masters.
-                # IMPORTANT: do NOT call b.to(device) here -- it would drag the CPU masters onto the GPU and
-                # they would never be released (every swap block would end up resident).
+                # IMPORTANT: do NOT call b.to(device) with the masters bound -- it would drag them onto the GPU
+                # and they would never be released (every swap block would end up resident).
+                if blocks_moved:
+                    self._unbind(i)
+                    b.to(self.device)
                 self._bind(i, self.cpu_master[i])
                 continue
 
