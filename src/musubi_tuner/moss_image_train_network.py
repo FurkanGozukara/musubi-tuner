@@ -36,15 +36,17 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-class MossImageNetworkTrainer(NetworkTrainer):
-    def __init__(self):
-        super().__init__()
-        self.control_adapter = False
-        self._control_embedder: Optional[moss_control.MossControlEmbedder] = None
-        self._control_module_names: dict = {}
-        self._control_shares = moss_control.DEFAULT_CONTROL_DROPOUT
-        self._caption_dropout = 0.0
-        self._empty_ctx: Optional[torch.Tensor] = None
+class MossImageTrainerMixin:
+    """MOSS-Image's model hooks: MossImageNetworkTrainer below runs them on the extended training loop (LoRA / DoRA,
+    control adapters), moss_image_train.py on trainer_base's loop, whose hooks the dense trainer overrides (full
+    fine-tuning)."""
+
+    control_adapter = False
+    _control_embedder: Optional[moss_control.MossControlEmbedder] = None
+    _control_module_names: dict = {}
+    _control_shares = moss_control.DEFAULT_CONTROL_DROPOUT
+    _caption_dropout = 0.0
+    _empty_ctx: Optional[torch.Tensor] = None
 
     # region model specific
 
@@ -102,61 +104,6 @@ class MossImageNetworkTrainer(NetworkTrainer):
             raise ValueError("--control_adapter writes DoRA as ComfyUI's input-axis dora_scale: drop dora_axis=output")
         if not any(arg.split("=", 1)[0].strip() == "include_text_embedder" for arg in network_args):
             args.network_args = network_args + ["include_text_embedder=True"]
-
-    def on_train_datasets(self, args, datasets):
-        """Control adapters: the datasets must carry the maps (a cache-only dataset cannot tell), and the caption
-        dropout reads the empty caption's context written by the text encoder caching."""
-        if not self.control_adapter:
-            return
-        has_maps = any(getattr(dataset, "has_control", False) for dataset in datasets)
-        cache_only = any(getattr(dataset, "cache_only", False) for dataset in datasets)
-        if not has_maps and not cache_only:
-            raise ValueError(
-                "MOSS-Image control adapter training needs colour and depth maps: a control_directory in the dataset config "
-                "with <image name>_0.png (one flat colour per region) and <image name>_1.png (depth, near = white) for each "
-                "image; moss_image_control_maps.py makes both"
-            )
-        if self._caption_dropout > 0:
-            self._empty_ctx = moss_control.load_empty_caption([getattr(dataset, "cache_directory", None) for dataset in datasets])
-
-    def _prepare_network_optimizer_params(self, args, network):
-        """The network's groups, then the control embedder's: its released columns and bias at the LoRA rate (no weight
-        decay: they start from the DiT's values), its control columns at --control_lr_ratio times that rate."""
-        params, descriptions = super()._prepare_network_optimizer_params(args, network)
-        if not self.control_adapter:
-            return params, descriptions
-        embedder = self._control_embedder
-        embedder.requires_grad_(True)
-        lr = float(args.learning_rate)
-        released = [embedder.base_weight] + ([embedder.bias] if embedder.bias is not None else [])
-        params = list(params) + [
-            {"params": released, "lr": lr, "weight_decay": 0.0, "group_name": "control_embedder"},
-            {"params": [embedder.control_weight], "lr": lr * float(args.control_lr_ratio), "group_name": "control_maps"},
-        ]
-        return params, list(descriptions or []) + ["control embedder", "control maps"]
-
-    def pre_train_hook(self, args, accelerator, transformer=None, network=None):
-        super().pre_train_hook(args, accelerator, transformer=transformer, network=network)
-        if self.control_adapter:
-            accelerator.register_for_checkpointing(self._control_embedder)  # --save_state / --resume keep the embedder
-
-    def extra_grad_params(self) -> list:
-        if not self.control_adapter or self._control_embedder is None:
-            return []
-        return [param for param in self._control_embedder.parameters() if param.requires_grad]
-
-    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False, **kwargs):
-        """Control adapters: the checkpoint becomes the file ComfyUI loads (moss_control.write_comfy_control_file)."""
-        super().post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload, **kwargs)
-        if not self.control_adapter or not accelerator.is_main_process:
-            return
-        base_model = "moss-sft" if "sft" in os.path.basename(str(args.dit)).lower() else "moss-base"
-        metadata = moss_control.control_metadata(self._control_shares, None, base_model)
-        metadata["control_lr_ratio"] = str(args.control_lr_ratio)
-        metadata["control_caption_dropout"] = str(self._caption_dropout)
-        count = moss_control.write_comfy_control_file(ckpt_file, self._control_embedder, self._control_module_names, metadata)
-        shares = ", ".join(f"{name} {value:.3f}" for name, value in self._control_embedder.control_share().items())
-        accelerator.print(f"saved the ComfyUI MOSS-Image control adapter: {ckpt_file} ({count} tensors; control columns / noisy: {shares})")
 
     @staticmethod
     def _negative(prompt_dict: dict) -> str:
@@ -319,6 +266,66 @@ class MossImageNetworkTrainer(NetworkTrainer):
         return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
+
+
+class MossImageNetworkTrainer(MossImageTrainerMixin, NetworkTrainer):
+    """LoRA / DoRA training and colour / depth control adapters on the extended training loop, whose dataset,
+    optimizer-group, checkpoint, gradient-clipping and save hooks carry the control adapter."""
+
+    def on_train_datasets(self, args, datasets):
+        """Control adapters: the datasets must carry the maps (a cache-only dataset cannot tell), and the caption
+        dropout reads the empty caption's context written by the text encoder caching."""
+        if not self.control_adapter:
+            return
+        has_maps = any(getattr(dataset, "has_control", False) for dataset in datasets)
+        cache_only = any(getattr(dataset, "cache_only", False) for dataset in datasets)
+        if not has_maps and not cache_only:
+            raise ValueError(
+                "MOSS-Image control adapter training needs colour and depth maps: a control_directory in the dataset config "
+                "with <image name>_0.png (one flat colour per region) and <image name>_1.png (depth, near = white) for each "
+                "image; moss_image_control_maps.py makes both"
+            )
+        if self._caption_dropout > 0:
+            self._empty_ctx = moss_control.load_empty_caption([getattr(dataset, "cache_directory", None) for dataset in datasets])
+
+    def _prepare_network_optimizer_params(self, args, network):
+        """The network's groups, then the control embedder's: its released columns and bias at the LoRA rate (no weight
+        decay: they start from the DiT's values), its control columns at --control_lr_ratio times that rate."""
+        params, descriptions = super()._prepare_network_optimizer_params(args, network)
+        if not self.control_adapter:
+            return params, descriptions
+        embedder = self._control_embedder
+        embedder.requires_grad_(True)
+        lr = float(args.learning_rate)
+        released = [embedder.base_weight] + ([embedder.bias] if embedder.bias is not None else [])
+        params = list(params) + [
+            {"params": released, "lr": lr, "weight_decay": 0.0, "group_name": "control_embedder"},
+            {"params": [embedder.control_weight], "lr": lr * float(args.control_lr_ratio), "group_name": "control_maps"},
+        ]
+        return params, list(descriptions or []) + ["control embedder", "control maps"]
+
+    def pre_train_hook(self, args, accelerator, transformer=None, network=None):
+        super().pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        if self.control_adapter:
+            accelerator.register_for_checkpointing(self._control_embedder)  # --save_state / --resume keep the embedder
+
+    def extra_grad_params(self) -> list:
+        if not self.control_adapter or self._control_embedder is None:
+            return []
+        return [param for param in self._control_embedder.parameters() if param.requires_grad]
+
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False, **kwargs):
+        """Control adapters: the checkpoint becomes the file ComfyUI loads (moss_control.write_comfy_control_file)."""
+        super().post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload, **kwargs)
+        if not self.control_adapter or not accelerator.is_main_process:
+            return
+        base_model = "moss-sft" if "sft" in os.path.basename(str(args.dit)).lower() else "moss-base"
+        metadata = moss_control.control_metadata(self._control_shares, None, base_model)
+        metadata["control_lr_ratio"] = str(args.control_lr_ratio)
+        metadata["control_caption_dropout"] = str(self._caption_dropout)
+        count = moss_control.write_comfy_control_file(ckpt_file, self._control_embedder, self._control_module_names, metadata)
+        shares = ", ".join(f"{name} {value:.3f}" for name, value in self._control_embedder.control_share().items())
+        accelerator.print(f"saved the ComfyUI MOSS-Image control adapter: {ckpt_file} ({count} tensors; control columns / noisy: {shares})")
 
 
 def moss_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

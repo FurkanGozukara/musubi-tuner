@@ -4,7 +4,8 @@ Reuses the LoRA trainer's data path, loss, sampling and saving lifecycle (``moss
 ``training.dense_trainer``: every DiT weight trains in BF16 with fused per-tensor Adafactor updates during backward,
 block swap with fused updates (``--block_swap_trainable_ring`` for the fastest swap) and dense resume. The checkpoint is
 written in the vendor / ComfyUI layout (fused ``proj.qkv``, ``rope.bands``), so it loads as the DiT here, in ComfyUI and
-in SwarmUI.
+in SwarmUI. It runs trainer_base's training loop, whose network / accelerator / resume hooks the dense trainer
+overrides: the extended loop of the LoRA trainer builds its LoRA network inline (no --network_module here).
 """
 
 from __future__ import annotations
@@ -15,12 +16,13 @@ from typing import Optional, Sequence
 import torch
 
 from musubi_tuner.moss_image import moss_model
-from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer, moss_image_setup_parser
+from musubi_tuner.moss_image_train_network import MossImageTrainerMixin, moss_image_setup_parser
 from musubi_tuner.training.dense_trainer import DenseTrainerMixin, add_dense_arguments
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.trainer_base import NetworkTrainer
 
 
-class MossImageTrainer(DenseTrainerMixin, MossImageNetworkTrainer):
+class MossImageTrainer(DenseTrainerMixin, MossImageTrainerMixin, NetworkTrainer):
     """Every MOSS-Image DiT weight in BF16; checkpoints in the layout ComfyUI and ``load_dit`` read."""
 
     dense_model_name = "MOSS-Image"

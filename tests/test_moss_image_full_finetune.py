@@ -94,3 +94,16 @@ def test_the_saved_layout_matches_the_released_file():
     fused = moss_model.fuse_qkv(model.state_dict(), model.params)
     assert set(fused) == keys
     assert torch.equal(fused["rope.bands"], bands)
+
+
+def test_full_fine_tuning_runs_the_loop_whose_hooks_the_dense_trainer_overrides():
+    """The extended loop (training_loop.train, the LoRA trainer's) builds its network from --network_module inline, so
+    the dense trainer's _build_network / _prepare_with_accelerator / _register_hooks_and_resume act only on
+    trainer_base's loop: the first GPU run of moss_image_train.py on the extended loop stopped at
+    importlib.import_module(None)."""
+    from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer, MossImageTrainerMixin
+    from musubi_tuner.training import trainer_base, training_loop
+
+    assert ft.MossImageTrainer.train is trainer_base.NetworkTrainer.train
+    assert MossImageNetworkTrainer.train is training_loop.train
+    assert issubclass(ft.MossImageTrainer, MossImageTrainerMixin) and not issubclass(ft.MossImageTrainer, MossImageNetworkTrainer)
