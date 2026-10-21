@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -42,8 +43,10 @@ def test_help_does_not_allocate_models(script):
     result = subprocess.run(
         [sys.executable, str(ROOT / script), "--help"],
         cwd=ROOT,
+        # the shared options' help is bilingual: a Windows pipe's cp1252 cannot print the Japanese half
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=60,
     )
 
