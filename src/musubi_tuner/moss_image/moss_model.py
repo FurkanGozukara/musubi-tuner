@@ -16,8 +16,10 @@ reference-image (edit) conditioning ai-toolkit adds is not part of the vendor mo
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from functools import partial
+from typing import Callable, Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -90,6 +92,9 @@ def rope_bands(device, head_dim: int, base: float) -> Tensor:
 class _CheckpointMixin:
     gradient_checkpointing = False
     activation_cpu_offloading = False
+    # set by the trainable block-swap ring (full fine-tuning): it binds a block's weights to a GPU slot only when asked,
+    # so the backward recompute of a checkpointed block waits for its slot as the forward does
+    recompute_wait: Optional[Callable[[], None]] = None
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
@@ -103,7 +108,17 @@ class _CheckpointMixin:
         if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
             if self.activation_cpu_offloading:
                 fn = create_cpu_offloading_wrapper(fn, self.norm1.weight.device)
-            return checkpoint(fn, *args, use_reentrant=False)
+            kwargs = {"use_reentrant": False}
+            if self.recompute_wait is not None:
+                wait = self.recompute_wait
+
+                @contextmanager
+                def before_recompute():
+                    wait()
+                    yield
+
+                kwargs["context_fn"] = lambda: (nullcontext(), before_recompute())
+            return checkpoint(fn, *args, **kwargs)
         return fn(*args)
 
 
@@ -228,6 +243,9 @@ class MossImage(nn.Module):
         assert 0 < num_blocks <= self.num_blocks - 2, f"MOSS-Image: blocks_to_swap must be 1 to {self.num_blocks - 2}, got {num_blocks}"
         self.blocks_to_swap = num_blocks
         self.offloader = create_offloader("single", self.layers, self.num_blocks, num_blocks, config)
+        if getattr(self.offloader, "recompute_requires_wait", False):  # the trainable ring (full fine-tuning)
+            for index, layer in enumerate(self.layers):
+                layer.recompute_wait = partial(self.offloader.wait_for_block, index)
         print(f"MOSS-Image: Block swap enabled. Swapping {num_blocks} of {self.num_blocks} blocks.")
 
     def switch_block_swap_for_inference(self):

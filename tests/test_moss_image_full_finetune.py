@@ -107,3 +107,52 @@ def test_full_fine_tuning_runs_the_loop_whose_hooks_the_dense_trainer_overrides(
     assert ft.MossImageTrainer.train is trainer_base.NetworkTrainer.train
     assert MossImageNetworkTrainer.train is training_loop.train
     assert issubclass(ft.MossImageTrainer, MossImageTrainerMixin) and not issubclass(ft.MossImageTrainer, MossImageNetworkTrainer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the trainable block-swap ring needs CUDA")
+@pytest.mark.parametrize("swapped", [1, 2])
+@pytest.mark.parametrize("activation_cpu_offload", [False, True], ids=["gpu_activations", "cpu_activations"])
+def test_trainable_ring_backward_matches_the_resident_model(swapped, activation_cpu_offload):
+    """The ring binds a streamed block's weights to a GPU slot only when asked, so each checkpointed block's backward
+    recompute waits for its slot (moss_model._CheckpointMixin.recompute_wait, as Kandinsky 6): without it the first
+    fine-tuning run with block swap stopped in the recompute with an RMSNorm weight still on the CPU."""
+    import copy
+
+    from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+
+    torch.manual_seed(0)
+    base = MossImage(MossImageParams(**{**PARAMS, "num_layers": 4}), "torch", False)
+    with torch.no_grad():
+        for parameter in base.parameters():
+            parameter.normal_(0, 0.05)
+    base = base.to(torch.bfloat16)
+    cuda = torch.device("cuda")
+    dense, ring = copy.deepcopy(base).to(cuda), copy.deepcopy(base)
+    dense.enable_gradient_checkpointing()
+    ring.enable_gradient_checkpointing(activation_cpu_offload)
+    config = BlockSwapConfig(device=cuda, supports_backward=True, use_pinned_memory=True, trainable_ring=True, ring_size=2)
+    ring.enable_block_swap(swapped, config)
+    assert all(layer.recompute_wait is not None for layer in ring.layers)
+    ring.move_to_device_except_swap_blocks(cuda)
+    ring.prepare_block_swap_before_forward()
+    ring.switch_block_swap_for_training()
+    dense.train()
+    ring.train()
+    torch.manual_seed(1)
+    x = torch.randn(1, PARAMS["latent_channels"], 4, 4, device=cuda, dtype=torch.bfloat16)
+    t = torch.tensor([400.0], device=cuda)
+    ctx = torch.randn(1, 6, PARAMS["text_dim"], device=cuda, dtype=torch.bfloat16)
+    mask = torch.ones(1, 6, dtype=torch.bool, device=cuda)
+    try:
+        outputs = []
+        for model in (dense, ring):
+            out = model(x, t, ctx, mask)
+            out.float().pow(2).mean().backward()
+            outputs.append(out.detach().float().cpu())
+        torch.cuda.synchronize()
+        torch.testing.assert_close(outputs[1], outputs[0], rtol=0.02, atol=0.02)
+        for (name, expected), (_, actual) in zip(dense.named_parameters(), ring.named_parameters()):
+            assert actual.grad is not None, name
+            torch.testing.assert_close(actual.grad.float().cpu(), expected.grad.float().cpu(), rtol=0.05, atol=0.01, msg=lambda m, name=name: f"{name}: {m}")
+    finally:
+        ring.offloader.offload_to_cpu(ring.layers)
