@@ -248,6 +248,52 @@ def test_call_dit_targets_noise_minus_latents_on_the_vendor_timestep_scale():
     assert torch.equal(out.target, noise - latents)
 
 
+def test_the_target_stays_fp32_when_the_network_runs_in_bf16():
+    """Full fine-tuning trains in BF16; the target is computed in FP32 like both reference trainers (it rounded the
+    latents to BF16 before)."""
+    from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer
+
+    trainer = MossImageNetworkTrainer()
+    model = _tiny().to(torch.bfloat16)
+    accelerator = types.SimpleNamespace(device=torch.device("cpu"), unwrap_model=lambda m: m)
+    torch.manual_seed(2)
+    latents = torch.randn(2, 8, 3, 4)
+    noise = torch.randn_like(latents)
+    contexts = [torch.randn(7, 48), torch.randn(4, 48)]
+    with torch.no_grad():
+        out = trainer.call_dit(
+            argparse.Namespace(gradient_checkpointing=False), accelerator, model, latents, {"ctx_vec": contexts}, noise,
+            0.5 * latents + 0.5 * noise, torch.tensor([500.0, 500.0]), torch.bfloat16,
+        )
+    assert out.target.dtype == torch.float32 and torch.equal(out.target, noise - latents)
+
+
+@pytest.mark.parametrize("trainer_kind", ["lora", "full"])
+def test_the_dit_gets_the_vendor_timestep_of_the_noise_it_sees(trainer_kind):
+    """The shared direct samplers return 1000 * sigma + 1 (HunyuanVideo's 1..1000 index); MOSS's DiT is conditioned on
+    1000 * sigma, as the vendor's sampler, kohya's sd-scripts and sdbds's port pass it. LoRA runs the extended loop's
+    sampler, full fine-tuning trainer_base's; uniform sampling of given bucket values makes both deterministic."""
+    if trainer_kind == "lora":
+        from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer as Trainer
+    else:
+        from musubi_tuner.moss_image_train import MossImageTrainer as Trainer
+
+    args = argparse.Namespace(
+        timestep_sampling="uniform", min_timestep=None, max_timestep=None, preserve_distribution_shape=False,
+        sigmoid_scale=1.0, discrete_flow_shift=3.0,
+    )
+    torch.manual_seed(3)
+    latents = torch.randn(2, 8, 3, 4)
+    noise = torch.randn_like(latents)
+    sigmas = [0.25, 0.8]
+    noisy, timesteps = Trainer().get_noisy_model_input_and_timesteps(
+        args, noise, latents, sigmas, None, torch.device("cpu"), torch.float32
+    )
+    assert torch.allclose(timesteps, torch.tensor(sigmas) * 1000.0, rtol=0, atol=1e-4)
+    mix = torch.tensor(sigmas).view(-1, 1, 1, 1)
+    assert torch.allclose(noisy, (1 - mix) * latents + mix * noise)
+
+
 @pytest.mark.parametrize("precision, warned", [("fp16", True), ("bf16", False)])
 def test_fp16_training_warns_about_the_residual_stream(caplog, precision, warned):
     """KBlueLeaf/MOSS-Image-FP16-fixed measured the residual stream near 62,000 at block 26 (FP16 ends at 65,504)."""

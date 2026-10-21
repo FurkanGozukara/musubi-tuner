@@ -29,6 +29,7 @@ from musubi_tuner.training.outputs import DiTOutput
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sample_decode import decode_sample
 from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import DIRECT_TIMESTEP_SAMPLING_METHODS
 from musubi_tuner.training.trainer_ext import NetworkTrainer
 from musubi_tuner.utils import model_utils
 
@@ -228,6 +229,17 @@ class MossImageTrainerMixin:
     def scale_shift_latents(self, latents):
         return latents  # the FLUX.2 VAE normalizes its packed latents itself
 
+    def get_noisy_model_input_and_timesteps(self, args, noise, latents, timesteps, noise_scheduler, device, dtype):
+        # the DiT is conditioned on the vendor's t = 1000 * sigma, as its sampler and both reference trainers (kohya's
+        # sd-scripts, sdbds's port) pass it; the shared direct samplers return 1000 * sigma + 1 (HunyuanVideo's 1..1000
+        # index), which told the model the noise level of sigma + 0.001. The scheduler path's grid pairs them exactly.
+        noisy_model_input, timesteps = super().get_noisy_model_input_and_timesteps(
+            args, noise, latents, timesteps, noise_scheduler, device, dtype
+        )
+        if args.timestep_sampling in DIRECT_TIMESTEP_SAMPLING_METHODS:
+            timesteps = timesteps - 1
+        return noisy_model_input, timesteps
+
     def call_dit(
         self,
         args: argparse.Namespace,
@@ -262,7 +274,8 @@ class MossImageTrainerMixin:
         t = timesteps.to(device=device, dtype=torch.float32)  # the vendor's 0..1000 scale, 1000 = pure noise
         model_pred = model(hidden, t, ctx, ctx_mask)
 
-        target = noise - latents.to(device=device, dtype=network_dtype)
+        # in FP32 like both reference trainers: in full fine-tuning network_dtype is BF16, which rounded the latents
+        target = noise.to(device=device, dtype=torch.float32) - latents.to(device=device, dtype=torch.float32)
         return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
