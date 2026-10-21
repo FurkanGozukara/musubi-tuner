@@ -389,11 +389,16 @@ class MossImage(nn.Module):
 
 def split_fused_qkv(state_dict: dict) -> dict:
     """ComfyUI / ai-toolkit layout ``layers.N.proj.qkv.weight`` (rows q, k, v) -> ``layers.N.proj.{q,k,v}.weight``.
-    In place; the text refiner's ``qkv`` stays fused (it is fused in every MOSS file and not a LoRA target)."""
-    for key in [k for k in state_dict if k.startswith("layers.") and k.endswith(".proj.qkv.weight")]:
-        base = key[: -len(".qkv.weight")]
-        for name, part in zip(("q", "k", "v"), state_dict.pop(key).chunk(3, dim=0)):
-            state_dict[f"{base}.{name}.weight"] = part.contiguous()
+    In place; the text refiner's ``qkv`` stays fused (it is fused in every MOSS file and not a LoRA target). In a ComfyUI
+    INT8 ConvRot file the per-row ``weight_scale`` splits with the rows and q, k and v each get the ``comfy_quant`` spec:
+    the rotation mixes input columns only, so the rows stay independent."""
+    for suffix in (".weight", ".weight_scale", ".comfy_quant"):
+        for key in [k for k in state_dict if k.startswith("layers.") and k.endswith(".proj.qkv" + suffix)]:
+            base = key[: -len(".qkv" + suffix)]
+            tensor = state_dict.pop(key)
+            parts = (tensor, tensor.clone(), tensor.clone()) if suffix == ".comfy_quant" else tensor.chunk(3, dim=0)
+            for name, part in zip(("q", "k", "v"), parts):
+                state_dict[f"{base}.{name}{suffix}"] = part.contiguous()
     state_dict.pop("rope.bands", None)  # a derived constant, recomputed in fp32
     return state_dict
 

@@ -103,6 +103,147 @@ def test_the_bf16_checkpoint_passes(tmp_path):
     moss_utils.check_dit_checkpoint(path)
 
 
+def test_lora_training_takes_int8_convrot_files_only(tmp_path):
+    released = {"shared_block_modulation.weight": torch.zeros(1), "layers.0.proj.qkv.weight": torch.zeros(1)}
+    int8 = str(tmp_path / "int8.safetensors")
+    save_file({**released, "layers.0.proj.qkv.comfy_quant": torch.zeros(1, dtype=torch.uint8)}, int8)
+    assert moss_utils.check_dit_checkpoint(int8, allow_int8=True) is True
+    fp8 = str(tmp_path / "fp8.safetensors")
+    save_file({**released, "layers.0.proj.qkv.weight_scale": torch.zeros(1), "layers.0.proj.qkv.input_scale": torch.zeros(1)}, fp8)
+    with pytest.raises(ValueError, match="another format"):
+        moss_utils.check_dit_checkpoint(fp8, allow_int8=True)
+
+
+def test_fused_qkv_of_an_int8_file_splits_its_scales_and_specs():
+    weight = torch.arange(12, dtype=torch.int8).reshape(6, 2)
+    scale = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+    spec = torch.tensor(list(b'{"format":"int8_tensorwise"}'), dtype=torch.uint8)
+    sd = {"layers.0.proj.qkv.weight": weight, "layers.0.proj.qkv.weight_scale": scale, "layers.0.proj.qkv.comfy_quant": spec}
+    moss_model.split_fused_qkv(sd)
+    assert torch.equal(sd["layers.0.proj.k.weight"], weight[2:4]) and torch.equal(sd["layers.0.proj.k.weight_scale"], scale[2:4])
+    assert all(torch.equal(sd[f"layers.0.proj.{name}.comfy_quant"], spec) for name in "qkv")
+    assert not any("qkv" in key for key in sd)
+
+
+# ConvRot groups are 256 inputs wide: the smallest DiT whose block projections all quantize
+INT8_PARAMS = dict(dim=256, ffn_dim=256, num_heads=4, num_layers=2, text_dim=48, freq_dim=16, latent_channels=8)
+INT8_SPEC = b'{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256}'
+INT8_LAYERS = {f"layers.{i}.proj.{name}.weight" for i in range(2) for name in ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")}
+
+
+def _released_dit(tmp_path, monkeypatch):
+    """A tiny DiT saved in the released files' layout (fused q / k / v); load_dit builds that size."""
+    torch.manual_seed(0)
+    params = MossImageParams(**INT8_PARAMS)
+    model = MossImage(params)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0.0, 0.1)
+    monkeypatch.setattr(moss_utils.moss_model, "MossImageParams", lambda: params)
+    path = str(tmp_path / "moss_image_base_bf16.safetensors")
+    save_file({k: v.contiguous() for k, v in moss_model.fuse_qkv(model.state_dict(), params).items()}, path)
+    return model.eval(), path
+
+
+def test_convrot_int8_quantizes_the_block_projections_while_loading(tmp_path, monkeypatch):
+    reference, path = _released_dit(tmp_path, monkeypatch)
+    model = moss_utils.load_dit("cpu", path, "torch", False, "cpu", torch.float32, convrot_int8=True)
+    assert {name for name, p in model.named_parameters() if p.dtype == torch.int8} == INT8_LAYERS
+    assert model.is_convrot_int8 and not any(p.requires_grad for p in model.parameters())
+    assert model.text_embedder.blocks[0].qkv.weight.dtype == torch.float32  # the refiner stays unquantized
+    x, t, ctx, mask = _inputs()
+    with torch.no_grad():
+        expected, out = reference(x, t, ctx, mask), model(x, t, ctx, mask)
+    assert ((out - expected).norm() / expected.norm()).item() < 0.02
+
+
+def test_an_int8_convrot_file_trains_as_it_is_and_holds_the_bf16_files_values(tmp_path, monkeypatch):
+    """Comfy-Org's INT8 files quantize the fused qkv (and carry a ComfyUI attention hint per block); the rotation mixes
+    input columns only, so its rows hold the split projections' values quantized while loading. The rotation's float
+    sums may round differently for the fused and the split matrix (an INT8 step at a rounding boundary on some CPUs).
+    Full fine-tuning refuses the file."""
+    from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
+
+    _, path = _released_dit(tmp_path, monkeypatch)
+    quantized_on_load = moss_utils.load_dit("cpu", path, "torch", False, "cpu", torch.float32, convrot_int8=True).state_dict()
+    released = {}
+    for key, value in moss_utils.load_safetensors(path, device="cpu").items():
+        if moss_utils.is_convrot_int8_target(key):
+            module = key[: -len(".weight")]
+            released[key], released[module + ".weight_scale"] = quantize_int8_convrot_weight(value, 256)
+            released[module + ".comfy_quant"] = torch.tensor(list(INT8_SPEC), dtype=torch.uint8)
+            released[module.rsplit(".proj.", 1)[0] + ".comfy_attention.config"] = torch.tensor(list(b'{"attention": "comfy_kitchen_int8"}'), dtype=torch.uint8)
+        else:
+            released[key] = value
+    int8_path = str(tmp_path / "moss_image_base_int8_convrot.safetensors")
+    save_file(released, int8_path)
+    with pytest.raises(ValueError, match="full fine-tuning"):
+        moss_utils.load_dit("cpu", int8_path, "torch", False, "cpu", torch.float32)
+    model = moss_utils.load_dit("cpu", int8_path, "torch", False, "cpu", torch.float32, allow_int8_file=True)
+    assert {name for name, p in model.named_parameters() if p.dtype == torch.int8} == INT8_LAYERS
+    state = model.state_dict()
+    assert state.keys() == quantized_on_load.keys()
+    for name, tensor in state.items():
+        expected = quantized_on_load[name]
+        if tensor.dtype == torch.int8:
+            steps = (tensor.int() - expected.int()).abs()
+            assert steps.max().item() <= 1 and steps.count_nonzero().item() <= tensor.numel() // 1000, name
+        else:
+            assert torch.allclose(tensor, expected, rtol=1e-5, atol=0), name
+
+
+def test_dora_trains_on_the_int8_convrot_dit(tmp_path, monkeypatch):
+    """DoRA reads the INT8 base in its original basis; with the up matrices at zero the adapted DiT is the base, and the
+    adapter gets gradients through the INT8 layers' backward."""
+    from musubi_tuner.networks import lora_moss_image
+
+    _, path = _released_dit(tmp_path, monkeypatch)
+    model = moss_utils.load_dit("cpu", path, "torch", False, "cpu", torch.float32, convrot_int8=True)
+    x, t, ctx, mask = _inputs()
+    with torch.no_grad():
+        base = model(x, t, ctx, mask)
+    network = lora_moss_image.create_arch_network(1.0, 4, 4, None, [], model, use_dora="True")
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    out = model(x, t, ctx, mask)
+    assert torch.allclose(out, base, atol=1e-5)
+    out.square().mean().backward()
+    assert all(p.grad is not None for p in network.parameters() if p.requires_grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused ConvRot INT8 kernels run on CUDA")
+@pytest.mark.parametrize("bwd", ["bf16", "int8"])
+def test_convrot_int8_runs_the_fused_kernels_on_the_gpu(tmp_path, monkeypatch, bwd):
+    """With Triton the INT8 layers also quantize their inputs row-wise: the DiT stays within a few percent of BF16, and
+    DoRA trains through either backward."""
+    from musubi_tuner.modules.convrot_int8_kernels import HAS_TRITON
+    from musubi_tuner.networks import lora_moss_image
+
+    if not HAS_TRITON:
+        pytest.skip("no Triton")
+    reference, path = _released_dit(tmp_path, monkeypatch)
+    model = moss_utils.load_dit("cuda", path, "torch", False, "cuda", torch.bfloat16, convrot_int8=True, convrot_int8_bwd=bwd)
+    x, t, ctx, mask = (value.cuda() for value in _inputs())
+    reference = reference.cuda().to(torch.bfloat16)
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        expected, out = reference(x, t, ctx, mask).float(), model(x, t, ctx, mask).float()
+    assert ((out - expected).norm() / expected.norm()).item() < 0.05
+    network = lora_moss_image.create_arch_network(1.0, 4, 4, None, [], model, use_dora="True")
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    network.cuda()
+    with torch.autocast("cuda", torch.bfloat16):
+        model(x, t, ctx, mask).float().square().mean().backward()
+    trained = [p for p in network.parameters() if p.requires_grad]
+    assert trained and all(p.grad is not None and torch.isfinite(p.grad).all() for p in trained)
+
+
+def test_the_trainer_refuses_int8_with_fp8():
+    from musubi_tuner.moss_image_train_network import MossImageNetworkTrainer
+
+    args = argparse.Namespace(mixed_precision="bf16", sample_prompts=None, text_encoder=None, convrot_int8=True, fp8_base=True, fp8_scaled=True)
+    with pytest.raises(ValueError, match="choose one"):
+        MossImageNetworkTrainer().handle_model_specific_args(args)
+
+
 def test_sigmas_follow_the_vendor_grid():
     sigmas = moss_utils.moss_sigmas(50)
     assert sigmas[0].item() == 1.0 and sigmas[-1].item() == 0.0

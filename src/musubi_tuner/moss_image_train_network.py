@@ -48,6 +48,7 @@ class MossImageTrainerMixin:
     _control_shares = moss_control.DEFAULT_CONTROL_DROPOUT
     _caption_dropout = 0.0
     _empty_ctx: Optional[torch.Tensor] = None
+    _convrot_int8 = False
 
     # region model specific
 
@@ -73,6 +74,8 @@ class MossImageTrainerMixin:
         self.default_discrete_flow_shift = moss_utils.DEFAULT_SHIFT
         if args.sample_prompts and not args.text_encoder:
             raise ValueError("MOSS-Image: sampling needs --text_encoder (Qwen3.5-9B)")
+        if getattr(args, "convrot_int8", False) and (args.fp8_base or args.fp8_scaled):
+            raise ValueError("MOSS-Image: --convrot_int8 and --fp8_base / --fp8_scaled quantize the same weights; choose one")
         self.control_adapter = bool(getattr(args, "control_adapter", False))
         if self.control_adapter:
             self._validate_control_adapter_args(args)
@@ -209,7 +212,11 @@ class MossImageTrainerMixin:
             dit_weight_dtype=dit_weight_dtype,
             fp8_scaled=args.fp8_scaled,
             disable_numpy_memmap=args.disable_numpy_memmap,
+            convrot_int8=bool(getattr(args, "convrot_int8", False)),
+            convrot_int8_bwd=getattr(args, "convrot_int8_bwd", None) or "bf16",
+            allow_int8_file=not getattr(self, "trains_full_transformer", False),  # an INT8 file trains LoRA only
         )
+        self._convrot_int8 = bool(getattr(model, "is_convrot_int8", False))
         if self.control_adapter:
             self._control_embedder = moss_control.widen_video_embedder(model)
             self._control_module_names = moss_control.lora_module_names(model)
@@ -222,7 +229,8 @@ class MossImageTrainerMixin:
             args,
             transformer,
             [transformer.layers, transformer.text_embedder.blocks],
-            disable_linear=self.blocks_to_swap > 0,
+            # ConvRot INT8 layers run a custom autograd Function with Triton kernels, which dynamo cannot trace
+            disable_linear=self.blocks_to_swap > 0 or self._convrot_int8,
             offloaders=[transformer.offloader if self.blocks_to_swap > 0 else None, None],
         )
 
@@ -344,6 +352,22 @@ class MossImageNetworkTrainer(MossImageTrainerMixin, NetworkTrainer):
 def moss_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """MOSS-Image specific options."""
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
+    parser.add_argument(
+        "--convrot_int8",
+        action="store_true",
+        help=(
+            "LoRA: quantize the joint blocks' projections of the frozen DiT to ConvRot INT8 while loading (Hadamard rotation, "
+            "row-wise INT8: half their BF16 memory; fused Triton INT8 GEMM, a slower dequantizing fallback without Triton). "
+            "A ComfyUI INT8 ConvRot DiT file is used as it is without this option. Not combinable with FP8"
+        ),
+    )
+    parser.add_argument(
+        "--convrot_int8_bwd",
+        type=str,
+        default="bf16",
+        choices=["bf16", "int8"],
+        help="backward of the ConvRot INT8 layers: bf16 (default, a transient dequantized matmul) or int8 (the fused INT8 GEMM, faster, needs Triton)",
+    )
     parser.add_argument("--text_encoder", type=str, default=None, help="Qwen3.5-9B ComfyUI file, needed for sampling")
     parser.add_argument(
         "--low_vram_text_encoding",

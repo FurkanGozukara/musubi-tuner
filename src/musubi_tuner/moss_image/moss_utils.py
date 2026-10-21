@@ -2,7 +2,8 @@
 
 * DiT: the ComfyUI single files of Comfy-Org/MOSS-Image (``moss_image_base_bf16`` / ``moss_image_sft_bf16``, the
   vendor's keys with each block's q / k / v fused into ``proj.qkv``) or the vendor's split layout; both load into
-  ``moss_model.MossImage`` with q / k / v split. The INT8 ConvRot repacks are inference files.
+  ``moss_model.MossImage`` with q / k / v split. LoRA training can keep the blocks' projections in ConvRot INT8: the
+  INT8 ConvRot files as they are, or the BF16 file quantized while loading (``--convrot_int8``, as kohya's sd-scripts).
 * VAE: the FLUX.2 VAE (``flux2_utils.load_ae``): MOSS-Image's latents are its packed, BatchNorm-normalized 128 channels
   at 1/16, so FLUX.2's latent caching is reused.
 * Text: Qwen3.5-9B's language tower (``Qwen3_5TextModel``, the vendor's text encoder without the vision tower: text-only
@@ -31,6 +32,14 @@ from torch import Tensor
 from tqdm import tqdm
 
 from musubi_tuner.flux_2.flux2_utils import load_ae  # noqa: F401  (the FLUX.2 VAE is MOSS-Image's VAE)
+from musubi_tuner.modules.comfy_quant_utils import COMFY_QUANT_SUFFIX, COMFY_WEIGHT_SCALE_SUFFIX
+from musubi_tuner.modules.convrot_int8_utils import (
+    CONVROT_GROUPSIZE,
+    apply_convrot_int8_monkey_patch,
+    canonicalize_convrot_int8_key,
+    parse_comfy_quant_spec,
+    quantize_weight_convrot,
+)
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 from musubi_tuner.modules.int8_convrot_utils import dequantize_int8_convrot_weight, parse_comfy_quant_tensor
 from musubi_tuner.moss_image import moss_model
@@ -39,6 +48,9 @@ from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# a uint8 JSON tensor per block in Comfy-Org's INT8 ConvRot DiT files: ComfyUI's attention backend for the block
+COMFY_ATTENTION_CONFIG_SUFFIX = ".comfy_attention.config"
 
 # pinned (Guardrail 6): the vendor tokenizer (its chat template equals Qwen3.5-9B's)
 MOSS_TOKENIZER_REPO = "OpenMOSS-Team/MOSS-Image-SFT"
@@ -92,17 +104,72 @@ DEFAULT_UNCOND_SKIP_LAYERS = (22,)
 
 
 # ---------------------------------------------------------------------------------------------------------------- DiT
-def check_dit_checkpoint(dit_path: str) -> None:
-    """Refuse files that cannot train as the MOSS-Image DiT, with the reason."""
+def check_dit_checkpoint(dit_path: str, allow_int8: bool = False) -> bool:
+    """Refuse files that cannot train as the MOSS-Image DiT, with the reason. True for a ComfyUI INT8 ConvRot file,
+    which only LoRA training takes (``allow_int8``: its INT8 layers are used as they are)."""
     with safe_open(dit_path, framework="pt") as handle:
         keys = list(handle.keys())
     if "shared_block_modulation.weight" not in keys or not any(k.startswith("layers.0.proj.") for k in keys):
         raise ValueError(f"{dit_path} is not a MOSS-Image DiT checkpoint (no shared_block_modulation / layers.N.proj)")
-    if any(k.endswith((".comfy_quant", ".weight_scale", ".input_scale")) for k in keys):
+    if not any(k.endswith((COMFY_QUANT_SUFFIX, COMFY_WEIGHT_SCALE_SUFFIX, ".input_scale")) for k in keys):
+        return False
+    if not allow_int8:
         raise ValueError(
-            f"{dit_path} is a pre-quantized MOSS-Image file (INT8 ConvRot), an inference file. Train on the BF16 file "
-            "(moss_image_base_bf16.safetensors or moss_image_sft_bf16.safetensors) and use FP8 Scaled for lower memory."
+            f"{dit_path} is a pre-quantized MOSS-Image file (INT8 ConvRot): full fine-tuning trains the BF16 file "
+            "(moss_image_base_bf16.safetensors or moss_image_sft_bf16.safetensors). LoRA training takes both."
         )
+    if any(k.endswith(".input_scale") for k in keys) or not any(k.endswith(COMFY_QUANT_SUFFIX) for k in keys):
+        raise ValueError(f"{dit_path} is a pre-quantized MOSS-Image file of another format: only INT8 ConvRot files train")
+    return True
+
+
+def is_convrot_int8_target(key: str) -> bool:
+    """The layers ConvRot INT8 quantizes: the six projections of the 42 joint blocks (q / k / v / o, ffn_up_gate,
+    ffn_down), the layers Comfy-Org's INT8 files hold in INT8 (their q / k / v fused) and kohya's sd-scripts quantizes.
+    The text refiner, the embedders, the modulations and the head stay BF16."""
+    return key.startswith("layers.") and ".proj." in key and key.endswith(".weight")
+
+
+def convrot_int8_state_dict(sd: dict, device: torch.device, dtype: Optional[torch.dtype], quantize: bool, keep_on_device: bool) -> dict:
+    """In place: ``sd`` (q / k / v split) in musubi's ConvRot INT8 layout, the ``.weight`` INT8 in the rotated basis
+    with its FP32 [N, 1] ``.scale_weight``; returns each INT8 layer's group size for ``apply_convrot_int8_monkey_patch``.
+
+    An INT8 ConvRot file's layers are kept as they are (``.weight_scale`` renamed, the group size from ``.comfy_quant``).
+    ``quantize`` turns the other BF16 targets into ConvRot INT8 on ``device`` (Hadamard groups of 256, row-wise scales:
+    Comfy-Org's files hold the same values for the same BF16 weights). Every other floating-point tensor gets ``dtype``;
+    ``keep_on_device`` keeps the quantized layers on ``device`` (no block swap)."""
+    groupsizes = {}
+    for key in [k for k in sd if k.endswith(COMFY_ATTENTION_CONFIG_SUFFIX)]:
+        del sd[key]  # ComfyUI's attention backend for the block ({"attention": "comfy_kitchen_int8"}), not a weight
+    for key in [k for k in sd if k.endswith(COMFY_QUANT_SUFFIX)]:
+        spec = parse_comfy_quant_spec(key, sd.pop(key))
+        groupsizes[key[: -len(COMFY_QUANT_SUFFIX)]] = spec["convrot_groupsize"]
+    for key in [k for k in sd if k.endswith(COMFY_WEIGHT_SCALE_SUFFIX)]:
+        sd[canonicalize_convrot_int8_key(key)] = sd.pop(key).float()
+    for module, groupsize in groupsizes.items():
+        weight, scale = sd.get(module + ".weight"), sd.get(module + ".scale_weight")
+        if weight is None or scale is None or weight.dtype != torch.int8 or tuple(scale.shape) != (weight.shape[0], 1):
+            raise ValueError(f"MOSS-Image INT8 layer {module}: expected an int8 weight with an FP32 [rows, 1] weight_scale")
+        if weight.shape[1] % groupsize:
+            raise ValueError(f"MOSS-Image INT8 layer {module}: {weight.shape[1]} inputs do not divide into ConvRot groups of {groupsize}")
+    target = device if keep_on_device else torch.device("cpu")
+    for key in list(sd):
+        value = sd[key]
+        module = key[: -len(".weight")] if key.endswith(".weight") else None
+        if module in groupsizes or key.endswith(".scale_weight"):
+            continue
+        if module is not None and value.dtype.itemsize == 1:
+            raise ValueError(f"MOSS-Image DiT weight {key} is {value.dtype} without an INT8 ConvRot spec")
+        if quantize and is_convrot_int8_target(key):
+            result = quantize_weight_convrot(key, value.to(device), (CONVROT_GROUPSIZE,))
+            if result is not None:
+                weight, scale, groupsize = result
+                sd[key], sd[module + ".scale_weight"] = weight.to(target), scale.to(target)
+                groupsizes[module] = groupsize
+                continue
+        if dtype is not None and value.is_floating_point():
+            sd[key] = value.to(dtype)
+    return groupsizes
 
 
 def load_dit(
@@ -114,10 +181,20 @@ def load_dit(
     dit_weight_dtype: Optional[torch.dtype] = None,
     fp8_scaled: bool = False,
     disable_numpy_memmap: bool = False,
+    convrot_int8: bool = False,
+    convrot_int8_bwd: str = "bf16",
+    allow_int8_file: bool = False,
 ) -> moss_model.MossImage:
+    """The MOSS-Image DiT. ``convrot_int8`` quantizes the joint blocks' projections to ConvRot INT8 while loading;
+    ``allow_int8_file`` (LoRA training) takes a ComfyUI INT8 ConvRot file, whose INT8 layers are used as they are. The
+    INT8 layers keep their nn.Linear modules with a patched forward (fused Triton INT8 GEMM, a dequantizing fallback
+    without Triton) and the model is frozen: INT8 weights cannot require gradients."""
     # dit_weight_dtype is None for fp8_scaled
     assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
-    check_dit_checkpoint(dit_path)
+    int8_file = check_dit_checkpoint(dit_path, allow_int8=allow_int8_file)
+    use_int8 = convrot_int8 or int8_file
+    if use_int8 and (fp8_scaled or dit_weight_dtype.itemsize == 1):
+        raise ValueError("MOSS-Image: ConvRot INT8 and FP8 are two quantizations of the same weights; choose one (FP8 Base / Scaled off)")
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
@@ -126,10 +203,17 @@ def load_dit(
         if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
 
-    logger.info(f"Loading MOSS-Image DiT from {dit_path}, device={loading_device}")
-    # q / k / v are split before any FP8 scaling, so every projection gets its own scales
-    sd = load_safetensors(dit_path, device="cpu", disable_mmap=True, dtype=dit_weight_dtype, disable_numpy_memmap=disable_numpy_memmap)
+    logger.info(f"Loading MOSS-Image DiT from {dit_path}, device={loading_device}" + (" (ConvRot INT8)" if use_int8 else ""))
+    # q / k / v are split before any FP8 scaling, so every projection gets its own scales; an INT8 file is read as stored
+    load_dtype = None if use_int8 else dit_weight_dtype
+    sd = load_safetensors(dit_path, device="cpu", disable_mmap=True, dtype=load_dtype, disable_numpy_memmap=disable_numpy_memmap)
     moss_model.split_fused_qkv(sd)
+    if use_int8:
+        groupsizes = convrot_int8_state_dict(sd, device, dit_weight_dtype, quantize=convrot_int8, keep_on_device=loading_device == device)
+        apply_convrot_int8_monkey_patch(model, sd, bwd_mode=convrot_int8_bwd, groupsize_map=groupsizes)
+        # load_state_dict(assign=True) gives the loaded tensors the placeholders' requires_grad, and INT8 cannot have it
+        model.requires_grad_(False)
+        print(f"MOSS-Image: {len(groupsizes)} block projections in ConvRot INT8 (backward {convrot_int8_bwd})")
     if fp8_scaled:
         sd = optimize_state_dict_with_fp8(
             sd,
