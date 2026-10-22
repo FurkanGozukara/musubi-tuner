@@ -272,6 +272,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
         ),
     )
+    parser.add_argument(
+        "--low_vram_text_encoding",
+        action="store_true",
+        help=(
+            "Text encoding during training (sample prompts) keeps the Gemma embedding table, the text projection and "
+            "the connectors in CPU RAM and moves each to the GPU only while it runs, as text caching's "
+            "--low_vram_text_encoding does: the 12 GB LoRA preset drew its samples at 8.5 instead of 11.7 GB allocated, "
+            "the same video, with a few GB of extra host-to-device copies per sample."
+        ),
+    )
 
     parser.add_argument(
         "--ltx2_mode",

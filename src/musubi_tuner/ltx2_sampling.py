@@ -916,6 +916,7 @@ class LTX2SamplingMixin:
         )
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
             apply_text_encoder_checkpoint_overrides,
+            enable_low_vram_text_encoding,
             module_ops_from_gemma_root,
         )
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
@@ -940,6 +941,9 @@ class LTX2SamplingMixin:
 
         build_device = accelerator.device
         is_quantized_load = getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)
+        # as text caching's --low_vram_text_encoding: the projection and connectors are built in CPU RAM and, with the
+        # embedding table, moved to the GPU per forward (the 10-12 GB LTX-2.3 presets drew samples at 11.6 GB without it)
+        low_vram = bool(getattr(args, "low_vram_text_encoding", False)) and build_device.type == "cuda"
         bnb_device_map = None
         if is_quantized_load and bool(getattr(args, "gemma_bnb_use_local_rank", False)):
             local_rank = int(os.environ.get("LOCAL_RANK", getattr(accelerator, "local_process_index", 0) or 0))
@@ -964,7 +968,7 @@ class LTX2SamplingMixin:
                 fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
                 device=build_device,
             ),
-        ).build(device=build_device, dtype=text_encoder_dtype)
+        ).build(device=torch.device("cpu") if low_vram else build_device, dtype=text_encoder_dtype)
         text_model = getattr(self._text_encoder, "model", None)
         is_quantized = False
         if text_model is not None:
@@ -972,7 +976,10 @@ class LTX2SamplingMixin:
                 getattr(text_model, "is_loaded_in_4bit", False)
             )
         is_fp8 = bool(getattr(self._text_encoder, "_has_fp8_model", False))
-        if not is_quantized and not is_fp8 and accelerator.device.type != "cpu":
+        if low_vram:
+            managed = enable_low_vram_text_encoding(self._text_encoder, build_device)
+            logger.info("Low-VRAM text encoding: %s stay in CPU RAM and move to the GPU only while they run", ", ".join(managed))
+        elif not is_quantized and not is_fp8 and accelerator.device.type != "cpu":
             self._text_encoder.to(accelerator.device)
         text_model = getattr(self._text_encoder, "model", None)
         if text_model is not None:

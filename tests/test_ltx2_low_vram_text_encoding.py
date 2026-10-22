@@ -99,3 +99,50 @@ def test_low_vram_encoding_keeps_weights_in_cpu_ram_between_forwards():
     assert torch.equal(encoder(input_ids), expected)
     assert encoder.model.norm.weight.device.type == "cuda"  # unmanaged Gemma weights stay where they run
     assert all(param.device.type == "cpu" for param in encoder.embeddings_connector.parameters())
+
+
+class _RecordingBuilder:
+    """Stands in for SingleGPUModelBuilder: records where the text encoder bundle is built."""
+
+    built_on: list = []
+
+    def __init__(self, **kwargs):
+        pass
+
+    def build(self, device, dtype):
+        _RecordingBuilder.built_on.append(torch.device(device))
+        return _TinyVideoEncoder()
+
+
+@pytest.mark.parametrize("low_vram", [False, True])
+def test_training_sample_prompts_encode_like_low_vram_text_caching(monkeypatch, low_vram):
+    """--low_vram_text_encoding in training: the sample prompts' text encoder is built in CPU RAM and streamed per
+    module, as in text caching (the 10 / 12 GB LTX-2.3 LoRA presets drew their samples at 11.6 GB without it)."""
+    from types import SimpleNamespace
+
+    from musubi_tuner import ltx2_sampling
+    from musubi_tuner.ltx_2.loader import single_gpu_model_builder, sft_loader
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders import base_encoder
+
+    _RecordingBuilder.built_on = []
+    streamed = []
+    monkeypatch.setattr(single_gpu_model_builder, "SingleGPUModelBuilder", _RecordingBuilder)
+    monkeypatch.setattr(sft_loader, "in_process_checkpoint_loader", lambda: None)
+    monkeypatch.setattr(base_encoder, "module_ops_from_gemma_root", lambda *args, **kwargs: ())
+    monkeypatch.setattr(base_encoder, "apply_text_encoder_checkpoint_overrides", lambda *args: None)
+    monkeypatch.setattr(base_encoder, "enable_low_vram_text_encoding", lambda encoder, device: streamed.append(torch.device(device)) or ["Gemma embeddings"])
+
+    class _Sampler(ltx2_sampling.LTX2SamplingMixin):
+        _audio_video = False
+
+        def __init__(self):
+            self._text_encoder = None
+
+    sampler = _Sampler()
+    sampler._text_encoder = None
+    args = SimpleNamespace(gemma_safetensors="gemma_fp8.safetensors", gemma_root=None, ltx2_checkpoint="ltx.safetensors", low_vram_text_encoding=low_vram)
+    accelerator = SimpleNamespace(device=torch.device("cuda"), mixed_precision="bf16")  # read as CUDA, never used as one
+    monkeypatch.setattr(_TinyVideoEncoder, "to", lambda self, device: self)  # the plain path moves the bundle to the GPU
+    assert sampler._build_text_encoder(args, accelerator) == torch.bfloat16
+    assert _RecordingBuilder.built_on == [torch.device("cpu") if low_vram else torch.device("cuda")]
+    assert streamed == ([torch.device("cuda")] if low_vram else [])
