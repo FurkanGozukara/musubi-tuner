@@ -1088,6 +1088,10 @@ class LTX2SamplingMixin:
         distributed_state = PartialState()  # for multi gpu distributed inference
 
         transformer = accelerator.unwrap_model(transformer)
+        # before the first move: a classic block swap finishes its transfers there
+        sampling_swap = transformer.begin_sampling_block_swap() if hasattr(transformer, "begin_sampling_block_swap") else []
+        if sampling_swap:
+            logger.info("Sampling block swap: %s (training's setup comes back after sampling)", ", ".join(sampling_swap))
         original_device = next(transformer.parameters()).device
         offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
@@ -1384,6 +1388,8 @@ class LTX2SamplingMixin:
             logger.info("Sampling offload: restored transformer to training device")
             clean_memory_on_device(accelerator.device)
 
+        if hasattr(transformer, "end_sampling_block_swap"):
+            transformer.end_sampling_block_swap()
         # Leaving inference mode first also finishes the block transfers still in flight before any block moves.
         transformer.switch_block_swap_for_training()
         # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep. The move rebinds the weights a

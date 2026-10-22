@@ -681,6 +681,84 @@ class LTXModel(torch.nn.Module):
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
 
+    def begin_sampling_block_swap(self) -> list[str]:
+        """Set the blocks up for sampling during training, which keeps no activations and changes no weights.
+
+        Activation CPU offload moves each block's weights to the CPU at the end of its forward, in inference too, and
+        the classic block swap copies every block it is done with back to the CPU, where an identical copy of a frozen
+        weight could stay. For the sampling the blocks keep their weights, and a classic swap over frozen weights
+        streams H2D-only (the 8 GB LTX-2.3 LoRA preset does both in training). ``end_sampling_block_swap`` restores
+        the training's setup. Returns what changed.
+        """
+        if getattr(self, "_sampling_swap_state", None) is not None:
+            return []
+        offloaded = [block for block in self.transformer_blocks if getattr(block, "activation_cpu_offloading", False)]
+        for block in offloaded:
+            block.activation_cpu_offloading = False
+        state = {"offloaded": offloaded, "classic": None}
+        changes = ["activation CPU offload off"] if offloaded else []
+        classic = self.offloader if type(self.offloader) is LTX2ModelOffloader else None
+        linears = [
+            module for block in self.transformer_blocks for module in block.modules() if module.__class__.__name__.endswith("Linear")
+        ]
+        if (
+            classic is not None
+            and self.blocks_to_swap
+            and getattr(self, "swap_mode", "default") == "default"
+            and classic.device.type == "cuda"
+            and not any(getattr(module, "weight", None) is not None and module.weight.requires_grad for module in linears)
+        ):
+            classic.set_forward_only(True)  # waits for the transfers still in flight
+            state["classic"] = classic
+            state["ltx2_block_swap"] = getattr(self, "_ltx2_block_swap", None)
+            # what enable_block_swap sets per block and per Linear; their readers default to None / False
+            state["attributes"] = [
+                (block, name, getattr(block, name, default))
+                for block in self.transformer_blocks
+                for name, default in (("_h2d_stream_offloader_ref", None), ("swap_weight_offload", False))
+            ] + [
+                (module, name, getattr(module, name, False))
+                for module in linears
+                for name in ("_h2d_stream_managed", "swap_weight_offload")
+            ]
+            self.enable_block_swap(
+                self.blocks_to_swap,
+                BlockSwapConfig(
+                    device=classic.device,
+                    supports_backward=False,
+                    use_pinned_memory=bool(classic.use_pinned_memory),
+                    h2d_only=True,
+                ),
+            )
+            changes.append("classic block swap streamed H2D-only")
+        if changes:
+            self._sampling_swap_state = state
+        return changes
+
+    def end_sampling_block_swap(self) -> None:
+        """Put back what ``begin_sampling_block_swap`` changed; the caller places the blocks for training afterwards."""
+        state = getattr(self, "_sampling_swap_state", None)
+        if state is None:
+            return
+        self._sampling_swap_state = None
+        for block in state["offloaded"]:
+            block.activation_cpu_offloading = True
+        classic = state["classic"]
+        if classic is None:
+            return
+        stream = self.offloader
+        if getattr(stream, "ring_param", None) is not None:
+            # the blocks bound to the ring go back to their CPU masters, which are the original Parameters
+            stream.copier.sync()
+            for block_idx in stream.in_slot:
+                if block_idx is not None:
+                    stream._bind(block_idx, stream.cpu_master[block_idx])
+            stream.in_slot = [None] * stream.B
+        self.offloader = classic
+        self._ltx2_block_swap = state["ltx2_block_swap"]
+        for obj, name, value in state["attributes"]:
+            setattr(obj, name, value)
+
     def synchronize_block_swap(self) -> None:
         if self.offloader is not None and hasattr(self.offloader, "synchronize"):
             self.offloader.synchronize()

@@ -169,7 +169,7 @@ class _Sampler(LTX2SamplingMixin):
         pass
 
 
-def _sample(tmp_path, monkeypatch, *, transformer_device: str, offload: bool) -> list:
+def _sample(tmp_path, monkeypatch, *, transformer_device: str, offload: bool, transformer_cls=_RecordingTransformer) -> list:
     monkeypatch.setattr(ltx2_sampling, "should_sample_images", lambda *args: True)
     monkeypatch.setattr(ltx2_sampling, "clean_memory_on_device", lambda device: None)
     log = []
@@ -184,7 +184,7 @@ def _sample(tmp_path, monkeypatch, *, transformer_device: str, offload: bool) ->
     # the offloading path runs on CUDA only; the device just has to read as one
     accelerator = _Accelerator("cuda" if offload else "cpu")
     prompts = [{"prompt_embeds": torch.zeros(1), "cfg_scale": 1.0} for _ in range(2)]
-    transformer = _RecordingTransformer(log, transformer_device)
+    transformer = transformer_cls(log, transformer_device)
     _Sampler(log).sample_images(accelerator, args, 1, 10, None, transformer, prompts, torch.float32)
     return log
 
@@ -217,6 +217,26 @@ def test_offloaded_sampling_prepares_the_block_ring_after_each_move_to_the_gpu(t
 
     assert log.count(("sample",)) == 2
     assert log.count(("move", "cpu")) >= 3  # before the prompt loop and after every prompt
+    _assert_ring_prepared_after_every_move(log)
+
+
+class _SwitchingTransformer(_RecordingTransformer):
+    def begin_sampling_block_swap(self):
+        self.log.append(("begin",))
+        return ["classic block swap streamed H2D-only"]
+
+    def end_sampling_block_swap(self):
+        self.log.append(("end",))
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_sampling_switches_the_block_swap_before_the_first_move_and_back_before_training(tmp_path, monkeypatch, offload):
+    log = _sample(tmp_path, monkeypatch, transformer_device="cuda", offload=offload, transformer_cls=_SwitchingTransformer)
+
+    assert log[0] == ("begin",)  # a classic swap finishes its transfers before anything moves
+    end = log.index(("end",))
+    assert log.count(("sample",)) == 2 and ("sample",) not in log[end:]
+    assert log[end + 1] == ("prepare", "training")
     _assert_ring_prepared_after_every_move(log)
 
 
@@ -440,3 +460,101 @@ def _assert_h2d_layout(model: LTXModel) -> None:
                     continue
                 expected = "cpu" if (id(module), name) in swap and not in_ring else "cuda"
                 assert tensor.device.type == expected, (idx, type(module).__name__, name)
+
+
+# ---------------------------------------------------------------- sampling over a classic swap
+# The 8 GB LTX-2.3 LoRA preset trains with the classic swap and activation CPU offload, which moves every block's
+# weights to the CPU after its forward, in inference too: its training samples took over a minute per sampling step.
+# Sampling streams such a swap H2D-only and keeps the weights in place, then restores the training's setup.
+
+
+def _classic_ltx(monkeypatch, num_layers: int = 4, blocks_to_swap: int = 2) -> LTXModel:
+    if not torch.cuda.is_available():  # the classic offloader opens a CUDA stream; here the device only reads as CUDA
+        monkeypatch.setattr(torch.cuda, "Stream", lambda *args, **kwargs: None)
+    model = _tiny_ltx(num_layers)
+    model.enable_gradient_checkpointing(activation_cpu_offloading=True)
+    model.enable_block_swap(blocks_to_swap, BlockSwapConfig(device=torch.device("cuda"), supports_backward=True))
+    return model
+
+
+def _swap_attributes(model: LTXModel) -> list:
+    return [
+        (block._h2d_stream_offloader_ref, block.swap_weight_offload, block.activation_cpu_offloading)
+        + tuple((getattr(module, "_h2d_stream_managed", False), module.swap_weight_offload) for module in _linears(block))
+        for block in model.transformer_blocks
+    ]
+
+
+def test_sampling_streams_a_classic_swap_h2d_only_and_restores_it(recording_copier, monkeypatch):
+    model = _classic_ltx(monkeypatch)
+    classic = model.offloader
+    training = _swap_attributes(model)
+    weights = {id(module): module.weight for block in model.transformer_blocks for module in _linears(block)}
+    values = {key: weight.detach().clone() for key, weight in weights.items()}
+
+    assert model.begin_sampling_block_swap() == ["activation CPU offload off", "classic block swap streamed H2D-only"]
+    assert model.begin_sampling_block_swap() == []  # already set up for sampling
+    stream = model.offloader
+    assert isinstance(stream, LoRAStreamOffloader) and stream.forward_only
+    assert not any(block.activation_cpu_offloading for block in model.transformer_blocks)
+    for idx, block in enumerate(model.transformer_blocks):
+        assert all(module._h2d_stream_managed == (idx in stream.stream_idx) for module in _linears(block))
+    stream.device = torch.device("cpu")  # the CPU stands in for the GPU
+    model.switch_block_swap_for_inference()
+    assert any(block_idx is not None for block_idx in stream.in_slot)  # streamed blocks bound to the ring
+
+    model.end_sampling_block_swap()
+
+    assert model.offloader is classic
+    assert _swap_attributes(model) == training
+    for block in model.transformer_blocks:
+        for module in _linears(block):
+            assert module.weight is weights[id(module)]  # the Parameters LoRA and the optimizer know
+            assert torch.equal(module.weight, values[id(module)])
+
+
+def test_sampling_keeps_the_classic_swap_of_a_trainable_base(recording_copier, monkeypatch):
+    model = _classic_ltx(monkeypatch)
+    _linears(model.transformer_blocks[3])[0].weight.requires_grad_(True)  # full fine-tuning: no H2D-only stream
+    classic = model.offloader
+
+    assert model.begin_sampling_block_swap() == ["activation CPU offload off"]
+    assert model.offloader is classic
+    model.end_sampling_block_swap()
+    assert all(block.activation_cpu_offloading for block in model.transformer_blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the block offloaders")
+@pytest.mark.parametrize("offload", [False, True])
+def test_cuda_sampling_over_a_classic_swap_restores_its_layout(monkeypatch, offload):
+    device = torch.device("cuda")
+    model = _classic_ltx(monkeypatch, num_layers=6, blocks_to_swap=4)
+    model.move_to_device_except_swap_blocks(device)
+    model.prepare_block_swap_before_forward()
+    weights = {id(module): module.weight for block in model.transformer_blocks for module in _linears(block)}
+    values = {key: weight.detach().cpu().clone() for key, weight in weights.items()}
+
+    # LTX2SamplingMixin.sample_images, with --sample_with_offloading and one prompt or without
+    model.begin_sampling_block_swap()
+    if offload:
+        model.to("cpu")  # before the prompt loop
+        model.move_to_device_except_swap_blocks(device)  # for the denoise
+        model.switch_block_swap_for_inference()
+        model.move_to_device_except_swap_blocks(torch.device("cpu"))  # for the VAE decode
+        model.to("cpu")  # after the prompt
+        model.move_to_device_except_swap_blocks(device)  # back on the training device
+    else:
+        model.switch_block_swap_for_inference()
+    model.end_sampling_block_swap()
+    model.switch_block_swap_for_training()
+    model.move_to_device_except_swap_blocks(device)
+    model.prepare_block_swap_before_forward()
+    torch.cuda.synchronize()
+
+    assert type(model.offloader).__name__ == "LTX2ModelOffloader"
+    for idx, block in enumerate(model.transformer_blocks):
+        assert block.activation_cpu_offloading
+        for module in _linears(block):
+            assert module.weight is weights[id(module)]
+            assert torch.equal(module.weight.detach().cpu(), values[id(module)])
+            assert module.weight.device.type == ("cuda" if idx < 2 else "cpu")  # the classic layout: 4 swapped
