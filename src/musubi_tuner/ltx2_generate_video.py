@@ -1019,11 +1019,15 @@ def _build_prompt_list(
         args.sample_num_frames = args.frame_count
         prompts = trainer.process_sample_prompts(args, accelerator, args.sample_prompts) or []
         # Forward CLI generation params into file prompts.
-        for _p in prompts:
+        for prompt_index, _p in enumerate(prompts):
             if isinstance(_p, dict):
                 _p["frame_count"] = args.frame_count
                 _p["frame_rate"] = args.frame_rate
                 _p["sample_steps"] = args.sample_steps
+                # --seed seeds the file's prompts that name no seed of their own (seed + prompt index); without
+                # --seed every prompt keeps its own (akane bc8a2328 added None + index, a TypeError without --seed)
+                if args.seed is not None and _p.get("seed") is None:
+                    _p["seed"] = args.seed + prompt_index
                 if getattr(args, "guidance_scale", None) is not None:
                     _p["guidance_scale"] = args.guidance_scale
                 if getattr(args, "height", None) is not None:
