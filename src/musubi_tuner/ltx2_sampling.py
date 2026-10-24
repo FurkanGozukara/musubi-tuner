@@ -94,11 +94,15 @@ def _vae_tiling_config(
 
             factors = _video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors)
             frames, height, width = (int(v) for v in latents.shape[-3:])
-            return vae.recommended_tiling_config(
-                height=height * int(factors.height),
-                width=width * int(factors.width),
-                num_frames=(frames - 1) * int(factors.time) + 1,
-            )
+            try:
+                return vae.recommended_tiling_config(
+                    height=height * int(factors.height),
+                    width=width * int(factors.width),
+                    num_frames=(frames - 1) * int(factors.time) + 1,
+                )
+            except ValueError as exc:
+                # the planner budgets free CUDA memory: a VAE on the CPU (or a full GPU) gets the configured tiles
+                logger.warning("DiffVAE auto tiling unavailable (%s); using %dpx tiles with %dpx overlap", exc, tile_size, tile_overlap)
         from musubi_tuner.ltx_2.tiling import DimensionSizeConfig, TileSizeConfig
 
         frames_config = (
