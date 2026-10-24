@@ -1342,7 +1342,13 @@ class LTX2Inferencer:
             ltx_version = tuple(int(part) for part in str(config.ltx_version).split(".")[:2])
         except ValueError:
             ltx_version = (0, 0)
-        use_ltx25_ancestral = config.two_stage and (ltx_version >= (2, 5) or config.sampling_preset == "ltx25")
+        # the official LTX-2.5 distilled pipeline's first stage is Euler ancestral; a run that resolved another sampler
+        # (e.g. res_2s for ltx25_full) keeps it instead of failing on the ancestral step's Euler requirement
+        use_ltx25_ancestral = (
+            config.two_stage
+            and (ltx_version >= (2, 5) or config.sampling_preset == "ltx25")
+            and resolved_sampler == "euler"
+        )
 
         with torch.no_grad():
             latents, audio_latents = self._denoise_loop(
