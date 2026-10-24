@@ -246,6 +246,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Path to a single Gemma safetensors file (for example, an fp8 export). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
+        "--ltx2_text_encoder_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "LTX-2.5 split pack: the packed Gemma 4 text encoder + projection file (gemma4-12b-with-proj-ltx-2.5-bf16."
+            "safetensors) the sample prompts are encoded with. Defaults to --ltx2_checkpoint (unified checkpoints)."
+        ),
+    )
+    parser.add_argument(
         "--gemma_load_in_8bit",
         action="store_true",
         help="Load Gemma LLM in 8-bit (bitsandbytes). CUDA only.",
