@@ -9,6 +9,8 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import shutil
+import subprocess
 import wave
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -1620,8 +1622,80 @@ def save_audio_wav(path: str, audio: torch.Tensor, sample_rate: int) -> None:
         wav.writeframes(interleaved)
 
 
-def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
-    """Mux video and audio files into a single file."""
+def find_ffmpeg_executable() -> Optional[str]:
+    """An FFmpeg executable: the one on PATH, else imageio-ffmpeg's bundled binary when that package is installed."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return None
+
+
+def mux_video_audio_ffmpeg(ffmpeg: str, video_path: str, audio_path: str, output_path: str) -> bool:
+    """Copy the encoded video stream and add the audio as AAC (no video re-encode). True when FFmpeg succeeded."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    command = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            # no console window for the helper process on Windows
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        logger.warning("Unable to run FFmpeg for audio/video muxing: %s", exc)
+        return False
+    if result.returncode != 0:
+        logger.warning("FFmpeg audio/video mux failed (%s); re-encoding with PyAV instead", (result.stderr or "").strip()[-500:])
+        return False
+    return os.path.exists(output_path)
+
+
+def mux_video_audio(video_path: str, audio_path: str, output_path: str, *, pyav_fallback=None) -> None:
+    """Mux video and audio files into a single file.
+
+    With an FFmpeg executable the already encoded video bitstream is copied unchanged (AkaneTendo25 d91b8753: the
+    PyAV path decodes and re-encodes the video, which costs quality). Without FFmpeg, or when it fails, the previous
+    PyAV re-encode runs (``pyav_fallback`` replaces it, e.g. the training sampler's own PyAV muxer).
+    """
+    if not os.path.exists(video_path) or not os.path.exists(audio_path):
+        return
+    ffmpeg = find_ffmpeg_executable()
+    if ffmpeg is not None and mux_video_audio_ffmpeg(ffmpeg, video_path, audio_path, output_path):
+        return
+    (pyav_fallback or mux_video_audio_pyav)(video_path, audio_path, output_path)
+
+
+def mux_video_audio_pyav(video_path: str, audio_path: str, output_path: str) -> None:
+    """Mux video and audio files into a single file with PyAV (re-encodes the video with libx264)."""
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
         return
 

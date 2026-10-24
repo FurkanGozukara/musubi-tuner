@@ -25,7 +25,7 @@ from accelerate import Accelerator, PartialState
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
-from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig
+from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig, mux_video_audio
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
 from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
 from musubi_tuner.training.sampling_prompts import load_prompts, should_sample_images
@@ -456,6 +456,12 @@ class LTX2SamplingMixin:
 
     @staticmethod
     def _mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
+        # FFmpeg copies the encoded video stream when it is available (AkaneTendo25 d91b8753); otherwise the previous
+        # PyAV re-encode below runs, so a machine without FFmpeg writes the same files as before
+        mux_video_audio(video_path, audio_path, output_path, pyav_fallback=LTX2SamplingMixin._mux_video_audio_pyav)
+
+    @staticmethod
+    def _mux_video_audio_pyav(video_path: str, audio_path: str, output_path: str) -> None:
         if not os.path.exists(video_path) or not os.path.exists(audio_path):
             return
         try:
