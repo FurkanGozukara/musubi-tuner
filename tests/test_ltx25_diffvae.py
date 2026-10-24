@@ -215,3 +215,22 @@ def test_ltx25_video_encoder_config_layout_builds_the_conv_encoder(tmp_path):
     video = torch.rand(1, 3, 9, 32, 32) * 2 - 1
     with torch.no_grad():
         assert torch.allclose(encoder(video), reference(video), atol=1e-6)
+
+
+def test_diffvae_defaults_to_bfloat16_without_an_explicit_vae_dtype(tmp_path):
+    from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
+
+    reference = _decoder()
+    path = tmp_path / "ltx-2.5-tiny-video-vae.safetensors"
+    save_file(
+        _release_state_dict(reference, torch.ones(reference.diff_blocks[0].attn.proj.weight.shape[0])),
+        str(path),
+        metadata={"config": json.dumps({"vae": TINY_VAE_CONFIG})},
+    )
+    trainer = LTX2NetworkTrainer.__new__(LTX2NetworkTrainer)
+    trainer._latent_norm_cache = {}
+    # the trainers' default (no --vae_dtype) is FP16, meant for the convolutional VAE
+    vae = trainer._load_vae_impl(SimpleNamespace(vae_dtype=None), torch.float16, str(path))
+    assert vae.dtype == torch.bfloat16
+    vae = trainer._load_vae_impl(SimpleNamespace(vae_dtype="float16"), torch.float16, str(path))
+    assert vae.dtype == torch.float16

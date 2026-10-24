@@ -4712,6 +4712,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             decoder_configurator = DiffusionVideoDecoderConfigurator
             decoder_sd_ops = video_decoder_sd_ops_for_checkpoint(str(vae_path), diffusion_vae=True)
             logger.info("Using the LTX-2.5 diffusion video decoder")
+            if vae_dtype == torch.float16 and getattr(args, "vae_dtype", None) is None:
+                # the transformer-based DiffVAE runs in BF16 / FP32 (ComfyUI's working dtypes); FP16 is only the
+                # trainers' default for the convolutional VAE, an explicit --vae_dtype still wins
+                vae_dtype = torch.bfloat16
+                logger.info("LTX-2.5 DiffVAE: decoding in bfloat16 (pass --vae_dtype to choose another dtype)")
 
         class _LTX2VideoVAE(torch.nn.Module):
             def __init__(self, decoder: torch.nn.Module):
