@@ -232,3 +232,59 @@ def test_lora_and_dora_train_the_bias_free_ltx25_feed_forward(network_args):
     state = network.state_dict()
     if network_args.get("dora_axis") == "input":
         assert all(f"{lora.lora_name}.dora_scale" in state for lora in ff_modules)
+
+
+def test_input_axis_dora_on_every_linear_of_the_ltx25_av_blocks():
+    """The ``full`` preset on an audio-video 2.5 model: bias-free video FF, the audio FF (with biases), self /
+    cross / audio-video attention and the attention gates all train with input-axis DoRA."""
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXModelConfigurator
+
+    config = _transformer_config(
+        ff_bias=False,
+        use_keyframes_abs_pos_embedding=True,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=8,
+        audio_in_channels=8,
+        audio_out_channels=8,
+        audio_cross_attention_dim=16,
+        av_ca_timestep_scale_multiplier=1000.0,
+        audio_positional_embedding_max_pos=[20],
+    )
+    torch.manual_seed(0)
+    model = LTXModelConfigurator.from_config({"transformer": config})
+    with torch.no_grad():
+        for _name, param in model.named_parameters():
+            param.normal_(0.0, 0.05)
+    model = model.float().requires_grad_(False)
+    block = model.transformer_blocks[0]
+    assert block.ff.net[0].proj.bias is None and block.audio_ff.net[0].proj.bias is not None
+
+    wrapper = LTX2Wrapper(model)
+    generator = torch.Generator().manual_seed(2)
+    video = torch.randn(1, 8, 2, 2, 2, generator=generator)
+    audio = torch.randn(1, 4, 4, 2, generator=generator)  # channels x mel = audio_in_channels
+    context = torch.randn(1, 5, 32, generator=generator)  # video + audio context
+    mask = torch.ones(1, 5, dtype=torch.long)
+
+    def forward():
+        out = wrapper([video, audio], timestep=torch.tensor([0.6]), context=context, attention_mask=mask, frame_rate=24)
+        return out[0].float().pow(2).mean() + out[1].float().pow(2).mean()
+
+    network = lora_ltx2.create_arch_network(
+        1.0, 4, 4, None, [], wrapper, audio_video=True, lora_target_preset="full", use_dora=True, dora_axis="input"
+    )
+    network.apply_to(None, wrapper, apply_text_encoder=False, apply_unet=True)
+    names = [lora.lora_name for lora in network.unet_loras]
+    for fragment in ("ff_net_0_proj", "audio_ff_net_0_proj", "attn1_to_q", "audio_attn1_to_q", "to_gate_logits"):
+        assert any(fragment in name for name in names), (fragment, names)
+    assert any("audio_to_video_attn" in name or "video_to_audio_attn" in name for name in names), names
+
+    network.train()
+    loss = forward()
+    loss.backward()
+    missing = [
+        lora.lora_name
+        for lora in network.unet_loras
+        if lora.dora_scale.grad is None or not torch.isfinite(lora.dora_scale.grad).all()
+    ]
+    assert not missing, missing
