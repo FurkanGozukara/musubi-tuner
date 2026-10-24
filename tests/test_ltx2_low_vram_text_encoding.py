@@ -174,6 +174,17 @@ def test_low_vram_encoding_leaves_the_layers_of_a_quantized_gemma_alone():
     assert torch.equal(encoder(input_ids), expected)
 
 
+def test_streamed_decoder_layers_keep_the_ram_they_were_loaded_into():
+    """Pinning made a second copy of every streamed weight: LTX-2.5's 20 GB of Gemma 4 decoder layers took text caching
+    to 53 GB of RAM. The layers stream from the tensors they were loaded into (pin=False; no CUDA needed to check)."""
+    from musubi_tuner.utils.model_utils import keep_weights_in_cpu_ram
+
+    layer = _TinyLayer()
+    pointers = [param.data_ptr() for param in layer.parameters()]
+    keep_weights_in_cpu_ram(layer, list(layer.parameters()), torch.device("cuda"), pin=False)
+    assert [param.data_ptr() for param in layer.parameters()] == pointers
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_low_vram_encoding_streams_decoder_layers_through_the_gpu():
     torch.manual_seed(0)
@@ -184,7 +195,8 @@ def test_low_vram_encoding_streams_decoder_layers_through_the_gpu():
     enable_low_vram_text_encoding(encoder, "cuda")
     language = encoder.model.model.language_model
     for layer in language.layers:
-        assert all(param.device.type == "cpu" and param.is_pinned() for param in layer.parameters())
+        # streamed from the RAM they were loaded into, not from a pinned second copy
+        assert all(param.device.type == "cpu" and not param.is_pinned() for param in layer.parameters())
         assert layer.scale.device.type == "cuda"
     assert language.norm.weight.device.type == "cuda"
     assert torch.equal(encoder(input_ids), expected)

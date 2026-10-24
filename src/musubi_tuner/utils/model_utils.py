@@ -853,17 +853,19 @@ def compile_transformer_inner_forwards(
     return transformer
 
 
-def keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.device) -> None:
+def keep_weights_in_cpu_ram(module: torch.nn.Module, params, device: torch.device, pin: bool = True) -> None:
     """Keep ``params`` in (pinned) CPU RAM and give them a GPU copy only while ``module`` runs (forward hooks).
 
     Assigning ``.data`` keeps every Parameter object, so tied weights (the Gemma LM head shares the embedding table)
     follow, and dropping the GPU copy after the forward frees it for the next module. Used for low-VRAM text encoding
-    (LTX-2.3's Gemma pieces, MOSS-Image's Qwen3.5 layers)."""
+    (LTX-2.3's Gemma pieces, MOSS-Image's Qwen3.5 layers, LTX-2.5's Gemma 4 decoder layers). ``pin=False`` keeps
+    weights that already sit in CPU RAM where they are: pinning makes a second copy (LTX-2.5's 20 GB of Gemma 4
+    layers took text caching to 53 GB of RAM), for about 3% faster copies on an RTX A6000 server."""
     params = list({id(param): param for param in params}.values())
     cpu_copies = []
     for param in params:
         cpu = param.data.to("cpu")
-        if device.type == "cuda":
+        if device.type == "cuda" and pin:
             cpu = cpu.pin_memory()
         param.data = cpu
         cpu_copies.append(cpu)

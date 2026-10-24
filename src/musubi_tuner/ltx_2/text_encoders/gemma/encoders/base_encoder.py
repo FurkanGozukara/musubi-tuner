@@ -460,6 +460,7 @@ def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", dev
     each prompt then copies every layer once. Returns the names of the modules that are now kept in CPU RAM."""
     device = torch.device(device)
     managed = []
+    layers = None
     model = getattr(text_encoder, "model", None)
     if model is not None:
         quantized = (
@@ -486,11 +487,13 @@ def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", dev
             model.to(device)
         if table is not None:
             # hooked on the whole Gemma forward: the LM head reuses this table at the end of the forward
-            _keep_weights_in_cpu_ram(model, [table], device)
+            _keep_weights_in_cpu_ram(model, [table], device, pin=layers is None)
             managed.append("Gemma embeddings")
         if layers is not None:
             for layer in layers:
-                _keep_weights_in_cpu_ram(layer, list(layer.parameters()), device)
+                # streamed from the RAM they were loaded into, like the table, the projection and the connectors: pinned
+                # second copies took LTX-2.5 text caching to 53 GB of RAM (FP8 / bitsandbytes Gemma keep their pinned copies)
+                _keep_weights_in_cpu_ram(layer, list(layer.parameters()), device, pin=False)
             managed.append(f"{len(layers)} Gemma decoder layers")
     projection = getattr(text_encoder, "feature_extractor_linear", None)
     if getattr(text_encoder, "audio_embeddings_connector", None) is None and getattr(projection, "audio_aggregate_embed", None) is not None:
@@ -503,7 +506,7 @@ def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", dev
             continue
         for buffer in module.buffers():
             buffer.data = buffer.data.to(device)
-        _keep_weights_in_cpu_ram(module, list(module.parameters()), device)
+        _keep_weights_in_cpu_ram(module, list(module.parameters()), device, pin=layers is None)
         managed.append(name)
     text_encoder._execution_device = device
     if device.type == "cuda":
