@@ -5110,6 +5110,7 @@ def main() -> None:
     if val_dataset_group is not None:
         conditioning_datasets.extend(val_dataset_group.datasets)
     trainer.configure_reference_target_ranges_from_datasets(conditioning_datasets)
+    trainer.check_dataset_caches(args, conditioning_datasets)
     checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
     if str(getattr(args, "ltx_version", "")) == "2.5":
         # an LTX-2.5 transformer names its generation and its Gemma: the fine-tuned checkpoint keeps both, so the

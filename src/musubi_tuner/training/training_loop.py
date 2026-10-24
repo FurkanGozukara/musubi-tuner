@@ -303,6 +303,11 @@ def train(self, args):
         if validation_dataset_group is not None:
             conditioning_datasets.extend(validation_dataset_group.datasets)
         self.configure_reference_target_ranges_from_datasets(conditioning_datasets)
+    if hasattr(self, "check_dataset_caches"):  # LTX-2: caches must belong to the model generation being trained
+        cache_checked_datasets = list(train_dataset_group.datasets)
+        if validation_dataset_group is not None:
+            cache_checked_datasets.extend(validation_dataset_group.datasets)
+        self.check_dataset_caches(args, cache_checked_datasets)
     if hasattr(self, "on_train_datasets"):  # MOSS-Image control adapters: maps present, the empty caption's context
         self.on_train_datasets(args, list(train_dataset_group.datasets))
 

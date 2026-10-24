@@ -52,6 +52,19 @@ def _video_scale_factors_from_vae(vae, fallback_type):
     return fallback_type(time=temporal, height=spatial, width=spatial)
 
 
+def _check_sample_cache_version(payload, args, cache_path: str, kind: str) -> None:
+    """A precached sample prompt / latent file belongs to one LTX generation (ltx2_cache_version; no field: LTX-2.3)."""
+    from musubi_tuner.ltx2_cache_version import normalize_ltx_version, same_side_of_ltx25
+
+    cached = normalize_ltx_version(payload.get("ltx_version") if isinstance(payload, dict) else None)
+    version = normalize_ltx_version(getattr(args, "ltx_version", None))
+    if not same_side_of_ltx25(cached, version):
+        raise ValueError(
+            f"The precached {kind} file {cache_path} was made for LTX-{cached}, this run is LTX-{version} (another text "
+            "encoder / VAE). Rebuild it with the caching scripts for this model or disable the precached samples."
+        )
+
+
 def _is_diffusion_vae(vae) -> bool:
     """True for the LTX-2.5 DiffVAE (the training wrapper holds it as ``decoder``)."""
     from musubi_tuner.ltx_2.model.video_vae import DiffusionVideoDecoder
@@ -741,6 +754,7 @@ class LTX2SamplingMixin:
         cached_params = payload.get("prompt_cache") or payload.get("sample_parameters")
         if not isinstance(cached_params, list) or not cached_params:
             raise ValueError(f"No sample prompts found in cache: {cache_path}")
+        _check_sample_cache_version(payload, args, cache_path, "sample prompt")
 
         if args.sample_prompts is None:
             raise ValueError("--sample_prompts is required when --use_precached_sample_prompts is set")
@@ -854,6 +868,7 @@ class LTX2SamplingMixin:
         logger.info(f"Loading precached conditioning latents from {cache_path}")
         try:
             latent_payload = torch.load(cache_path, map_location="cpu")
+            _check_sample_cache_version(latent_payload, args, cache_path, "sample latent")
             latent_cache = latent_payload.get("latent_cache", [])
 
             # Match latents with prompts by index

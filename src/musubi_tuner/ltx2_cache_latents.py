@@ -23,6 +23,7 @@ from musubi_tuner.audio_io_utils import coerce_decoded_audio_to_channels_first
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.cache_io import build_source_freshness_metadata
+from musubi_tuner.ltx2_cache_version import cache_matches_version, cache_metadata, resolve_caching_version
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     AUDIO_EXTENSIONS,
@@ -98,7 +99,9 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
     return cast(Sequence[BaseDataset], datasets)
 
 
-def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None, *, atomic_cache_writes: bool = False) -> None:
+def encode_and_save_batch(
+    vae, batch: List[ItemInfo], tiling_config=None, *, atomic_cache_writes: bool = False, ltx_version: Optional[str] = None
+) -> None:
     contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if contents.ndim == 4:
         contents = contents.unsqueeze(1)
@@ -167,7 +170,9 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None, *, ato
                 align_corners=False,
             )[0].clamp(0.0, 1.0)
             extra_tensors = {"video_loss_mask": latent_mask.to(dtype=torch.float32)}
-        save_latent_cache_ltx2(item, latents[idx], extra_tensors=extra_tensors, atomic=atomic_cache_writes)
+        save_latent_cache_ltx2(
+            item, latents[idx], extra_tensors=extra_tensors, atomic=atomic_cache_writes, ltx_version=ltx_version
+        )
 
 
 def _adjust_ltx2_frame_count(frame_count: int) -> int:
@@ -385,6 +390,7 @@ def encode_and_save_audio_cache(
     audio_only: bool = False,
     preserve_audio_timing: bool = False,
     atomic_cache_writes: bool = False,
+    ltx_version: Optional[str] = None,
 ) -> None:
     try:
         import torchaudio
@@ -607,6 +613,7 @@ def encode_and_save_audio_cache(
     metadata.update(build_source_freshness_metadata(item_info, source_path=audio_path))
     metadata["duration_seconds"] = str(float(waveform.shape[-1]) / max(float(sample_rate), 1.0))
     metadata["target_fps"] = str(float(target_fps))
+    metadata.update(cache_metadata(ltx_version))
 
     if atomic_cache_writes:
         save_file_atomic(sd, audio_cache_path, metadata=metadata)
@@ -824,7 +831,7 @@ def encode_and_save_latent_guides(
                             f"{stem}_{w_b:04d}x{h_b:04d}_{ds.architecture}_kf_guide.safetensors",
                         )
 
-                    if skip_existing and os.path.exists(cache_path):
+                    if skip_existing and cache_matches_version(cache_path, getattr(args, "_ltx_cache_version", None)):
                         per_kind_stats[kind]["skipped"] += 1
                         continue
 
@@ -861,7 +868,12 @@ def encode_and_save_latent_guides(
                         )
                         guide_item_info.latent_cache_path = cache_path
                         guide_item_info.frame_count = 1
-                        save_latent_cache_ltx2(guide_item_info, guide_latent, atomic=atomic_cache_writes)
+                        save_latent_cache_ltx2(
+                            guide_item_info,
+                            guide_latent,
+                            atomic=atomic_cache_writes,
+                            ltx_version=getattr(args, "_ltx_cache_version", None),
+                        )
                         per_kind_stats[kind]["cached"] += 1
                     except Exception as e:
                         logger.warning("Failed to cache %s for %r: %s", label, stem, e)
@@ -1038,7 +1050,7 @@ def encode_and_save_reference_latents(
                         item_info, "reference_latent_cache_paths", None
                     ) or ds.get_reference_latent_cache_paths(item_info)
                     for ref_idx, (ref_dir, ref_cache_path) in enumerate(zip(ref_dirs, ref_cache_paths)):
-                        if skip_existing and os.path.exists(ref_cache_path):
+                        if skip_existing and cache_matches_version(ref_cache_path, getattr(args, "_ltx_cache_version", None)):
                             # The cache path encodes only basename/resolution/architecture, so a cache
                             # written at a different --reference_frames / --reference_temporal_scale
                             # would otherwise be silently reused with the wrong frame count. Compare the
@@ -1107,7 +1119,12 @@ def encode_and_save_reference_latents(
                         # Pre-pad frame count (== num_frames when no temporal subsample; the reduced
                         # count when --reference_temporal_scale > 1).
                         ref_item_info.frame_count = frames
-                        save_latent_cache_ltx2(ref_item_info, ref_latent, atomic=atomic_cache_writes)
+                        save_latent_cache_ltx2(
+                            ref_item_info,
+                            ref_latent,
+                            atomic=atomic_cache_writes,
+                            ltx_version=getattr(args, "_ltx_cache_version", None),
+                        )
                         cached_count += 1
 
                 except Exception as e:
@@ -1186,7 +1203,9 @@ def encode_and_save_reference_audio_latents(
                         item_info, "reference_audio_latent_cache_paths", None
                     ) or ds.get_reference_audio_latent_cache_paths(item_info)
                     for ref_audio_dir, ref_audio_cache_path in zip(ref_audio_dirs, ref_audio_cache_paths):
-                        if skip_existing and os.path.exists(ref_audio_cache_path):
+                        if skip_existing and cache_matches_version(
+                            ref_audio_cache_path, getattr(args, "_ltx_cache_version", None)
+                        ):
                             skipped_count += 1
                             continue
 
@@ -1228,6 +1247,7 @@ def encode_and_save_reference_audio_latents(
                             audio_only=False,
                             preserve_audio_timing=bool(getattr(args, "preserve_audio_timing", False)),
                             atomic_cache_writes=atomic_cache_writes,
+                            ltx_version=getattr(args, "_ltx_cache_version", None),
                         )
                         cached_count += 1
                 except Exception as e:
@@ -1533,6 +1553,15 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     payload = {
         "version": 1,
         "latent_cache": latent_cache,
+        # the VAE generation of these latents (ltx2_cache_version); a cache without it counts as LTX-2.3
+        "ltx_version": resolve_caching_version(
+            args,
+            [
+                getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None),
+                getattr(args, "ltx2_checkpoint", None),
+                getattr(args, "ltx2_audio_vae", None),
+            ],
+        ),
     }
     if bool(getattr(args, "atomic_cache_writes", False)):
         atomic_torch_save(payload, cache_path)
@@ -1614,6 +1643,24 @@ def main() -> None:
         logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
         audio_only = True
 
+    # the LTX generation these caches are for, recorded in each file (ltx2_cache_version): --skip_existing re-encodes a
+    # cache made for another version (old caches without the field count as LTX-2.3)
+    ltx_cache_version = resolve_caching_version(
+        args,
+        [
+            getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None),
+            getattr(args, "ltx2_checkpoint", None),
+            getattr(args, "ltx2_audio_vae", None),
+        ],
+    )
+    args._ltx_cache_version = ltx_cache_version
+    logger.info("LTX latent caches are written for LTX-%s", ltx_cache_version)
+
+    def latent_cache_is_current(item: ItemInfo) -> bool:
+        return cache_latents.latent_cache_matches_bucket(item) and cache_matches_version(
+            item.latent_cache_path, ltx_cache_version
+        )
+
     if not audio_only:
         if args.vae is None:
             if getattr(args, "ltx2_checkpoint", None) is None:
@@ -1669,11 +1716,13 @@ def main() -> None:
         atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
 
         def encode_fn(batch: List[ItemInfo]) -> None:
-            encode_and_save_batch(vae, batch, tiling_config, atomic_cache_writes=atomic_cache_writes)
+            encode_and_save_batch(
+                vae, batch, tiling_config, atomic_cache_writes=atomic_cache_writes, ltx_version=ltx_cache_version
+            )
 
         # Only pass non-audio datasets to the video encoder; AudioDataset items have
         # content=None (no visual frames) and are handled separately below.
-        cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args)
+        cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args, cache_is_current=latent_cache_is_current)
 
         # Reference/guide caching is not shard-partitioned (cross-item path derivation), so
         # under distributed sharding only rank 0 runs it to avoid concurrent identical writes.
@@ -1779,9 +1828,12 @@ def main() -> None:
                         "ltx2_virtual_width_int32": torch.tensor(int(virtual_width), dtype=torch.int32),
                     },
                     atomic=bool(getattr(args, "atomic_cache_writes", False)),
+                    ltx_version=ltx_cache_version,
                 )
 
-        cache_latents.encode_datasets(list(audio_datasets), encode_audio_only_video_latents, args)
+        cache_latents.encode_datasets(
+            list(audio_datasets), encode_audio_only_video_latents, args, cache_is_current=latent_cache_is_current
+        )
     if audio_video or audio_only:
         audio_vae_path = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
         if audio_vae_path is None:
@@ -1831,7 +1883,7 @@ def main() -> None:
                     # Stable per-item assignment by cache path → order-independent disjoint cover.
                     if shard_world > 1 and not cache_latents.cache_shard_takes(audio_cache_path, shard_rank, shard_world):
                         continue
-                    if args.skip_existing and os.path.exists(audio_cache_path):
+                    if args.skip_existing and cache_matches_version(audio_cache_path, ltx_cache_version):
                         audio_skipped_count += 1
                         continue
                     if isinstance(ds, AudioDataset):
@@ -1861,6 +1913,7 @@ def main() -> None:
                             audio_only=isinstance(ds, AudioDataset),
                             preserve_audio_timing=bool(getattr(args, "preserve_audio_timing", False)),
                             atomic_cache_writes=bool(getattr(args, "atomic_cache_writes", False)),
+                            ltx_version=ltx_cache_version,
                         )
                         audio_encoded_count += 1
                     except Exception as e:

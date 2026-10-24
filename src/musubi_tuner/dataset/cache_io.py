@@ -196,7 +196,10 @@ def save_latent_cache_ltx2(
     extra_tensors: Optional[dict[str, torch.Tensor]] = None,
     *,
     atomic: bool = False,
+    ltx_version: Optional[str] = None,
 ):
+    """``ltx_version`` is recorded in the metadata (``ltx2_cache_version``): --skip_existing re-encodes a cache made
+    for another LTX version and training refuses one from the other side of the LTX-2.5 boundary."""
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
@@ -206,12 +209,14 @@ def save_latent_cache_ltx2(
         for key, value in extra_tensors.items():
             sd[key] = value.detach().cpu().contiguous()
 
+    from musubi_tuner.ltx2_cache_version import cache_metadata
+
     save_latent_cache_common(
         item_info,
         sd,
         ARCHITECTURE_LTX2_FULL,
         atomic=atomic,
-        extra_metadata=build_source_freshness_metadata(item_info),
+        extra_metadata={**build_source_freshness_metadata(item_info), **cache_metadata(ltx_version)},
     )
 
 
@@ -581,7 +586,11 @@ def save_text_encoder_output_cache_ltx2_gemma(
     video_features: Optional[torch.Tensor] = None,
     audio_features: Optional[torch.Tensor] = None,
     atomic: bool = False,
+    ltx_version: Optional[str] = None,
 ):
+    """``ltx_version`` is recorded in the metadata (``ltx2_cache_version``). An existing cache recorded for another
+    LTX version is replaced instead of merged: its tensors (e.g. LTX-2.3 audio embeddings) belong to another text
+    encoder."""
     assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
         f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
     )
@@ -614,7 +623,19 @@ def save_text_encoder_output_cache_ltx2_gemma(
     if prompt_attention_mask is not None:
         sd["text_mask"] = prompt_attention_mask.detach().cpu()
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL, atomic=atomic)
+    from musubi_tuner.ltx2_cache_version import cache_matches_version, cache_metadata
+
+    merge_existing = True
+    if ltx_version and os.path.exists(item_info.text_encoder_output_cache_path):
+        merge_existing = cache_matches_version(item_info.text_encoder_output_cache_path, ltx_version, log=False)
+    save_text_encoder_output_cache_common(
+        item_info,
+        sd,
+        ARCHITECTURE_LTX2_FULL,
+        atomic=atomic,
+        merge_existing=merge_existing,
+        additional_metadata=cache_metadata(ltx_version) or None,
+    )
 
 
 def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor):

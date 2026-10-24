@@ -37,6 +37,7 @@ from musubi_tuner.preservation import (
     parse_preservation_args,
 )
 from musubi_tuner.utils.safetensors_utils import atomic_torch_save
+from musubi_tuner.ltx2_cache_version import cache_matches_version, resolve_caching_version
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ def encode_and_save_batch_gemma(
     autocast_dtype: torch.dtype | None,
     audio_video: bool,
     atomic_cache_writes: bool = False,
+    ltx_version: str | None = None,
 ) -> None:
     if autocast_dtype is not None and device.type == "cuda":
         autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
@@ -104,6 +106,7 @@ def encode_and_save_batch_gemma(
                 audio_prompt_embeds=audio_embed_out,
                 prompt_attention_mask=mask,
                 atomic=atomic_cache_writes,
+                ltx_version=ltx_version,
             )
 
 
@@ -115,6 +118,7 @@ def encode_and_save_batch_pre_connector(
     autocast_dtype: torch.dtype | None,
     audio_video: bool,
     atomic_cache_writes: bool = False,
+    ltx_version: str | None = None,
 ) -> None:
     """Encode and save with both pre-connector features and post-connector embeddings.
 
@@ -159,6 +163,7 @@ def encode_and_save_batch_pre_connector(
                 video_features=video_feat_out,
                 audio_features=audio_feat_out,
                 atomic=atomic_cache_writes,
+                ltx_version=ltx_version,
             )
 
 
@@ -292,6 +297,8 @@ def _precache_sample_prompts(
         "ltx_mode": ltx_mode,
         "audio_video": audio_video,
         "prompt_cache": prompt_cache,
+        # the text encoder generation of these embeddings (ltx2_cache_version); no field: LTX-2.3
+        "ltx_version": getattr(args, "_ltx_cache_version", None) or resolve_caching_version(args, []),
     }
     if bool(getattr(args, "atomic_cache_writes", False)):
         atomic_torch_save(payload, cache_path)
@@ -595,6 +602,19 @@ def main() -> None:
 
     cache_before_connector = bool(getattr(args, "cache_before_connector", False))
     atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
+    # the LTX generation of these captions (Gemma 3 for LTX-2 / 2.3, Gemma 4 for LTX-2.5), recorded in each cache
+    # (ltx2_cache_version): --skip_existing re-encodes a cache made for another version (no field: LTX-2.3)
+    ltx_cache_version = resolve_caching_version(
+        args,
+        [
+            getattr(args, "ltx2_checkpoint", None),
+            getattr(args, "ltx2_text_encoder_checkpoint", None),
+            gemma_safetensors,
+            getattr(args, "gemma_root", None),
+        ],
+    )
+    args._ltx_cache_version = ltx_cache_version
+    logger.info("LTX text encoder caches are written for LTX-%s", ltx_cache_version)
 
     def encode_fn(batch: list[ItemInfo]) -> None:
         if cache_before_connector:
@@ -605,6 +625,7 @@ def main() -> None:
                 autocast_dtype=autocast_dtype,
                 audio_video=audio_video,
                 atomic_cache_writes=atomic_cache_writes,
+                ltx_version=ltx_cache_version,
             )
         else:
             encode_and_save_batch_gemma(
@@ -614,6 +635,7 @@ def main() -> None:
                 autocast_dtype=autocast_dtype,
                 audio_video=audio_video,
                 atomic_cache_writes=atomic_cache_writes,
+                ltx_version=ltx_cache_version,
             )
 
     # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
@@ -653,6 +675,7 @@ def main() -> None:
         all_cache_paths_for_dataset,
         encode_fn,
         shard=_shard,
+        cache_is_current=lambda item: cache_matches_version(item.text_encoder_output_cache_path, ltx_cache_version),
     )
 
     cache_text_encoder_outputs.post_process_cache_files(

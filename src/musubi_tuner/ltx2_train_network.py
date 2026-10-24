@@ -4323,6 +4323,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             return None
         return json.dumps([list(value) for value in ranges], separators=(",", ":"))
 
+    def check_dataset_caches(self, args: argparse.Namespace, datasets) -> None:
+        """Refuse LTX-2 / 2.3 caches in an LTX-2.5 run and LTX-2.5 caches in an older one (ltx2_cache_version): the
+        text encoder (Gemma 3 vs 4) and the VAE differ, and the tensors may even have the same shapes."""
+        from musubi_tuner.ltx2_cache_version import check_training_caches
+
+        check_training_caches(datasets, str(getattr(args, "ltx_version", self._ltx_version)))
+
     def configure_reference_target_ranges_from_datasets(self, datasets) -> None:
         range_sets = []
         for dataset in datasets:
