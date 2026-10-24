@@ -2205,10 +2205,10 @@ def main() -> None:
         getattr(args, "ltx2_checkpoint", None) is not None and args.dit != args.ltx2_checkpoint
     ):
         args.dit = args.ltx2_checkpoint
-    if getattr(args, "vae", None) is None or (
-        getattr(args, "ltx2_checkpoint", None) is not None and args.vae != args.ltx2_checkpoint
-    ):
-        args.vae = args.ltx2_checkpoint
+    # an LTX-2.5 split pack keeps its video VAE in --ltx2_video_vae
+    video_vae = getattr(args, "ltx2_video_vae", None) or getattr(args, "ltx2_checkpoint", None)
+    if getattr(args, "vae", None) is None or (getattr(args, "ltx2_checkpoint", None) is not None and args.vae != video_vae):
+        args.vae = video_vae
 
     args.weighting_scheme = "none"
 

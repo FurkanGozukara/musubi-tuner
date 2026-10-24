@@ -736,6 +736,7 @@ When changing checkpoints (important):
 - If you change `--ltx2_checkpoint` or model version, re-run **both** caches:
   - `ltx2_cache_latents.py`
   - `ltx2_cache_text_encoder_outputs.py`
+- Every LTX cache records the LTX version it was made for (`ltx_version` in its safetensors metadata; a cache from before this field counts as LTX-2.3). With `--skip_existing`, both caching scripts re-encode a cache recorded for another version, and training refuses LTX-2 / 2.3 caches in an LTX-2.5 run and LTX-2.5 caches in an older one (LTX-2.5 uses Gemma 4 and its own VAE, so the tensors are wrong even where their shapes agree). The caching scripts record `--ltx_version`, or LTX-2.5 whenever the files they read are LTX-2.5 (the 2.5 transformer, a Gemma 4 text encoder, the 2.5 video VAE). Precached sample prompt / latent files carry the version too.
 - Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
 - If you use `--dataset_manifest`, regenerate it from the recache step so training points to the new cache files.
 - Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) work with both `--fp8_base` and `--fp8_base --fp8_scaled`. The loader dequantizes to bf16 using the checkpoint's scale tensors before any further processing.
@@ -817,7 +818,7 @@ For LTX-2 checkpoints, replace:
 - `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
 - `--ltx_version 2.3` -> `--ltx_version 2.0`
 
-For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.5`, and provide the split text encoder and VAEs listed under [Downloading Required Models](#downloading-required-models). Existing LoRA, optimization, and block-swap options remain unchanged; use `--int8_base_dynamic` to quantize the official BF16 transformer at load time.
+For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.5`, and provide the split text encoder and VAEs listed under [Downloading Required Models](#downloading-required-models): `--ltx2_text_encoder_checkpoint` (packed Gemma 4, for sample prompts), `--ltx2_video_vae` (DiffVAE, for samples) and `--ltx2_audio_vae` (audio or AV). Existing LoRA, DoRA, optimization, and block-swap options remain unchanged; use `--int8_base_dynamic` to quantize the official BF16 transformer at load time. LoRA training uses the development transformer (`ltx-2.5-22b-dev-transformer-bf16.safetensors`), so training samples need `--sample_sampling_preset ltx25_full`: the `ltx25` default is the distilled two-stage recipe (8 steps, CFG 1, 1536x1024, spatial upsampler) and does not fit a non-distilled checkpoint. The LTX-2.5 transformer drops the video feed-forward biases; LoRA and DoRA (both axes) train those layers as any other Linear.
 
 #### Training on a Unified LTX-2.5 Checkpoint
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -1274,7 +1275,7 @@ reference_cache_directory/                  # IC-LoRA only
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
-| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | Reinstall the declared dependencies with `pip install -e .` (LTX-2.5 requires `transformers>=5.15,<5.16`). |
+| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | LTX-2.5's Gemma 4 needs a Transformers release with Gemma 4 and per-layer configs (5.15 or newer; this fork runs 5.19). Every Transformers internal the loader uses is listed in `src/musubi_tuner/ltx_2/text_encoders/gemma/gemma4_compat.py`; after an upgrade run `tests/test_ltx25_gemma4_packed_loading.py`. |
 | A nominally video-only LoRA contains audio or AV cross-modal adapter keys | `--ltx2_mode av` constructs the audio/cross-modal modules, and a broad target preset can select them. In `--ltx2_mode v`/`video`, those modules are not constructed. | Use `--ltx2_mode v` when no audio path is needed. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict adapter targets to the video branch. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
@@ -2740,7 +2741,9 @@ For LTX-2.5, use `--ltx_version 2.5`, pass the packed Gemma 4 file with `--ltx2_
 
 For generated audio, add `--ltx2_mode av --ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors`. Standalone AV generation writes a WAV sidecar and an `_av.mp4` containing the generated audio track.
 
-Rebuild LTX-2.5 text caches created before Gemma 4 BOS handling was added, and rebuild latent and text caches whenever switching model versions.
+Rebuild LTX-2.5 text caches created before Gemma 4 BOS handling was added, and rebuild latent and text caches whenever switching model versions (`--skip_existing` re-encodes caches recorded for another LTX version). The BOS token is added for the Gemma 4 tokenizers only; LTX-2 / 2.3 text encoding is unchanged (a Gemma 3 directory adds BOS itself, the single-file Gemma 3 tokenizer keeps encoding without it).
+
+The `_av.mp4` of an audio-video sample copies the encoded video stream and adds the audio as AAC when an FFmpeg executable is available (PATH, or the `imageio-ffmpeg` package); otherwise the video is re-encoded with PyAV as before.
 
 `ltx2_generate_video.py` also accepts a few standalone-inference-only overrides that are not part of the training sample table:
 
@@ -5075,6 +5078,8 @@ The same LTX-2 modality paths used by LoRA training are available in full-parame
 Reference-conditioned runs use `--ic_lora_strategy`: `v2v` for video-to-video/reference-video training in video mode, `audio_ref_ic` for reference-audio conditioning in AV or audio mode, `av_ic` for combined video+audio reference conditioning in AV mode, and `video_ref_only_av` for reference-video conditioning with target AV loss in AV mode. These strategies are implemented in `ltx2_train.py` and route the corresponding conditioning and loss path. For full-parameter commands, set `--ic_lora_strategy` explicitly; `--lora_target_preset` is not used to choose full-parameter trainable layers.
 
 Use `ltx2_train.py` for these commands. `ltx2_train_network.py` is the LoRA/network trainer entry point.
+
+LTX-2.5 full fine-tuning takes the same flags as LoRA training: `--ltx_version 2.5`, the transformer as `--ltx2_checkpoint`, and for samples `--ltx2_text_encoder_checkpoint`, `--ltx2_video_vae` (split pack) and `--sample_sampling_preset ltx25_full`. A fine-tuned LTX-2.5 transformer keeps the source's `model_version` and `gemma_source_checkpoint` metadata, so it passes the version and Gemma checks when it is trained on or sampled later; `--save_merged_checkpoint` merges with the transformer file, which for a split pack holds no VAE.
 
 ### Dataset Preparation
 <sub>[↑ contents](#table-of-contents)</sub>

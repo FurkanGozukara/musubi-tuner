@@ -1837,7 +1837,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         kw = parse_audio_metrics_args(getattr(args, "audio_metrics_args", None))
         config = _config_from_kwargs(kw) if kw else AudioMetricsConfig()
         self._audio_metrics = AudioMetricsModule(config)
-        self._audio_metrics_checkpoint = getattr(args, "ltx2_checkpoint", None)
+        # an LTX-2.5 split pack keeps its audio VAE in --ltx2_audio_vae
+        self._audio_metrics_checkpoint = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
         self._audio_metrics_decoder = None  # lazy-loaded
         logger.info(
             "Audio metrics enabled: latent_fd=%s temporal_coherence=%s av_latent_sync=%s mel=%s clap=%s fad_clap=%s av_desync=%s",

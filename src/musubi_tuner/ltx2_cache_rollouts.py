@@ -326,8 +326,10 @@ def main() -> None:
     if getattr(args, "ltx2_checkpoint", None) is not None:
         if getattr(args, "dit", None) != args.ltx2_checkpoint:
             args.dit = args.ltx2_checkpoint
-        if getattr(args, "vae", None) != args.ltx2_checkpoint:
-            args.vae = args.ltx2_checkpoint
+        # an LTX-2.5 split pack keeps its video VAE in --ltx2_video_vae
+        video_vae = getattr(args, "ltx2_video_vae", None) or args.ltx2_checkpoint
+        if getattr(args, "vae", None) != video_vae:
+            args.vae = video_vae
     LTX2RolloutCacher().run(args)
 
 
