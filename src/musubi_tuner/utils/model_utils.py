@@ -929,13 +929,16 @@ def checkpoint_parameter_count(checkpoints) -> Optional[int]:
         if file.lower().endswith(".safetensors"):
             from safetensors import safe_open
 
-            with safe_open(file, framework="pt") as handle:
-                for key in handle.keys():
-                    shape = handle.get_slice(key).get_shape()
-                    count = 1
-                    for size in shape:
-                        count *= size
-                    total += count
+            try:
+                with safe_open(file, framework="pt") as handle:
+                    for key in handle.keys():
+                        shape = handle.get_slice(key).get_shape()
+                        count = 1
+                        for size in shape:
+                            count *= size
+                        total += count
+            except Exception:  # an unreadable header (an empty or broken file): the size is unknown
+                return None
         else:
             total += os.path.getsize(file) // 2
     return total

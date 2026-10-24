@@ -42,6 +42,11 @@ def test_parameters_come_from_the_safetensors_headers(tmp_path):
     assert model_utils.checkpoint_parameter_count(str(other)) == 500  # counted as half precision
     assert model_utils.checkpoint_parameter_count("org/model-id") is None
     assert model_utils.checkpoint_parameter_count(None) is None
+    # an unreadable header (tests that stand in an empty file for the text encoder) is an unknown size, not an error:
+    # on a CPU that is slow in BF16 the sample-prompt path counts it (test_flux2_sample_prompt_cache on the server)
+    broken = tmp_path / "broken.safetensors"
+    broken.write_bytes(b"x")
+    assert model_utils.checkpoint_parameter_count(str(broken)) is None
 
 
 def test_slow_cpu_bf16_becomes_fp32_when_the_ram_holds_it(tmp_path, slow_cpu):
