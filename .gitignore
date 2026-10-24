@@ -19,3 +19,5 @@ projects/
 .agents
 dev/
 .artifacts/
+# Kandinsky 6 BigVGAN's CUDA activation JIT-builds into the source tree when its module is imported
+src/musubi_tuner/kandinsky6/**/alias_free_activation/cuda/build/
