@@ -27,7 +27,13 @@ def _read_safetensors_metadata(path: str) -> dict:
 
 
 def validate_gemma_checkpoint_compatibility(transformer_checkpoint: str, gemma_checkpoint: str) -> None:
-    """Reject a transformer/Gemma pair whose official version markers disagree."""
+    """Reject a transformer/Gemma pair whose official version markers disagree.
+
+    Only transformers that declare ``model_version`` >= 2.4 (LTX-2.5) are checked; a missing transformer file is left
+    to the loader that reports it.
+    """
+    if not transformer_checkpoint or not os.path.isfile(transformer_checkpoint):
+        return
     transformer_metadata = _read_safetensors_metadata(transformer_checkpoint)
 
     model_version = transformer_metadata.get("model_version", "0")
