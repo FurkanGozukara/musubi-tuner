@@ -229,6 +229,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
 
+LTX-2 additionally requires `torchaudio`, because the audio VAE is imported by the latent caching script even in video-only runs. Install it alongside PyTorch from the same CUDA index, or install the matching extra (`pip install -e ".[cu128]"`). Without it, `ltx2_cache_latents.py` fails at import with `ModuleNotFoundError: No module named 'torchaudio'`.
+
 Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper; that section documents the script's current operations and options.
 
 Command examples assume the repository root and an activated project environment. Ellipses and parenthesized phrases are placeholders for the remaining required arguments.
@@ -274,6 +276,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
 - LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
 - LTX-2.5 distilled inference: [ltx-2.5-22b-distilled-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors)
+- LTX-2.5 Pre-Trained (22B): [ltx-2.5-22b-pt-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained/resolve/main/ltx-2.5-22b-pt-bf16.safetensors) — a unified checkpoint holding the transformer, both VAEs, and the text projections; its Gemma 4 text encoder ships as the `ltx-2.5-22b-gemma4-12b/` directory in the same repository. This is the base checkpoint from before supervised fine-tuning, so it needs more data and steps than the released model, and the `ltx25` sampling preset does not apply to it.
 
 **Gemma Text Encoder**:
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
@@ -532,7 +535,7 @@ python ltx2_cache_latents.py ^
   --ltx2_audio_source video
 ```
 
-For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`.
+For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`. A unified LTX-2.5 checkpoint carries the VAEs itself, so point `--vae` (and `--ltx2_audio_vae`) at that same file.
 
 ### Latent Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
