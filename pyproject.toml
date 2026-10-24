@@ -8,11 +8,11 @@ dependencies = [
     "accelerate>=1.15.0",
     "adv_optm",
     "apollo-torch",
-    "av==19.0.1",
+    "av==19.0.2",
     "bitsandbytes",
-    "diffusers==0.41.0",
+    "diffusers==0.42.0",
     "einops>=0.7.0",
-    "huggingface-hub>=1.32.0",
+    "huggingface-hub>=2.3.0,<3",
     "lpips",
     # opencv-python has no wheel for Windows on ARM64 (e.g. NVIDIA RTX Spark PCs); a Pillow/NumPy
     # fallback (musubi_tuner.utils.cv2_compat) is used automatically when it is missing.
@@ -25,7 +25,7 @@ dependencies = [
     "toml==0.10.2",
     "tqdm==4.70.1",
     "torch-optimi",
-    "transformers==5.19.0",
+    "transformers==5.20.2",
     "voluptuous==0.16.0",
     # Wan2.1
     "ftfy==6.3.1",
