@@ -104,16 +104,6 @@ def same_side_of_ltx25(cached: str, version: str) -> bool:
 # --- the version a caching run writes ------------------------------------------------------------------------
 
 
-def _safetensors_metadata(path: str) -> dict:
-    header = _read_header(path)
-    return dict(header.get("__metadata__") or {}) if header else {}
-
-
-def _tensor_names(path: str) -> list[str]:
-    header = _read_header(path)
-    return [key for key in header if key != "__metadata__"] if header else []
-
-
 def file_is_ltx25(path: Optional[str]) -> bool:
     """Whether a model file or directory belongs to LTX-2.5: an official model_version >= 2.4, the 2.5 transformer's
     keyframe embedding, a packed Gemma 4 text encoder, a Gemma 4 model directory, or the 2.5 video VAE layout."""
@@ -129,7 +119,8 @@ def file_is_ltx25(path: Optional[str]) -> bool:
         return bool(model_type) and model_type.startswith("gemma") and not model_type.startswith("gemma3")
     if not os.path.isfile(path):
         return False
-    metadata = _safetensors_metadata(path)
+    header = _read_header(path) or {}
+    metadata = dict(header.get("__metadata__") or {})
     if metadata.get("model_version") is not None and is_ltx25(metadata["model_version"]):
         return True
     raw_gemma = metadata.get("gemma_config")
@@ -148,7 +139,7 @@ def file_is_ltx25(path: Optional[str]) -> bool:
             vae = {}
         if isinstance(vae, dict) and (vae.get("_class_name", "CausalVideoAutoencoder") != "CausalVideoAutoencoder"):
             return True
-    return any(name.endswith("keyframes_abs_pos_embedding") for name in _tensor_names(path))
+    return any(name.endswith("keyframes_abs_pos_embedding") for name in header if name != "__metadata__")
 
 
 def resolve_caching_version(args, model_paths: Iterable[Optional[str]]) -> str:
