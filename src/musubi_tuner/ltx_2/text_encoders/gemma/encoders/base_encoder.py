@@ -18,6 +18,42 @@ from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer, PackedTokenizerAssets
 
 
+def _read_safetensors_metadata(path: str) -> dict:
+    """``__metadata__`` of a safetensors file with plain file reads (fork): training-time sampling builds the text
+    encoder while the DiT holds tensors mapped from the transformer checkpoint, and safetensors cannot map that file a
+    second time on Windows (a CUDA open fails with "invalid python storage", a CPU open crashes the process)."""
+    with MemoryEfficientSafeOpen(path, disable_numpy_memmap=True) as handle:
+        return dict(handle.metadata() or {})
+
+
+def validate_gemma_checkpoint_compatibility(transformer_checkpoint: str, gemma_checkpoint: str) -> None:
+    """Reject a transformer/Gemma pair whose official version markers disagree."""
+    transformer_metadata = _read_safetensors_metadata(transformer_checkpoint)
+
+    model_version = transformer_metadata.get("model_version", "0")
+    try:
+        version_tuple = tuple(int(part) for part in model_version.split(".")[:2])
+    except ValueError:
+        version_tuple = (0, 0)
+    if version_tuple < (2, 4):
+        return
+
+    raw_source = transformer_metadata.get("gemma_source_checkpoint")
+    if raw_source is None:
+        raise ValueError(f"LTX {model_version} checkpoint has no gemma_source_checkpoint marker; cannot verify its text encoder.")
+    expected = json.loads(raw_source).get("gemma_version")
+
+    gemma_metadata = _read_safetensors_metadata(gemma_checkpoint)
+    raw_config = gemma_metadata.get("gemma_config")
+    actual = json.loads(raw_config).get("gemma_version") if raw_config else None
+    if not expected or not actual:
+        raise ValueError(f"LTX {model_version} requires a packed Gemma checkpoint with a gemma_version marker.")
+    if actual != expected:
+        raise ValueError(
+            f"Incompatible LTX/Gemma checkpoints: transformer expects {expected!r}, but the text encoder provides {actual!r}."
+        )
+
+
 def _packed_ltx25_assets(path: str) -> tuple[object | None, PackedTokenizerAssets | None]:
     """Read Gemma 4 config/tokenizer assets without materializing model tensors."""
 

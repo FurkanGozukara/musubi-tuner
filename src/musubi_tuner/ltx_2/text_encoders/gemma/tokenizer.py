@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 from tokenizers import Tokenizer
@@ -27,6 +28,7 @@ class _SentencePieceTokenizerAdapter:
         self.model_max_length = max_length
         self.padding_side = "left"
         self.pad_token_id = self.sp.pad_id() if self.sp.pad_id() >= 0 else self.sp.eos_id()
+        self.bos_token_id = self.sp.bos_id()
         self.eos_token_id = self.sp.eos_id()
         self.pad_token = self.sp.IdToPiece(self.pad_token_id) if self.pad_token_id >= 0 else "<eos>"
         self.eos_token = self.sp.IdToPiece(self.eos_token_id) if self.eos_token_id >= 0 else "<eos>"
@@ -77,13 +79,20 @@ class LTXVGemmaTokenizer:
     ensuring correct settings and output formatting for downstream consumption.
     """
 
-    def __init__(self, tokenizer_path: str | bytes | PackedTokenizerAssets, max_length: int = 256):
+    def __init__(
+        self, tokenizer_path: str | bytes | PackedTokenizerAssets, max_length: int = 256, ensure_bos: bool | None = None
+    ):
         """
         Initialize the tokenizer.
         Args:
             tokenizer_path (str | bytes): Path to the pretrained tokenizer files or model directory,
                 or raw spiece_model bytes extracted from a safetensors file.
             max_length (int, optional): Max sequence length for encoding. Defaults to 256.
+            ensure_bos (bool, optional): Put Gemma's BOS token in front of every prompt that lacks it (the official
+                LTX-2.5 pipeline and ComfyUI do). ``None`` turns it on for the Gemma 4 tokenizers only: the packed
+                LTX-2.5 file and a ``tokenizer.json``-only directory. Gemma 3 keeps its previous tokens: a Gemma 3
+                directory adds BOS itself, and the single-file Gemma 3 tokenizer (spiece bytes) encodes without it as
+                before, so existing LTX-2 / LTX-2.3 caches stay valid.
         """
         if isinstance(tokenizer_path, PackedTokenizerAssets):
             config = tokenizer_path.tokenizer_config
@@ -108,6 +117,14 @@ class LTXVGemmaTokenizer:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.max_length = max_length
+        if ensure_bos is None:
+            ensure_bos = isinstance(tokenizer_path, PackedTokenizerAssets) or (
+                isinstance(tokenizer_path, str)
+                and os.path.isdir(tokenizer_path)
+                and not os.path.isfile(os.path.join(tokenizer_path, "tokenizer.model"))
+                and os.path.isfile(os.path.join(tokenizer_path, "tokenizer.json"))
+            )
+        self.ensure_bos = bool(ensure_bos)
 
     def tokenize_with_weights(self, text: str, return_word_ids: bool = False) -> dict[str, list[tuple[int, int]]]:
         """
@@ -136,6 +153,21 @@ class LTXVGemmaTokenizer:
         )
         input_ids = encoded.input_ids
         attention_mask = encoded.attention_mask
+        bos_token_id = getattr(self.tokenizer, "bos_token_id", None) if self.ensure_bos else None
+        if bos_token_id is not None:
+            active_ids = input_ids[0][attention_mask[0].bool()].tolist()
+            if not active_ids or active_ids[0] != bos_token_id:
+                active_ids = [bos_token_id, *active_ids[: self.max_length - 1]]
+                pad_len = self.max_length - len(active_ids)
+                pad_id = int(self.tokenizer.pad_token_id)
+                if getattr(self.tokenizer, "padding_side", "right") == "left":
+                    ids = [pad_id] * pad_len + active_ids
+                    mask = [0] * pad_len + [1] * len(active_ids)
+                else:
+                    ids = active_ids + [pad_id] * pad_len
+                    mask = [1] * len(active_ids) + [0] * pad_len
+                input_ids = input_ids.new_tensor([ids])
+                attention_mask = attention_mask.new_tensor([mask])
         tuples = [(token_id, attn, i) for i, (token_id, attn) in enumerate(zip(input_ids[0], attention_mask[0], strict=True))]
         out = {"gemma": tuples}
 
