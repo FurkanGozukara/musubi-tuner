@@ -5200,11 +5200,19 @@ class LTX2SamplingMixin:
         # Prepare tiled VAE config
         tiled_vae_config = None
         if getattr(args, "sample_tiled_vae", False):
+            temporal_tile_size = int(getattr(args, "sample_vae_temporal_tile_size", 0) or 0)
+            is_ltx25 = str(getattr(args, "ltx_version", "")) == "2.5"
             tiled_vae_config = {
+                "auto": is_ltx25 and temporal_tile_size == 0,
                 "tile_size": getattr(args, "sample_vae_tile_size", 512),
                 "tile_overlap": getattr(args, "sample_vae_tile_overlap", 64),
-                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0) or 8192,
-                "temporal_tile_overlap": getattr(args, "sample_vae_temporal_tile_overlap", 8),
+                "temporal_tile_size": temporal_tile_size or 8192,
+                # the DiffVAE's wider receptive field needs at least 40 overlapping frames (LTX-2.5 only)
+                "temporal_tile_overlap": (
+                    max(40, int(getattr(args, "sample_vae_temporal_tile_overlap", 8)))
+                    if is_ltx25 and temporal_tile_size == 0
+                    else getattr(args, "sample_vae_temporal_tile_overlap", 8)
+                ),
             }
 
         # Build inference config
