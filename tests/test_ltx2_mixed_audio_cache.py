@@ -70,3 +70,34 @@ def test_audio_cache_without_video_latent_is_dropped(tmp_path):
     dataset = _cached_audio_dataset(tmp_path, cache_dir)
 
     assert dataset.num_train_items == 0
+
+def test_audio_dataset_builds_from_a_dataset_config(tmp_path):
+    """Every dataset of a config gets skip_corrupted_cache (BaseDatasetParams, the corrupted-cache handling); the audio
+    dataset refused it, so each LTX audio-only run stopped at latent caching with a TypeError."""
+    import argparse
+
+    from musubi_tuner.dataset import config_utils
+
+    config = {"general": {"caption_extension": ".txt", "batch_size": 1},
+              "datasets": [{"audio_directory": str(tmp_path), "cache_directory": str(tmp_path / "cache"), "num_repeats": 1}]}
+    blueprint = config_utils.BlueprintGenerator(config_utils.ConfigSanitizer()).generate(
+        config, argparse.Namespace(), architecture=ARCHITECTURE_LTX2
+    )
+    group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    assert isinstance(group.datasets[0], AudioDataset)
+
+def test_every_dataset_class_takes_every_field_of_its_config_params():
+    """generate_dataset_group_by_blueprint calls each dataset class with asdict(params): a field added to the shared
+    BaseDatasetParams (an upstream merge) must reach every class, the fork-only AudioDataset included."""
+    import dataclasses
+    import inspect
+
+    from musubi_tuner.dataset import config_utils
+    from musubi_tuner.dataset.image_video_dataset import ImageDataset, VideoDataset
+
+    pairs = ((config_utils.ImageDatasetParams, ImageDataset), (config_utils.VideoDatasetParams, VideoDataset),
+             (config_utils.AudioDatasetParams, AudioDataset))
+    for params, dataset_class in pairs:
+        accepted = set(inspect.signature(dataset_class.__init__).parameters)
+        missing = [field.name for field in dataclasses.fields(params) if field.name not in accepted]
+        assert not missing, f"{dataset_class.__name__} does not take {missing}"

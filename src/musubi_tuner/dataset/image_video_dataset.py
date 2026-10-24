@@ -3196,6 +3196,7 @@ class AudioDataset(BaseDataset):
         spatial_crop_region: Optional[Sequence[int]] = None,
         audio_cond_mask_directory: Optional[str] = None,
         bucket_batch_sizes: Optional[Dict[str, int]] = None,
+        skip_corrupted_cache: bool = False,
     ):
         super(AudioDataset, self).__init__(
             resolution,
@@ -3235,6 +3236,9 @@ class AudioDataset(BaseDataset):
             spatial_crop_region=spatial_crop_region,
             audio_cond_mask_directory=audio_cond_mask_directory,
             bucket_batch_sizes=bucket_batch_sizes,
+            # every dataset of a config gets it (BaseDatasetParams): an audio dataset refused it, so each LTX audio-only
+            # run stopped at latent caching ("unexpected keyword argument 'skip_corrupted_cache'")
+            skip_corrupted_cache=skip_corrupted_cache,
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
