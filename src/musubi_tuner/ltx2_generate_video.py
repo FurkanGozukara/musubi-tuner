@@ -35,6 +35,7 @@ from musubi_tuner.ltx2_lora_utils import (
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -1120,11 +1121,16 @@ def main() -> None:
     # -- Block swap --
     if trainer.blocks_to_swap > 0:
         logger.info("Block swap: %d blocks to CPU from %s", trainer.blocks_to_swap, device)
+        # Inference never writes the weights back: stream the swapped blocks host-to-device only (AkaneTendo25
+        # 12eedd9f). H2D-only streaming needs CUDA; another device keeps the classic swap.
         transformer.enable_block_swap(
             trainer.blocks_to_swap,
-            device,
-            supports_backward=False,
-            use_pinned_memory=bool(args.use_pinned_memory_for_block_swap),
+            BlockSwapConfig(
+                device=device,
+                supports_backward=False,
+                use_pinned_memory=bool(args.use_pinned_memory_for_block_swap),
+                h2d_only=device.type == "cuda",
+            ),
         )
         if hasattr(transformer, "move_to_device_except_swap_blocks"):
             transformer.move_to_device_except_swap_blocks(device)
