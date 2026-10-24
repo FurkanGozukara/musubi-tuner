@@ -1,16 +1,9 @@
 import os
-from dataclasses import dataclass
 
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-
-@dataclass(frozen=True)
-class PackedTokenizerAssets:
-    """Tokenizer payload embedded in an LTX-2.5 text-encoder safetensors."""
-
-    tokenizer_json: bytes
-    tokenizer_config: dict
+from musubi_tuner.ltx_2.text_encoders.gemma.gemma4_compat import PackedTokenizerAssets  # noqa: F401  (re-exported)
 
 
 class _SentencePieceTokenizerAdapter:

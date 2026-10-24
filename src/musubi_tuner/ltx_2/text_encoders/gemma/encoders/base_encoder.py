@@ -9,13 +9,12 @@ logger = logging.getLogger(__name__)
 
 import torch
 from einops import rearrange
-from transformers import AutoImageProcessor, AutoModelForImageTextToText, Gemma3ForConditionalGeneration, Gemma3Processor
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
 from musubi_tuner.utils.model_utils import keep_weights_in_cpu_ram as _keep_weights_in_cpu_ram
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
-from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer, PackedTokenizerAssets
+from musubi_tuner.ltx_2.text_encoders.gemma import gemma4_compat
+from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
 
 def _read_safetensors_metadata(path: str) -> dict:
@@ -99,36 +98,6 @@ def resolve_gemma4_directory(gemma_root: str | None) -> str | None:
     return None if model_type.startswith("gemma3") else gemma_root
 
 
-def _is_gemma3_config(config: object) -> bool:
-    """Report whether a Gemma config describes the Gemma 3 family."""
-
-    return str(getattr(config, "model_type", "") or "").startswith("gemma3")
-
-
-# Gemma 4 exports disagree on the vision-branch names across Transformers releases:
-# 5.10 wrote ``model.vision_embedder.*`` and a bare ``embedding_projection``, while
-# 5.14 expects ``model.embed_vision.*`` with a ``multimodal_embedder`` level. Checkpoints
-# are therefore matched against the live module tree, trying each spelling in turn.
-_GEMMA_KEY_ALIASES: tuple[tuple[str, str], ...] = (
-    ("model.embed_vision.embedding_projection.", "model.embed_vision.multimodal_embedder.embedding_projection."),
-    ("model.embed_vision.multimodal_embedder.embedding_projection.", "model.embed_vision.embedding_projection."),
-    ("model.vision_embedder.", "model.embed_vision."),
-    ("model.embed_vision.", "model.vision_embedder."),
-)
-
-
-def _key_alias_candidates(key: str) -> list[str]:
-    """Return alternative spellings for a checkpoint key, most specific first."""
-
-    candidates = []
-    for source, target in _GEMMA_KEY_ALIASES:
-        if key.startswith(source):
-            candidate = target + key[len(source) :]
-            if candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
-
-
 class _ShardedSafeOpen:
     """Present several safetensors shards as one ``safe_open``-style handle."""
 
@@ -167,132 +136,6 @@ def _open_weight_shards(paths: list[str]):
     if len(paths) == 1:
         return safe_open(paths[0], framework="pt", device="cpu")
     return _ShardedSafeOpen(paths)
-
-
-def _quantize_linear_modules(
-    model: torch.nn.Module,
-    quantization_config,
-    *,
-    skip: tuple[str, ...] = ("lm_head",),
-) -> int:
-    """Swap `nn.Linear` for its bitsandbytes counterpart, carrying the loaded weights over.
-
-    Transformers' own helper builds the replacement modules on the meta device because it runs
-    before the checkpoint is read. Weights that are already materialized need the opposite
-    order, so the tensors are handed to the bnb parameter types here and quantized when the
-    module is moved to the accelerator.
-    """
-
-    import bitsandbytes as bnb
-
-    eight_bit = quantization_config.quantization_method() == "llm_int8"
-    replaced = 0
-    for parent_name, parent in list(model.named_modules()):
-        for child_name, child in list(parent.named_children()):
-            full_name = f"{parent_name}.{child_name}" if parent_name else child_name
-            if type(child) is not torch.nn.Linear or any(part in full_name.split(".") for part in skip):
-                continue
-            if eight_bit:
-                replacement = bnb.nn.Linear8bitLt(
-                    child.in_features,
-                    child.out_features,
-                    child.bias is not None,
-                    has_fp16_weights=quantization_config.llm_int8_has_fp16_weight,
-                    threshold=quantization_config.llm_int8_threshold,
-                )
-                replacement.weight = bnb.nn.Int8Params(
-                    child.weight.data,
-                    requires_grad=False,
-                    has_fp16_weights=quantization_config.llm_int8_has_fp16_weight,
-                )
-            else:
-                replacement = bnb.nn.Linear4bit(
-                    child.in_features,
-                    child.out_features,
-                    child.bias is not None,
-                    compute_dtype=quantization_config.bnb_4bit_compute_dtype,
-                    compress_statistics=quantization_config.bnb_4bit_use_double_quant,
-                    quant_type=quantization_config.bnb_4bit_quant_type,
-                )
-                replacement.weight = bnb.nn.Params4bit(
-                    child.weight.data,
-                    requires_grad=False,
-                    compress_statistics=quantization_config.bnb_4bit_use_double_quant,
-                    quant_type=quantization_config.bnb_4bit_quant_type,
-                )
-            if child.bias is not None:
-                replacement.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
-            setattr(parent, child_name, replacement)
-            replaced += 1
-    return replaced
-
-
-def _is_non_weight_key(key: str) -> bool:
-    """Report whether a checkpoint key carries packed assets rather than weights."""
-
-    return key == "tokenizer_json" or key.startswith("hf_asset__")
-
-
-def _packed_ltx25_assets(path: str) -> tuple[object | None, PackedTokenizerAssets | None]:
-    """Read Gemma 4 config/tokenizer assets without materializing model tensors."""
-
-    from safetensors import safe_open
-
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        metadata = handle.metadata() or {}
-        raw_config = metadata.get("gemma_config")
-        keys = set(handle.keys())
-        if raw_config is None or "tokenizer_json" not in keys:
-            return None, None
-        config_dict = json.loads(raw_config)
-        model_type = config_dict.get("model_type")
-        if not model_type:
-            raise ValueError(f"Packed text encoder {path} has no model_type in gemma_config")
-        try:
-            config_class = CONFIG_MAPPING[model_type]
-        except KeyError as exc:
-            raise ValueError(
-                f"transformers does not support packed Gemma model_type={model_type!r}; LTX-2.5 requires transformers>=5.8.0"
-            ) from exc
-        config = config_class.from_dict(config_dict)
-        tokenizer_json = handle.get_tensor("tokenizer_json").cpu().numpy().astype("uint8", copy=False).tobytes()
-        sidecar_key = "hf_asset__tokenizer_config.json"
-        tokenizer_config = {}
-        if sidecar_key in keys:
-            raw = handle.get_tensor(sidecar_key).cpu().numpy().astype("uint8", copy=False).tobytes()
-            tokenizer_config = json.loads(raw)
-        return config, PackedTokenizerAssets(tokenizer_json, tokenizer_config)
-
-
-def _initialize_packed_gemma_runtime_buffers(model: torch.nn.Module) -> None:
-    """Materialize deterministic Gemma 4 buffers that are not stored in checkpoints."""
-
-    language_model = model.model.language_model
-    config = model.config.text_config
-    rotary = language_model.rotary_emb
-    for layer_type in dict.fromkeys(config.layer_types):
-        rope_parameters = config.rope_parameters[layer_type]
-        if rope_parameters is None:
-            continue
-        rope_type = rope_parameters["rope_type"]
-        # Transformers 5.15 resolves the matching heterogeneous per-layer
-        # config internally when layer_type is provided, including the wider
-        # full-attention head dimension used by Gemma 4. Its default RoPE
-        # initializer is model-specific rather than registered globally.
-        if rope_type == "default":
-            layer_config = config.per_layer_config[layer_type]
-            inv_freq, attention_scaling = rotary.compute_default_rope_parameters(
-                layer_config,
-                layer_type=layer_type,
-            )
-        else:
-            inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, layer_type=layer_type)
-        rotary.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
-        rotary.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
-        setattr(rotary, f"{layer_type}_attention_scaling", attention_scaling)
-
-    embed_scale = torch.tensor(config.hidden_size**0.5, device="cpu")
-    language_model.embed_tokens.register_buffer("embed_scale", embed_scale, persistent=False)
 
 
 class GemmaTextEncoderModelBase(torch.nn.Module):
@@ -879,7 +722,7 @@ def module_ops_from_gemma_root(
             raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
         gemma_weights_path = gemma_safetensors
         gemma_root = None
-        packed_config, packed_tokenizer = _packed_ltx25_assets(gemma_safetensors)
+        packed_config, packed_tokenizer = gemma4_compat.read_packed_gemma_assets(gemma_safetensors)
         keep_fp8 = _has_fp8_weights(gemma_safetensors)
 
     # FP8Linear can keep its FP8 weight in CPU RAM and move it per forward; resolved before loading so the loader
@@ -929,6 +772,8 @@ def module_ops_from_gemma_root(
         directory_model_type = _directory_model_type(gemma_path) or _directory_model_type(gemma_root)
         is_gemma3_directory = directory_model_type is None or directory_model_type.startswith("gemma3")
         if not is_gemma3_directory:
+            from transformers import AutoModelForImageTextToText
+
             directory_model_class = AutoModelForImageTextToText
         if not is_gemma3_directory and not (load_in_8bit or load_in_4bit):
             weight_files = sorted(Path(gemma_path).glob("model*.safetensors"))
@@ -1027,13 +872,13 @@ def module_ops_from_gemma_root(
                         config = config_class(**inferred)
 
                 # Gemma 3 keeps its dedicated class; every newer family is built through Auto.
-                build_with_auto_model = not _is_gemma3_config(config)
+                build_with_auto_model = not gemma4_compat.is_gemma3_config(config)
 
                 # Initialize on meta device to avoid immediate allocation
-                with torch.device("meta"):
-                    if build_with_auto_model:
-                        module.model = AutoModelForImageTextToText.from_config(config).to(dtype=torch_dtype)
-                    else:
+                if build_with_auto_model:
+                    module.model = gemma4_compat.build_model_from_config(config, torch_dtype)
+                else:
+                    with torch.device("meta"):
                         module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
 
                 weight_shards = gemma_weights_path if isinstance(gemma_weights_path, list) else [gemma_weights_path]
@@ -1099,7 +944,7 @@ def module_ops_from_gemma_root(
                                 sub_mod, param_name = _resolve_module_and_attr(module.model, new_key)
                             except AttributeError:
                                 # Fall back to the other spellings this Transformers release may use.
-                                for alias in _key_alias_candidates(new_key):
+                                for alias in gemma4_compat.key_alias_candidates(new_key):
                                     try:
                                         sub_mod, param_name = _resolve_module_and_attr(module.model, alias)
                                     except AttributeError:
@@ -1169,7 +1014,7 @@ def module_ops_from_gemma_root(
                 # A model directory must map completely: an unmatched weight would otherwise be
                 # left randomly initialized, which is silent and very hard to notice downstream.
                 if directory_weights:
-                    unmapped_weights = [orig for orig, _ in unmatched_keys if not _is_non_weight_key(orig)]
+                    unmapped_weights = [orig for orig, _ in unmatched_keys if not gemma4_compat.is_non_weight_key(orig)]
                     if unmapped_weights:
                         raise ValueError(
                             f"{len(unmapped_weights)} Gemma tensor(s) from {gemma_root} have no counterpart in the "
@@ -1185,7 +1030,10 @@ def module_ops_from_gemma_root(
                         logger.warning("Failed to tie Gemma lm_head weights: %s", e)
 
                 if build_with_auto_model:
-                    _initialize_packed_gemma_runtime_buffers(module.model)
+                    # rotary frequencies and the embedding scale (non-persistent, never in a checkpoint); see
+                    # gemma4_compat for the Transformers internals this relies on
+                    rebuilt = gemma4_compat.initialize_runtime_buffers(module.model)
+                    logger.info("Rebuilt %d Gemma runtime buffers from the config: %s", len(rebuilt), rebuilt)
 
                 meta_params = [(name, p) for name, p in module.model.named_parameters() if p.device.type == "meta"]
                 meta_buffers = [(name, b) for name, b in module.model.named_buffers() if b.device.type == "meta"]
@@ -1257,7 +1105,7 @@ def module_ops_from_gemma_root(
 
                 if quantize:
                     quantization_config = _quantization_config()
-                    replaced = _quantize_linear_modules(module.model, quantization_config)
+                    replaced = gemma4_compat.quantize_linear_modules(module.model, quantization_config)
                     module.model = module.model.to(quantized_target_device)
                     module.model.config.quantization_config = quantization_config
                     # the markers Transformers' bitsandbytes quantizers set: GemmaTextEncoderModelBase.to,
