@@ -258,11 +258,12 @@ class Ideogram4InputAndCacheTests(unittest.TestCase):
 
         class FakeRotary(nn.Module):
             # the real rotary embedding computes inv_freq from the config in __init__ and keeps it as a
-            # non-persistent buffer, which to_empty() would leave uninitialized
-            def __init__(self, config, device=None):
+            # non-persistent buffer, which to_empty() would leave uninitialized; transformers 5.20 takes the config
+            # only (5.19 also took device=, which the loader passed: TypeError on 5.20)
+            def __init__(self, config):
                 super().__init__()
                 self.config = config
-                self.inv_freq = nn.Buffer(torch.tensor([1.0, 0.5], device=device), persistent=False)
+                self.inv_freq = nn.Buffer(torch.tensor([1.0, 0.5]), persistent=False)
 
         class FakeModel(nn.Module):
             def __init__(self):
