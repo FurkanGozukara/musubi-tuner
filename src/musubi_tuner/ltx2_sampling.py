@@ -1081,8 +1081,12 @@ class LTX2SamplingMixin:
                 bnb_device_map=bnb_device_map,
                 fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
                 device=build_device,
+                low_vram=low_vram,
             ),
         ).build(device=torch.device("cpu") if low_vram else build_device, dtype=text_encoder_dtype)
+        # before the low-VRAM hooks take their CPU copies of the weights (an override assigned afterwards would be
+        # replaced by the base weight at the next forward)
+        apply_text_encoder_checkpoint_overrides(self._text_encoder, str(text_encoder_checkpoint))
         text_model = getattr(self._text_encoder, "model", None)
         is_quantized = False
         if text_model is not None:
@@ -1106,7 +1110,6 @@ class LTX2SamplingMixin:
                 )
             except StopIteration:
                 pass
-        apply_text_encoder_checkpoint_overrides(self._text_encoder, str(text_encoder_checkpoint))
         self._text_encoder.eval()
 
         # Connector LoRA: replace text encoder's connectors with the wrapper's

@@ -152,6 +152,24 @@ def test_packed_ltx25_text_encoder_loads_like_transformers(tmp_path, multimodal)
     assert [int(t) for t in active] == [2, 4, 5, 6]
 
 
+def test_low_vram_loads_the_gemma_into_cpu_ram_and_streams_its_decoder_layers(tmp_path):
+    """--low_vram_text_encoding: an unquantized Gemma 4 loads into CPU RAM even when the run's device is the GPU (the
+    BF16 file held 23.4 GB of VRAM while loading, before the layers moved back), and its decoder layers stream through
+    the GPU one at a time with the same hidden states. Needs no GPU: nothing may go to the requested one."""
+    config = _tiny_config()
+    reference = _reference_model(config)
+    packed = tmp_path / "gemma4-tiny-with-proj-ltx-2.5.safetensors"
+    _write_packed_file(packed, config, reference)
+    ops = base_encoder.module_ops_from_gemma_root(
+        None, gemma_safetensors=str(packed), torch_dtype=torch.float32, device=torch.device("cuda"), low_vram=True
+    )
+    encoder = _load(ops)
+    assert {param.device.type for param in encoder.model.parameters()} == {"cpu"}
+    managed = base_encoder.enable_low_vram_text_encoding(encoder, "cpu")
+    assert managed[:2] == ["Gemma embeddings", f"{config.text_config.num_hidden_layers} Gemma decoder layers"]
+    _assert_same_forward(encoder.model, reference, config.text_config.num_hidden_layers)
+
+
 @pytest.mark.parametrize("multimodal", [False, True])
 def test_gemma4_directory_streams_like_transformers(tmp_path, multimodal):
     config = _tiny_config(multimodal)

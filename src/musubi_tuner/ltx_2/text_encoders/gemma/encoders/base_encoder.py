@@ -435,13 +435,29 @@ def _forward_accepts(model, name: str) -> bool:
     return name in _forward_parameters(type(model))
 
 
+def _gemma_decoder_layers(model) -> torch.nn.ModuleList | None:
+    """The decoder layers of a Hugging Face Gemma 3 / Gemma 4 model (``model.language_model.layers`` in
+    transformers 5), or None when the model has no such list."""
+    for path in ("model.language_model.layers", "language_model.layers", "model.layers"):
+        module = model
+        for part in path.split("."):
+            module = getattr(module, part, None)
+            if module is None:
+                break
+        if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
+            return module
+    return None
+
+
 def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", device) -> list[str]:
     """Keep the Gemma embedding table, the text projection and the embeddings connectors in CPU RAM and move each
     to the GPU only while it runs, so at most one of them (1.9 / 2.2 / 3.0 GB for LTX-2.3) is resident at a time.
 
     With FP8 Gemma weights offloaded too (``--gemma_fp8_weight_offload``, the default for the single-file FP8
     Gemma) LTX-2.3 text caching then fits GPUs with 8-12 GB; each prompt pays a few GB of extra host-to-device
-    copies. Returns the names of the modules that are now kept in CPU RAM."""
+    copies. An unquantized Gemma (LTX-2.5's BF16 Gemma 4: 48 decoder layers of 0.42-0.45 GB, 20.3 GB in all) keeps
+    its decoder layers in CPU RAM as well and streams them through the GPU one at a time, with identical outputs;
+    each prompt then copies every layer once. Returns the names of the modules that are now kept in CPU RAM."""
     device = torch.device(device)
     managed = []
     model = getattr(text_encoder, "model", None)
@@ -451,14 +467,31 @@ def enable_low_vram_text_encoding(text_encoder: "GemmaTextEncoderModelBase", dev
             or bool(getattr(model, "is_loaded_in_4bit", False))
             or bool(getattr(text_encoder, "_has_fp8_model", False))
         )
-        if not quantized:
-            # the bundle may have been built on the CPU; an unquantized Gemma runs on the GPU as a whole
-            model.to(device)
         embeddings = model.get_input_embeddings()
-        if embeddings is not None and getattr(embeddings, "weight", None) is not None:
+        table = getattr(embeddings, "weight", None) if embeddings is not None else None
+        layers = None if quantized else _gemma_decoder_layers(model)
+        if layers is not None:
+            # the bundle may have been built on the CPU: everything but the decoder layers and the embedding table
+            # (norms, rotary buffers, the unused vision tower) moves to the GPU
+            kept = {id(param) for layer in layers for param in layer.parameters()}
+            if table is not None:
+                kept.add(id(table))
+            for param in model.parameters():
+                if id(param) not in kept:
+                    param.data = param.data.to(device)
+            for buffer in model.buffers():
+                buffer.data = buffer.data.to(device)
+        elif not quantized:
+            # the bundle may have been built on the CPU; an unquantized Gemma without a layer list runs on the GPU
+            model.to(device)
+        if table is not None:
             # hooked on the whole Gemma forward: the LM head reuses this table at the end of the forward
-            _keep_weights_in_cpu_ram(model, [embeddings.weight], device)
+            _keep_weights_in_cpu_ram(model, [table], device)
             managed.append("Gemma embeddings")
+        if layers is not None:
+            for layer in layers:
+                _keep_weights_in_cpu_ram(layer, list(layer.parameters()), device)
+            managed.append(f"{len(layers)} Gemma decoder layers")
     projection = getattr(text_encoder, "feature_extractor_linear", None)
     if getattr(text_encoder, "audio_embeddings_connector", None) is None and getattr(projection, "audio_aggregate_embed", None) is not None:
         # a video-only encoder discards the audio projection's output (LTX-2.3: 0.7 GB of weights plus its activations);
@@ -711,6 +744,7 @@ def module_ops_from_gemma_root(
     bnb_device_map=None,
     fp8_weight_offload: bool | None = None,
     device: torch.device | None = None,
+    low_vram: bool = False,
 ) -> tuple[ModuleOps, ...]:
     # -- gemma_safetensors preprocessing --
     keep_fp8 = False
@@ -842,6 +876,12 @@ def module_ops_from_gemma_root(
         else:
             if gemma_weights_path is not None:
                 load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+                one_byte_weights = gemma_weights_dtype is not None and gemma_weights_dtype.itemsize == 1
+                if low_vram and not quantize and not keep_fp8 and not one_byte_weights:
+                    # low-VRAM text encoding streams an unquantized Gemma's decoder layers through the GPU one at a time
+                    # (enable_low_vram_text_encoding): load it into CPU RAM, never whole onto the GPU (LTX-2.5's BF16
+                    # Gemma 4 held 23.4 GB of it while loading)
+                    load_device = torch.device("cpu")
                 quantized_target_device = None
                 if quantize:
                     # Stage on CPU: bitsandbytes quantizes on the move to CUDA, so the dense copy

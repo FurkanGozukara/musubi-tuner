@@ -581,6 +581,7 @@ def main() -> None:
             bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
             bnb_4bit_compute_dtype=bnb_compute_dtype,
             fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
+            low_vram=low_vram_text_encoding,
         ),
     ).build(device=torch.device("cpu") if low_vram_text_encoding else device, dtype=dtype)
     apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
