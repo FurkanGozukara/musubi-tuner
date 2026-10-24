@@ -243,7 +243,9 @@ def _apply_remote_config_overrides(
             if any("to_gate_logits" in key for key in handle.keys()):
                 transformer_config["apply_gated_attention"] = True
                 logger.info("Auto-detected gated attention from checkpoint keys")
-    return config
+    from musubi_tuner.ltx2_model_loading import enrich_ltx2_config_from_checkpoint
+
+    return enrich_ltx2_config_from_checkpoint(config, model_path)
 
 
 def _resolve_ltx2_configurator(*, audio_video: bool, audio_only_model: bool):

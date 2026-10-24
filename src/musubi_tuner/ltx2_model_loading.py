@@ -1,5 +1,6 @@
 """LTX-2 model loading and configuration detection utilities."""
 
+import json
 import os
 import re
 import logging
@@ -424,6 +425,79 @@ def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any
 
     logger.info("Inferred LTX-2 transformer config from weights (no config metadata): %s", tcfg)
     return {"transformer": tcfg}
+
+
+def read_ltx2_checkpoint_header(model_path: Union[str, List[str], Tuple[str, ...]]) -> Tuple[Dict[str, str], List[str]]:
+    """(``__metadata__``, tensor names) of an LTX checkpoint (every shard of a list), with plain file reads: no tensor
+    is loaded and no memory map is made, so it is safe while a training process holds the same file mapped."""
+    paths = [model_path] if isinstance(model_path, str) else list(model_path)
+    metadata: Dict[str, str] = {}
+    keys: List[str] = []
+    for index, path in enumerate(paths):
+        with MemoryEfficientSafeOpen(str(path), disable_numpy_memmap=True) as handle:
+            if index == 0:
+                metadata = dict(handle.metadata() or {})
+            keys.extend(handle.keys())
+    return metadata, keys
+
+
+def parse_ltx_model_version(value: Any) -> Optional[Tuple[int, int]]:
+    """(major, minor) of an official ``model_version`` metadata string such as "2.5.0", or None."""
+    if value is None:
+        return None
+    try:
+        parts = [int(part) for part in str(value).strip().split(".")[:2]]
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    return (parts[0], parts[1] if len(parts) > 1 else 0)
+
+
+LTX25_CHECKPOINT_TENSOR = "keyframes_abs_pos_embedding"
+
+
+def detect_ltx_checkpoint_version(
+    model_path: Union[str, List[str], Tuple[str, ...]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[str]]:
+    """The LTX generation of a transformer checkpoint ("2.0" / "2.3" / "2.5") and the markers that decided it.
+
+    ``infer_ltx_version_from_checkpoint_config`` reads only the architecture config; LTX-2.5 is also recognised by the
+    checkpoint-owned ``keyframes_abs_pos_embedding`` tensor (the official loader and ComfyUI detect it from the tensor
+    names, so the config need not declare it) and by an official ``model_version`` >= 2.4 (the official pipeline maps
+    every such checkpoint onto the 2.5 code path). LTX-2 / 2.3 checkpoints have neither, so their answer is the
+    config's, as before.
+    """
+    metadata, keys = read_ltx2_checkpoint_header(model_path)
+    if config is None:
+        raw_config = metadata.get("config")
+        try:
+            config = json.loads(raw_config) if raw_config else {}
+        except ValueError:
+            config = {}
+    detected, markers = infer_ltx_version_from_checkpoint_config(config)
+    if any(key.endswith(LTX25_CHECKPOINT_TENSOR) for key in keys):
+        markers.append(f"tensor {LTX25_CHECKPOINT_TENSOR}")
+        detected = "2.5"
+    model_version = parse_ltx_model_version(metadata.get("model_version"))
+    if model_version is not None and model_version >= (2, 4):
+        markers.append(f"model_version={metadata.get('model_version')}")
+        detected = "2.5"
+    return detected, markers
+
+
+def enrich_ltx2_config_from_checkpoint(
+    config: Dict[str, Any], model_path: Union[str, List[str], Tuple[str, ...]]
+) -> Dict[str, Any]:
+    """The transformer config with the capabilities the checkpoint's tensor names imply (LTX-2.5: bias-free video
+    feed-forward, the keyframe embedding, native-dtype AdaLN), as SingleGPUModelBuilder does through
+    ``prepare_config_from_state_dict``. Values the config states are kept; a LTX-2 / 2.3 checkpoint gets the
+    defaults its model was always built with (feed-forward biases on, no keyframe embedding, FP32 AdaLN)."""
+    from musubi_tuner.ltx_2.model.transformer.ltx25_compat import enrich_config_from_state_dict
+
+    _metadata, keys = read_ltx2_checkpoint_header(model_path)
+    return enrich_config_from_state_dict(config, keys)
 
 
 def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[str, List[str]]:
@@ -1507,6 +1581,9 @@ def load_ltx2_model(
         if not (int8_base or int8_convrot_base or int4_convrot_base):
             raise
         config = infer_ltx2_transformer_config_from_weights(_config_path)
+    # LTX-2.5 capabilities from the tensor names (bias-free video FF, keyframe embedding, native-dtype AdaLN): the
+    # configurators read them from the config, which the official 2.5 metadata need not state
+    config = enrich_ltx2_config_from_checkpoint(config, model_path)
     attn_mode = (attn_mode or "torch").lower()
     attn_type = None
     if attn_mode in {"xformers", "xformers-attn"}:

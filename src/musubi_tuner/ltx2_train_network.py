@@ -1221,6 +1221,7 @@ from musubi_tuner.ltx2_model_loading import (  # noqa: F401 — re-exported for 
     detect_ltx2_dtype,
     detect_ltx2_config,
     infer_ltx_version_from_checkpoint_config,
+    detect_ltx_checkpoint_version,
     load_ltx2_model,
     KEEP_FP8_HIGH_PRECISION_TOKENS,
 )
@@ -2858,7 +2859,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         try:
             config = self._load_ltx2_checkpoint_config(args)
-            detected_version, markers = infer_ltx_version_from_checkpoint_config(config)
+            # config markers plus the 2.5 tensor / model_version markers (detect_ltx_checkpoint_version)
+            detected_version, markers = detect_ltx_checkpoint_version(str(args.ltx2_checkpoint), config)
         except Exception as exc:
             message = f"Failed to inspect checkpoint metadata for --ltx_version consistency check: {exc}"
             if check_mode == "error":
