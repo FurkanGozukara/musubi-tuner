@@ -279,6 +279,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
 - LTX-2 / LTX-2.3, single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
 - LTX-2.5, packed Gemma 4 and connector (`--ltx2_text_encoder_checkpoint`): [gemma4-12b-with-proj-ltx-2.5-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
+- LTX-2.5, Gemma 4 model directory (`--gemma_root`): used by checkpoints that ship the text encoder as a Transformers directory instead of a packed file
 
 **LTX-2.5 VAEs**:
 - Video (`--ltx2_video_vae`, or `--vae` during latent caching): [ltx-2.5-video-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors)
@@ -286,7 +287,9 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 
 For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial upscaler](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors). The optional [LTX-2.5 distilled LoRA](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) is for applying the distilled recipe to the development transformer.
 
-Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested. Use the packed Gemma 4 file for LTX-2.5.
+Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested.
+
+LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` apply to Gemma 3 directories only.
 
 ---
 
@@ -650,7 +653,7 @@ python ltx2_cache_text_encoder_outputs.py ^
   --batch_size 1
 ```
 
-For LTX-2.5, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`.
+For LTX-2.5 with a split pack, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`. When the text encoder is a Gemma 4 directory, keep `--gemma_root /path/to/gemma4-dir`, drop `--gemma_load_in_8bit`, and leave `--ltx2_text_encoder_checkpoint` unset so the connector weights are read from `--ltx2_checkpoint`.
 
 ### Text Encoder Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -1256,7 +1259,7 @@ reference_cache_directory/                  # IC-LoRA only
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
-| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | Reinstall the declared dependencies with `pip install -e .` (LTX-2.5 requires `transformers>=5.8.0,<5.15`). |
+| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | Reinstall the declared dependencies with `pip install -e .` (LTX-2.5 requires `transformers>=5.15,<5.16`). |
 | A nominally video-only LoRA contains audio or AV cross-modal adapter keys | `--ltx2_mode av` constructs the audio/cross-modal modules, and a broad target preset can select them. In `--ltx2_mode v`/`video`, those modules are not constructed. | Use `--ltx2_mode v` when no audio path is needed. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict adapter targets to the video branch. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
