@@ -84,6 +84,21 @@ def _directory_model_type(directory: str | None) -> str | None:
     return str(model_type) if model_type else None
 
 
+def resolve_gemma4_directory(gemma_root: str | None) -> str | None:
+    """Return `gemma_root` when it is a usable Gemma 4 model directory, else None.
+
+    `--gemma_root` carries a Gemma 3 default path that may not exist, so presence of the
+    argument alone says nothing about which text encoder the user actually supplied.
+    """
+
+    if not gemma_root or not Path(gemma_root).is_dir():
+        return None
+    model_type = _directory_model_type(gemma_root)
+    if model_type is None:
+        return None
+    return None if model_type.startswith("gemma3") else gemma_root
+
+
 def _is_gemma3_config(config: object) -> bool:
     """Report whether a Gemma config describes the Gemma 3 family."""
 
