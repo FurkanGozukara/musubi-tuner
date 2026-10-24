@@ -3296,9 +3296,12 @@ def main() -> None:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
     args.dit = args.ltx2_checkpoint
 
-    if getattr(args, "vae", None) is not None and args.vae != args.ltx2_checkpoint:
-        logger.warning("Ignoring --vae for LTX-2; using --ltx2_checkpoint instead")
-    args.vae = args.ltx2_checkpoint
+    # as the LoRA trainer (AkaneTendo25 d631633c): an LTX-2.5 split pack has its video VAE in --ltx2_video_vae; a
+    # unified checkpoint (LTX-2 / 2.3, LTX-2.5 Pre-Trained) holds it itself
+    video_vae = getattr(args, "ltx2_video_vae", None)
+    if getattr(args, "vae", None) is not None and args.vae not in {args.ltx2_checkpoint, video_vae}:
+        logger.warning("Ignoring generic --vae for LTX-2; use --ltx2_video_vae for split LTX-2.5 packs")
+    args.vae = video_vae or args.ltx2_checkpoint
 
     if getattr(args, "weighting_scheme", None) not in {None, "none"}:
         logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")
@@ -5108,6 +5111,15 @@ def main() -> None:
         conditioning_datasets.extend(val_dataset_group.datasets)
     trainer.configure_reference_target_ranges_from_datasets(conditioning_datasets)
     checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
+    if str(getattr(args, "ltx_version", "")) == "2.5":
+        # an LTX-2.5 transformer names its generation and its Gemma: the fine-tuned checkpoint keeps both, so the
+        # version check and the Gemma compatibility check accept it later (LTX-2 / 2.3 saves are unchanged)
+        from musubi_tuner.ltx2_model_loading import read_ltx2_checkpoint_header
+
+        source_metadata, _source_keys = read_ltx2_checkpoint_header(args.ltx2_checkpoint)
+        for key in ("model_version", "gemma_source_checkpoint"):
+            if source_metadata.get(key):
+                checkpoint_extra_metadata[key] = str(source_metadata[key])
     if checkpoint_extra_metadata:
         metadata.update(checkpoint_extra_metadata)
 
