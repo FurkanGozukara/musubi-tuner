@@ -46,6 +46,13 @@ PACKED_CONFIG_METADATA_KEY = "gemma_config"
 PACKED_TOKENIZER_KEY = "tokenizer_json"
 PACKED_TOKENIZER_CONFIG_KEY = "hf_asset__tokenizer_config.json"
 
+# hf_asset__tokenizer_config.json of the Gemma 4 text encoder Lightricks first published with LTX-2.5. They replaced the
+# file on 2026-08-17 ("Aligns the published encoders with the LTX-2.5 model checkpoints": 490 of its 686 tensors changed,
+# the text projection by up to 26.7%, with the chat template and this tokenizer config); copies made before, in mirrors
+# and downloaders, still carry it
+SUPERSEDED_TOKENIZER_CONFIG_SHA256 = frozenset({"794a39f8330ce05020774c70c091225bc5f031b9cacf41fc20e52eb54b4b52d8"})
+ALLOW_SUPERSEDED_ENV = "LTX2_ALLOW_SUPERSEDED_GEMMA4"
+
 
 @dataclass(frozen=True)
 class PackedTokenizerAssets:
@@ -63,6 +70,25 @@ def is_gemma3_config(config: object) -> bool:
 def is_non_weight_key(key: str) -> bool:
     """Whether a packed checkpoint key carries packed assets rather than weights."""
     return key == PACKED_TOKENIZER_KEY or key.startswith("hf_asset__")
+
+
+def check_packed_gemma_release(path: str, tokenizer_config: bytes) -> None:
+    """Refuse the Gemma 4 release Lightricks replaced on 2026-08-17 (its embedded tokenizer config identifies it): its
+    embeddings do not match the LTX-2.5 transformer. ``LTX2_ALLOW_SUPERSEDED_GEMMA4=1`` only warns."""
+    import hashlib
+    import os
+
+    if hashlib.sha256(tokenizer_config).hexdigest() not in SUPERSEDED_TOKENIZER_CONFIG_SHA256:
+        return
+    message = (
+        f"{path} is the Gemma 4 text encoder Lightricks replaced on 2026-08-17: 490 of its 686 tensors differ from the file "
+        "that matches the LTX-2.5 transformer. Download text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors again "
+        "from Lightricks/LTX-2.5 (or from a mirror updated after 2026-08-17)."
+    )
+    if os.environ.get(ALLOW_SUPERSEDED_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        logger.warning("%s Continuing because %s is set.", message, ALLOW_SUPERSEDED_ENV)
+        return
+    raise ValueError(f"{message} Set {ALLOW_SUPERSEDED_ENV}=1 to use it anyway.")
 
 
 def _uint8_tensor_bytes(tensor: torch.Tensor) -> bytes:
@@ -107,7 +133,9 @@ def read_packed_gemma_assets(path: str) -> tuple[Any | None, PackedTokenizerAsse
         tokenizer_json = _uint8_tensor_bytes(handle.get_tensor(PACKED_TOKENIZER_KEY))
         tokenizer_config = {}
         if PACKED_TOKENIZER_CONFIG_KEY in keys:
-            tokenizer_config = json.loads(_uint8_tensor_bytes(handle.get_tensor(PACKED_TOKENIZER_CONFIG_KEY)))
+            raw_tokenizer_config = _uint8_tensor_bytes(handle.get_tensor(PACKED_TOKENIZER_CONFIG_KEY))
+            check_packed_gemma_release(path, raw_tokenizer_config)
+            tokenizer_config = json.loads(raw_tokenizer_config)
     return config, PackedTokenizerAssets(tokenizer_json, tokenizer_config)
 
 

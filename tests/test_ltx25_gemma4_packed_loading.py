@@ -152,6 +152,28 @@ def test_packed_ltx25_text_encoder_loads_like_transformers(tmp_path, multimodal)
     assert [int(t) for t in active] == [2, 4, 5, 6]
 
 
+def test_the_superseded_gemma4_release_is_refused(tmp_path, monkeypatch):
+    """Lightricks replaced the Gemma 4 file on 2026-08-17 (490 of 686 tensors changed); copies made before, which mirrors
+    and downloaders still serve, carry the old embedded tokenizer config, and their embeddings do not match the
+    LTX-2.5 transformer."""
+    import hashlib
+
+    from safetensors import safe_open
+
+    config = _tiny_config()
+    packed = tmp_path / "gemma4-tiny-with-proj-ltx-2.5.safetensors"
+    _write_packed_file(packed, config, _reference_model(config))
+    with safe_open(str(packed), "pt") as handle:
+        raw = handle.get_tensor(gemma4_compat.PACKED_TOKENIZER_CONFIG_KEY).numpy().tobytes()
+    monkeypatch.setattr(gemma4_compat, "SUPERSEDED_TOKENIZER_CONFIG_SHA256", frozenset({hashlib.sha256(raw).hexdigest()}))
+    monkeypatch.delenv(gemma4_compat.ALLOW_SUPERSEDED_ENV, raising=False)
+    with pytest.raises(ValueError, match="2026-08-17"):
+        gemma4_compat.read_packed_gemma_assets(str(packed))
+    monkeypatch.setenv(gemma4_compat.ALLOW_SUPERSEDED_ENV, "1")
+    packed_config, _ = gemma4_compat.read_packed_gemma_assets(str(packed))
+    assert packed_config.model_type == "gemma4_unified"
+
+
 def test_low_vram_loads_the_gemma_into_cpu_ram_and_streams_its_decoder_layers(tmp_path):
     """--low_vram_text_encoding: an unquantized Gemma 4 loads into CPU RAM even when the run's device is the GPU (the
     BF16 file held 23.4 GB of VRAM while loading, before the layers moved back), and its decoder layers stream through
