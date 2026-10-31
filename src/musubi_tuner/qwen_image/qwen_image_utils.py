@@ -292,18 +292,55 @@ def load_qwen2_5_vl(
 
                     return forward
 
+                def decoder_forward_hook_v5(module):
+                    # transformers 5: the layer takes past_key_values and returns the hidden states tensor
+                    def forward(
+                        hidden_states: torch.Tensor,
+                        attention_mask: Optional[torch.Tensor] = None,
+                        position_ids: Optional[torch.LongTensor] = None,
+                        past_key_values=None,
+                        use_cache: Optional[bool] = False,
+                        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+                        **kwargs,
+                    ) -> torch.Tensor:
+                        residual = hidden_states
+                        hidden_states = module.input_layernorm(hidden_states)
+                        hidden_states, _ = module.self_attn(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_values=past_key_values,
+                            use_cache=use_cache,
+                            position_embeddings=position_embeddings,
+                            **kwargs,
+                        )
+                        input_dtype = hidden_states.dtype
+                        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(input_dtype)
+
+                        residual = hidden_states
+                        hidden_states = module.post_attention_layernorm(hidden_states)
+                        hidden_states = module.mlp(hidden_states)
+                        return residual + hidden_states
+
+                    return forward
+
+                # transformers 5 renamed the norms (Qwen2RMSNorm -> Qwen2_5_VLRMSNorm) and the vision rotary embedding
+                # (Qwen2_5_VisionRotaryEmbedding -> Qwen2_5_VLVisionRotaryEmbedding), and its decoder layers take
+                # past_key_values and return a tensor. With only the 4.x names nothing was hooked: every FP8 VL run
+                # (text caching with --fp8_vl, captioning with FP8) stopped at the first norm ("Promotion for Float8
+                # Types is not supported"). Both names are matched; the layer hook follows the installed signature.
+                import inspect
+
                 for module in vl_model.modules():
-                    if module.__class__.__name__ in ["Embedding"]:
-                        # print("set", module.__class__.__name__, "to", target_dtype)
+                    name = module.__class__.__name__
+                    if name in ["Embedding"]:
                         module.to(target_dtype)
-                    if module.__class__.__name__ in ["Qwen2RMSNorm"]:
-                        # print("set", module.__class__.__name__, "hooks")
+                    if name in ["Qwen2RMSNorm", "Qwen2_5_VLRMSNorm"]:
                         module.forward = forward_hook(module)
-                    if module.__class__.__name__ in ["Qwen2_5_VLDecoderLayer"]:
-                        # print("set", module.__class__.__name__, "hooks")
-                        module.forward = decoder_forward_hook(module)
-                    if module.__class__.__name__ in ["Qwen2_5_VisionRotaryEmbedding"]:
-                        # print("set", module.__class__.__name__, "hooks")
+                    if name in ["Qwen2_5_VLDecoderLayer"]:
+                        takes_cache = "past_key_values" in inspect.signature(type(module).forward).parameters
+                        module.forward = decoder_forward_hook_v5(module) if takes_cache else decoder_forward_hook(module)
+                    if name in ["Qwen2_5_VisionRotaryEmbedding", "Qwen2_5_VLVisionRotaryEmbedding"]:
                         module.to(target_dtype)
 
             prepare_fp8(qwen2_5_vl, org_dtype)
