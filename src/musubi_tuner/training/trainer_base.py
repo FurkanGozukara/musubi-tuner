@@ -75,6 +75,7 @@ from musubi_tuner.training.timesteps import (
     compute_ideogram4_shift_timestep,
     compute_loss_weighting_for_sd3,
     get_sigmas,
+    truncated_logit_normal_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -876,6 +877,12 @@ class NetworkTrainer:
             noisy_model_input = (1 - t) * latents + t * noise
 
             timesteps += 1  # 1 to 1000
+        elif args.timestep_sampling == "truncated_logit_normal":
+            # the MOSS-Image pre-training schedule on the (shift-aware) grid; min / max timestep do not apply
+            indices = truncated_logit_normal_indices(args, batch_size, noise_scheduler.config.num_train_timesteps)
+            timesteps = noise_scheduler.timesteps[indices].to(device=device)  # 1 to 1000
+            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
         else:
             # Sample a random timestep for each image
             # for weighting schemes where we sample timesteps non-uniformly
@@ -1704,6 +1711,8 @@ class NetworkTrainer:
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
                 " / データセットに学習データがありません。latent/Text Encoderキャッシュを事前に作成したか確認してください"
             )
+        if hasattr(self, "on_train_datasets"):  # as the extended loop: MOSS-Image reads its caption-dropout context here
+            self.on_train_datasets(args, list(train_dataset_group.datasets))
 
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
         collator = collator_class(current_epoch, ds_for_collator)

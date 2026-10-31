@@ -9,13 +9,7 @@ from musubi_tuner.training.full_finetune import FullFineTuningTrainerMixin, add_
 
 
 def krea2_full_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument(
-        "--dit_variant",
-        type=str,
-        choices=["raw", "turbo"],
-        default="raw",
-        help="variant of the full-finetune --dit checkpoint; Turbo uses the fixed mu=1.15 sampling schedule",
-    )
+    # --dit_variant (raw / turbo) comes from krea2_setup_parser, shared with LoRA training
     return parser
 
 

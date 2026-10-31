@@ -1231,13 +1231,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return transformer
 
     def compile_transformer(self, args, transformer):
-        # ConvRot int8 Linears are excluded from compile: the custom autograd.Function +
-        # autotuned Triton kernels are not dynamo-traceable (cf. krea2_train_network).
+        # ConvRot int8 Linears compile as well: the fused Triton path is a torch.library custom op
+        # (opaque node, no graph break; kohya-ss/sd-scripts a4aaa20). Only block swap excludes Linears.
         return model_utils.compile_transformer(
             args,
             transformer,
             [transformer.blocks],
-            disable_linear=bool(self.blocks_to_swap) or bool(getattr(transformer, "is_convrot_int8", False)),
+            disable_linear=bool(self.blocks_to_swap),
             offloaders=[transformer.offloader if self.blocks_to_swap else None],
         )
 

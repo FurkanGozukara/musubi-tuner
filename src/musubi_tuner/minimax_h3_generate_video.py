@@ -494,14 +494,13 @@ def _load_transformer(args: argparse.Namespace, device: torch.device) -> tuple[t
         transformer.to(device)
     transformer.eval().requires_grad_(False)
     if args.compile:
-        # mirrors minimax_h3_train_network.compile_transformer: ConvRot INT8 Linears are
-        # excluded (custom autograd.Function + autotuned Triton kernels are not
-        # dynamo-traceable), as are the Linears of swapped blocks
+        # mirrors minimax_h3_train_network.compile_transformer: only the Linears of swapped
+        # blocks are excluded; ConvRot INT8 Linears are a torch.library custom op and compile
         transformer = compile_transformer(
             args,
             transformer,
             [transformer.blocks],
-            disable_linear=bool(args.blocks_to_swap) or bool(getattr(transformer, "is_convrot_int8", False)),
+            disable_linear=bool(args.blocks_to_swap),
         )
     return transformer, attached_lora_networks
 

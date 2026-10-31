@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass, replace
 import torch
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 
 logger = logging.getLogger(__name__)
@@ -205,9 +205,14 @@ class AttentionParams:
     split_attn: bool = False
     img_len: Optional[int] = None
     attention_mask: Optional[torch.Tensor] = None
-    seqlens: Optional[torch.Tensor] = None
+    seqlens: Optional[List[int]] = None  # valid length (img_len + text length) of each batch element, Python ints
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+    # Set when all batch elements have the same valid length and split_attn is False: `attention` trims the sequence to
+    # this length instead of masking (modes other than flash / sageattn). Python ints, not tensors, so that no graph break
+    # occurs inside torch.compile'd blocks (kohya-ss/sd-scripts 4e3905f); compile treats them as dynamic after the first
+    # recompile.
+    uniform_seqlen: Optional[int] = None
 
     def __post_init__(self):
         if self.attn_mode == "sdpa":
@@ -226,33 +231,38 @@ class AttentionParams:
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)
         else:
             # Note: attention_mask is only for text tokens, not including image tokens
-            seqlens = attention_mask.sum(dim=1).to(torch.int32) + img_len  # [B]
+            # The sequence lengths are converted to Python ints here, once per model forward (one device sync), so that
+            # the per-block `attention` calls need no data-dependent control flow (kohya-ss/sd-scripts 4e3905f).
+            seqlens = [int(n) + img_len for n in attention_mask.sum(dim=1).tolist()]  # [B]
             max_seqlen = attention_mask.shape[1] + img_len
 
             if split_attn:
                 # cu_seqlens is not needed for split attention
                 return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, None, max_seqlen)
 
-            # Convert attention mask to cumulative sequence lengths for flash attention
+            # All batch elements have the same valid length: `attention` may trim the sequence instead of masking
+            uniform_seqlen = seqlens[0] if all(n == seqlens[0] for n in seqlens) else None
+
+            # Convert attention mask to cumulative sequence lengths for flash attention (built on the CPU, one upload)
             batch_size = attention_mask.shape[0]
-            cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=attention_mask.device)
+            cu_seqlens_list = [0]
             for i in range(batch_size):
-                cu_seqlens[2 * i + 1] = i * max_seqlen + seqlens[i]  # end of valid tokens for query
-                cu_seqlens[2 * i + 2] = (i + 1) * max_seqlen  # end of all tokens for query
+                cu_seqlens_list.append(i * max_seqlen + seqlens[i])  # end of valid tokens for query
+                cu_seqlens_list.append((i + 1) * max_seqlen)  # end of all tokens for query
+            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=attention_mask.device)
 
             # Expand attention mask to include image tokens
             attention_mask = torch.nn.functional.pad(attention_mask, (img_len, 0), value=1)  # [B, img_len + L]
 
             # attention bias for xformers
             if attn_mode == "xformers":
-                seqlens_list = seqlens.cpu().tolist()
-                attention_mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-                    seqlens_list, seqlens_list, device=attention_mask.device
-                )
+                attention_mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(seqlens, seqlens, device=attention_mask.device)
             elif attn_mode == "torch":
                 attention_mask = attention_mask[:, None, None, :].to(torch.bool)  # [B, 1, 1, img_len + L]
 
-            return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen)
+            return AttentionParams(
+                attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen, uniform_seqlen
+            )
 
 
 def _flash3_output(result):
@@ -309,22 +319,24 @@ def attention(
 
     # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence
     seqlen_trimmed = False
-    # Trim if all seqlens are the same, for attention modes other than flash or sageattn (which can handle masks efficiently)
+    # Trim if all seqlens are the same, for attention modes other than flash or sageattn (which can handle masks efficiently).
+    # uniform_seqlen is a Python int computed in create_attention_params_from_mask: no tensor comparison or .item() here,
+    # so this does not break the graph of a torch.compile'd block (kohya-ss/sd-scripts 4e3905f).
     if (
         not attn_params.split_attn
         and attn_params.attention_mask is not None
-        and attn_params.seqlens is not None
+        and attn_params.uniform_seqlen is not None
         and (attn_params.attn_mode != "flash" and attn_params.attn_mode != "sageattn")
     ):
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
+        seqlen = attn_params.uniform_seqlen
+        if seqlen < q.shape[1]:
             q = q[:, :seqlen]
             k = k[:, :seqlen]
             v = v[:, :seqlen]
-            max_seqlen = attn_params.max_seqlen
-            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
-            attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
             seqlen_trimmed = True
+        max_seqlen = attn_params.max_seqlen
+        attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
+        attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
 
     # Determine tensor layout based on attention implementation
     if attn_params.attn_mode == "torch" or (
@@ -343,7 +355,7 @@ def attention(
         if attn_params.seqlens is None:
             # If no seqlens provided, assume all tokens are valid
             attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True)  # do not in-place modify
-            attn_params.seqlens = torch.tensor([q.shape[1]] * q.shape[0], device=q.device)
+            attn_params.seqlens = [q.shape[1]] * q.shape[0]
             attn_params.max_seqlen = q.shape[1]
         q = [transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(q))]
         k = [transpose_fn(k[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(k))]

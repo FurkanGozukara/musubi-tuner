@@ -33,6 +33,7 @@ logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.dataset.architectures import *  # noqa: F401,F403
 from musubi_tuner.dataset.architectures import (  # explicit imports for local use
+    ARCHITECTURE_FIBO2,
     ARCHITECTURE_FLUX_2_DEV,
     ARCHITECTURE_FLUX_2_KLEIN_4B,
     ARCHITECTURE_FLUX_2_KLEIN_9B,
@@ -2703,14 +2704,17 @@ class ImageDataset(BaseDataset):
             or self.architecture == ARCHITECTURE_FLUX_2_KLEIN_4B
             or self.architecture == ARCHITECTURE_FLUX_2_KLEIN_9B
             or self.architecture == ARCHITECTURE_FLUX_3
+            or self.architecture == ARCHITECTURE_FIBO2
         ):
             control_count_per_image = None  # can be multiple control images
-        elif self.architecture in (ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_21, ARCHITECTURE_MAGE_FLOW_EDIT):
-            control_count_per_image = None  # can be multiple control images
+        elif self.architecture in (ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_21, ARCHITECTURE_MAGE_FLOW_EDIT, ARCHITECTURE_KREA2):
+            control_count_per_image = None  # can be multiple control images (Krea 2 Edit: reference images)
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
         elif self.architecture == ARCHITECTURE_MOSS_IMAGE:
-            control_count_per_image = 2  # control adapter maps: <name>_0 colour regions, <name>_1 depth (both, in order)
+            # control adapter maps: <name>_0 colour regions, <name>_1 depth (both, in order, at the target's bucket); edit
+            # references keep their framing (control_resolution, which the GUI writes for MOSS-Image Edit only): any number
+            control_count_per_image = None if control_resolution is not None else 2
 
         if self.cache_only:
             self.datasource = None
@@ -2939,6 +2943,14 @@ class ImageDataset(BaseDataset):
                             )
                             resized_control = resize_image_to_bucket(control, control_bucket_reso)
                             resized_controls.append(resized_control)
+                    elif self.architecture == ARCHITECTURE_FIBO2 and len(controls) > 1:
+                        # FIBO 2.0 (Bria's rule): several references each keep their own aspect ratio at the target's pixel
+                        # count; a single one is cropped to the target's size (below), so the edit lines up with it
+                        from musubi_tuner.fibo2.fibo2_sizes import trained_size
+
+                        for control in controls:
+                            size = trained_size(control.size[0] / control.size[1], bucket_reso[0] * bucket_reso[1])
+                            resized_controls.append(resize_image_to_bucket(control, size))
                     else:
                         for control in controls:
                             resized_control = resize_image_to_bucket(control, bucket_reso)

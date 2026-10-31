@@ -221,6 +221,30 @@ def load_krea2_text_encoder(
     )
 
 
+def reference_tokens(
+    references: list[torch.Tensor], patch: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Edit references, each (B, C, h, w) latents, as DiT tokens (B, Lr, C*patch*patch) and positions (B, Lr, 3).
+
+    Reference i (from 1) sits at RoPE axis-0 index i with its own y / x grid from 0, as ComfyUI's Krea 2
+    (``process_img(ref, index=i)``) and ai-toolkit's ``pack_ref_latents`` place them; the target image is index 0."""
+    from einops import rearrange
+
+    tokens, positions = [], []
+    for index, reference in enumerate(references, 1):
+        batch, _, height, width = reference.shape
+        if height % patch or width % patch:
+            raise ValueError(f"reference latents {tuple(reference.shape)} are not a multiple of the patch size {patch}")
+        rows, cols = height // patch, width // patch
+        tokens.append(rearrange(reference, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch))
+        ids = torch.zeros(rows, cols, 3, device=device)
+        ids[..., 0] = index
+        ids[..., 1] = torch.arange(rows, device=device)[:, None]
+        ids[..., 2] = torch.arange(cols, device=device)[None, :]
+        positions.append(ids.reshape(1, rows * cols, 3).expand(batch, -1, -1))
+    return torch.cat(tokens, dim=1).to(device=device, dtype=dtype), torch.cat(positions, dim=1)
+
+
 @torch.no_grad()
 def get_krea2_prompt_embeds(encoder: Qwen3VLConditioner, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (hiddens, mask).

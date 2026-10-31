@@ -55,6 +55,55 @@ def compute_density_for_timestep_sampling(
     return u
 
 
+def sample_truncated_logit_normal_indices(
+    batch_size: int,
+    num_timesteps: int,
+    logit_mean: float,
+    logit_std: float,
+    cutoff: float,
+    uniform_ratio: float,
+) -> torch.Tensor:
+    """Indices on the descending timestep grid (index 0 = sigma 1) of the MOSS-Image pre-training schedule (kohya
+    sd-scripts 188c03c; the technical report's eq. 4): ``S = sigmoid(-Z)``, ``Z ~ N(logit_mean, logit_std)`` (a negative
+    mean biases towards more noise), truncated to ``S <= cutoff`` by inverse-CDF sampling, rescaled by ``1 / cutoff`` to
+    (0, 1] and snapped to the grid point whose cell holds it (``sigma = ceil(S * T) / T``); with probability
+    ``uniform_ratio`` the grid point is drawn uniformly instead. The pre-training used mean -1.09, std 0.95, cutoff 0.95,
+    ratio 0.01 on the unshifted grid (shift 1). Returns a CPU LongTensor."""
+    if not (0.0 < cutoff <= 1.0):
+        raise ValueError(f"--timestep_cutoff must be in (0, 1], got {cutoff}")
+    if not (0.0 <= uniform_ratio <= 1.0):
+        raise ValueError(f"--timestep_uniform_ratio must be in [0, 1], got {uniform_ratio}")
+    mean = torch.full((batch_size,), float(logit_mean), dtype=torch.float64)
+    std = float(logit_std)
+    # S <= cutoff  <=>  Z >= -logit(cutoff): draw the CDF value uniformly in [P(Z < z_lo), 1) and invert
+    if cutoff < 1.0:
+        z_lo = -math.log(cutoff / (1.0 - cutoff))
+        p_lo = torch.special.ndtr((z_lo - mean) / std)
+    else:
+        p_lo = torch.zeros_like(mean)
+    p = p_lo + torch.rand(batch_size, dtype=torch.float64) * (1.0 - p_lo)
+    z = mean + std * torch.special.ndtri(p.clamp(max=1.0 - 1e-12))
+    s = torch.sigmoid(-z) / cutoff  # (0, 1]
+    indices = (num_timesteps - torch.ceil(s * num_timesteps).long()).clamp(0, num_timesteps - 1)
+    if uniform_ratio > 0.0:
+        use_uniform = torch.rand(batch_size) < uniform_ratio
+        indices = torch.where(use_uniform, torch.randint(0, num_timesteps, (batch_size,)), indices)
+    return indices
+
+
+def truncated_logit_normal_indices(args, batch_size: int, num_timesteps: int) -> torch.Tensor:
+    """``--timestep_sampling truncated_logit_normal`` with the run's --logit_mean / --logit_std / --timestep_cutoff /
+    --timestep_uniform_ratio (kohya's defaults for the last two)."""
+    return sample_truncated_logit_normal_indices(
+        batch_size,
+        num_timesteps,
+        float(getattr(args, "logit_mean", 0.0) if getattr(args, "logit_mean", None) is not None else 0.0),
+        float(getattr(args, "logit_std", 1.0) if getattr(args, "logit_std", None) is not None else 1.0),
+        float(getattr(args, "timestep_cutoff", 0.95) if getattr(args, "timestep_cutoff", None) is not None else 0.95),
+        float(getattr(args, "timestep_uniform_ratio", 0.01) if getattr(args, "timestep_uniform_ratio", None) is not None else 0.01),
+    )
+
+
 def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)

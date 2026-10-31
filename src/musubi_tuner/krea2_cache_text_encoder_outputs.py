@@ -19,6 +19,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, save_text_encoder_output_cache_krea2
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2
 from musubi_tuner.krea2 import krea2_utils
+from musubi_tuner.qwen_image_21 import qwen_image_21_utils
 
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 
@@ -30,6 +31,19 @@ def encode_and_save_batch(encoder, batch: list[ItemInfo]):
     prompts = [item.caption for item in batch]
     for i, item in enumerate(batch):
         print(f"Item {i}: {item.item_key}, prompt: {item.caption}")
+
+    if any(item.control_content for item in batch):
+        # Krea 2 Edit: the reference images join the prompt as vision tokens, one item at a time (as ComfyUI's
+        # Text Encode Qwen Image Edit Plus node encodes them for the Krea 2 text encoder)
+        for item in batch:
+            references = list(item.control_content or [])
+            if not references:
+                raise ValueError(f"{item.item_key}: an edit dataset item without reference images")
+            embed = encoder.encode_edit(item.caption, references)
+            save_text_encoder_output_cache_krea2(
+                item, cast_for_cache(encoder, embed), reference_hashes=qwen_image_21_utils.reference_fingerprints(references)
+            )
+        return
 
     hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, prompts)  # (B, seq, L, D), (B, seq)
 
@@ -88,6 +102,8 @@ def main():
         nonlocal encoder
         encode_and_save_batch(encoder, batch)
 
+    # edit datasets need the reference images themselves (resized as for latent caching)
+    has_references = any(getattr(dataset, "has_control", False) for dataset in datasets)
     cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
         args.skip_existing,
@@ -96,6 +112,7 @@ def main():
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
+        requires_content=has_references,
     )
     del encoder
 

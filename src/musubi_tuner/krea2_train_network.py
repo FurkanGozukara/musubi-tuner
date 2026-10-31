@@ -23,6 +23,7 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 from tqdm import tqdm
 from einops import rearrange, repeat
+from PIL import Image
 
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
 from musubi_tuner.hv_train_network import (
@@ -37,12 +38,52 @@ from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.networks import lora_krea2
 from musubi_tuner.qwen_image import qwen_image_utils
+from musubi_tuner.training.base_weights_sampling import SampleBaseWeights, add_sample_multiplier_argument, sample_multiplier_deltas
 from musubi_tuner.utils import model_utils
 
 import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def krea2_dit_lora_names(dit_path: str) -> set[str]:
+    """``lora_unet_<layer>`` for every weight of a Krea 2 DiT file, from its safetensors header (ComfyUI prefixes removed)."""
+    from safetensors import safe_open
+
+    with safe_open(dit_path, framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+    names = set()
+    for key in keys:
+        key = key.removeprefix("model.diffusion_model.").removeprefix("diffusion_model.")
+        if key.endswith(".weight"):
+            names.add("lora_unet_" + key[: -len(".weight")].replace(".", "_"))
+    return names
+
+
+def reference_latents_from_batch(batch: dict) -> list[torch.Tensor]:
+    """The edit references of a training batch, (B, C, h, w) each in reference order, after checking that the text
+    encoder cache encoded the same reference images (its vision tokens) as the latent cache: a text-to-image cache of the
+    same image would train an edit LoRA without the references in the prompt."""
+    keys = sorted((key for key in batch if key.startswith("latents_control_")), key=lambda key: int(key.rsplit("_", 1)[1]))
+    if not keys:
+        return []
+    if keys != [f"latents_control_{index}" for index in range(len(keys))]:
+        raise ValueError("Krea 2 reference latent cache indices must be contiguous; rebuild the latent cache")
+    latent_hashes, text_hashes = batch.get("reference_hashes"), batch.get("vlm_reference_hashes")
+    if latent_hashes is None or text_hashes is None:
+        raise ValueError(
+            "Krea 2 Edit caches without reference fingerprints: rebuild the latent and the text encoder caches with the "
+            "reference images (Krea 2 Edit encodes the references in the prompt as well)"
+        )
+    for latent_hash, text_hash in zip(latent_hashes, text_hashes):
+        if latent_hash.shape != (len(keys), 32) or not torch.equal(latent_hash.cpu(), text_hash.cpu()):
+            raise ValueError("Krea 2 Edit references differ between the latent and the text encoder caches; rebuild both caches")
+    references = []
+    for key in keys:
+        latent = batch[key]
+        references.append(latent.squeeze(2) if latent.dim() == 5 else latent)
+    return references
 
 
 class Krea2NetworkTrainer(NetworkTrainer):
@@ -58,6 +99,10 @@ class Krea2NetworkTrainer(NetworkTrainer):
         self._raw_stash = None
         # --turbo_lora: second, frozen LoRANetwork composed on RAW (see _build_turbo_lora_network).
         self._turbo_lora_network = None
+        # --base_weights merged while loading (before fp8 / ConvRot quantization); the training loop then skips its own merge
+        self._base_weights_merged_at_load = False
+        # --base_weights_sample_multiplier: a training adapter left out of the samples (training/base_weights_sampling.py)
+        self._sample_base_weights = SampleBaseWeights([])
 
     # region model specific
 
@@ -112,12 +157,21 @@ class Krea2NetworkTrainer(NetworkTrainer):
             )
         if (args.turbo_dit or turbo_lora) and not args.sample_prompts:
             logger.warning("--turbo_dit/--turbo_lora is set but --sample_prompts is not; Turbo is only used for sample generation.")
+        dit_variant = getattr(args, "dit_variant", "raw")
+        if dit_variant == "turbo" and (args.turbo_dit or turbo_lora):
+            raise ValueError("--dit_variant turbo trains the Turbo DiT itself: --turbo_dit / --turbo_lora (Turbo samples of a RAW run) do not apply.")
+        self._sample_base_weights = SampleBaseWeights(sample_multiplier_deltas(args))
+        if dit_variant == "turbo" and not args.base_weights and args.network_module:
+            logger.warning(
+                "Krea 2 Turbo without a training adapter (--base_weights): training breaks the step distillation quickly; "
+                "ostris/krea2_turbo_training_adapter keeps it while the LoRA trains."
+            )
 
     def use_turbo_sampling_schedule(self, args: argparse.Namespace) -> bool:
         # --turbo_dit swaps in the distilled checkpoint directly; --turbo_lora is a rank-extracted
         # delta between the released raw/turbo checkpoints, so it approximates the same fixed-mu
-        # weights. Pin the Turbo sampling schedule for either.
-        return bool(args.turbo_dit or getattr(args, "turbo_lora", None))
+        # weights. Pin the Turbo sampling schedule for either, and for a Turbo DiT trained directly.
+        return bool(args.turbo_dit or getattr(args, "turbo_lora", None) or getattr(args, "dit_variant", "raw") == "turbo")
 
     def process_sample_prompts(
         self,
@@ -148,15 +202,26 @@ class Krea2NetworkTrainer(NetworkTrainer):
         mark_cpu_fp32_fallback(encoder, torch.bfloat16, te_dtype)
 
         logger.info("Encoding sample prompts with Qwen3-VL")
-        te_outputs = {}  # prompt str -> (valid_len, num_layers, hidden) on cpu
+        te_outputs = {}  # (prompt, reference paths) -> (valid_len, num_layers, hidden) on cpu
+        references = {}  # path -> RGB PIL image (edit samples)
         with torch.no_grad():
             for prompt_dict in prompts:
+                paths = tuple(prompt_dict.get("control_image_path") or [])
+                for path in paths:
+                    if path not in references:
+                        with Image.open(path) as image:
+                            references[path] = image.convert("RGB")
                 for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", None)]:
-                    if p is None or p in te_outputs:
+                    if p is None or (p, paths) in te_outputs:
                         continue
-                    hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [p])  # (1, seq, L, D), (1, seq)
-                    embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
-                    te_outputs[p] = cast_for_cache(encoder, embed.to("cpu"))
+                    if paths:
+                        # an edit sample: the references reach the text encoder as ComfyUI's edit node sends them,
+                        # for the negative prompt too (TextEncodeQwenImageEditPlus encodes either with its images)
+                        embed = encoder.encode_edit(p, [references[path] for path in paths])
+                    else:
+                        hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [p])  # (1, seq, L, D), (1, seq)
+                        embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
+                    te_outputs[(p, paths)] = cast_for_cache(encoder, embed.to("cpu"))
 
         del encoder
         gc.collect()
@@ -165,10 +230,12 @@ class Krea2NetworkTrainer(NetworkTrainer):
         sample_parameters = []
         for prompt_dict in prompts:
             prompt_dict_copy = prompt_dict.copy()
-            prompt_dict_copy["krea2_vl_embed"] = te_outputs[prompt_dict.get("prompt", "")]
+            paths = tuple(prompt_dict.get("control_image_path") or [])
+            prompt_dict_copy["krea2_vl_embed"] = te_outputs[(prompt_dict.get("prompt", ""), paths)]
             negative_prompt = prompt_dict.get("negative_prompt", None)
             if negative_prompt is not None:
-                prompt_dict_copy["negative_krea2_vl_embed"] = te_outputs[negative_prompt]
+                prompt_dict_copy["negative_krea2_vl_embed"] = te_outputs[(negative_prompt, paths)]
+            prompt_dict_copy["krea2_reference_images"] = [references[path] for path in paths]
             sample_parameters.append(prompt_dict_copy)
 
         clean_memory_on_device(device)
@@ -246,6 +313,20 @@ class Krea2NetworkTrainer(NetworkTrainer):
         if do_cfg:
             _, unpos, unmask = krea2_sampling.prepare(noise, untxt.shape[1], patch, untxtmask)
 
+        # edit samples: the references' clean latents lead the sequence (t = 0 modulation, axis-0 index 1, 2, ...)
+        ref_tokens, ref_len = None, 0
+        references = sample_parameter.get("krea2_reference_images") or []
+        if references:
+            ref_tokens, ref_pos = self._encode_reference_images(vae, references, (width, height), device, dit_dtype, patch)
+            ref_len = ref_tokens.shape[1]
+            ref_mask = torch.ones(1, ref_len, device=device, dtype=torch.bool)
+            pos, mask = torch.cat((ref_pos, pos), dim=1), torch.cat((ref_mask, mask), dim=1)
+            if do_cfg:
+                unpos, unmask = torch.cat((ref_pos, unpos), dim=1), torch.cat((ref_mask, unmask), dim=1)
+
+        def with_references(tokens):
+            return tokens if ref_tokens is None else torch.cat((ref_tokens, tokens), dim=1)
+
         # mu interpolation endpoints (krea2 sample defaults minres=256, maxres=1280).
         x1 = (256 // align) ** 2
         x2 = (1280 // align) ** 2
@@ -256,9 +337,9 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
         for tcurr, tprev in tqdm(zip(ts[:-1], ts[1:]), total=len(ts) - 1, desc="Denoising steps"):
             t = torch.full((1,), tcurr, dtype=img.dtype, device=device)
-            cond = model(img=img, context=txt, t=t, pos=pos, mask=mask)
+            cond = model(img=with_references(img), context=txt, t=t, pos=pos, mask=mask, ref_len=ref_len)
             if do_cfg:
-                uncond = model(img=img, context=untxt, t=t, pos=unpos, mask=unmask)
+                uncond = model(img=with_references(img), context=untxt, t=t, pos=unpos, mask=unmask, ref_len=ref_len)
                 v = uncond + cfg * (cond - uncond)
             else:
                 v = cond
@@ -277,6 +358,29 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
         pixels = pixels.unsqueeze(2).to(torch.float32).cpu()  # (1, C, 1, H, W) for the grid saver
         return pixels
+
+    @staticmethod
+    def _encode_reference_images(vae, references, size, device, dtype, patch):
+        """Sample references -> DiT tokens: each image keeps its framing at the sample's pixel count, sides a multiple of 16
+        (ComfyUI's edit node scales references to about 1024 x 1024 pixels, the size of the training samples), Qwen-Image
+        VAE latents normalized as in latent caching."""
+        import numpy as np
+
+        from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2
+        from musubi_tuner.dataset.bucket import BucketSelector
+        from musubi_tuner.dataset.media_utils import resize_image_to_bucket
+
+        vae.to(device)
+        latents = []
+        with torch.no_grad():
+            for image in references:
+                bucket = BucketSelector.calculate_bucket_resolution(image.size, size, architecture=ARCHITECTURE_KREA2)
+                array = resize_image_to_bucket(np.asarray(image.convert("RGB")), bucket)
+                pixels = torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1)[None, :, None].float() / 127.5 - 1.0
+                latent = vae.encode_pixels_to_latents(pixels.to(vae.device, dtype=vae.dtype))  # (1, C, 1, h, w)
+                latents.append(latent.squeeze(2))
+        vae.to("cpu")
+        return krea2_utils.reference_tokens(latents, patch, device, dtype)
 
     # region RAW-train / Turbo-sample (base-weight swap)
 
@@ -368,6 +472,10 @@ class Krea2NetworkTrainer(NetworkTrainer):
         return network
 
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        if self._sample_base_weights:
+            # a training adapter left out of the samples (built at the first sample, outside the trained network)
+            self._sample_base_weights.build(lora_krea2, accelerator.unwrap_model(transformer), self._load_base_weights)
+            self._sample_base_weights.before_sampling(accelerator.device, dit_dtype)
         if args.turbo_dit:
             # Swap RAW -> Turbo base weights for sample generation (LoRA stays hooked and
             # applies on top automatically).
@@ -408,6 +516,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
             self._turbo_lora_network.set_enabled(True)
 
     def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        if self._sample_base_weights:
+            self._sample_base_weights.after_sampling()
         if args.turbo_dit:
             # Restore RAW base weights after sampling.
             model = accelerator.unwrap_model(transformer)
@@ -457,6 +567,17 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # For convrot_int8, dit_weight_dtype equals dit_dtype (bf16), so the post-load cast is
         # a no-op; nn.Module.to would not touch the int8 weights anyway.
         dtype = dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
+        # --base_weights (a Turbo training adapter) merge while loading, before an fp8 / ConvRot INT8 quantization: merged
+        # into the quantized weights afterwards (the training loop's merge) they would be added unscaled to fp8 values
+        lora_weights = None
+        if getattr(args, "network_module", None) and args.base_weights:
+            layers = krea2_dit_lora_names(dit_path)
+            lora_weights = [self._load_base_weights(path, layers) for path in args.base_weights]
+            self._base_weights_merged_at_load = True
+            print(
+                "Krea 2: merging --base_weights while loading: "
+                + ", ".join(f"{path.replace(chr(92), '/').rsplit('/', 1)[-1]} ({len({k.split('.', 1)[0] for k in sd})} modules)" for path, sd in zip(args.base_weights, lora_weights))
+            )
         model = krea2_utils.load_krea2_dit(
             dit_path,
             # device is the calc device for quantization / LoRA merge; under block swap
@@ -471,17 +592,38 @@ class Krea2NetworkTrainer(NetworkTrainer):
             split_attn=split_attn,
             convrot_int8=args.convrot_int8,
             convrot_int8_bwd=args.convrot_int8_bwd,
+            lora_weights=lora_weights,
+            lora_multipliers=list(args.base_weights_multiplier or []) if lora_weights else None,
         )
         return model
+
+    @staticmethod
+    def _load_base_weights(path: str, layers: set[str] | None = None) -> dict[str, torch.Tensor]:
+        """A --base_weights file in this network's names (ai-toolkit / ComfyUI keys converted); with ``layers``, every LoRA
+        module must match a layer of the DiT (the merge while loading skips unmatched keys with only a warning)."""
+        from musubi_tuner.convert_lora import convert_from_diffusers
+
+        weights = load_file(path)
+        if weights and next(iter(weights)).startswith(("diffusion_model.", "transformer.")):
+            weights = convert_from_diffusers("lora_unet_", weights)
+        if layers is not None:
+            modules = {key.split(".", 1)[0] for key in weights if "." in key}
+            unmatched = sorted(modules - layers)
+            if unmatched:
+                raise ValueError(
+                    f"--base_weights {path}: {len(unmatched)} of {len(modules)} LoRA modules have no layer in the Krea 2 DiT "
+                    f"(e.g. {', '.join(unmatched[:3])}); is it a Krea 2 LoRA?"
+                )
+        return weights
 
     def compile_transformer(self, args, transformer):
         model = transformer  # SingleStreamDiT
         # Compile the per-block SingleStreamBlocks (the heavy, repeated compute). The forward
         # already pads the combined sequence to a multiple of 256 to keep kernel shapes stable.
         # When block swap is on, exclude the swap blocks' Linears from compile (cf. zimage/qwen_image).
-        # ConvRot int8 Linears are also excluded: the custom autograd.Function + autotuned Triton
-        # kernels are not dynamo-traceable.
-        disable_linear = self.blocks_to_swap > 0 or args.convrot_int8
+        # ConvRot int8 Linears compile as well: the fused Triton path is a torch.library custom op
+        # (opaque node, no graph break; kohya-ss/sd-scripts a4aaa20).
+        disable_linear = self.blocks_to_swap > 0
         return model_utils.compile_transformer(
             args,
             model,
@@ -542,11 +684,22 @@ class Krea2NetworkTrainer(NetworkTrainer):
             txtmask[i, :n] = True
         txtpos = torch.zeros(bsize, max_len, 3, device=device)
 
+        img_tokens = img_tokens.to(device=device, dtype=network_dtype)
+
+        # --- edit references (Krea 2 Edit): clean latents ahead of the image tokens, t = 0 modulation ---
+        ref_len = 0
+        references = reference_latents_from_batch(batch)
+        if references:
+            ref_tokens, ref_pos = krea2_utils.reference_tokens(references, patch, device, network_dtype)
+            ref_len = ref_tokens.shape[1]
+            img_tokens = torch.cat((ref_tokens, img_tokens), dim=1)
+            imgpos = torch.cat((ref_pos, imgpos), dim=1)
+            imgmask = torch.cat((torch.ones(bsize, ref_len, device=device, dtype=torch.bool), imgmask), dim=1)
+
         # --- combine (image-first: valid tokens form a contiguous prefix per sample) ---
         mask = torch.cat((imgmask, txtmask), dim=1)
         pos = torch.cat((imgpos, txtpos), dim=1)
 
-        img_tokens = img_tokens.to(device=device, dtype=network_dtype)
         t = (timesteps / 1000.0).to(device=device)
 
         if args.gradient_checkpointing:
@@ -554,7 +707,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
             context.requires_grad_(True)
 
         with accelerator.autocast():
-            model_pred = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask)  # (B, h*w, c*ph*pw)
+            model_pred = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask, ref_len=ref_len)  # (B, h*w, c*ph*pw)
 
         # unpatchify to latent space (B, C, 1, H, W)
         model_pred = rearrange(model_pred, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=h_, w=w_)
@@ -626,6 +779,15 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         default=1.0,
         help="Multiplier for the Turbo LoRA's delta.",
     )
+    parser.add_argument(
+        "--dit_variant",
+        type=str,
+        choices=["raw", "turbo"],
+        default="raw",
+        help="variant of the --dit checkpoint; Turbo uses the fixed mu=1.15 sampling schedule (train a Turbo LoRA with "
+        "ostris' krea2_turbo_training_adapter as --base_weights and --base_weights_sample_multiplier 0)",
+    )
+    add_sample_multiplier_argument(parser)
     return parser
 
 

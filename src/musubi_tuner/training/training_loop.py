@@ -451,7 +451,10 @@ def train(self, args):
     accelerator.print("import network module:", args.network_module)
     network_module: lora_module = importlib.import_module(args.network_module)  # actual module may be different
 
-    if args.base_weights is not None:
+    if getattr(self, "_base_weights_merged_at_load", False):
+        # the trainer merged them while loading, before an fp8 / ConvRot quantization (Krea 2)
+        accelerator.print(f"base weights merged while loading: {', '.join(args.base_weights)}")
+    elif args.base_weights is not None:
         # if base_weights is specified, merge the weights to DiT model
         for i, weight_path in enumerate(args.base_weights):
             if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
@@ -813,6 +816,8 @@ def train(self, args):
 
     accelerator.unwrap_model(network).prepare_grad_etc(transformer)
     self._current_call_network = accelerator.unwrap_model(network)
+    if hasattr(self, "post_prepare_network"):  # replica training (training/replica_trainer.py): a DiT + network per extra GPU
+        self.post_prepare_network(args, accelerator, transformer, network)
 
     ema_model = None
     ema_state_filename = "network_ema.pt"
@@ -2688,6 +2693,9 @@ def train(self, args):
                 grad_metrics = {}
                 self.validate_loss_before_backward(loss)
                 accelerator.backward(loss)
+                if accelerator.sync_gradients and hasattr(self, "before_gradient_sync"):
+                    # replica training: the replicas' gradients join the master's before clipping and the step
+                    self.before_gradient_sync(accelerator, network)
                 if accelerator.sync_gradients:
                     # Automagic v1/v3 retain low-precision gradients in a
                     # stochastic accumulation buffer until the update boundary.

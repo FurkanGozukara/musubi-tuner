@@ -166,6 +166,7 @@ def load_qwen3_vl_conditioner(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo, max_length=max_length)
     processor = Qwen2TokenizerFast.from_pretrained(tokenizer_repo, max_length=max_length)
     conditioner = Qwen3VLConditioner(qwen, tokenizer, processor, max_length=max_length, select_layers=select_layers)
+    conditioner.tokenizer_repo = tokenizer_repo  # the image processor of edit prompts comes from the same repo
     return conditioner.eval().requires_grad_(False)
 
 
@@ -188,6 +189,7 @@ class Qwen3VLConditioner(torch.nn.Module):
         self.prompt_template_encode_suffix = "<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 34
         self.prompt_template_encode_suffix_start_idx = 5
+        self.tokenizer_repo = QWEN3_VL_4B_INSTRUCT_REPO_ID
 
     def forward(self, text: list[str]) -> tuple[Tensor, Tensor]:
         prefix_idx = self.prompt_template_encode_start_idx
@@ -222,3 +224,130 @@ class Qwen3VLConditioner(torch.nn.Module):
             mask = mask[:, prefix_idx:]
 
             return hiddens, mask
+
+    @torch.no_grad()
+    def encode_edit(self, prompt: str, images: list) -> Tensor:
+        """One edit prompt with its reference images, as ComfyUI's Text Encode Qwen Image Edit Plus node feeds the Krea 2
+        text encoder (the Krea-2 Turbo "Image Style Reference" template): Qwen-Image-Edit's system prompt, then
+        ``Picture N: <vision>`` per reference before the prompt, each reference area-resized to about 384 x 384 for the
+        vision tower (``edit_vision_pixels``), and Krea2TEModel's cut after ``<|im_start|>user\\n``. Returns the selected
+        hidden states of the remaining tokens, vision tokens included: (L, num_select_layers, hidden)."""
+        if not images:
+            raise ValueError("encode_edit needs at least one reference image")
+        processor = self._vl_processor()
+        pictures = [edit_vision_pixels(image) for image in images]
+        text = EDIT_TEMPLATE.format(
+            "".join(f"Picture {index + 1}: <|vision_start|><|image_pad|><|vision_end|>" for index in range(len(pictures))) + prompt
+        )
+        inputs = processor(text=[text], images=[picture.permute(2, 0, 1) for picture in pictures], return_tensors="pt", do_rescale=False)
+        # the vision tower gets ComfyUI's own patches (bilinear to the 32-pixel grid, mean / std 0.5) for each reference
+        patches, grids = zip(*(comfy_qwen3vl_patches(picture) for picture in pictures))
+        grids = torch.cat(grids, dim=0)
+        if not torch.equal(grids, inputs["image_grid_thw"].cpu()):
+            raise RuntimeError(f"Qwen3-VL processor grid {inputs['image_grid_thw'].tolist()} differs from ComfyUI's {grids.tolist()}")
+        device = self.qwen.device
+        dtype = next(self.qwen.parameters()).dtype
+        extra = {key: value.to(device) for key, value in inputs.items() if key not in ("input_ids", "attention_mask", "pixel_values")}
+        input_ids = inputs["input_ids"].to(device)
+        # DeepStack adds visual features at the image positions after each of the first decoder layers. ComfyUI taps a
+        # layer's input (after that addition); transformers records the layer outputs before it. Keep ComfyUI's taps.
+        captured = {}
+
+        def keep_deepstack(_module, _args, kwargs):
+            captured["masks"] = kwargs.get("visual_pos_masks")
+            captured["embeds"] = kwargs.get("deepstack_visual_embeds")
+
+        language_model = self.qwen.model.language_model
+        handle = language_model.register_forward_pre_hook(keep_deepstack, with_kwargs=True)
+        try:
+            states = self.qwen(
+                input_ids=input_ids,
+                attention_mask=inputs["attention_mask"].to(device),
+                pixel_values=torch.cat(patches, dim=0).to(device, dtype=dtype),
+                output_hidden_states=True,
+                **extra,
+            )
+        finally:
+            handle.remove()
+        layers = list(states.hidden_states)
+        deepstack, masks = captured.get("embeds") or [], captured.get("masks")
+        for index in set(self.select_layers):
+            if 1 <= index <= len(deepstack) and masks is not None:
+                layers[index] = layers[index].clone()
+                layers[index][masks] = layers[index][masks] + deepstack[index - 1].to(layers[index])
+        hiddens = torch.stack([layers[i] for i in self.select_layers], dim=2)[0]
+        starts = (input_ids[0] == IM_START_TOKEN_ID).nonzero().flatten().tolist()
+        if len(starts) < 2:
+            raise RuntimeError("edit prompt template lost its user turn")
+        return hiddens[starts[1] + 3 :]  # after "<|im_start|>", "user", "\n" (Krea2TEModel.encode_token_weights)
+
+    def _vl_processor(self):
+        if getattr(self, "_processor_vl", None) is None:
+            from transformers import AutoProcessor
+
+            self._processor_vl = AutoProcessor.from_pretrained(self.tokenizer_repo)
+        return self._processor_vl
+
+
+# ComfyUI comfy_extras/nodes_qwen.py TextEncodeQwenImageEditPlus: the template it passes for every text encoder it gets
+EDIT_TEMPLATE = (
+    "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), "
+    "then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the "
+    "user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n"
+    "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+)
+IM_START_TOKEN_ID = 151644
+EDIT_VISION_PIXELS = 384 * 384
+
+
+def edit_vision_pixels(image) -> Tensor:
+    """A reference image (PIL, or HWC uint8 / float array) as ComfyUI's edit node sends it to the vision tower:
+    float32 (H, W, 3) in [0, 1], area-resized (adaptive average) to about 384 x 384 pixels, aspect kept."""
+    import math
+
+    import numpy as np
+    from PIL import Image
+
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGB"))
+    array = np.asarray(image)
+    if array.ndim != 3:
+        raise ValueError(f"reference image must be (H, W, C), got {array.shape}")
+    tensor = torch.from_numpy(np.array(array[..., :3], copy=True)).float()  # a writable copy (PIL arrays are read-only)
+    if array.dtype == np.uint8:
+        tensor = tensor / 255.0
+    height, width = tensor.shape[:2]
+    scale = math.sqrt(EDIT_VISION_PIXELS / (width * height))
+    size = (round(height * scale), round(width * scale))
+    resized = torch.nn.functional.interpolate(tensor.permute(2, 0, 1)[None], size=size, mode="area")
+    return resized[0].permute(1, 2, 0).contiguous()
+
+
+def comfy_qwen3vl_patches(image: Tensor, patch_size: int = 16, merge_size: int = 2, temporal_patch_size: int = 2):
+    """comfy.text_encoders.qwen_vl.process_qwen2vl_images as ComfyUI's Qwen3-VL calls it (patch 16, mean / std 0.5):
+    (H, W, 3) in [0, 1] -> flattened patches and the (1, 3) grid."""
+    import math
+
+    factor = patch_size * merge_size
+    height, width = image.shape[:2]
+    h_bar, w_bar = round(height / factor) * factor, round(width / factor) * factor
+    min_pixels, max_pixels = 3136, 12845056
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    pixels = torch.nn.functional.interpolate(image.permute(2, 0, 1)[None].float(), size=(h_bar, w_bar), mode="bilinear", align_corners=False)[0]
+    pixels = (pixels - 0.5) / 0.5
+    grid_h, grid_w = h_bar // patch_size, w_bar // patch_size
+    channels = pixels.shape[0]
+    pixels = pixels[None].repeat(temporal_patch_size, 1, 1, 1)
+    patches = pixels.reshape(
+        1, temporal_patch_size, channels, grid_h // merge_size, merge_size, patch_size, grid_w // merge_size, merge_size, patch_size
+    )
+    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+    flat = patches.reshape(grid_h * grid_w, channels * temporal_patch_size * patch_size * patch_size)
+    return flat, torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)

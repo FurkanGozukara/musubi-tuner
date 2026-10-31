@@ -18,6 +18,7 @@ from musubi_tuner.training.timesteps import (
     compute_ideogram4_shift_timestep,
     compute_loss_weighting_for_sd3,
     get_sigmas,
+    truncated_logit_normal_indices,
 )
 from musubi_tuner.utils import train_utils
 
@@ -248,19 +249,23 @@ def get_noisy_model_input_and_timesteps(
 
         timesteps += 1  # 1 to 1000
     else:
-        # Sample a random timestep for each image
-        # for weighting schemes where we sample timesteps non-uniformly
-        u = compute_density_for_timestep_sampling(
-            weighting_scheme=args.weighting_scheme,
-            batch_size=batch_size,
-            logit_mean=args.logit_mean,
-            logit_std=args.logit_std,
-            mode_scale=args.mode_scale,
-        )
-        # indices = (u * noise_scheduler.config.num_train_timesteps).long()
-        t_min = args.min_timestep if args.min_timestep is not None else 0
-        t_max = args.max_timestep if args.max_timestep is not None else 1000
-        indices = (u * (t_max - t_min) + t_min).long()
+        if args.timestep_sampling == "truncated_logit_normal":
+            # the MOSS-Image pre-training schedule on the (shift-aware) grid; min / max timestep do not apply
+            indices = truncated_logit_normal_indices(args, batch_size, noise_scheduler.config.num_train_timesteps)
+        else:
+            # Sample a random timestep for each image
+            # for weighting schemes where we sample timesteps non-uniformly
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme=args.weighting_scheme,
+                batch_size=batch_size,
+                logit_mean=args.logit_mean,
+                logit_std=args.logit_std,
+                mode_scale=args.mode_scale,
+            )
+            # indices = (u * noise_scheduler.config.num_train_timesteps).long()
+            t_min = args.min_timestep if args.min_timestep is not None else 0
+            t_max = args.max_timestep if args.max_timestep is not None else 1000
+            indices = (u * (t_max - t_min) + t_min).long()
 
         timesteps = noise_scheduler.timesteps[indices].to(device=device)  # 1 to 1000
 

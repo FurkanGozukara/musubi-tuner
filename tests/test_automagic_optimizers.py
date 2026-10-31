@@ -12,7 +12,7 @@ from musubi_tuner.modules.adafactor_fused import patch_adafactor_fused
 from musubi_tuner.modules.convrot_int8_utils import CONVROT_GROUPSIZE, ConvRotInt8LinearFn
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
-from musubi_tuner.optimizers import Automagic, Automagic2, Automagic3, AutomagicEXPERIMENT
+from musubi_tuner.optimizers import Automagic, Automagic2, Automagic3, Automagic4, AutomagicEXPERIMENT
 from musubi_tuner.optimizers.optimizer_utils import stochastic_grad_accummulation
 from musubi_tuner.ideogram4.constants import LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR
 from musubi_tuner.ideogram4.ideogram4_model import Ideogram4Config, Ideogram4Transformer
@@ -71,6 +71,8 @@ def test_automagic_optimizer_updates_float32_parameter(optimizer_class, kwargs):
         (Automagic3, {"fused": False}),
         (AutomagicEXPERIMENT, {"fused": True}),
         (AutomagicEXPERIMENT, {"fused": False}),
+        (Automagic4, {"fused": True}),
+        (Automagic4, {"fused": False}),
     ],
 )
 def test_automagic_optimizer_state_round_trip(optimizer_class, kwargs):
@@ -299,7 +301,7 @@ def test_automagic3_automatically_uses_fused_mode_when_safe(monkeypatch):
     assert kwargs["fused"] is True
 
 
-@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "AutomagicEXPERIMENT"])
+@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "Automagic4", "AutomagicEXPERIMENT"])
 def test_automagic_ignores_adafactor_preset_arguments(monkeypatch, caplog, optimizer_type):
     monkeypatch.setattr("musubi_tuner.optimizers.factory._world_size", lambda: 1)
     parameter = torch.nn.Parameter(torch.ones(2))
@@ -641,11 +643,11 @@ def test_automagic_updates_lora_on_scaled_fp8_base(monkeypatch, optimizer_type):
     assert any(not torch.equal(old, parameter) for old, parameter in zip(before, parameters))
 
 
-@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "AutomagicEXPERIMENT"])
+@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "Automagic4", "AutomagicEXPERIMENT"])
 def test_explicit_fused_optimizer_rejects_unsafe_configuration(monkeypatch, optimizer_type):
     monkeypatch.setattr("musubi_tuner.optimizers.factory._world_size", lambda: 1)
     parameter = torch.nn.Parameter(torch.ones(2))
-    kwargs = {"fused": True} if optimizer_type in {"Automagic", "Automagic3", "AutomagicEXPERIMENT"} else {}
+    kwargs = {"fused": True} if optimizer_type in {"Automagic", "Automagic3", "Automagic4", "AutomagicEXPERIMENT"} else {}
 
     with pytest.raises(ValueError, match="gradient_accumulation_steps"):
         prepare_automagic_optimizer(
@@ -657,7 +659,7 @@ def test_explicit_fused_optimizer_rejects_unsafe_configuration(monkeypatch, opti
         )
 
 
-@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "AutomagicEXPERIMENT"])
+@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "Automagic4", "AutomagicEXPERIMENT"])
 def test_separate_adafactor_fused_backward_mode_is_rejected(monkeypatch, optimizer_type):
     monkeypatch.setattr("musubi_tuner.optimizers.factory._world_size", lambda: 1)
 
@@ -754,7 +756,7 @@ def test_all_trainer_factories_construct_automagic3(monkeypatch, trainer_factory
     assert scheduler.get_last_lr() == [1e-4]
 
 
-@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "AutomagicEXPERIMENT"])
+@pytest.mark.parametrize("optimizer_type", ["Automagic", "Automagic2", "Automagic3", "Automagic4", "AutomagicEXPERIMENT"])
 def test_modular_trainer_constructs_every_automagic_variant(monkeypatch, optimizer_type):
     monkeypatch.setattr("musubi_tuner.optimizers.factory._world_size", lambda: 1)
     trainer = __import__("musubi_tuner.training.trainer_ext", fromlist=["NetworkTrainer"]).NetworkTrainer()

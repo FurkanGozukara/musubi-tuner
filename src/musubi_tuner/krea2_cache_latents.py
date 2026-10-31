@@ -2,7 +2,7 @@
 
 K2 uses the *same* Qwen-Image VAE as musubi's qwen_image integration, and the same
 latent normalization (`(raw - mean) / std`), so this reuses `qwen_image_utils.load_vae`
-and `encode_pixels_to_latents` directly. Plain text-to-image only (no control/edit).
+and `encode_pixels_to_latents` directly. Edit datasets (control images) also cache each reference's latents.
 """
 
 import logging
@@ -16,6 +16,7 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo, save_latent_cache
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.qwen_image import qwen_image_autoencoder_kl
+from musubi_tuner.qwen_image_21 import qwen_image_21_utils
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
@@ -39,8 +40,25 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
 
     for b, item in enumerate(batch):
         target_latent = latents[b]  # (C, 1, H, W)
-        print(f"Saving cache for item {item.item_key} at {item.latent_cache_path}, latents shape: {target_latent.shape}")
-        save_latent_cache_krea2(item_info=item, latent=target_latent)
+        # Krea 2 Edit: each reference image at its own size (the dataset keeps its framing at the training pixel count)
+        control_latents = [encode_reference(vae, control) for control in item.control_content or []]
+        print(
+            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, latents shape: {target_latent.shape}"
+            + (f", reference latents: {[tuple(c.shape) for c in control_latents]}" if control_latents else "")
+        )
+        save_latent_cache_krea2(
+            item_info=item,
+            latent=target_latent,
+            control_latents=control_latents,
+            reference_hashes=qwen_image_21_utils.reference_fingerprints(item.control_content) if control_latents else None,
+        )
+
+
+def encode_reference(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage, image) -> torch.Tensor:
+    """One reference image (H, W, C) uint8 -> normalized Qwen-Image VAE latents (C, 1, h, w), RGB only."""
+    pixels = torch.from_numpy(image[..., :3].copy()).permute(2, 0, 1)[None, :, None].float() / 127.5 - 1.0
+    with torch.no_grad():
+        return vae.encode_pixels_to_latents(pixels.to(vae.device, dtype=vae.dtype))[0]
 
 
 def main():

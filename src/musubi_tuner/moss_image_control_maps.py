@@ -8,7 +8,8 @@ other subjects.
 For every image of --image_dir it writes ``<output_dir>/<image name>_0.png`` (colour) and ``<image name>_1.png`` (depth)
 at the image's size as stored (EXIF rotation is ignored, as the trainers ignore it), the dataset's control_directory
 layout; --dataset_config does that for every dataset of a training config that names a control_directory. Depth Anything
-V2 Large is licensed CC-BY-NC-4.0 (non-commercial); --depth_model depth-anything/Depth-Anything-V2-Small-hf is Apache-2.0.
+V2 Large is the depth model the published adapter was trained with; --depth_model depth-anything/Depth-Anything-V2-Small-hf
+is a smaller, faster one.
 """
 
 from __future__ import annotations
@@ -215,7 +216,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models_dir", default=None, help="download folder of the two models (default: the Hugging Face cache)")
     parser.add_argument("--device", default=None, help="cuda, cuda:1 or cpu (default: cuda when available)")
     parser.add_argument("--segmentation_model", default=SEGMENTATION_MODEL, help="Hugging Face Mask2Former panoptic model")
-    parser.add_argument("--depth_model", default=DEPTH_MODEL, help="Hugging Face depth model (Depth Anything V2 Large: CC-BY-NC-4.0)")
+    parser.add_argument("--depth_model", default=DEPTH_MODEL, help="Hugging Face depth model (default: Depth Anything V2 Large, the published adapter's)")
     parser.add_argument("--max_side", type=int, default=1024, help="long side the segmentation runs at (the map keeps the image's size)")
     parser.add_argument("--skip_existing", action="store_true", help="leave images that already have both maps")
     parser.add_argument("--seed", type=int, default=0, help="seed of the region colours (per image, from its name)")

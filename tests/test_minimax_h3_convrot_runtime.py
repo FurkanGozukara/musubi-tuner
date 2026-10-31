@@ -201,6 +201,11 @@ def test_training_detection_guards_merges_and_compile_policy(monkeypatch):
     assert trainer.compile_transformer(args, int8) is int8
     assert captured["load"]["convrot_int8_bwd"] == "int8"
     assert captured["load"]["lora_weights"] is None
+    # V39: the INT8 Linears are a torch.library custom op and compile with their blocks; only block swap excludes them
+    assert captured["compile"]["disable_linear"] is False
+    trainer.blocks_to_swap = 4
+    int8.offloader = None
+    assert trainer.compile_transformer(args, int8) is int8
     assert captured["compile"]["disable_linear"] is True
 
 

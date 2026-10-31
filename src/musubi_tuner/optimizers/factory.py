@@ -8,6 +8,7 @@ import torch
 from .automagic import Automagic
 from .automagic2 import Automagic2
 from .automagic3 import Automagic3
+from .automagic4 import Automagic4
 from .automagic_experiment import AutomagicEXPERIMENT
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,7 @@ AUTOMAGIC_OPTIMIZER_CLASSES = {
     "automagic": Automagic,
     "automagic2": Automagic2,
     "automagic3": Automagic3,
+    "automagic4": Automagic4,
     "automagicexperiment": AutomagicEXPERIMENT,
 }
 
@@ -112,8 +114,9 @@ def prepare_automagic_optimizer(
         if problems:
             raise ValueError("Automagic2 uses fused backward updates and is incompatible with this configuration: " + "; ".join(problems))
         logger.info("use Automagic2 fused-backward optimizer | %s", resolved_kwargs)
-    elif normalized_type in ("automagic3", "automagicexperiment"):
-        # AutomagicEXPERIMENT is Automagic3 with a full int8 second moment: the same fused-mode rules
+    elif normalized_type in ("automagic3", "automagic4", "automagicexperiment"):
+        # Automagic4 (sensitivity-balanced updates) and AutomagicEXPERIMENT (full int8 second moment) are Automagic3
+        # subclasses: the same fused-mode rules
         name = optimizer_class.__name__
         explicitly_configured = "fused" in resolved_kwargs
         if not explicitly_configured:

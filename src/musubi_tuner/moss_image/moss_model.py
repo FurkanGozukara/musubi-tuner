@@ -10,8 +10,14 @@ different lengths run padded with the padding masked out of every attention (ide
 Differences that do not change the outputs: each block's q / k / v are separate Linears (``proj.q`` / ``proj.k`` /
 ``proj.v``; the ComfyUI files fuse them into ``proj.qkv``, split on load), so a LoRA / DoRA trains one module per
 projection under the names ComfyUI maps onto the fused weight's row slices (``lora_unet_layers_0_proj_q``; Guardrail 18:
-fused modules would share one DoRA magnitude); the blocks swap to the CPU and checkpoint their activations. The
-reference-image (edit) conditioning ai-toolkit adds is not part of the vendor model and is not ported.
+fused modules would share one DoRA magnitude); the blocks swap to the CPU and checkpoint their activations.
+
+Edit LoRAs (ai-toolkit b7cd8a1 / 88360c6, not part of the vendor model; ComfyUI's ``TextEncodeMOSSImageEdit``, edit_format
+"ai-toolkit"): the clean latents of the reference images ride after the text tokens, modulated at t = 0, reference i on
+the RoPE axis r = i + 1 (0 for the image and the text) at the image's frame coordinate with its own centered grid.
+``isolate_refs`` (ai-toolkit's kv_cache) lets reference queries attend only to reference keys, so the references' keys
+and values do not depend on the step and are computed once at inference (``precompute_ref_kv``); without padding the
+isolation runs as two unmasked SDPA calls instead of a boolean mask, which would force SDPA off flash attention.
 """
 
 from __future__ import annotations
@@ -72,13 +78,40 @@ def rotate(x: Tensor, rope: Tensor) -> Tensor:
     return x * cos + torch.cat((-b, a), -1) * sin
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, rope: Tensor, heads: int, mask: Optional[Tensor]) -> Tensor:
+def attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    rope: Tensor,
+    heads: int,
+    mask: Optional[Tensor],
+    isolate_split: Optional[int] = None,
+    kv_capture: Optional[list] = None,
+    kv_cache: Optional[tuple[Tensor, Tensor]] = None,
+) -> Tensor:
+    """Joint attention. ``isolate_split``: tokens from there on are references that attend only to each other (the
+    others attend to every key), as two unmasked SDPA calls. ``kv_capture`` (a list) receives this call's post-RoPE
+    keys and values; ``kv_cache`` holds the references' keys and values, attended to after this call's own keys."""
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
     q = rotate(q.reshape(shape), rope).transpose(1, 2)
     k = rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
+    if kv_capture is not None:
+        # copies: views would pin the whole projection output for the rest of the sampling
+        kv_capture.append((k.clone(memory_format=torch.contiguous_format), v.clone(memory_format=torch.contiguous_format)))
+    if kv_cache is not None:
+        cached_k, cached_v = kv_cache
+        if cached_k.shape[0] != k.shape[0]:  # one set of references for the whole batch
+            cached_k, cached_v = cached_k.expand(k.shape[0], -1, -1, -1), cached_v.expand(k.shape[0], -1, -1, -1)
+        k = torch.cat((k, cached_k.to(device=k.device, dtype=k.dtype)), 2)
+        v = torch.cat((v, cached_v.to(device=v.device, dtype=v.dtype)), 2)
     q, k = q.to(v.dtype), k.to(v.dtype)
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    if isolate_split is not None:
+        live = F.scaled_dot_product_attention(q[:, :, :isolate_split], k, v)
+        ref = F.scaled_dot_product_attention(q[:, :, isolate_split:], k[:, :, isolate_split:], v[:, :, isolate_split:])
+        out = torch.cat((live, ref), 2)
+    else:
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
     return out.transpose(1, 2).flatten(2)
 
 
@@ -174,19 +207,61 @@ class MossImageBlock(_CheckpointMixin, nn.Module):
             }
         )
 
-    def _forward(self, x: Tensor, rope: Tensor, modulation: Tensor, mask: Optional[Tensor]) -> Tensor:
-        m = modulation.unbind(1)
-        y = self.norm1(x) * (1 + m[1][:, None]) + m[0][:, None]
+    def _forward(
+        self,
+        x: Tensor,
+        rope: Tensor,
+        modulation,
+        mask: Optional[Tensor],
+        isolate_split: Optional[int] = None,
+        kv_capture: Optional[list] = None,
+        kv_cache: Optional[tuple[Tensor, Tensor]] = None,
+    ) -> Tensor:
+        # modulation (B, 6, D), or (mod, ref_mod, split) for edit LoRAs: tokens from split on are clean references,
+        # modulated at t = 0
+        if isinstance(modulation, tuple):
+            mod, ref_mod, split = modulation
+            m, r = mod.unbind(1), ref_mod.unbind(1)
+
+            def affine(h, scale, shift):
+                return torch.cat(
+                    (h[:, :split] * (1 + m[scale][:, None]) + m[shift][:, None], h[:, split:] * (1 + r[scale][:, None]) + r[shift][:, None]), 1
+                )
+
+            def gate(h, index):
+                return torch.cat((h[:, :split] * m[index][:, None], h[:, split:] * r[index][:, None]), 1)
+
+        else:
+            m = modulation.unbind(1)
+
+            def affine(h, scale, shift):
+                return h * (1 + m[scale][:, None]) + m[shift][:, None]
+
+            def gate(h, index):
+                return h * m[index][:, None]
+
+        y = affine(self.norm1(x), 1, 0)
         q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
         v = self.proj["v"](y)
-        x = x + self.proj["o"](attention(q, k, v, rope, self.heads, mask)) * m[2][:, None]
-        y = self.norm2(x) * (1 + m[4][:, None]) + m[3][:, None]
-        hidden, gate = self.proj["ffn_up_gate"](y).chunk(2, -1)
-        return x + self.proj["ffn_down"](situ(hidden, gate)) * m[5][:, None]
+        x = x + gate(self.proj["o"](attention(q, k, v, rope, self.heads, mask, isolate_split, kv_capture, kv_cache)), 2)
+        y = affine(self.norm2(x), 4, 3)
+        hidden, ffn_gate = self.proj["ffn_up_gate"](y).chunk(2, -1)
+        return x + gate(self.proj["ffn_down"](situ(hidden, ffn_gate)), 5)
 
-    def forward(self, x: Tensor, rope: Tensor, modulation: Tensor, mask: Optional[Tensor]) -> Tensor:
-        return self._run(self._forward, x, rope, modulation, mask)
+    def forward(
+        self,
+        x: Tensor,
+        rope: Tensor,
+        modulation,
+        mask: Optional[Tensor],
+        isolate_split: Optional[int] = None,
+        kv_capture: Optional[list] = None,
+        kv_cache: Optional[tuple[Tensor, Tensor]] = None,
+    ) -> Tensor:
+        if kv_capture is not None or kv_cache is not None:  # inference only: a recompute would capture twice
+            return self._forward(x, rope, modulation, mask, isolate_split, kv_capture, kv_cache)
+        return self._run(self._forward, x, rope, modulation, mask, isolate_split)
 
 
 class MossImage(nn.Module):
@@ -297,15 +372,77 @@ class MossImage(nn.Module):
         coords[:, 3] = (w - (width - 1) / 2).flatten()
         return coords
 
-    def _rope(self, lengths: Tensor, height: int, width: int, text_len: int, device) -> Tensor:
+    def _rope(self, lengths: Tensor, height: int, width: int, text_len: int, device, image_at_zero: bool = False) -> Tensor:
         """(B, H*W + S, head_dim) fp32: image tokens at (0, item text length, centered h, centered w), text token i at
-        (0, i, 0, 0)."""
+        (0, i, 0, 0). ``image_at_zero`` shifts both by minus the item's text length (image f = 0, the text before it), the
+        layout of references whose keys were computed at f = 0 (precompute_ref_kv, ComfyUI); attention sees only the
+        differences of positions, so the outputs are the same."""
         batch = lengths.shape[0]
         image = self._image_coords(height, width, device).unsqueeze(0).repeat(batch, 1, 1)
         image[..., 1] = lengths.float()[:, None]
         text = torch.zeros(batch, text_len, 4, device=device)
         text[..., 1] = torch.arange(text_len, device=device, dtype=torch.float32)
+        if image_at_zero:
+            image[..., 1] -= lengths.float()[:, None]
+            text[..., 1] -= lengths.float()[:, None]
         return self._rope_from_coords(torch.cat((image, text), 1))
+
+    def _pack_refs(self, ref_latents, frame: Tensor, device, dtype) -> tuple[Tensor, Tensor, Tensor]:
+        """Per-sample lists of clean (C, h, w) reference latents -> right-padded tokens (B, R, C), their rope (B, R,
+        head_dim) and the (B, R) mask of real tokens. Reference i sits on the RoPE axis r = i + 1 (0 for the image and the
+        text) at frame coordinate ``frame[b]`` (the image's: the item's text length) with its own centered grid."""
+        tokens, coords = [], []
+        for refs, f in zip(ref_latents, frame.tolist()):
+            sample_tokens, sample_coords = [], []
+            for index, latent in enumerate(refs or ()):
+                _, h, w = latent.shape
+                sample_tokens.append(latent.flatten(1).transpose(0, 1))
+                c = self._image_coords(h, w, device)
+                c[:, 0] = index + 1
+                c[:, 1] = f
+                sample_coords.append(c)
+            if sample_tokens:
+                tokens.append(torch.cat(sample_tokens).to(device=device, dtype=dtype))
+                coords.append(torch.cat(sample_coords))
+            else:
+                tokens.append(torch.zeros(0, self.params.latent_channels, device=device, dtype=dtype))
+                coords.append(torch.zeros(0, 4, device=device))
+        num_ref = max(t.shape[0] for t in tokens)
+        valid = torch.stack([torch.arange(num_ref, device=device) < t.shape[0] for t in tokens])
+        tokens = torch.stack([F.pad(t, (0, 0, 0, num_ref - t.shape[0])) for t in tokens])
+        coords = torch.stack([F.pad(c, (0, 0, 0, num_ref - c.shape[0])) for c in coords])
+        return tokens, self._rope_from_coords(coords), valid
+
+    def _embed_refs(self, tokens: Tensor) -> Tensor:
+        # a control adapter's widened patch embedder takes [latent | maps]: references carry no maps (ComfyUI pads too)
+        extra = getattr(self.video_embedder, "in_features", tokens.shape[-1]) - tokens.shape[-1]
+        if extra > 0:
+            tokens = F.pad(tokens, (0, extra))
+        return self.video_embedder(tokens.contiguous())
+
+    @torch.no_grad()
+    def precompute_ref_kv(self, ref_latents) -> dict:
+        """Every block's keys and values of the references alone (isolated references at t = 0 depend on nothing else),
+        for sampling: pass the result as ``ref_kv_cache``. The references sit at f = 0, so the forward that uses them puts
+        the image at f = 0 as well (ComfyUI's ``preprocess_refs``); one cache serves both CFG branches, as in ComfyUI."""
+        device, dtype = self.device, self.dtype
+        frame = torch.zeros(len(ref_latents), device=device)
+        tokens, rope, valid = self._pack_refs(ref_latents, frame, device, dtype)
+        mod, _ = self._time_modulation(torch.zeros(len(ref_latents), device=device), dtype)
+        mask = None if bool(valid.all()) else (valid[:, None, :, None] & valid[:, None, None, :]) | torch.eye(
+            valid.shape[1], dtype=torch.bool, device=device
+        )
+        x = self._embed_refs(tokens)
+        kv = {}
+        for index, layer in enumerate(self.layers):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(index)
+            slot = []
+            x = layer(x, rope.to(dtype), mod, mask, kv_capture=slot)
+            kv[index] = slot[0]
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.layers, index)
+        return {"kv": kv, "mask": valid}
 
     def _time_modulation(self, times: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         half = self.params.freq_dim // 2
@@ -324,11 +461,21 @@ class MossImage(nn.Module):
         encoder_hidden_states: Tensor,
         encoder_attention_mask: Optional[Tensor] = None,
         skip_layers: Optional[Iterable[int]] = None,
+        ref_latents=None,
+        isolate_refs: bool = False,
+        ref_kv_cache: Optional[dict] = None,
     ) -> Tensor:
         """Velocity (noise - clean) of ``hidden_states`` (B, 128, H, W) at ``timestep`` (B,) on the 0..1000 scale (1000 =
         pure noise), conditioned on ``encoder_hidden_states`` (B, S, 4096) with ``encoder_attention_mask`` (B, S) bool.
-        ``skip_layers``: block indices left out (the negative branch of the vendor's CFG skips block 22)."""
+        ``skip_layers``: block indices left out (the negative branch of the vendor's CFG skips block 22).
+
+        Edit LoRAs: ``ref_latents`` per sample a list of clean (128, h, w) reference latents, appended after the text at
+        t = 0; ``isolate_refs`` keeps the reference queries on the reference keys (ai-toolkit's kv_cache);
+        ``ref_kv_cache`` (inference, from precompute_ref_kv) replaces ``ref_latents`` with the references' keys and values."""
         skip = frozenset(skip_layers or ())
+        reuse_refs = ref_kv_cache is not None
+        if reuse_refs and ref_kv_cache.get("kv") is None:
+            raise ValueError("ref_kv_cache must come from precompute_ref_kv")
         batch, _, height, width = hidden_states.shape
         num_image = height * width
         device = hidden_states.device
@@ -354,29 +501,65 @@ class MossImage(nn.Module):
         times = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1).expand(batch)
         mod, time = self._time_modulation(times, dtype)
         head = self.video_head_modulation(time.to(dtype)).view(batch, 2, -1)
-        rope = self._rope(lengths, height, width, text_len, device).to(dtype)
+        rope = self._rope(lengths, height, width, text_len, device, image_at_zero=reuse_refs).to(dtype)
+        num_live = num_image + text_len
 
-        text_mask = joint_mask = None
+        num_ref, ref_valid, modulation, ref_tokens = 0, None, mod, None
+        if reuse_refs:
+            ref_valid = ref_kv_cache["mask"].to(device)
+            if ref_valid.shape[0] != batch:  # one set of references for the whole batch
+                ref_valid = ref_valid.expand(batch, -1)
+        elif ref_latents is not None and any(len(refs or ()) > 0 for refs in ref_latents):
+            if len(ref_latents) != batch:
+                raise ValueError(f"ref_latents holds {len(ref_latents)} samples for a batch of {batch}")
+            ref_tokens, ref_rope, ref_valid = self._pack_refs(ref_latents, lengths, device, dtype)
+            num_ref = ref_tokens.shape[1]
+            ref_mod, _ = self._time_modulation(torch.zeros_like(times), dtype)
+            modulation = (mod, ref_mod, num_live)
+            rope = torch.cat((rope, ref_rope.to(dtype)), 1)
+
+        text_mask = joint_mask = isolate_split = None
         if padded:
             text_mask = valid[:, None, None, :]
-            live_valid = torch.cat((torch.ones(batch, num_image, dtype=torch.bool, device=device), valid), 1)
+        live_valid = torch.cat((torch.ones(batch, num_image, dtype=torch.bool, device=device), valid), 1)
+        if num_ref and isolate_refs:
+            key_valid = torch.cat((live_valid, ref_valid), 1)
+            if bool(key_valid.all()):
+                isolate_split = num_live  # no padding anywhere: two unmasked attention calls
+            else:
+                is_ref = torch.arange(num_live + num_ref, device=device) >= num_live
+                allowed = key_valid[:, None, :] & (~is_ref[:, None] | is_ref[None, :])[None]
+                # every query keeps at least itself (a padded row would be all masked)
+                joint_mask = (allowed | torch.eye(num_live + num_ref, dtype=torch.bool, device=device))[:, None]
+        elif num_ref or reuse_refs:
+            # image and text queries see every real reference key (cached ones included)
+            key_valid = torch.cat((live_valid, ref_valid), 1)
+            if not bool(key_valid.all()):
+                joint_mask = key_valid[:, None, None, :]
+        elif padded:
             joint_mask = live_valid[:, None, None, :]
 
         video = self.video_embedder(hidden_states.flatten(2).transpose(1, 2).to(dtype).contiguous())
         text = self.text_embedder.proj(context.to(dtype))
-        text_rope = rope[:, num_image:]
+        text_rope = rope[:, num_image:num_live]
         for block in self.text_embedder.blocks:
             text = block(text, text_rope, text_mask)
         # activation CPU offloading returns each checkpointed block's output on the CPU (the next block brings its
         # input back), so the refined text joins the image tokens on the GPU
-        x = torch.cat((video, text.to(device)), 1)
-        del video, text, context
+        parts = [video, text.to(device)]
+        if num_ref:
+            parts.append(self._embed_refs(ref_tokens))
+        x = torch.cat(parts, 1)
+        del video, text, context, parts, ref_tokens
 
         for index, layer in enumerate(self.layers):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
             if index not in skip:
-                x = layer(x, rope, mod, joint_mask)
+                if reuse_refs:
+                    x = layer(x, rope, modulation, joint_mask, kv_cache=ref_kv_cache["kv"][index])
+                else:
+                    x = layer(x, rope, modulation, joint_mask, isolate_split)
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.layers, index)
 

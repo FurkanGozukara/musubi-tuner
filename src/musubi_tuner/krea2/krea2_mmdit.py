@@ -280,11 +280,37 @@ class SingleStreamBlock(nn.Module):
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x: Tensor, vec: Tensor, freqs: Tensor, attn_params: AttentionParams | None = None) -> Tensor:
-        prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, attn_params)
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+    def forward(
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        attn_params: AttentionParams | None = None,
+        ref_vec: Tensor | None = None,
+        ref_len: int = 0,
+    ) -> Tensor:
+        if ref_vec is None or ref_len == 0:
+            prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
+            x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, attn_params)
+            x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+            return x
 
+        # Edit references lead the sequence: their first ``ref_len`` tokens are modulated with t = 0 (ComfyUI Krea 2
+        # ``index_timestep_zero``, ai-toolkit's Krea 2 edit), the noisy image and the text with the sampled t.
+        m = self.mod(vec)
+        r = self.mod(ref_vec)
+
+        def modulate(h: Tensor, scale: int, shift: int) -> Tensor:
+            return torch.cat(
+                ((1 + r[scale]) * h[:, :ref_len] + r[shift], (1 + m[scale]) * h[:, ref_len:] + m[shift]),
+                dim=1,
+            )
+
+        def gate(h: Tensor, index: int) -> Tensor:
+            return torch.cat((r[index] * h[:, :ref_len], m[index] * h[:, ref_len:]), dim=1)
+
+        x = x + gate(self.attn(modulate(self.prenorm(x), 0, 1), freqs, attn_params), 2)
+        x = x + gate(self.mlp(modulate(self.postnorm(x), 3, 4)), 5)
         return x
 
 
@@ -401,12 +427,19 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        ref_len: int = 0,
     ) -> Tensor:
+        """``ref_len`` > 0: the first ``ref_len`` tokens of ``img`` are clean edit references (their positions carry the
+        reference index on axis 0), modulated with t = 0; the output covers the noisy image tokens after them."""
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
+        ref_vec = None
+        if ref_len > 0:
+            t0 = self.tmlp(temb(torch.zeros(t.shape[0], device=img.device), self.config.tdim, device=img.device, dtype=img.dtype))
+            ref_vec = self.tproj(t0)
 
-        # `mask`/`pos` arrive in image-first order: [img (all valid), text (valid prefix + pad)].
+        # `mask`/`pos` arrive in image-first order: [refs + img (all valid), text (valid prefix + pad)].
         # The text-only key-padding mask is therefore the tail beyond the image tokens.
         imglen = img.shape[1]
         txtmask = mask[:, imglen:]  # (B, txt_len) bool
@@ -448,9 +481,11 @@ class SingleStreamDiT(nn.Module):
                     # dataclass) passes through untouched -- if AttentionParams ever becomes a NamedTuple this
                     # would silently break.
                     forward_fn = create_cpu_offloading_wrapper(forward_fn, img.device)
-                combined = torch.utils.checkpoint.checkpoint(forward_fn, combined, tvec, freqs, attn_params, use_reentrant=False)
+                combined = torch.utils.checkpoint.checkpoint(
+                    forward_fn, combined, tvec, freqs, attn_params, ref_vec, ref_len, use_reentrant=False
+                )
             else:
-                combined = block(combined, tvec, freqs, attn_params)
+                combined = block(combined, tvec, freqs, attn_params, ref_vec, ref_len)
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, index)
@@ -459,6 +494,6 @@ class SingleStreamDiT(nn.Module):
             combined = combined.to(img.device)
 
         final = self.last(combined, t)
-        output = final[:, :imglen, :]  # image tokens are the leading slice now
+        output = final[:, ref_len:imglen, :]  # the noisy image tokens follow the references
 
         return output

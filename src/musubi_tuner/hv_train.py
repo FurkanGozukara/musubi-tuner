@@ -1422,7 +1422,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3, AutomagicEXPERIMENT. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3, Automagic4, AutomagicEXPERIMENT. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(

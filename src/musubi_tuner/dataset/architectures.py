@@ -49,6 +49,10 @@ ARCHITECTURE_FLUX_3 = "f3k"
 ARCHITECTURE_FLUX_3_FULL = "flux_3_klein"
 ARCHITECTURE_MOSS_IMAGE = "mi"
 ARCHITECTURE_MOSS_IMAGE_FULL = "moss_image"
+ARCHITECTURE_FIBO2 = "fb2"
+ARCHITECTURE_FIBO2_FULL = "fibo2"
+ARCHITECTURE_ANIMA = "an"
+ARCHITECTURE_ANIMA_FULL = "anima"
 
 
 def round_down_frame_count(frame_count: int, architecture: str, vae_frame_stride: int) -> int:

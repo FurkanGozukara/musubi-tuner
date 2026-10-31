@@ -16,6 +16,11 @@ from musubi_tuner.qwen_image_21 import qwen_image_21_utils
 
 logger = logging.getLogger(__name__)
 
+# Qwen-Image-2.1-Turbo's 8-step schedule: `sample_sigmas` of Qwen/Qwen-Image-2.1-Turbo's model_index.json (the Diffusers
+# pipeline uses it whatever num_inference_steps says; ComfyUI's Turbo templates: ManualSigmas with these values and a final 0,
+# euler, CFG 1; ai-toolkit `qwen_image_2:turbo`). The last step runs from 0.414568 to 0.
+TURBO_SAMPLE_SIGMAS = (1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568)
+
 
 def encode_sample_prompts(processor, encoder, prompts: list[dict], control_image_size: tuple[int, int] | None = None) -> list[dict]:
     """Encode sample prompts, reusing captions with the same ordered control images."""
@@ -61,8 +66,10 @@ def sample_image(
     cfg_scale: float | None = None,
     do_classifier_free_guidance: bool = True,
     return_latents: bool = False,
+    sigmas: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
-    """Return normalized latents or an RGBA image in [0, 1] on CPU."""
+    """Return normalized latents or an RGBA image in [0, 1] on CPU. ``sigmas`` is a fixed schedule (Turbo) that replaces
+    the resolution-shifted one of ``sample_steps`` steps."""
     width, height = max(32, width // 32 * 32), max(32, height // 32 * 32)
     vae.to(device)
     if sample_parameter["reference_images"]:
@@ -86,12 +93,18 @@ def sample_image(
         noise = latents.clone()
     # Qwen-Image 2.1 uses the same scheduler configuration as Qwen-Image.
     scheduler = qwen_image_utils.get_scheduler(discrete_flow_shift)
-    if sample_steps == 1:
-        # A single sigma at 1 cannot be stretched to a different terminal sigma.
-        scheduler.shift_terminal = None
-    sigmas = np.linspace(1.0, 1 / sample_steps, sample_steps)
-    mu = qwen_image_utils.calculate_shift_qwen_image(latents.shape[1])
-    scheduler.set_timesteps(sample_steps, device=device, sigmas=sigmas, mu=mu)
+    if sigmas is not None:
+        # a fixed schedule, used as it is: no shift, no terminal stretch (the scheduler appends the final 0)
+        scheduler = qwen_image_utils.FlowMatchEulerDiscreteScheduler(1000, shift=1.0, use_dynamic_shifting=False, shift_terminal=None)
+        scheduler.set_timesteps(sigmas=np.array(sigmas, dtype=np.float32), device=device)
+        sample_steps = len(sigmas)
+    else:
+        if sample_steps == 1:
+            # A single sigma at 1 cannot be stretched to a different terminal sigma.
+            scheduler.shift_terminal = None
+        schedule = np.linspace(1.0, 1 / sample_steps, sample_steps)
+        mu = qwen_image_utils.calculate_shift_qwen_image(latents.shape[1])
+        scheduler.set_timesteps(sample_steps, device=device, sigmas=schedule, mu=mu)
     scheduler.set_begin_index(0)
     cfg_scale = 1.0 if cfg_scale is None else cfg_scale
     do_cfg = do_classifier_free_guidance and cfg_scale > 1.0

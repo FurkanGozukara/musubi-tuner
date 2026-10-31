@@ -11,7 +11,9 @@ from safetensors.torch import load_file
 from torch.nn import functional as F
 
 from musubi_tuner.dataset.architectures import ARCHITECTURE_QWEN_IMAGE_21, ARCHITECTURE_QWEN_IMAGE_21_FULL
+from musubi_tuner.networks import lora_qwen_image_21
 from musubi_tuner.qwen_image_21 import qwen_image_21_model, qwen_image_21_sampling, qwen_image_21_utils
+from musubi_tuner.training.base_weights_sampling import SampleBaseWeights, add_sample_multiplier_argument, sample_multiplier_deltas
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer, comfy_lora_path
@@ -20,6 +22,43 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def dit_lora_names(dit_path: str) -> set[str]:
+    """The LoRA module names (``lora_unet_<layer>``) of every weight in a Qwen-Image 2.1 DiT file or shard folder, in this
+    model's layout (ComfyUI prefixes removed, the fused MLP gate / up split), read from the safetensors headers only."""
+    from safetensors import safe_open
+
+    paths = [dit_path]
+    if os.path.isdir(dit_path):
+        paths = sorted(os.path.join(dit_path, name) for name in os.listdir(dit_path) if name.endswith(".safetensors"))
+    names = set()
+    for path in paths:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            keys = list(handle.keys())
+        for key in keys:
+            for name in qwen_image_21_model.canonical_weight_hook(key, None)[0]:
+                if name.endswith(".weight"):
+                    names.add("lora_unet_" + name[: -len(".weight")].replace(".", "_"))
+    return names
+
+
+def load_base_weights(path: str, layer_names: set[str] | None = None) -> dict[str, torch.Tensor]:
+    """A ``--base_weights`` file in this trainer's LoRA layout: ai-toolkit / ComfyUI / Diffusers keys are converted (the
+    Turbo training adapter fuses the MLP gate and up layers), and every LoRA module must match a layer of the DiT. The merge
+    while loading skips a key without a layer with only a warning, which would train on a partly merged adapter."""
+    weights = load_file(path)
+    converted = lora_qwen_image_21.convert_weight_keys(weights)
+    weights = converted if converted is not None else weights
+    if layer_names is not None:
+        modules = {key.split(".", 1)[0] for key in weights if "." in key}
+        unmatched = sorted(modules - layer_names)
+        if unmatched:
+            raise ValueError(
+                f"--base_weights {path}: {len(unmatched)} of {len(modules)} LoRA modules have no layer in the Qwen-Image 2.1 "
+                f"DiT (e.g. {', '.join(unmatched[:3])}); is it a Qwen-Image 2.1 LoRA?"
+            )
+    return weights
 
 
 def prepare_conditioning(batch: dict, device: torch.device, dtype: torch.dtype):
@@ -65,6 +104,7 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.vae_frame_stride = 1
+        self._sample_base_weights = SampleBaseWeights([])
 
     @property
     def architecture(self):
@@ -105,8 +145,23 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
         self.default_discrete_flow_shift = None
         if args.sample_prompts and (not args.text_encoder or not args.vae):
             raise ValueError("Sampling requires --text_encoder and --vae")
+        self._sample_base_weights = SampleBaseWeights(sample_multiplier_deltas(args))
+        if getattr(args, "dit_variant", "base") == "turbo" and not args.base_weights:
+            logger.warning(
+                "Qwen-Image 2.1 Turbo without a training adapter (--base_weights): training breaks the step distillation "
+                "quickly; ostris/qwen_image_2_turbo_training_adapter keeps it while the LoRA trains."
+            )
 
     def load_transformer(self, accelerator, args, dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype):
+        lora_weights_list = None
+        if args.base_weights:
+            names = dit_lora_names(dit_path)
+            lora_weights_list = [load_base_weights(path, names) for path in args.base_weights]
+            # the trainer's INFO logging is not shown in the GUI: print what is merged
+            print(
+                "Qwen-Image 2.1: merging --base_weights while loading: "
+                + ", ".join(f"{os.path.basename(path)} ({len({k.split('.', 1)[0] for k in sd})} modules)" for path, sd in zip(args.base_weights, lora_weights_list))
+            )
         model = qwen_image_21_model.load_model(
             dit_path,
             device=accelerator.device,
@@ -116,7 +171,7 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
             config_path=args.dit_config,
             disable_numpy_memmap=args.disable_numpy_memmap,
             attn_mode=attn_mode,
-            lora_weights_list=[load_file(path) for path in args.base_weights] if args.base_weights else None,
+            lora_weights_list=lora_weights_list,
             lora_multipliers=args.base_weights_multiplier,
             num_layers=args.num_layers,
         )
@@ -126,6 +181,16 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
     def merge_base_weights(self, args, accelerator, transformer, network_module, weight_dtype):
         # load_model merges base weights before FP8 quantization.
         pass
+
+    def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        if self._sample_base_weights:
+            # built at the first sample, after the trained network: it wraps the trained layers' forward
+            self._sample_base_weights.build(lora_qwen_image_21, accelerator.unwrap_model(transformer), load_base_weights)
+            self._sample_base_weights.before_sampling(accelerator.device, dit_dtype)
+
+    def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        if self._sample_base_weights:
+            self._sample_base_weights.after_sampling()
 
     def compile_transformer(self, args, transformer):
         return model_utils.compile_transformer(
@@ -219,6 +284,8 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
                 discrete_flow_shift=discrete_flow_shift,
                 cfg_scale=cfg_scale,
                 do_classifier_free_guidance=do_classifier_free_guidance,
+                # Turbo samples with the 8-step schedule its checkpoint ships, whatever the step count says
+                sigmas=qwen_image_21_sampling.TURBO_SAMPLE_SIGMAS if getattr(args, "dit_variant", "base") == "turbo" else None,
             )
         return pixels.unsqueeze(2)
 
@@ -231,6 +298,15 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dit_config", help="Optional Diffusers transformer config.json")
     parser.add_argument("--text_encoder", help="Qwen3-VL-8B directory or BF16/FP32 safetensors file, needed only for sampling")
     parser.add_argument("--vae_tiling", action="store_true", help="Enable spatial tiling for the Qwen-Image 2.1 VAE")
+    parser.add_argument(
+        "--dit_variant",
+        type=str,
+        choices=["base", "turbo"],
+        default="base",
+        help="the --dit checkpoint: base, or the 8-step Turbo (samples with its fixed 8-step schedule; train it with "
+        "ostris' training adapter as --base_weights and --base_weights_sample_multiplier 0)",
+    )
+    add_sample_multiplier_argument(parser)
     parser.set_defaults(network_module="networks.lora_qwen_image_21", dit_dtype="bfloat16", vae_dtype="bfloat16", split_attn=True)
     return parser
 

@@ -428,7 +428,7 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3, AutomagicEXPERIMENT. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic, Automagic2, Automagic3, Automagic4, AutomagicEXPERIMENT. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
@@ -583,11 +583,27 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
             "qinglong_flux",
             "qinglong_qwen",
             "shifted_logit_normal",
+            "truncated_logit_normal",
         ],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, shifted uniform, sigmoid of random normal, shift of sigmoid, "
-        "flux shift, or shifted_logit_normal (sequence-length-adaptive LTX-2 method)."
+        "flux shift, shifted_logit_normal (sequence-length-adaptive LTX-2 method), or truncated_logit_normal (the MOSS-Image "
+        "pre-training schedule: --logit_mean -1.09 --logit_std 0.95 --discrete_flow_shift 1.0, kohya sd-scripts 188c03c)."
         " / タイムステップをサンプリングする方法：sigma、random uniform、shiftしたuniform、random normalのsigmoid、sigmoidのシフト、flux shift。",
+    )
+    parser.add_argument(
+        "--timestep_cutoff",
+        type=float,
+        default=0.95,
+        help="truncated_logit_normal: truncate the sigma distribution at this value and rescale it to (0, 1] "
+        "(default 0.95, the MOSS-Image pre-training's)",
+    )
+    parser.add_argument(
+        "--timestep_uniform_ratio",
+        type=float,
+        default=0.01,
+        help="truncated_logit_normal: share of the timesteps drawn uniformly from the grid (default 0.01, the MOSS-Image "
+        "pre-training's)",
     )
     parser.add_argument(
         "--discrete_flow_shift",

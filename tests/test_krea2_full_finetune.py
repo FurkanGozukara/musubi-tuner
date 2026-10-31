@@ -110,12 +110,15 @@ def _run_sample(monkeypatch, *, args=None, trainer=None, turbo_dit=None):
     return observed_schedule, model, pixels
 
 
-def test_lora_parser_does_not_expose_full_only_dit_variant():
+def test_lora_parser_takes_dit_variant_raw_by_default():
+    # V39: a LoRA trains on the Turbo DiT itself (Krea 2 Turbo card, with ostris' training adapter), so --dit_variant is
+    # shared by the LoRA and the full fine-tuning parsers; RAW stays the default
     parser = krea2_setup_parser(argparse.ArgumentParser())
 
-    assert not hasattr(parser.parse_args([]), "dit_variant")
+    assert parser.parse_args([]).dit_variant == "raw"
+    assert parser.parse_args(["--dit_variant", "turbo"]).dit_variant == "turbo"
     with pytest.raises(SystemExit):
-        parser.parse_args(["--dit_variant", "turbo"])
+        parser.parse_args(["--dit_variant", "distilled"])
 
 
 def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
@@ -132,15 +135,21 @@ def test_raw_primary_uses_resolution_aware_sampling_schedule(monkeypatch):
     }
 
 
-def test_lora_injected_dit_variant_does_not_change_raw_primary_schedule(monkeypatch):
+def test_lora_on_a_turbo_dit_samples_with_the_turbo_schedule(monkeypatch):
     args = SimpleNamespace(dit_variant="turbo", turbo_dit=None, mixed_precision="no")
 
     schedule, _, _ = _run_sample(monkeypatch, args=args)
 
+    assert schedule["mu"] == 1.15
+
+
+def test_lora_without_dit_variant_keeps_the_raw_schedule(monkeypatch):
+    schedule, _, _ = _run_sample(monkeypatch, args=SimpleNamespace(turbo_dit=None, mixed_precision="no"))
+
     assert schedule["mu"] is None
 
 
-def test_lora_toml_injected_dit_variant_does_not_change_raw_primary_schedule(tmp_path, monkeypatch):
+def test_lora_toml_dit_variant_turbo_selects_the_turbo_schedule(tmp_path, monkeypatch):
     config_path = tmp_path / "lora.toml"
     config_path.write_text('[model]\ndit_variant = "turbo"\n', encoding="utf-8")
     parser = krea2_setup_parser(setup_parser_common())
@@ -153,7 +162,7 @@ def test_lora_toml_injected_dit_variant_does_not_change_raw_primary_schedule(tmp
     schedule, _, _ = _run_sample(monkeypatch, args=args)
 
     assert args.dit_variant == "turbo"
-    assert schedule["mu"] is None
+    assert schedule["mu"] == 1.15
 
 
 def test_sampling_schedule_uses_explicit_trainer_policy_hook(monkeypatch):

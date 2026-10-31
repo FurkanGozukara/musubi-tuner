@@ -12,17 +12,25 @@
   would leak into the gated delta-net recurrence). Read from the ComfyUI file: Comfy-Org/MOSS-Image's
   ``qwen3.5_9b_int8_convrot`` (dequantized to BF16 on load, the file SwarmUI uses) or Comfy-Org/Qwen3.5's BF16 file.
   Matches ComfyUI's ``MOSSImageTokenizer`` / ``qwen35`` text model, where the trained LoRAs are used.
+* Edit LoRAs (ai-toolkit's layout, ComfyUI's ``TextEncodeMOSSImageEdit`` edit_format "ai-toolkit"): the text encoder is
+  the whole ``Qwen3_5Model`` (language and vision towers, the same files), and each prompt is preceded by its reference
+  images, ``Picture N: <|vision_start|><|image_pad|>...<|vision_end|>``, each scaled down by area to at most 384 x 384
+  pixels, then to Qwen's 32 px grid (bilinear), mean / std 0.5, as ComfyUI prepares them (``vlm_pixels``).
 * Flow: sigma 1 = noise, the DiT predicts ``noise - clean``; the vendor sampler shifts a uniform grid by 5 and snaps it
   to the 1000 training sigmas (50 steps, CFG 3 whose negative branch skips block 22, empty negative prompt).
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import itertools
 import logging
+import math
 from typing import Optional, Sequence, Union
+
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -94,6 +102,28 @@ QWEN35_9B_TEXT_CONFIG = {
         "partial_rotary_factor": 0.25,
     },
 }
+
+# Qwen/Qwen3.5-9B config.json (the same revision): the vision tower, for edit LoRAs (the INT8 ConvRot file holds it)
+QWEN35_9B_VISION_CONFIG = {
+    "deepstack_visual_indexes": [],
+    "depth": 27,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "in_channels": 3,
+    "initializer_range": 0.02,
+    "intermediate_size": 4304,
+    "num_heads": 16,
+    "num_position_embeddings": 2304,
+    "out_hidden_size": 4096,
+    "patch_size": 16,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2,
+}
+QWEN35_9B_TOKEN_IDS = {"image_token_id": 248056, "video_token_id": 248057, "vision_start_token_id": 248053, "vision_end_token_id": 248054}
+# the reference images the text encoder sees: at most 384 x 384 pixels (144 tokens), ComfyUI's TextEncodeMOSSImageEdit
+VLM_MAX_PIXELS = 384 * 384
+# a caption file can hold several captions separated by lines starting with this (kohya sd-scripts caab8bb's default)
+CAPTION_SEPARATOR = "---===---"
 
 MAX_TEXT_TOKENS = 4096
 DEFAULT_SHIFT = 5.0  # the vendor's sampler shift (ComfyUI's model_sampling); ai-toolkit also trains at it, the GUI presets
@@ -262,15 +292,19 @@ def _dequantize_rows(q: Tensor, scale: Tensor, quant: dict, dtype: torch.dtype, 
     return out
 
 
-def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str, Tensor]:
+def _text_encoder_state_dict(path: str, dtype: torch.dtype, device, vision: bool = False) -> dict[str, Tensor]:
     """The language tower's weights of a ComfyUI Qwen3.5 file in ``dtype``: INT8 ConvRot tensors (``comfy_quant``)
-    dequantized, the LM head, MTP head and vision tower dropped."""
+    dequantized, the LM head, MTP head and vision tower dropped. ``vision`` keeps the vision tower too, in
+    ``Qwen3_5Model``'s names (``visual.*`` and ``language_model.*``)."""
     out = {}
     with safe_open(path, framework="pt") as handle:
         keys = list(handle.keys())
         quantized = {k[: -len(".comfy_quant")] for k in keys if k.endswith(".comfy_quant")}
+        if vision and not any(k.startswith(("model.visual.", "visual.")) for k in keys):
+            raise ValueError(f"{path} holds no Qwen3.5 vision tower (model.visual.*), which MOSS-Image edit training needs")
         for key in keys:
-            if key.startswith(_TE_DROPPED) or key.endswith((".comfy_quant", ".weight_scale")):
+            is_visual = key.startswith(("model.visual.", "visual."))
+            if (key.startswith(_TE_DROPPED) and not (vision and is_visual)) or key.endswith((".comfy_quant", ".weight_scale")):
                 continue
             base = key[: -len(".weight")] if key.endswith(".weight") else None
             if base is not None and base in quantized:
@@ -282,10 +316,15 @@ def _text_encoder_state_dict(path: str, dtype: torch.dtype, device) -> dict[str,
                 tensor = handle.get_tensor(key)
                 if tensor.is_floating_point():
                     tensor = tensor.to(dtype)  # one dtype throughout, as the vendor's BF16 text encoder
-            for prefix in _TE_PREFIXES:
-                if key.startswith(prefix):
-                    key = key[len(prefix) :]
-                    break
+            if is_visual:
+                key = "visual." + key.split("visual.", 1)[1]
+            else:
+                for prefix in _TE_PREFIXES:
+                    if key.startswith(prefix):
+                        key = key[len(prefix) :]
+                        break
+                if vision:
+                    key = "language_model." + key
             out[key] = tensor
     return out
 
@@ -350,34 +389,57 @@ def install_qwen35_kernel_dispatch(module=None) -> list[str]:
     return routed
 
 
-def load_text_encoder(path: str, dtype: torch.dtype = torch.bfloat16, device: Union[str, torch.device] = "cpu", stream: bool = False):
+def qwen35_vl_config(text_config: Optional[dict] = None, vision_config: Optional[dict] = None):
+    """``Qwen3_5Config`` of Qwen3.5-9B with both towers (the edit LoRAs' text encoder)."""
+    from transformers import Qwen3_5Config
+
+    return Qwen3_5Config(
+        text_config=dict(text_config or QWEN35_9B_TEXT_CONFIG),
+        vision_config=dict(vision_config or QWEN35_9B_VISION_CONFIG),
+        tie_word_embeddings=False,
+        **QWEN35_9B_TOKEN_IDS,
+    )
+
+
+def load_text_encoder(
+    path: str, dtype: torch.dtype = torch.bfloat16, device: Union[str, torch.device] = "cpu", stream: bool = False, vision: bool = False
+):
     """Qwen3.5-9B's language tower from a ComfyUI file and the pinned vendor tokenizer: (model, tokenizer). ``stream``
-    (CUDA only) keeps the tower in CPU RAM and runs it on ``device`` one decoder layer at a time (stream_text_encoder)."""
-    from transformers import AutoTokenizer, Qwen3_5TextConfig, Qwen3_5TextModel
+    (CUDA only) keeps the tower in CPU RAM and runs it on ``device`` one decoder layer at a time (stream_text_encoder).
+    ``vision`` (edit LoRAs) loads ``Qwen3_5Model`` with the vision tower as well; its ``language_model`` is the text tower
+    (streamed when ``stream``), the vision tower (0.4B parameters) runs on ``device``."""
+    from transformers import AutoTokenizer, Qwen3_5Model, Qwen3_5TextConfig, Qwen3_5TextModel
 
     install_qwen35_kernel_dispatch()
     device, dtype, stream = text_encoder_plan(device, dtype, stream)
-    config = Qwen3_5TextConfig(**QWEN35_9B_TEXT_CONFIG)
     with init_empty_weights():
-        model = Qwen3_5TextModel(config)
+        model = Qwen3_5Model(qwen35_vl_config()) if vision else Qwen3_5TextModel(Qwen3_5TextConfig(**QWEN35_9B_TEXT_CONFIG))
     # dequantizing on the GPU is ~10x faster than on the CPU; the result goes to the CPU first either way
     dequant_device = torch.device("cuda") if torch.cuda.is_available() and torch.device(device).type == "cuda" else torch.device("cpu")
-    logger.info(f"Loading MOSS-Image text encoder (Qwen3.5-9B) from {path}")
-    sd = _text_encoder_state_dict(path, dtype, dequant_device)
+    logger.info(f"Loading MOSS-Image text encoder (Qwen3.5-9B{' with its vision tower' if vision else ''}) from {path}")
+    sd = _text_encoder_state_dict(path, dtype, dequant_device, vision=vision)
     info = model.load_state_dict(sd, strict=False, assign=True)
-    missing = [k for k in info.missing_keys if "rotary_emb" not in k]
+    missing = [k for k in info.missing_keys if "rotary_emb" not in k and "rotary_pos_emb" not in k]
     if missing or info.unexpected_keys:
         raise RuntimeError(f"Qwen3.5 text encoder checkpoint did not match: missing={missing[:10]}, unexpected={info.unexpected_keys[:10]}")
-    # buffers the checkpoint does not hold (rotary inv_freq) are still on the meta device
+    # buffers the checkpoint does not hold (rotary inv_freq) are built by the constructors, never on the meta device
     for name, buffer in list(model.named_buffers()):
         if buffer.device.type == "meta":
             raise RuntimeError(f"Qwen3.5 text encoder buffer {name} was not initialized")
+    text = model.language_model if vision else model
     if stream and torch.device(device).type == "cuda":
-        stream_text_encoder(model, device)
+        stream_text_encoder(text, device)
+        if vision:
+            model.visual.to(device)
     else:
         model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(MOSS_TOKENIZER_REPO, subfolder="tokenizer", revision=MOSS_TOKENIZER_REVISION)
     return model.eval().requires_grad_(False), tokenizer
+
+
+def text_tower(model):
+    """The language tower of a text encoder from load_text_encoder (``Qwen3_5Model.language_model`` or the model)."""
+    return getattr(model, "language_model", model)
 
 
 def text_encoder_plan(device: Union[str, torch.device], dtype: torch.dtype, stream: bool) -> tuple[torch.device, torch.dtype, bool]:
@@ -439,6 +501,7 @@ def encode_prompts(
     states are cut back to its own length. With --low_vram_text_encoding a forward copies the 17 GB of layer weights to
     the GPU once, so 8 captions took 8 s instead of 63 s on the real model (vram_lab/moss_te_batch_check.py).
     """
+    model = text_tower(model)  # text-only prompts give the same states with or without the vision tower
     stream_device = getattr(model, "_moss_stream_device", None)
     device = stream_device or next(model.parameters()).device
     pad = getattr(tokenizer, "pad_token_id", None) or 0
@@ -464,6 +527,148 @@ def pad_contexts(contexts: list[Tensor], device, dtype) -> tuple[Tensor, Tensor]
     stacked = torch.stack([F.pad(c.to(device=device, dtype=dtype), (0, 0, 0, length - c.shape[0])) for c in contexts])
     mask = torch.stack([torch.arange(length, device=device) < c.shape[0] for c in contexts])
     return stacked, mask
+
+
+def split_caption_candidates(caption: str, separator: Optional[str] = CAPTION_SEPARATOR) -> list[str]:
+    """The captions of one caption file: lines whose stripped text starts with ``separator`` separate them (text after
+    ``#`` on such a line is a comment, other text there is refused); each candidate keeps its inner line breaks, loses
+    trailing spaces and leading / trailing blank lines; empty candidates are dropped (kohya sd-scripts caab8bb). Without a
+    separator, or none in the text, the whole caption is the one candidate."""
+    if not separator or separator not in str(caption or ""):
+        return [str(caption or "")]
+    candidates, current = [], []
+    for line in str(caption).split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(separator):
+            reserved = stripped[len(separator) :].split("#", 1)[0].strip()
+            if reserved:
+                raise ValueError(f"unsupported text after the caption separator (only # comments are allowed): {line!r}")
+            candidates.append("\n".join(current))
+            current = []
+        else:
+            current.append(line)
+    candidates.append("\n".join(current))
+    cleaned = []
+    for candidate in candidates:
+        lines = [line.rstrip() for line in candidate.split("\n")]
+        while lines and lines[0] == "":
+            lines.pop(0)
+        while lines and lines[-1] == "":
+            lines.pop()
+        if lines:
+            cleaned.append("\n".join(lines))
+    return cleaned or [""]
+
+
+def _image_tensor(image) -> Tensor:
+    """(1, 3, H, W) float32 in [0, 1] from an (H, W, C) uint8 array, a PIL image or a (3, H, W) / (1, 3, H, W) tensor in
+    [0, 1]."""
+    if isinstance(image, Tensor):
+        tensor = image.detach().float()
+        return (tensor if tensor.dim() == 4 else tensor.unsqueeze(0))[:, :3].cpu()
+    if not isinstance(image, np.ndarray):
+        image = np.asarray(image.convert("RGB"))
+    array = np.ascontiguousarray(image[..., :3])
+    return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+
+def vlm_pixels(image, max_pixels: int = VLM_MAX_PIXELS, patch: int = 16, merge: int = 2, temporal: int = 2) -> tuple[Tensor, Tensor]:
+    """A reference image for Qwen3.5's vision tower, prepared as ComfyUI's ``TextEncodeMOSSImageEdit`` and
+    ``qwen_vl.process_qwen2vl_images`` do: scaled down (never up) by area to at most ``max_pixels``, resized bilinearly to
+    the 32 px grid, normalized with mean / std 0.5 and cut into 2 x 16 x 16 patches in Qwen's order.
+    Returns (patches (N, 3 * 2 * 16 * 16) float32, grid_thw (1, 3))."""
+    x = _image_tensor(image)
+    _, _, height, width = x.shape
+    scale = min(1.0, math.sqrt(max_pixels / (height * width)))
+    height, width = round(height * scale), round(width * scale)
+    x = F.interpolate(x, size=(height, width), mode="area")
+    factor = patch * merge
+    h_bar, w_bar = round(height / factor) * factor, round(width / factor) * factor
+    if h_bar * w_bar < 3136:  # Qwen's minimum pixel count (tiny references only)
+        beta = math.sqrt(3136 / (height * width))
+        h_bar, w_bar = math.ceil(height * beta / factor) * factor, math.ceil(width * beta / factor) * factor
+    h_bar, w_bar = max(factor, h_bar), max(factor, w_bar)
+    x = F.interpolate(x, size=(h_bar, w_bar), mode="bilinear", align_corners=False)[0]
+    x = (x - 0.5) / 0.5
+    grid_h, grid_w = h_bar // patch, w_bar // patch
+    patches = x.unsqueeze(0).repeat(temporal, 1, 1, 1).reshape(
+        1, temporal, 3, grid_h // merge, merge, patch, grid_w // merge, merge, patch
+    )
+    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(grid_h * grid_w, 3 * temporal * patch * patch)
+    return patches.contiguous(), torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+
+
+def edit_prompt_text(prompt: str, image_tokens: Sequence[int]) -> str:
+    """The user turn of an edit prompt: ``Picture N: <|vision_start|><|image_pad|> x tokens<|vision_end|>`` per reference,
+    then the instruction (the Qwen-Image-Edit-Plus layout ai-toolkit trains and ComfyUI's TextEncodeMOSSImageEdit builds)."""
+    pictures = "".join(f"Picture {index + 1}: <|vision_start|>{'<|image_pad|>' * count}<|vision_end|>" for index, count in enumerate(image_tokens))
+    return pictures + str(prompt or "")
+
+
+@torch.no_grad()
+def encode_prompts_with_images(model, tokenizer, prompts: list[str], images: list[Optional[Sequence]]) -> list[Tensor]:
+    """One (L_i, 4096) final hidden state per prompt, each prompt preceded by its reference images (edit LoRAs; ``model``
+    from load_text_encoder(vision=True)). A prompt without images is a text-only prompt. One forward per prompt with
+    images (their image-pad runs differ); the vision tower's tokens replace the pads, positions are Qwen's M-RoPE
+    (``get_rope_index``), as ComfyUI's qwen35 model computes them."""
+    language = text_tower(model)
+    stream_device = getattr(language, "_moss_stream_device", None)
+    device = stream_device or next(language.parameters()).device
+    image_token = int(model.config.image_token_id)
+    merge = int(model.config.vision_config.spatial_merge_size)
+    out: list[Optional[Tensor]] = [None] * len(prompts)
+    text_only = [index for index, refs in enumerate(images) if not refs]
+    if text_only:
+        for index, state in zip(text_only, encode_prompts(language, tokenizer, [prompts[i] for i in text_only])):
+            out[index] = state
+    visual_dtype = next(model.visual.parameters()).dtype
+    for index, (prompt, refs) in enumerate(zip(prompts, images)):
+        if not refs:
+            continue
+        patches, grids = zip(*(vlm_pixels(image, patch=int(model.config.vision_config.patch_size), merge=merge) for image in refs))
+        grid = torch.cat(grids)
+        counts = (grid.prod(-1) // merge**2).tolist()
+        input_ids = tokenizer(chat_text(tokenizer, edit_prompt_text(prompt, counts)), return_tensors="pt")["input_ids"]
+        mm_types = (input_ids == image_token).int()
+        if int(mm_types.sum()) != sum(counts):
+            raise ValueError(f"the prompt holds {int(mm_types.sum())} image tokens for {sum(counts)} image features")
+        embeds = language.embed_tokens(input_ids if stream_device is not None else input_ids.to(device)).to(device)
+        features = model.visual(torch.cat(patches).to(device=device, dtype=visual_dtype), grid_thw=grid.to(device)).pooler_output
+        slots = (input_ids == image_token).to(device).unsqueeze(-1).expand_as(embeds)
+        embeds = embeds.masked_scatter(slots, features.to(embeds.dtype))
+        position_ids, _ = model.get_rope_index(input_ids.to(device), mm_types.to(device), image_grid_thw=grid.to(device))
+        hidden = language(inputs_embeds=embeds, position_ids=position_ids, use_cache=False).last_hidden_state
+        out[index] = hidden[0].clone()
+        del hidden, embeds, features
+    return out  # type: ignore[return-value]
+
+
+def reference_signature(images: Optional[Sequence]) -> str:
+    """A short hash of reference images as the text encoder sees them (shape and pixels), stored with a text encoder
+    cache so --skip_existing re-encodes a caption whose references changed."""
+    if not images:
+        return "none"
+    digest = hashlib.sha1()
+    for image in images:
+        tensor = _image_tensor(image)
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update((tensor * 255).round().to(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def fit_reference(image, width: int, height: int):
+    """A sample's reference image as training saw its references: aspect kept at about ``width`` x ``height`` pixels,
+    sides on the 16 px grid (the dataset's control_resolution bucket). Returns (H, W, 3) uint8."""
+    from musubi_tuner.dataset.architectures import ARCHITECTURE_MOSS_IMAGE
+    from musubi_tuner.dataset.bucket import BucketSelector
+    from musubi_tuner.dataset.media_utils import resize_image_to_bucket
+
+    if not isinstance(image, np.ndarray):
+        image = np.asarray(image.convert("RGB"))
+    image = np.ascontiguousarray(image[..., :3])
+    size = (image.shape[1], image.shape[0])
+    reso = BucketSelector.calculate_bucket_resolution(size, (int(width), int(height)), architecture=ARCHITECTURE_MOSS_IMAGE)
+    return resize_image_to_bucket(image, reso)
 
 
 # ----------------------------------------------------------------------------------------------------------- sampling
@@ -497,18 +702,28 @@ def denoise(
     guidance: float,
     shift: float = DEFAULT_SHIFT,
     uncond_skip_layers: Sequence[int] = DEFAULT_UNCOND_SKIP_LAYERS,
+    ref_latents=None,
+    isolate_refs: bool = False,
 ) -> Tensor:
     """The vendor's sampler: fp32 Euler on fp32 noise (B, 128, h, w); CFG combines fp32 predictions, its negative
-    branch skipping ``uncond_skip_layers``."""
+    branch skipping ``uncond_skip_layers``. Edit LoRAs: ``ref_latents`` (per sample a list of (128, h, w) reference
+    latents) ride in both branches; isolated references (kv_cache) are computed once, before the first step, as ComfyUI
+    does (``precompute_ref_kv``), and serve both branches."""
     latents = noise.float()
     do_cfg = neg_ctx is not None and guidance != 1.0
+    ref_kwargs = {}
+    if ref_latents is not None and any(len(refs or ()) > 0 for refs in ref_latents):
+        if isolate_refs:
+            ref_kwargs = {"isolate_refs": True, "ref_kv_cache": model.precompute_ref_kv(ref_latents)}
+        else:
+            ref_kwargs = {"ref_latents": ref_latents}
     sigmas = moss_sigmas(num_steps, shift=shift).to(latents.device)
     for index in tqdm(range(len(sigmas) - 1), desc="Sampling"):
         sigma, sigma_next = sigmas[index], sigmas[index + 1]
         timestep = (sigma * moss_model.NUM_TRAIN_TIMESTEPS).reshape(1).expand(latents.shape[0])
-        pred = model(latents, timestep, ctx, ctx_mask).float()
+        pred = model(latents, timestep, ctx, ctx_mask, **ref_kwargs).float()
         if do_cfg:
-            pred_uncond = model(latents, timestep, neg_ctx, neg_mask, skip_layers=uncond_skip_layers).float()
+            pred_uncond = model(latents, timestep, neg_ctx, neg_mask, skip_layers=uncond_skip_layers, **ref_kwargs).float()
             pred = pred_uncond + guidance * (pred - pred_uncond)
         latents = latents + (sigma_next - sigma) * pred
     return latents

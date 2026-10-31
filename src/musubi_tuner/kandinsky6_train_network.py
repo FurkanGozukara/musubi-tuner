@@ -343,7 +343,8 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 transformer.audio_text_transformer_blocks,
                 transformer.visual_transformer_blocks,
             ],
-            disable_linear=bool(self.blocks_to_swap) or bool(args.convrot_int8) or bool(args.fp8_base),
+            # ConvRot INT8 Linears compile (torch.library custom op, kohya-ss/sd-scripts a4aaa20); FP8 ones stay eager
+            disable_linear=bool(self.blocks_to_swap) or bool(args.fp8_base),
             offloaders=[None, None, getattr(transformer, "offloader", None) if self.blocks_to_swap else None],
         )
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import os
+import random
+import re
 from typing import Optional, TYPE_CHECKING
 
 import torch
@@ -338,18 +340,31 @@ def save_latent_cache_qwen_image_21(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_21_FULL)
 
 
-def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_krea2(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    control_latents: Optional[list[torch.Tensor]] = None,
+    reference_hashes: Optional[torch.Tensor] = None,
+):
     """Krea 2 (K2) architecture. Single image (F=1), Qwen-Image VAE latents (normalized).
 
     The latent uses the *same* normalization as the Qwen-Image VAE
     (`(raw - mean) / std`), which is exactly what K2's decoder inverts, so the
-    Qwen-Image latent caching is reused as-is. No control latent for plain t2i.
+    Qwen-Image latent caching is reused as-is. Krea 2 Edit adds the reference images' latents
+    (``latents_control_<i>``, each at its own size) and their fingerprints, which the text encoder
+    cache repeats for the references it encoded in the prompt.
     """
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+    for index, control in enumerate(control_latents or []):
+        assert control.dim() == 4, "control latent should be 4D tensor (channel, frame, height, width)"
+        _, F_c, H_c, W_c = control.shape
+        sd[f"latents_control_{index}_{F_c}x{H_c}x{W_c}_{dtype_to_str(control.dtype)}"] = control.detach().cpu().contiguous()
+    if control_latents:
+        sd["varlen_reference_hashes_uint8"] = reference_hashes.cpu().contiguous()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
@@ -711,7 +726,7 @@ def save_text_encoder_output_cache_qwen_image_21(
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_21_FULL, merge_existing=False)
 
 
-def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tensor):
+def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tensor, reference_hashes: Optional[torch.Tensor] = None):
     """Krea 2 (K2) architecture.
 
     `embed` is the per-item stack of *selected* Qwen3-VL hidden-state layers for the
@@ -726,8 +741,12 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     sd = {}
     dtype_str = dtype_to_str(embed.dtype)
     sd[f"varlen_krea2_vl_embed_{dtype_str}"] = embed.detach().cpu()
-
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+    if reference_hashes is None:
+        save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+        return
+    # Krea 2 Edit: the prompt carries the reference images' vision tokens; their fingerprints must match the latent cache's
+    sd["varlen_vlm_reference_hashes_uint8"] = reference_hashes.cpu().contiguous()
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL, merge_existing=False)
 
 
 def save_text_encoder_output_cache_flux_3(item_info: ItemInfo, ctx: torch.Tensor):
@@ -738,12 +757,92 @@ def save_text_encoder_output_cache_flux_3(item_info: ItemInfo, ctx: torch.Tensor
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FLUX_3_FULL)
 
 
-def save_text_encoder_output_cache_moss_image(item_info: ItemInfo, ctx: torch.Tensor):
+def save_text_encoder_output_cache_moss_image(
+    item_info: ItemInfo,
+    ctx: torch.Tensor,
+    candidates: Optional[list[torch.Tensor]] = None,
+    uncond: Optional[torch.Tensor] = None,
+    metadata: Optional[dict[str, str]] = None,
+):
     """MOSS-Image: one caption's (L, 4096) Qwen3.5-9B final state, L its own token count (unpadded, as the vendor
-    encodes); a batch is right-padded with the padding masked out of the DiT's attention."""
+    encodes); a batch is right-padded with the padding masked out of the DiT's attention. ``candidates``: the other
+    captions of a caption file with several (``varlen_ctx_vec_cand<k>``, one of them is picked when the batch loads:
+    ``pick_caption_candidate``); ``uncond``: an edit caption's references-only context for caption dropout
+    (``varlen_ctx_vec_uncond``). The file holds only this item's MOSS keys (no merge with an older file)."""
     assert ctx.dim() == 2, "ctx should be a 2D tensor (tokens, 4096)"
-    sd = {f"varlen_ctx_vec_{dtype_to_str(ctx.dtype)}": ctx.detach().cpu().contiguous()}
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MOSS_IMAGE_FULL)
+    dtype_str = dtype_to_str(ctx.dtype)
+    sd = {f"varlen_ctx_vec_{dtype_str}": ctx.detach().cpu().contiguous()}
+    for index, candidate in enumerate(candidates or (), start=1):
+        sd[f"varlen_ctx_vec_cand{index}_{dtype_to_str(candidate.dtype)}"] = candidate.detach().cpu().contiguous()
+    if uncond is not None:
+        sd[f"varlen_ctx_vec_uncond_{dtype_to_str(uncond.dtype)}"] = uncond.detach().cpu().contiguous()
+    save_text_encoder_output_cache_common(
+        item_info, sd, ARCHITECTURE_MOSS_IMAGE_FULL, merge_existing=False, additional_metadata=metadata
+    )
+
+
+_CAPTION_CANDIDATE_KEY = re.compile(r"^(varlen_.+)_cand(\d+)_([a-z0-9_]+)$")
+
+
+def pick_caption_candidate(sd: dict[str, torch.Tensor], rng=random) -> dict[str, torch.Tensor]:
+    """A text encoder cache with several captions (``<key>_cand<k>_<dtype>`` beside ``<key>_<dtype>``, MOSS-Image): one of
+    them, drawn uniformly per load, takes the base key's place and the other candidates leave the dict, so every item of
+    a batch carries the same keys. A cache without candidates is returned as it is."""
+    groups: dict[str, list[str]] = {}
+    for key in sd:
+        match = _CAPTION_CANDIDATE_KEY.match(key)
+        if match:
+            groups.setdefault(f"{match.group(1)}_{match.group(3)}", []).append(key)
+    if not groups:
+        return sd
+    out = dict(sd)
+    for base, extras in groups.items():
+        if base not in out:
+            continue
+        choice = rng.randrange(len(extras) + 1)
+        chosen = sorted(extras, key=lambda key: int(_CAPTION_CANDIDATE_KEY.match(key).group(2)))[choice - 1] if choice else None
+        if chosen is not None:
+            out[base] = out[chosen]
+        for key in extras:
+            out.pop(key, None)
+    return out
+
+
+def save_text_encoder_output_cache_fibo2(item_info: ItemInfo, taps: torch.Tensor, reference_sizes: Sequence[tuple[int, int]] = ()):
+    """FIBO 2.0: one caption's (L, 15 * 2560) RMS-normalized Qwen3-VL taps (fibo2_utils.expand_taps builds the DiT's
+    (L, 46080) bundles), L its own token count. An edit caption was encoded with its references: their (width, height)
+    are recorded, so a cache made for other reference sizes (another resolution, another reference count) is re-encoded
+    by --skip_existing (fibo2_cache_text_encoder_outputs.cache_is_current)."""
+    from musubi_tuner.dataset.architectures import ARCHITECTURE_FIBO2_FULL  # FIBO 2.0 (fork)
+
+    assert taps.dim() == 2, "taps should be a 2D tensor (tokens, 15 * 2560)"
+    sd = {f"varlen_ctx_vec_{dtype_to_str(taps.dtype)}": taps.detach().cpu().contiguous()}
+    metadata = {"fibo2_text": "taps15_v1", "fibo2_references": ";".join(f"{w}x{h}" for w, h in reference_sizes)}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FIBO2_FULL, merge_existing=False, additional_metadata=metadata)
+
+
+def save_latent_cache_anima(item_info: ItemInfo, latent: torch.Tensor):
+    """Anima: the Qwen-Image VAE's normalized (16, 1, H, W) latent of one image (Wan 2.1 statistics, ComfyUI's Wan21
+    latent format)."""
+    from musubi_tuner.dataset.architectures import ARCHITECTURE_ANIMA_FULL  # Anima (fork)
+
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+    _, frames, height, width = latent.shape
+    sd = {f"latents_{frames}x{height}x{width}_{dtype_to_str(latent.dtype)}": latent.detach().cpu().contiguous()}
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_ANIMA_FULL)
+
+
+def save_text_encoder_output_cache_anima(item_info: ItemInfo, qwen_states: torch.Tensor, t5_ids: torch.Tensor):
+    """Anima: one caption's Qwen3-0.6B last hidden state (L, 1024), its own token count, and its T5 token ids (T,) with
+    the closing </s>; the DiT's LLM adapter turns both into the text context in every forward (anima/anima_utils.py)."""
+    from musubi_tuner.dataset.architectures import ARCHITECTURE_ANIMA_FULL  # Anima (fork)
+
+    assert qwen_states.dim() == 2 and t5_ids.dim() == 1, "qwen_states (tokens, 1024), t5_ids (tokens,)"
+    sd = {
+        f"varlen_ctx_vec_{dtype_to_str(qwen_states.dtype)}": qwen_states.detach().cpu().contiguous(),
+        "varlen_t5_ids_int64": t5_ids.detach().cpu().to(torch.int64).contiguous(),
+    }
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_ANIMA_FULL, merge_existing=False)
 
 
 def save_text_encoder_output_cache_mage_flow(item_info: ItemInfo, embed: torch.Tensor, *, is_edit: bool):

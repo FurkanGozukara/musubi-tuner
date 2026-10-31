@@ -347,7 +347,9 @@ def test_h3_skips_the_post_load_base_weights_merge_when_the_loader_already_merge
     assert printed == ["all weights merged during the ConvRot INT8 load: adapter.safetensors"]
 
 
-def test_h3_trainer_passes_backward_mode_to_loader_and_excludes_int8_linears_from_compile(monkeypatch):
+def test_h3_trainer_passes_backward_mode_to_loader_and_compiles_int8_linears(monkeypatch):
+    """V39: the ConvRot INT8 Linear is a torch.library custom op, so compiled blocks keep their INT8 Linears; only block
+    swap keeps Linears eager."""
     import musubi_tuner.minimax_h3_train_network as train
 
     captured = {}
@@ -374,6 +376,10 @@ def test_h3_trainer_passes_backward_mode_to_loader_and_excludes_int8_linears_fro
     assert trainer._convrot_int8_active is True
     assert compiled is transformer
     assert captured["load"]["convrot_int8_bwd"] == "int8"
+    assert captured["compile"]["disable_linear"] is False
+    trainer.blocks_to_swap = 8
+    transformer.offloader = None
+    trainer.compile_transformer(args, transformer)
     assert captured["compile"]["disable_linear"] is True
 
 

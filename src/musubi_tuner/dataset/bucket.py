@@ -39,6 +39,8 @@ from musubi_tuner.dataset.architectures import (
 
 # LTX-2 fork additions — separate import so upstream's inserts into the sorted block above don't conflict
 from musubi_tuner.dataset.architectures import ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL
+from musubi_tuner.dataset.architectures import ARCHITECTURE_FIBO2  # FIBO 2.0 (fork)
+from musubi_tuner.dataset.architectures import ARCHITECTURE_ANIMA  # Anima (fork)
 from musubi_tuner.dataset.media_utils import divisible_by
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
 
@@ -154,6 +156,8 @@ class BucketSelector:
         ARCHITECTURE_FLUX_2_KLEIN_9B: RESOLUTION_STEPS_FLUX_2,
         ARCHITECTURE_FLUX_3: RESOLUTION_STEPS_FLUX_3,
         ARCHITECTURE_MOSS_IMAGE: RESOLUTION_STEPS_MOSS_IMAGE,
+        ARCHITECTURE_FIBO2: 16,  # FIBO 2.0: FLUX.2 VAE f8 x 2x2 packing
+        ARCHITECTURE_ANIMA: 16,  # Anima: Qwen-Image VAE f8 x 2x2 patches
         ARCHITECTURE_QWEN_IMAGE: RESOLUTION_STEPS_QWEN_IMAGE,
         ARCHITECTURE_QWEN_IMAGE_21: RESOLUTION_STEPS_QWEN_IMAGE_21,
         ARCHITECTURE_QWEN_IMAGE_EDIT: RESOLUTION_STEPS_QWEN_IMAGE_EDIT,
@@ -580,6 +584,10 @@ class BucketBatchManager:
                 if item_info.text_encoder_output_cache_path
                 else {}
             )
+            if any("_cand" in key for key in sd_te):  # several captions (MOSS-Image): one of them for this load
+                from musubi_tuner.dataset.cache_io import pick_caption_candidate
+
+                sd_te = pick_caption_candidate(sd_te)
             sd = {**sd_latent, **sd_te}
             # When the text encoder is trained (full fine-tune), Gemma runs live at train
             # time and needs the original caption string. Training-item enumeration leaves

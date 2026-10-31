@@ -56,6 +56,11 @@ def detect_arch_config(unet):
 
         return MOSS_IMAGE_TARGET_REPLACE_MODULES, [r".*(norm).*"]
 
+    if "AnimaBlock" in module_class_names:
+        from .lora_anima import ANIMA_TARGET_REPLACE_MODULES
+
+        return ANIMA_TARGET_REPLACE_MODULES, [r".*(_modulation|_norm|_embedder|final_layer).*"]
+
     if "Flux3JointBlock" in module_class_names:
         from .lora_flux_3 import FLUX_3_TARGET_REPLACE_MODULES
 
